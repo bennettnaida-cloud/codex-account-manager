@@ -1,0 +1,22 @@
+{
+  "name": "codex-account-manager-macos",
+  "version": "1.1.5",
+  "private": true,
+  "description": "Codex Account Manager for macOS",
+  "main": "src/main.js",
+  "productName": "Codex Account Manager",
+  "scripts": {
+    "test": "node tests/core.test.js && node --test tests/account-activation.test.js tests/codex-cli.test.js tests/gateway-secret.test.js tests/history-service.test.js tests/local-pat-gateway.test.js tests/main-wiring.test.js tests/packaging.test.js tests/pat-gateway-controller.test.js tests/release-privacy.test.js tests/renderer-delete-race.test.js tests/system-service.test.js tests/theme-service.test.js tests/usage-stats.test.js",
+    "icon:mac": "node scripts/generate-icon.mjs",
+    "build:mac": "node scripts/build-macos.mjs",
+    "verify:mac": "node scripts/verify-release.mjs",
+    "clean:mac": "node scripts/clean-build-cache.mjs"
+  },
+  "devDependencies": {
+    "@electron/asar": "4.2.0",
+    "@electron/get": "5.0.0",
+    "archiver": "7.0.1",
+    "electron": "43.1.1",
+    "png2icons": "2.0.1"
+  }
+}

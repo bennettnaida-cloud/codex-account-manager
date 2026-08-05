@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'">
+  <title>Codex Account Manager</title>
+  <link rel="stylesheet" href="./renderer.css">
+</head>
+<body>
+  <div class="app-shell" id="appShell" aria-busy="true">
+    <div class="window-drag-region" aria-hidden="true"></div>
+
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <span></span><span></span><span></span>
+        </div>
+        <div>
+          <strong>Codex</strong>
+          <small>Account Manager</small>
+        </div>
+      </div>
+
+      <nav class="main-nav" aria-label="主导航">
+        <button class="nav-item is-active" type="button" data-page="accounts">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.2c0-2.55 2.35-4.62 5.25-4.62h5.5c2.9 0 5.25 2.07 5.25 4.62V20H4v-.8ZM12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z"/></svg>
+          <span>账号中心</span>
+        </button>
+        <button class="nav-item" type="button" data-page="history">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4.5h14v12H9l-4 3v-15Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M8 8h8M8 12h5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+          <span>聊天记录</span>
+        </button>
+        <button class="nav-item" type="button" data-page="status">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5c0 4.5 2.8 8.1 7 10 4.2-1.9 7-5.5 7-10V6l-7-3Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="m9 12 2 2 4-4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span>状态与凭据</span>
+        </button>
+        <button class="nav-item" type="button" data-page="usage">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 18.5V11h3v7.5H4Zm6.5 0V5h3v13.5h-3Zm6.5 0V8h3v10.5h-3Z"/><path d="M3 20h18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+          <span>用量统计</span>
+        </button>
+        <button class="nav-item" type="button" data-page="quota">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 7v5l3 2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span>额度显示</span>
+        </button>
+        <button class="nav-item" type="button" data-page="themes">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18h1.2a1.8 1.8 0 0 0 .5-3.5 1.3 1.3 0 0 1 .4-2.5h2.4A4.5 4.5 0 0 0 21 10.5C21 6.4 17 3 12 3Z" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="7.5" cy="10" r="1"/><circle cx="10" cy="6.8" r="1"/><circle cx="14.2" cy="7" r="1"/></svg>
+          <span>Codex 主题</span>
+        </button>
+        <button class="nav-item" type="button" data-page="settings">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Z" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="m19 13.7 1.2 1-.2 2-1.5.8-.8 1.5.2 1.7-1.8 1-1.4-1-1.7.2-1 1.3h-2l-1-1.3-1.7-.2-1.4 1-1.8-1 .2-1.7-.8-1.5-1.5-.8-.2-2 1.2-1v-1.6l-1.2-1 .2-2 1.5-.8.8-1.5-.2-1.7 1.8-1 1.4 1 1.7-.2 1-1.3h2l1 1.3 1.7.2 1.4-1 1.8 1-.2 1.7.8 1.5 1.5.8.2 2-1.2 1v1.6Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>
+          <span>系统配置</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-note">
+        <span class="note-orbit" aria-hidden="true"></span>
+        <div><strong>本地优先</strong><small>凭据仅保存在此 Mac</small></div>
+      </div>
+
+      <div class="sidebar-footer">
+        <button class="theme-button" id="themeButton" type="button" aria-label="切换外观">
+          <svg class="sun-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.7"/><path d="M12 2v2.1M12 19.9V22M2 12h2.1M19.9 12H22M4.93 4.93l1.49 1.49M17.58 17.58l1.49 1.49M19.07 4.93l-1.49 1.49M6.42 17.58l-1.49 1.49" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+          <span id="themeLabel">跟随系统</span>
+          <kbd>⌘⇧L</kbd>
+        </button>
+        <div class="version-label" id="versionLabel">macOS</div>
+      </div>
+    </aside>
+
+    <main class="content">
+      <div class="ambient ambient-one" aria-hidden="true"></div>
+      <div class="ambient ambient-two" aria-hidden="true"></div>
+
+      <section class="page is-active" id="accountsPage" data-page-panel="accounts">
+        <header class="page-header">
+          <div>
+            <p class="eyebrow">WORKSPACE</p>
+            <h1>账号中心</h1>
+            <p class="page-subtitle">在独立环境中安全切换、登录并启动 Codex。</p>
+          </div>
+          <div class="header-actions">
+            <button class="button button-secondary" id="importButton" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 15.5V20h14v-4.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              导入
+            </button>
+            <button class="button button-primary" id="addAccountButton" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+              添加账号
+            </button>
+          </div>
+        </header>
+
+        <div class="current-card" id="currentCard">
+          <div class="current-visual" aria-hidden="true">
+            <div class="current-orbit orbit-a"></div>
+            <div class="current-orbit orbit-b"></div>
+            <div class="current-core"><span id="currentInitial">C</span></div>
+          </div>
+          <div class="current-copy">
+            <div class="section-kicker"><span class="pulse-dot"></span>当前工作账号</div>
+            <h2 id="currentName">尚未选择账号</h2>
+            <div class="current-meta">
+              <span id="currentAuth">添加账号后即可开始</span>
+              <span class="meta-separator">•</span>
+              <span class="status-inline" id="currentLoginStatus">未连接</span>
+            </div>
+          </div>
+          <div class="current-metrics">
+            <div><span>本周期 Token</span><strong id="heroTokens">—</strong></div>
+            <div><span id="heroValueLabel">金额</span><strong id="heroValue">—</strong></div>
+          </div>
+          <button class="button button-glass" id="launchCurrentButton" type="button" disabled>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 8 7-8 7V5Z"/></svg>
+            在终端启动
+          </button>
+        </div>
+
+        <div class="workspace-grid">
+          <section class="panel accounts-panel">
+            <div class="panel-header">
+              <div><h3>全部账号</h3><span class="count-badge" id="accountCount">0</span></div>
+              <label class="search-field">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.7" cy="10.7" r="6.2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="m15.4 15.4 4.1 4.1" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+                <input id="accountSearch" type="search" autocomplete="off" placeholder="搜索账号" aria-label="搜索账号">
+              </label>
+            </div>
+            <div class="account-list" id="accountList"></div>
+          </section>
+
+          <section class="panel detail-panel" id="detailPanel">
+            <div class="empty-detail" id="detailEmpty">
+              <div class="empty-constellation" aria-hidden="true"><i></i><i></i><i></i><span></span></div>
+              <h3>选择一个账号</h3>
+              <p>查看登录状态、账号目录与快捷操作。</p>
+            </div>
+            <div class="account-detail is-hidden" id="accountDetail">
+              <div class="detail-heading">
+                <div class="account-avatar large" id="detailAvatar">C</div>
+                <div><h3 id="detailName">—</h3><p id="detailType">—</p></div>
+                <span class="status-pill" id="detailStatus"><i></i>未检查</span>
+              </div>
+              <dl class="detail-list">
+                <div><dt>账号目录</dt><dd id="detailHome">—</dd></div>
+                <div><dt>模型</dt><dd id="detailModel">默认模型</dd></div>
+                <div><dt>最近使用</dt><dd id="detailLastUsed">尚未使用</dd></div>
+              </dl>
+              <div class="detail-primary-actions">
+                <button class="button button-primary" id="detailLaunchButton" type="button">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 8 7-8 7V5Z"/></svg>在终端启动
+                </button>
+                <button class="button button-secondary" id="detailAppLaunchButton" type="button">启动 ChatGPT（Codex）</button>
+                <button class="button button-secondary" id="setCurrentButton" type="button">切换账号</button>
+              </div>
+              <div class="detail-secondary-actions">
+                <button class="text-action" id="checkLoginButton" type="button">检查登录</button>
+                <button class="text-action" id="loginButton" type="button">登录 / 更新凭据</button>
+                <button class="text-action" id="editAccountButton" type="button">编辑</button>
+                <button class="text-action danger" id="deleteAccountButton" type="button">删除</button>
+              </div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="page" id="historyPage" data-page-panel="history">
+        <header class="page-header">
+          <div>
+            <p class="eyebrow">CONVERSATIONS</p>
+            <h1>聊天记录</h1>
+            <p class="page-subtitle">按账号浏览、搜索、归档和清理本地 Codex 会话。</p>
+          </div>
+          <button class="button button-secondary" id="refreshHistoryButton" type="button">刷新记录</button>
+        </header>
+        <div class="workspace-toolbar">
+          <label class="search-field toolbar-search"><span class="sr-only">搜索聊天记录</span><input id="historySearch" type="search" autocomplete="off" placeholder="搜索标题、正文或工作目录"></label>
+          <label class="compact-field"><span>账号</span><select id="historyAccountFilter"><option value="all">全部账号</option></select></label>
+          <label class="compact-field"><span>状态</span><select id="historyArchiveFilter"><option value="all">全部记录</option><option value="active">活动</option><option value="archived">已归档</option></select></label>
+          <span class="toolbar-count" id="historyCount">0 条记录</span>
+        </div>
+        <div class="split-workspace history-workspace">
+          <section class="panel history-list-panel" aria-label="聊天记录列表"><div class="history-list" id="historyList"></div></section>
+          <section class="panel thread-reader" id="threadReader">
+            <div class="empty-state" id="threadReaderEmpty"><span class="empty-state-mark">⌁</span><h3>选择一条聊天记录</h3><p>这里会显示本地保存的用户与助手消息。</p></div>
+            <div class="thread-reader-content is-hidden" id="threadReaderContent">
+              <header class="thread-reader-header"><div><h3 id="threadTitle">—</h3><p id="threadMeta">—</p></div><div class="thread-actions"><button class="mini-button" id="copyThreadButton" type="button">复制正文</button><button class="mini-button" id="archiveThreadButton" type="button">归档</button><button class="mini-button danger" id="deleteThreadButton" type="button">删除</button></div></header>
+              <div class="thread-messages" id="threadMessages"></div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="page" id="statusPage" data-page-panel="status">
+        <header class="page-header">
+          <div>
+            <p class="eyebrow">CREDENTIALS</p>
+            <h1>状态与凭据</h1>
+            <p class="page-subtitle">集中检查各账号登录状态，并更新各自独立保存的凭据。</p>
+          </div>
+          <button class="button button-secondary" id="statusCheckAllButton" type="button">检查全部</button>
+        </header>
+        <section class="panel status-panel">
+          <div class="status-account-list" id="statusAccountList"></div>
+        </section>
+      </section>
+
+      <section class="page" id="usagePage" data-page-panel="usage">
+        <header class="page-header usage-header">
+          <div>
+            <p class="eyebrow">INSIGHTS</p>
+            <h1>用量统计</h1>
+            <p class="page-subtitle">从本地会话汇总 Token 消耗与模型分布。</p>
+          </div>
+          <div class="range-control" id="rangeControl" role="group" aria-label="统计范围">
+            <button type="button" data-range="today">今天</button>
+            <button type="button" data-range="7d">7 天</button>
+            <button class="is-active" type="button" data-range="30d">30 天</button>
+            <button type="button" data-range="all">全部</button>
+          </div>
+        </header>
+
+        <div class="workspace-toolbar usage-toolbar">
+          <label class="compact-field"><span>统计账号</span><select id="usageAccountFilter"><option value="all">全部账号</option><option value="unattributed">未归属会话</option></select></label>
+          <label class="compact-field"><span>定时刷新</span><select id="usageRefreshInterval"><option value="0">关闭</option><option value="15" selected>15 秒</option><option value="30">30 秒</option><option value="60">60 秒</option></select></label>
+          <button class="button button-secondary" id="usageRefreshButton" type="button">立即刷新</button>
+        </div>
+
+        <div class="metric-switch" id="metricSwitch" role="tablist" aria-label="统计口径">
+          <button class="is-active" type="button" data-metric="value" role="tab" aria-selected="true">
+            <span class="metric-icon value-icon">$</span><span><strong id="valueMetricLabel">金额</strong><small>本地估算，非实际账单</small></span>
+          </button>
+          <button type="button" data-metric="tokens" role="tab" aria-selected="false">
+            <span class="metric-icon token-icon">T</span><span><strong>Token</strong><small>原始 Token 数量</small></span>
+          </button>
+        </div>
+
+        <div class="summary-grid">
+          <article class="summary-card accent-blue"><span class="summary-label" id="primaryMetricLabel">金额</span><strong id="primaryMetricValue">$0.00</strong><small id="primaryMetricHint">所选时间范围</small></article>
+          <article class="summary-card accent-violet"><span class="summary-label">输入 Token</span><strong id="inputTokenValue">0</strong><small>含缓存写入</small></article>
+          <article class="summary-card accent-cyan"><span class="summary-label">缓存读取</span><strong id="cachedTokenValue">0</strong><small id="cacheRateHint">占输入 0%</small></article>
+          <article class="summary-card accent-pink"><span class="summary-label">输出 Token</span><strong id="outputTokenValue">0</strong><small>模型生成内容</small></article>
+        </div>
+
+        <div class="analytics-grid">
+          <section class="panel chart-panel">
+            <div class="panel-header chart-heading">
+              <div><h3 id="chartTitle">金额趋势</h3><p id="chartSubtitle">最近 30 天</p></div>
+              <div class="chart-total"><span>合计</span><strong id="chartTotal">$0.00</strong></div>
+            </div>
+            <div class="chart-wrap" id="chartWrap">
+              <svg id="usageChart" viewBox="0 0 760 280" preserveAspectRatio="none" role="img" aria-label="用量趋势图"></svg>
+              <div class="chart-tooltip" id="chartTooltip" hidden></div>
+              <div class="chart-empty" id="chartEmpty"><span></span><p>暂无可统计的本地会话</p></div>
+            </div>
+          </section>
+
+          <section class="panel distribution-panel">
+            <div class="panel-header"><div><h3>模型分布</h3><p>按当前统计口径</p></div></div>
+            <div class="distribution-body">
+              <div class="model-ring" id="modelRing" aria-label="模型使用分布">
+                <div class="ring-center"><strong id="modelCount">0</strong><span>个模型</span></div>
+              </div>
+              <div class="model-legend" id="modelLegend"></div>
+            </div>
+          </section>
+        </div>
+
+        <section class="panel token-breakdown">
+          <div class="panel-header"><div><h3>Token 构成</h3><p>每类 Token 独立统计</p></div></div>
+          <div class="breakdown-bars" id="breakdownBars"></div>
+        </section>
+      </section>
+
+      <section class="page" id="quotaPage" data-page-panel="quota">
+        <header class="page-header">
+          <div>
+            <p class="eyebrow">LIMITS</p>
+            <h1>额度显示</h1>
+            <p class="page-subtitle">分别查看每个账号的 5 小时、周与月度额度窗口。</p>
+          </div>
+          <button class="button button-secondary" id="refreshQuotaButton" type="button">刷新额度</button>
+        </header>
+        <div class="workspace-toolbar">
+          <label class="compact-field"><span>账号</span><select id="quotaAccountFilter"><option value="all">全部账号</option></select></label>
+          <span class="toolbar-count" id="quotaUpdatedAt">尚未读取 · 每 30 秒自动刷新</span>
+        </div>
+        <div class="quota-grid" id="quotaGrid"></div>
+      </section>
+
+      <section class="page" id="themesPage" data-page-panel="themes">
+        <header class="page-header">
+          <div>
+            <p class="eyebrow">APPEARANCE</p>
+            <h1>Codex 主题</h1>
+            <p class="page-subtitle">管理 Codex App 主题，并保存可重复使用的本地自定义方案。</p>
+          </div>
+          <div class="header-actions"><button class="button button-secondary" id="refreshThemesButton" type="button">刷新主题</button><button class="button button-secondary" id="restoreThemeButton" type="button">恢复官方主题</button></div>
+        </header>
+        <div class="theme-workspace">
+          <section class="panel theme-library"><div class="panel-header"><div><h3>可用主题</h3><p>应用到本机 Codex App</p></div></div><div class="theme-grid" id="themeGrid"></div></section>
+          <section class="panel custom-theme-panel">
+            <div class="panel-header"><div><h3>自定义主题</h3><p>保存后即可在左侧主题库中应用</p></div></div>
+            <form class="custom-theme-form" id="customThemeForm">
+              <label class="field field-wide"><span>主题名称</span><input id="customThemeName" maxlength="60" required autocomplete="off" placeholder="例如：深海蓝"></label>
+              <label class="field"><span>外观模式</span><select id="customThemeMode"><option value="dark">深色</option><option value="light">浅色</option></select></label>
+              <label class="field"><span>代码主题</span><input id="customThemeCodeTheme" autocomplete="off" placeholder="留空沿用当前设置"></label>
+              <label class="field"><span>强调色</span><input id="customThemeAccent" type="color" value="#6173ff"></label>
+              <label class="field"><span>表面色</span><input id="customThemeSurface" type="color" value="#151b2d"></label>
+              <label class="field"><span>文字色</span><input id="customThemeText" type="color" value="#f2f5fb"></label>
+              <label class="field field-wide"><span>背景图片路径</span><input id="customThemeBackground" autocomplete="off" placeholder="可选：本地图片绝对路径"></label>
+              <button class="button button-primary field-wide" id="saveCustomThemeButton" type="submit">保存自定义主题</button>
+            </form>
+          </section>
+        </div>
+      </section>
+
+      <section class="page" id="settingsPage" data-page-panel="settings">
+        <header class="page-header">
+          <div>
+            <p class="eyebrow">SYSTEM</p>
+            <h1>系统配置</h1>
+            <p class="page-subtitle">设置启动目录与本地代理；自动检测仅扫描本机地址。</p>
+          </div>
+        </header>
+        <form class="panel settings-form" id="settingsForm">
+          <div class="settings-section">
+            <div class="settings-section-copy"><h3>本地目录</h3><p>管理器目录只读；启动目录用于新开的 Codex 工作区。</p></div>
+            <div class="settings-grid">
+              <label class="field field-with-action"><span>项目根目录</span><div><input id="projectRootInput" readonly><button class="mini-button" id="openProjectRootButton" type="button">打开</button></div></label>
+              <label class="field field-with-action"><span>默认启动目录</span><div><input id="launchDirectoryInput" autocomplete="off" placeholder="留空使用项目根目录"><button class="mini-button" id="openLaunchDirectoryButton" type="button">打开</button></div></label>
+            </div>
+          </div>
+          <div class="settings-section">
+            <div class="settings-section-copy"><h3>ChatGPT（Codex）桌面应用</h3><p>选择官方含 Codex 的 ChatGPT.app 或旧版 Codex.app；保存前会校验应用身份与代码签名。</p></div>
+            <div class="settings-grid">
+              <label class="field codex-app-path-field" for="codexAppPathInput">
+                <span>应用路径</span>
+                <div class="codex-app-path-row">
+                  <input id="codexAppPathInput" readonly placeholder="自动检测 /Applications/ChatGPT.app 或 Codex.app" aria-describedby="codexAppPathHint">
+                  <button class="mini-button" id="chooseCodexAppButton" type="button">选择应用</button>
+                  <button class="mini-button" id="autoDetectCodexAppButton" type="button">恢复自动检测</button>
+                </div>
+                <small id="codexAppPathHint">当前使用自动检测；选择后需保存系统配置。</small>
+              </label>
+            </div>
+          </div>
+          <div class="settings-section">
+            <div class="settings-section-copy"><h3>代理连接</h3><p>地址默认本机，端口可手动设置，也可自动检测本机代理。</p></div>
+            <div class="settings-grid proxy-settings-grid">
+              <label class="field"><span>代理地址</span><input id="proxyHostInput" autocomplete="off" placeholder="127.0.0.1"></label>
+              <label class="field"><span>代理端口</span><input id="proxyPortInput" type="number" min="1" max="65535" inputmode="numeric" placeholder="自动检测"></label>
+              <label class="switch-field"><input id="proxyAutoDetectInput" type="checkbox"><span>启动时自动检测本地代理</span></label>
+              <div class="proxy-detect-row"><button class="button button-secondary" id="detectProxyButton" type="button">自动检测本地端口</button><span id="detectedProxyStatus">尚未检测</span></div>
+            </div>
+          </div>
+          <footer class="settings-footer"><button class="button button-primary" id="saveSystemSettingsButton" type="submit">保存系统配置</button></footer>
+        </form>
+      </section>
+    </main>
+
+    <div class="loading-layer" id="loadingLayer"><div class="loader-mark"><i></i><i></i><i></i></div><span>正在读取本地数据…</span></div>
+    <div class="toast-stack" id="toastStack" aria-live="polite" aria-atomic="true"></div>
+  </div>
+
+  <dialog class="modal" id="accountModal">
+    <form class="modal-card account-form" id="accountForm" method="dialog">
+      <header class="modal-header"><div><p class="eyebrow" id="accountModalEyebrow">NEW PROFILE</p><h2 id="accountModalTitle">添加账号</h2></div><button class="icon-button" type="button" data-close-modal="accountModal" aria-label="关闭">×</button></header>
+      <div class="modal-body">
+        <div class="form-grid">
+          <label class="field field-wide"><span>账号名称</span><input id="accountNameInput" name="name" maxlength="60" required autocomplete="off" placeholder="例如：个人账号"></label>
+          <div class="field"><label for="authKindInput">登录方式</label><div class="oauth-method-row"><select id="authKindInput" name="authKind"><option value="access_token">Access Token</option><option value="official_oauth">通过 ChatGPT 登录（官方）</option><option value="compatible_api">兼容 API</option></select><button class="oauth-login-button is-hidden" id="oauthLoginButton" type="button">生成登录链接</button></div><small class="oauth-login-status is-hidden" id="oauthLoginStatus" role="status" aria-live="polite">尚未登录</small></div>
+          <label class="field" id="modelField"><span>默认模型</span><input id="modelInput" name="model" autocomplete="off" placeholder="留空使用默认模型"></label>
+          <label class="field field-wide"><span>账号目录（自动管理）</span><input id="codexHomeInput" name="codexHome" autocomplete="off" readonly placeholder="保存后自动创建独立目录"></label>
+          <div class="api-fields field-wide is-hidden" id="apiFields">
+            <label class="field"><span>服务商名称</span><input id="providerNameInput" name="providerName" autocomplete="off" placeholder="例如：团队网关"></label>
+            <label class="field"><span>API Base URL</span><input id="baseUrlInput" name="baseUrl" type="url" autocomplete="off" placeholder="https://api.example.com/v1"></label>
+            <label class="field"><span>API 协议</span><select id="wireApiInput" name="wireApi" disabled><option value="responses">Responses（新版 Codex）</option></select></label>
+          </div>
+          <div class="privacy-note field-wide is-hidden" id="oauthFields"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 10V8a5.5 5.5 0 0 1 11 0v2M5 10h14v10H5V10Z" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="12" cy="15" r="1.5"/></svg><span>软件不会自动打开浏览器。点击“生成登录链接”后，官方 OpenAI 登录地址会复制到剪贴板；网页登录成功并显示“✓ 已登录”后才可保存账号。OAuth 凭据由官方 Codex CLI 写入此账号的独立目录。</span></div>
+          <label class="field field-wide" id="accountSecretField"><span id="secretFieldLabel">Access Token</span><div class="secret-input"><input id="secretInput" name="secret" type="password" autocomplete="new-password" placeholder="仅保存在此账号目录"><button type="button" id="revealSecretButton" aria-label="显示或隐藏凭据">显示</button></div><small id="secretFieldHint">编辑时留空会保留原凭据。</small></label>
+        </div>
+        <div class="privacy-note"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 10V8a5.5 5.5 0 0 1 11 0v2M5 10h14v10H5V10Z" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="12" cy="15" r="1.5"/></svg><span>凭据通过本机进程保存，不会进入界面缓存或统计数据。</span></div>
+      </div>
+      <footer class="modal-footer"><button class="button button-secondary" type="button" data-close-modal="accountModal">取消</button><button class="button button-primary" id="saveAccountButton" type="submit">保存账号</button></footer>
+    </form>
+  </dialog>
+
+  <dialog class="modal" id="loginModal">
+    <form class="modal-card compact-modal" id="loginForm" method="dialog">
+      <header class="modal-header"><div><p class="eyebrow">SECURE LOGIN</p><h2>登录账号</h2></div><button class="icon-button" type="button" data-close-modal="loginModal" aria-label="关闭">×</button></header>
+      <div class="modal-body">
+        <p class="modal-description" id="loginDescription">通过应用内置的官方 Codex CLI 完成登录。</p>
+        <label class="field" id="loginSecretField"><span id="loginSecretLabel">Access Token</span><div class="secret-input"><input id="loginSecretInput" type="password" autocomplete="new-password" required placeholder="粘贴凭据"><button type="button" id="revealLoginSecretButton">显示</button></div></label>
+      </div>
+      <footer class="modal-footer"><button class="button button-secondary" type="button" data-close-modal="loginModal">取消</button><button class="button button-primary" id="confirmLoginButton" type="submit">安全登录</button></footer>
+    </form>
+  </dialog>
+
+  <dialog class="modal" id="confirmModal">
+    <form class="modal-card confirm-card" method="dialog">
+      <div class="danger-symbol">!</div><h2 id="confirmTitle">删除账号？</h2><p id="confirmMessage">此操作无法撤销。</p>
+      <footer class="modal-footer"><button class="button button-secondary" value="cancel">取消</button><button class="button button-danger" id="confirmActionButton" value="confirm">确认删除</button></footer>
+    </form>
+  </dialog>
+
+  <script src="./renderer.js"></script>
+</body>
+</html>

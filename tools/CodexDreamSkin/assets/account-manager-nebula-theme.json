@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "account-manager-nebula",
+  "name": "Account Manager 星云夜色",
+  "brandSubtitle": "CODEX ACCOUNT MANAGER",
+  "tagline": "把额度星球与模型轨道带进 Codex。",
+  "projectPrefix": "选择项目 · ",
+  "projectLabel": "选择项目",
+  "statusText": "ACCOUNT MANAGER THEME ONLINE",
+  "quote": "FOCUS ON THE WORK",
+  "image": "account-manager-nebula-orbit.jpg",
+  "appearance": "dark",
+  "art": {
+    "focusX": 0.76,
+    "focusY": 0.43,
+    "safeArea": "left",
+    "taskMode": "ambient"
+  },
+  "palette": {
+    "accent": "#7c5cfc"
+  }
+}

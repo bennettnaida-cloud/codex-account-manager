@@ -1,0 +1,47 @@
+# 依赖和构建目录
+node_modules/
+dist/
+artifacts/
+.artifacts/
+.cache/
+macos/node_modules/
+
+# 安装包和二进制载荷
+*.zip
+*.tgz
+*.dmg
+*.app
+
+# 账号和本地运行数据
+accounts.json
+appsettings.json
+token-metadata.json
+quota-*.json
+usage-account-switches.json
+sub2api-usage-ledger.json
+*.jsonl
+*.sqlite
+*.sqlite3
+
+# 密钥和环境配置
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+pat-gateway-secret
+pat-gateway-control-v1
+
+# 本机开发工具缓存
+.tools/
+.vs/
+bin/
+obj/
+
+# 发布脚本使用的脱敏空白模板（允许进入源码仓库）
+!packaging/defaults/
+!packaging/defaults/accounts.json
+!packaging/defaults/appsettings.json
+!packaging/defaults/token-metadata.json
+!packaging/defaults/usage-account-switches.json

@@ -1,0 +1,33 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <ApplicationIcon>..\..\assets\CodexAccountManager.ico</ApplicationIcon>
+    <!-- Normal developer builds run through the bundled dotnet host.  Omitting the
+         framework-dependent apphost prevents an accidental double-click/test launch
+         from opening the .NET download page on machines without a system-wide 10.x
+         desktop runtime.  Self-contained single-file publish still produces the real EXE. -->
+    <UseAppHost Condition="'$(PublishSingleFile)' != 'true'">false</UseAppHost>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="..\..\assets\CodexAccountManager.ico" Link="assets\CodexAccountManager.ico" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\assets\CodexAccountManager.png" Link="assets\CodexAccountManager.png" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\tools\CodexDreamSkin\**\*">
+      <Link>CodexDreamSkin\%(RecursiveDir)%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
+    </Content>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite.Core" Version="10.0.9" />
+    <PackageReference Include="SQLitePCLRaw.provider.winsqlite3" Version="3.0.3" />
+  </ItemGroup>
+
+</Project>
