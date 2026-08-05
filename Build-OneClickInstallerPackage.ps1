@@ -537,7 +537,13 @@ try {
             -Wait `
             -PassThru
         if ($installerTest.ExitCode -ne 0) {
-            throw "Isolated one-click installer test failed with exit code $($installerTest.ExitCode)"
+            $installerFailureDetail = if (Test-Path -LiteralPath $testInstallerLog -PathType Leaf) {
+                Get-Content -LiteralPath $testInstallerLog -Raw -ErrorAction SilentlyContinue
+            }
+            else {
+                'The installer did not create its diagnostic log.'
+            }
+            throw "Isolated one-click installer test failed with exit code $($installerTest.ExitCode): $installerFailureDetail"
         }
     }
     finally {
