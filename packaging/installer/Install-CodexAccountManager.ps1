@@ -12,6 +12,26 @@ $ErrorActionPreference = 'Stop'
 $script:InstallerLogPath = $null
 $script:InstallerScriptPath = $PSCommandPath
 
+function Get-Sha256Hex {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $stream = $null
+    $sha256 = $null
+    try {
+        $stream = [IO.File]::OpenRead($Path)
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        return ([BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '')
+    }
+    finally {
+        if ($null -ne $sha256) {
+            $sha256.Dispose()
+        }
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+    }
+}
+
 function Initialize-InstallerLog {
     $resolvedLogPath = $LogPath
     if ([string]::IsNullOrWhiteSpace($resolvedLogPath)) {
@@ -270,7 +290,7 @@ try {
             -not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
             throw "安装包校验文件不存在或路径无效：$relativePath"
         }
-        $actualHash = (Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash
+        $actualHash = Get-Sha256Hex -Path $candidate
         if (-not $actualHash.Equals($Matches[1], [StringComparison]::OrdinalIgnoreCase)) {
             throw "安装包文件校验失败：$relativePath"
         }
