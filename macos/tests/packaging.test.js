@@ -29,8 +29,9 @@ test('installer quits the manager and precisely stops the daemon before replacin
   assert.ok(installActions.indexOf('BACKUP_CREATED=1') < installActions.indexOf('mv "$TARGET_APP" "$BACKUP_APP"'));
   assert.ok(installActions.indexOf('TARGET_REPLACED=1') < installActions.indexOf('mv "$TEMP_APP" "$TARGET_APP"'));
   assert.ok(installActions.indexOf('INSTALL_COMMITTED=1') < installActions.indexOf('rm -rf "$BACKUP_APP"'));
-  assert.match(installer, /CFBundleShortVersionString 1\.1\.5/);
-  assert.match(installer, /CFBundleVersion 5/);
+  assert.match(installer, /app-version\.txt/);
+  assert.match(installer, /CFBundleShortVersionString \$APP_SHORT_VERSION/);
+  assert.match(installer, /CFBundleVersion \$APP_BUILD_VERSION/);
 });
 
 test('uninstaller stops only this bundle manager and daemon before deleting either app', () => {
@@ -52,7 +53,7 @@ test('release verification compares the packaged gateway controller with source'
   assert.match(releaseVerifier, /listPackage\(appAsar\)/);
   assert.match(releaseVerifier, /collectTree\(sourceRoot\)/);
   assert.match(releaseVerifier, /发布 ZIP 与当前 packaging 文件不一致/);
-  assert.match(releaseVerifier, /packageJson\?\.version !== '1\.1\.5'/);
+  assert.match(releaseVerifier, /packageJson\?\.version !== appVersion/);
 });
 
 test('quota snapshots are treated as private runtime data and labelled in the UI', () => {

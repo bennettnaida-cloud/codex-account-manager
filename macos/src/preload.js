@@ -33,6 +33,7 @@ contextBridge.exposeInMainWorld('codexManager', {
   restoreCodexTheme: () => ipcRenderer.invoke('codex-theme:restore'),
   saveCustomTheme: (options) => ipcRenderer.invoke('codex-theme:save-custom', options || {}),
   setTheme: (theme) => ipcRenderer.invoke('theme:set', theme),
+  checkForUpdates: () => ipcRenderer.invoke('app:update-check'),
   onStateChanged: (callback) => {
     const listener = (_event, state) => callback(state);
     ipcRenderer.on('state:changed', listener);

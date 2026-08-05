@@ -21,9 +21,19 @@ else {
 $assetsRoot = Join-Path $root 'assets'
 $defaultsRoot = Join-Path $root 'packaging\defaults'
 $installerRoot = Join-Path $root 'packaging\installer'
-$codexRuntime = Join-Path $root '.tools\codex-cli\node_modules'
+$codexRuntime = if ([string]::IsNullOrWhiteSpace($env:CODEX_ACCOUNT_MANAGER_CODEX_RUNTIME)) {
+    Join-Path $root '.tools\codex-cli\node_modules'
+}
+else {
+    [IO.Path]::GetFullPath($env:CODEX_ACCOUNT_MANAGER_CODEX_RUNTIME)
+}
 $stamp = Get-Date -Format 'yyyyMMdd'
-$displayVersion = Get-Date -Format 'yyyy.MM.dd'
+$displayVersion = if ([string]::IsNullOrWhiteSpace($env:CAM_VERSION)) {
+    Get-Date -Format 'yyyy.MM.dd'
+}
+else {
+    $env:CAM_VERSION.Trim()
+}
 $useDefaultOutputPath = [string]::IsNullOrWhiteSpace($OutputPath)
 if ($useDefaultOutputPath) {
     $OutputPath = Join-Path (Split-Path -Parent $root) "CodexAccountManager-一键安装版-$stamp.zip"

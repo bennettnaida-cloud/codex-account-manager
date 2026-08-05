@@ -179,3 +179,10 @@ macOS 发布脚本会校验固定版本的 Electron 和 Codex CLI SHA256。由�
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\Test-CodexAccountSwitcher.ps1
 ```
+## 自动更新与发布
+
+推送到 GitHub 的 `main` 分支后，`.github/workflows/build-latest.yml` 会自动在 Windows 和 macOS runner 上构建安装包，并更新 `latest` Release。安装包不会进入源码仓库。
+
+Windows 和 macOS 客户端启动后会检查该 Release 的 `update-manifest.json`。发现新版本时，客户端会下载对应平台的 ZIP、校验 SHA256，得到确认后关闭旧程序并运行内置安装器；账号、Token 元数据、额度快照和聊天记录不会被更新流程删除。
+
+因此日常发布只需要：修改源码并推送到 `main`。GitHub Actions 完成后，已安装客户端会在下一次启动时自动提示更新。第一次安装仍需手动安装一次；macOS 当前发布包面向 Apple Silicon，且未配置 Apple Developer ID 公证。

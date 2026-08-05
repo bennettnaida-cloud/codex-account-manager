@@ -34,11 +34,12 @@ const ELECTRON_VERSION = '43.1.1';
 const ELECTRON_PAYLOAD_SHA256 = 'd6d0598d042ef4d146278d08d84deac9dde145eae31eb4f32ef46206d6bd6169';
 const CODEX_CLI_VERSION = '0.144.1';
 const CODEX_CLI_PAYLOAD_SHA256 = '365a5685170f66bad58dd1dabb0462dfb824f82a870bcc8d9af2eb0a41cf2e18';
+const APP_VERSION = process.env.CAM_VERSION || '1.1.5';
 const RELEASE_PREFIX = 'CodexAccountManager-macOS-一键安装版';
 const ELECTRON_PAYLOAD_NAME = `electron-v${ELECTRON_VERSION}-darwin-arm64.zip`;
 const CODEX_CLI_PAYLOAD_NAME = `openai-codex-${CODEX_CLI_VERSION}-darwin-arm64.tgz`;
 const PAYLOAD_FILES = [ELECTRON_PAYLOAD_NAME, CODEX_CLI_PAYLOAD_NAME, 'app.asar', 'AppIcon.icns'];
-const LOOSE_FILES = ['一键安装.command', '卸载.command', 'README.md'];
+const LOOSE_FILES = ['一键安装.command', '卸载.command', 'README.md', 'app-version.txt'];
 
 function parseArguments(argv) {
   const options = {
@@ -139,7 +140,7 @@ async function buildAppAsar(workRoot) {
   await writeFile(path.join(sourceRoot, 'package.json'), `${JSON.stringify({
     name: 'codex-account-manager-macos',
     productName: APP_NAME,
-    version: '1.1.5',
+    version: APP_VERSION,
     private: true,
     main: 'src/main.js',
   }, null, 2)}\n`, 'utf8');
@@ -248,8 +249,10 @@ async function stagePayload(releaseRoot, appAsar, electronZip, codexCliTgz) {
   await copyFile(appAsar, path.join(payloadRoot, 'app.asar'));
   await copyFile(path.join(MACOS_DIR, 'assets', 'AppIcon.icns'), path.join(payloadRoot, 'AppIcon.icns'));
   for (const file of LOOSE_FILES) {
+    if (file === 'app-version.txt') continue;
     await copyFile(path.join(PACKAGING_DIR, file), path.join(releaseRoot, file));
   }
+  await writeFile(path.join(releaseRoot, 'app-version.txt'), `${APP_VERSION}\n`, 'utf8');
 }
 
 async function scanReleasePrivacy(releaseRoot) {

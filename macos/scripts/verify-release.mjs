@@ -12,7 +12,7 @@ const ELECTRON_PAYLOAD = 'electron-v43.1.1-darwin-arm64.zip';
 const ELECTRON_SHA256 = 'd6d0598d042ef4d146278d08d84deac9dde145eae31eb4f32ef46206d6bd6169';
 const CODEX_CLI_PAYLOAD = 'openai-codex-0.144.1-darwin-arm64.tgz';
 const CODEX_CLI_SHA256 = '365a5685170f66bad58dd1dabb0462dfb824f82a870bcc8d9af2eb0a41cf2e18';
-const LOOSE_FILES = ['一键安装.command', '卸载.command', 'README.md'];
+const LOOSE_FILES = ['一键安装.command', '卸载.command', 'README.md', 'app-version.txt'];
 const EXPECTED_CHECKSUM_FILES = new Set([
   `payload/${ELECTRON_PAYLOAD}`,
   `payload/${CODEX_CLI_PAYLOAD}`,
@@ -160,6 +160,10 @@ async function verifyInternalRelease(zipPath) {
     const entries = await readdir(temporaryRoot, { withFileTypes: true });
     if (entries.length !== 1 || !entries[0].isDirectory()) throw new Error('发布 ZIP 顶层结构异常。');
     const releaseRoot = path.join(temporaryRoot, entries[0].name);
+    const appVersion = (await readFile(path.join(releaseRoot, 'app-version.txt'), 'utf8')).trim();
+    if (!/^\d+(?:\.\d+){2,3}$/.test(appVersion)) {
+      throw new Error(`发布包版本号无效：${appVersion}`);
+    }
     const releaseTree = await collectTree(releaseRoot);
     assertExactSet(releaseTree.files, EXPECTED_RELEASE_FILES, '发布 ZIP');
     assertExactSet(releaseTree.directories, EXPECTED_RELEASE_DIRECTORIES, '发布 ZIP 目录');
@@ -183,7 +187,9 @@ async function verifyInternalRelease(zipPath) {
     const packagingRoot = path.resolve(SCRIPT_DIR, '..', 'packaging');
     for (const relative of LOOSE_FILES) {
       const packed = await readFile(path.join(releaseRoot, relative));
-      const source = await readFile(path.join(packagingRoot, relative));
+      const source = relative === 'app-version.txt'
+        ? Buffer.from(`${appVersion}\n`, 'utf8')
+        : await readFile(path.join(packagingRoot, relative));
       if (!packed.equals(source)) throw new Error(`发布 ZIP 与当前 packaging 文件不一致：${relative}`);
     }
     verifyCodexCliPayload(path.join(releaseRoot, 'payload', CODEX_CLI_PAYLOAD));
@@ -193,7 +199,7 @@ async function verifyInternalRelease(zipPath) {
     assertExactSet(Object.keys(packageJson || {}), ['name', 'productName', 'version', 'private', 'main'], 'app.asar package.json');
     if (packageJson?.name !== 'codex-account-manager-macos' ||
         packageJson?.productName !== 'Codex Account Manager' ||
-        packageJson?.version !== '1.1.5' || packageJson?.private !== true || packageJson?.main !== 'src/main.js') {
+        packageJson?.version !== appVersion || packageJson?.private !== true || packageJson?.main !== 'src/main.js') {
       throw new Error('app.asar 版本或入口与发布版本不一致。');
     }
     const sourceRoot = path.resolve(SCRIPT_DIR, '..', 'src');

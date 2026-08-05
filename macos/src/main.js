@@ -17,6 +17,7 @@ const { LocalPatGateway, createPatGatewayUpstreamPreparer } = require('./service
 const { DAEMON_ARGUMENT, PatGatewayController } = require('./services/pat-gateway-controller');
 const { loadGatewaySecret, loadOrCreateGatewaySecret } = require('./services/gateway-secret');
 const { ThemeService, buildCustomThemeCss, normalizeCustomTheme } = require('./services/theme-service');
+const { checkForUpdate, downloadAndScheduleInstall } = require('./services/update-service');
 const {
   applyProxyEnvironment,
   detectLocalProxy,
@@ -44,6 +45,7 @@ const OAUTH_DRAFT_TTL_MS = 15 * 60 * 1000;
 const SHARED_HISTORY_ACCOUNT_ID = 'shared';
 let oauthShutdownPromise = null;
 let oauthShutdownComplete = false;
+let updateCheckInFlight = null;
 const isPatGatewayDaemon = process.argv.includes(DAEMON_ARGUMENT);
 
 app.setName('Codex Account Manager');
@@ -1049,6 +1051,64 @@ function installIpcHandlers() {
     notifyStateChanged();
     return { ok: true };
   });
+  handleIpc('app:update-check', () => checkForUpdate({
+    currentVersion: app.getVersion(),
+    platform: process.platform,
+  }));
+}
+
+async function promptForUpdate(manual = false) {
+  if (updateCheckInFlight) return updateCheckInFlight;
+  updateCheckInFlight = (async () => {
+    try {
+      const update = await checkForUpdate({
+        currentVersion: app.getVersion(),
+        platform: process.platform,
+      });
+      if (!update) {
+        if (manual) {
+          await dialog.showMessageBox(mainWindow, {
+            type: 'info',
+            title: '检查更新',
+            message: '当前已经是最新版本，或暂时无法连接 GitHub。',
+          });
+        }
+        return null;
+      }
+
+      const answer = await dialog.showMessageBox(mainWindow, {
+        type: 'info',
+        title: 'Codex Account Manager 更新',
+        message: `发现新版本 ${update.version}`,
+        detail: '现在下载并安装吗？已有账号、额度记录和本地配置会保留。',
+        buttons: ['现在更新', '稍后'],
+        defaultId: 0,
+        cancelId: 1,
+      });
+      if (answer.response !== 0) return update;
+      await downloadAndScheduleInstall(update, { currentPid: process.pid });
+      await dialog.showMessageBox(mainWindow, {
+        type: 'info',
+        title: '更新已准备',
+        message: '更新包已校验完成，程序将关闭并安装新版本。',
+      });
+      app.quit();
+      return update;
+    } catch (error) {
+      if (manual) {
+        await dialog.showMessageBox(mainWindow, {
+          type: 'warning',
+          title: '更新失败',
+          message: '更新失败，当前版本未被修改。',
+          detail: String(error?.message || error),
+        });
+      }
+      return null;
+    } finally {
+      updateCheckInFlight = null;
+    }
+  })();
+  return updateCheckInFlight;
 }
 
 function createMenu() {
@@ -1057,6 +1117,7 @@ function createMenu() {
       label: 'Codex Account Manager',
       submenu: [
         { role: 'about', label: '关于 Codex Account Manager' },
+        { label: '检查更新', click: () => { promptForUpdate(true).catch(() => {}); } },
         { type: 'separator' },
         { role: 'hide', label: '隐藏' },
         { role: 'hideOthers', label: '隐藏其他' },
@@ -1179,6 +1240,7 @@ if (isPatGatewayDaemon) {
     installIpcHandlers();
     createMenu();
     createWindow();
+    setTimeout(() => { promptForUpdate(false).catch(() => {}); }, 5000).unref();
     app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
   }).catch((error) => {
     const message = String(error?.message || '未知启动错误').replace(/[\r\n]+/g, ' ').slice(0, 800);

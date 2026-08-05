@@ -222,6 +222,8 @@ public partial class Form1 : Form
     private readonly ModernButton _quotaUsageNavButton = new();
     private readonly ModernButton _themeSettingsNavButton = new();
     private readonly ModernButton _systemConfigNavButton = new();
+    private readonly ModernButton _checkUpdatesButton = new();
+    private readonly AppUpdateService _updateService = new();
     private readonly Label _headerTitle = new();
     private readonly Label _headerSubtitle = new();
     private readonly ToolTip _toolTip = new()
@@ -305,6 +307,7 @@ public partial class Form1 : Form
     private readonly Dictionary<string, QuotaTrendScope> _quotaTrendScopes =
         new(StringComparer.Ordinal);
     private bool _formClosed;
+    private bool _updateCheckRunning;
     private CancellationTokenSource? _proxyDetectionCancellation;
     private ModernInputShell? _searchShell;
     private ModernInputShell? _projectPathShell;
@@ -363,6 +366,7 @@ public partial class Form1 : Form
             {
                 _ = DetectLocalPatGatewayProxyAsync(updateStatus: false);
             }
+            _ = CheckForUpdatesAsync(manual: false);
         };
     }
 
@@ -748,6 +752,17 @@ public partial class Form1 : Form
             Radius = 10
         };
         controlsRow.Controls.Add(_searchShell);
+
+        _checkUpdatesButton.Text = "检查更新";
+        _checkUpdatesButton.Width = 112;
+        _checkUpdatesButton.Height = 42;
+        _checkUpdatesButton.Margin = new Padding(0, 1, 0, 0);
+        _checkUpdatesButton.Tag = "app-update";
+        _checkUpdatesButton.Radius = 11;
+        _checkUpdatesButton.Padding = new Padding(10, 0, 10, 0);
+        _checkUpdatesButton.Font = new Font(Font.FontFamily, 8.9F);
+        _checkUpdatesButton.Click += async (_, _) => await CheckForUpdatesAsync(manual: true);
+        controlsRow.Controls.Add(_checkUpdatesButton);
 
         controlsRow.SizeChanged += (_, _) => UpdateHeaderControlLayout();
 
@@ -2918,7 +2933,78 @@ public partial class Form1 : Form
         }
 
         var available = Math.Max(260, _controlsRow.ClientSize.Width - _controlsRow.Padding.Horizontal);
-        _searchShell.Width = Math.Max(260, Math.Min(500, available));
+        var updateButtonWidth = _checkUpdatesButton.Visible ? _checkUpdatesButton.Width + _checkUpdatesButton.Margin.Horizontal : 0;
+        _searchShell.Width = Math.Max(260, Math.Min(500, available - updateButtonWidth));
+    }
+
+    private async Task CheckForUpdatesAsync(bool manual)
+    {
+        if (_formClosed || _updateCheckRunning)
+        {
+            return;
+        }
+
+        _updateCheckRunning = true;
+        if (!_checkUpdatesButton.IsDisposed)
+        {
+            _checkUpdatesButton.Enabled = false;
+        }
+
+        try
+        {
+            var update = await _updateService.CheckAsync();
+            if (update is null)
+            {
+                if (manual && !_formClosed)
+                {
+                    MessageBox.Show(
+                        this,
+                        "当前已经是最新版本，或暂时无法连接 GitHub。",
+                        "检查更新",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+                }
+                return;
+            }
+
+            var answer = MessageBox.Show(
+                this,
+                $"发现新版本 {update.Version}。\r\n\r\n现在下载并安装吗？安装会保留已有账号和本地配置。",
+                "Codex Account Manager 更新",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Information,
+                MessageBoxDefaultButton.Button1);
+            if (answer != DialogResult.Yes)
+            {
+                return;
+            }
+
+            _statusBox.Text = "正在下载并校验更新包，请稍候……";
+            await _updateService.ScheduleInstallAsync(update);
+            _statusBox.Text = "更新包已准备完成，程序即将关闭并安装新版本。";
+            await Task.Delay(350);
+            Application.Exit();
+        }
+        catch (Exception ex)
+        {
+            if (!_formClosed)
+            {
+                MessageBox.Show(
+                    this,
+                    $"更新失败，当前版本未被修改。\r\n\r\n{ex.Message}",
+                    "Codex Account Manager 更新",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
+        }
+        finally
+        {
+            _updateCheckRunning = false;
+            if (!_formClosed && !_checkUpdatesButton.IsDisposed)
+            {
+                _checkUpdatesButton.Enabled = true;
+            }
+        }
     }
 
     private void UpdateStatusBarLayout()

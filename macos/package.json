@@ -6,7 +6,7 @@
   "main": "src/main.js",
   "productName": "Codex Account Manager",
   "scripts": {
-    "test": "node tests/core.test.js && node --test tests/account-activation.test.js tests/codex-cli.test.js tests/gateway-secret.test.js tests/history-service.test.js tests/local-pat-gateway.test.js tests/main-wiring.test.js tests/packaging.test.js tests/pat-gateway-controller.test.js tests/release-privacy.test.js tests/renderer-delete-race.test.js tests/system-service.test.js tests/theme-service.test.js tests/usage-stats.test.js",
+    "test": "node tests/core.test.js && node --test tests/account-activation.test.js tests/codex-cli.test.js tests/gateway-secret.test.js tests/history-service.test.js tests/local-pat-gateway.test.js tests/main-wiring.test.js tests/packaging.test.js tests/pat-gateway-controller.test.js tests/release-privacy.test.js tests/renderer-delete-race.test.js tests/system-service.test.js tests/theme-service.test.js tests/update-service.test.js tests/usage-stats.test.js",
     "icon:mac": "node scripts/generate-icon.mjs",
     "build:mac": "node scripts/build-macos.mjs",
     "verify:mac": "node scripts/verify-release.mjs",

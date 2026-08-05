@@ -2,9 +2,29 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$dotnet = Join-Path $root '.tools\dotnet\dotnet.exe'
+$bundledDotnet = Join-Path $root '.tools\dotnet\dotnet.exe'
+$dotnet = if (-not [string]::IsNullOrWhiteSpace($env:CODEX_ACCOUNT_MANAGER_DOTNET)) {
+    [IO.Path]::GetFullPath($env:CODEX_ACCOUNT_MANAGER_DOTNET)
+}
+elseif (Test-Path -LiteralPath $bundledDotnet -PathType Leaf) {
+    $bundledDotnet
+}
+else {
+    $command = Get-Command dotnet -ErrorAction SilentlyContinue
+    if ($null -eq $command) { $bundledDotnet } else { $command.Source }
+}
+$usingBundledDotnet = [string]::Equals(
+    [IO.Path]::GetFullPath($dotnet),
+    [IO.Path]::GetFullPath($bundledDotnet),
+    [StringComparison]::OrdinalIgnoreCase)
 $project = Join-Path $root 'src\CodexAccountManager\CodexAccountManager.csproj'
 $out = Join-Path $root 'dist\CodexAccountManager'
+$buildVersion = if ([string]::IsNullOrWhiteSpace($env:CAM_VERSION)) {
+    Get-Date -Format 'yyyy.MM.dd'
+}
+else {
+    $env:CAM_VERSION.Trim()
+}
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("codex-account-manager-build-" + [guid]::NewGuid().ToString('N'))
 $oldAccountManagerHome = $env:CODEX_ACCOUNT_MANAGER_HOME
 $oldDotnetRoot = $env:DOTNET_ROOT
@@ -63,7 +83,7 @@ if (@(Get-NetTCPConnection -State Listen -LocalPort 8317 -ErrorAction SilentlyCo
 }
 
 if (-not (Test-Path -LiteralPath $dotnet -PathType Leaf)) {
-    throw "Missing local dotnet SDK: $dotnet"
+    throw "Missing dotnet SDK: $dotnet"
 }
 
 $dotnetInfo = (& $dotnet --info 2>&1 | Out-String)
@@ -73,16 +93,19 @@ if ($LASTEXITCODE -ne 0 -or
     throw "The local dotnet SDK is not an x64 installation: $dotnet"
 }
 
-$desktopRuntimeRoot = Join-Path $localDotnetRoot 'shared\Microsoft.WindowsDesktop.App'
-$compatibleDesktopRuntime = Get-ChildItem -LiteralPath $desktopRuntimeRoot -Directory -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -match '^10\.\d+\.\d+(?:\.\d+)?$' } |
-    Select-Object -First 1
-if ($null -eq $compatibleDesktopRuntime) {
-    throw "Missing x64 Microsoft.WindowsDesktop.App 10.x under the local dotnet root: $localDotnetRoot. The build will not open a download page automatically."
+if ($usingBundledDotnet) {
+    $desktopRuntimeRoot = Join-Path $localDotnetRoot 'shared\Microsoft.WindowsDesktop.App'
+    $compatibleDesktopRuntime = Get-ChildItem -LiteralPath $desktopRuntimeRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^10\.\d+\.\d+(?:\.\d+)?$' } |
+        Select-Object -First 1
+    if ($null -eq $compatibleDesktopRuntime) {
+        throw "Missing x64 Microsoft.WindowsDesktop.App 10.x under the local dotnet root: $localDotnetRoot."
+    }
 }
 
 & $dotnet publish $project -c Release -r win-x64 --self-contained true `
     -p:PublishSingleFile=true `
+    "-p:Version=$buildVersion" `
     -p:IncludeNativeLibrariesForSelfExtract=true `
     -p:DebugType=None `
     -p:DebugSymbols=false `

@@ -1,0 +1,162 @@
+name: Build and publish latest packages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # The run number is monotonic for this workflow, so every push produces a
+  # strictly newer version without requiring a second manual version edit.
+  # Keep this above the locally validated 2.0.x packages so existing installs
+  # can receive the first automatic update published by this workflow.
+  CAM_VERSION: 2.1.${{ github.run_number }}
+
+jobs:
+  build-windows:
+    name: Build Windows package
+    runs-on: windows-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Download the pinned Codex CLI runtime
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path '.tools/codex-cli' | Out-Null
+          npm install --prefix '.tools/codex-cli' --no-package-lock --ignore-scripts '@openai/codex@0.144.1'
+
+      - name: Build and package Windows
+        shell: pwsh
+        run: |
+          $env:CODEX_ACCOUNT_MANAGER_DOTNET = (Get-Command dotnet).Source
+          $env:CODEX_ACCOUNT_MANAGER_CODEX_RUNTIME = (Resolve-Path '.tools/codex-cli/node_modules').Path
+          & .\Build-CodexAccountManager.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Windows application build failed.' }
+          & .\Build-OneClickInstallerPackage.ps1 -OutputPath (Join-Path $PWD 'CodexAccountManager-Windows-latest.zip')
+          if ($LASTEXITCODE -ne 0) { throw 'Windows installer package build failed.' }
+          (Get-FileHash -LiteralPath 'CodexAccountManager-Windows-latest.zip' -Algorithm SHA256).Hash.ToLowerInvariant() |
+            Set-Content -LiteralPath 'CodexAccountManager-Windows-latest.zip.sha256' -Encoding ascii
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-package
+          path: |
+            CodexAccountManager-Windows-latest.zip
+            CodexAccountManager-Windows-latest.zip.sha256
+          if-no-files-found: error
+
+  build-macos:
+    name: Build macOS package
+    runs-on: macos-14
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: macos/package-lock.json
+
+      - name: Install macOS build dependencies
+        shell: bash
+        run: |
+          npm ci --prefix macos
+          mkdir -p dist
+          npm pack --prefix macos '@openai/codex@0.144.1-darwin-arm64' --pack-destination dist
+
+      - name: Build and verify macOS
+        shell: bash
+        env:
+          CAM_VERSION: ${{ env.CAM_VERSION }}
+        run: |
+          set -euo pipefail
+          export CODEX_CLI_PAYLOAD_PATH="$PWD/dist/openai-codex-0.144.1-darwin-arm64.tgz"
+          npm --prefix macos run build:mac -- --date "$(date +%Y%m%d)" --output "$PWD/CodexAccountManager-macOS-latest.zip"
+          npm --prefix macos run verify:mac -- "$PWD/CodexAccountManager-macOS-latest.zip"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-package
+          path: |
+            CodexAccountManager-macOS-latest.zip
+            CodexAccountManager-macOS-latest.zip.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish rolling latest release
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download built packages
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create update manifest
+        shell: bash
+        env:
+          CAM_VERSION: ${{ env.CAM_VERSION }}
+          WIN_HASH: ${{ hashFiles('release-assets/CodexAccountManager-Windows-latest.zip') }}
+          MAC_HASH: ${{ hashFiles('release-assets/CodexAccountManager-macOS-latest.zip') }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib
+          root = pathlib.Path('release-assets')
+          payload = {
+              'schemaVersion': 1,
+              'version': os.environ['CAM_VERSION'],
+              'commit': os.environ['GITHUB_SHA'],
+              'releaseTag': 'latest',
+              'assets': {
+                  'windows': {
+                      'name': 'CodexAccountManager-Windows-latest.zip',
+                      'sha256': os.environ['WIN_HASH'],
+                  },
+                  'macos': {
+                      'name': 'CodexAccountManager-macOS-latest.zip',
+                      'sha256': os.environ['MAC_HASH'],
+                  },
+              },
+          }
+          (root / 'update-manifest.json').write_text(json.dumps(payload, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+          PY
+
+      - name: Publish or replace the latest release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          target_commitish: ${{ github.sha }}
+          name: Codex Account Manager ${{ env.CAM_VERSION }}
+          body: |
+            自动构建版本 `${{ env.CAM_VERSION }}`。
+
+            推送到 `main` 的源码会自动构建 Windows/macOS 安装包；已安装的软件会检查此 Release 并提示更新。
+          prerelease: true
+          make_latest: false
+          files: |
+            release-assets/CodexAccountManager-Windows-latest.zip
+            release-assets/CodexAccountManager-Windows-latest.zip.sha256
+            release-assets/CodexAccountManager-macOS-latest.zip
+            release-assets/CodexAccountManager-macOS-latest.zip.sha256
+            release-assets/update-manifest.json
+          fail_on_unmatched_files: true

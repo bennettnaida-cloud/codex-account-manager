@@ -8,6 +8,16 @@ ELECTRON_ZIP="$PAYLOAD_DIR/electron-v43.1.1-darwin-arm64.zip"
 CODEX_CLI_TGZ="$PAYLOAD_DIR/openai-codex-0.144.1-darwin-arm64.tgz"
 APP_ASAR="$PAYLOAD_DIR/app.asar"
 APP_ICON="$PAYLOAD_DIR/AppIcon.icns"
+APP_VERSION="1.1.5"
+if [[ -f "$SCRIPT_DIR/app-version.txt" ]]; then
+  APP_VERSION="$(/usr/bin/tr -d '\r\n' < "$SCRIPT_DIR/app-version.txt")"
+fi
+APP_SHORT_VERSION="$APP_VERSION"
+APP_BUILD_VERSION="5"
+if [[ "$APP_VERSION" == *.*.*.* ]]; then
+  APP_SHORT_VERSION="${APP_VERSION%.*}"
+  APP_BUILD_VERSION="${APP_VERSION##*.}"
+fi
 MAINTENANCE_LOCK_DIR=""
 MAINTENANCE_LOCK_NONCE=""
 
@@ -359,8 +369,8 @@ PLIST_BUDDY="/usr/libexec/PlistBuddy"
 "$PLIST_BUDDY" -c "Set :CFBundleExecutable $APP_DISPLAY_NAME" "$INFO_PLIST"
 "$PLIST_BUDDY" -c "Set :CFBundleName $APP_DISPLAY_NAME" "$INFO_PLIST"
 "$PLIST_BUDDY" -c "Set :CFBundleIdentifier com.codexaccountmanager.desktop" "$INFO_PLIST"
-"$PLIST_BUDDY" -c "Set :CFBundleShortVersionString 1.1.5" "$INFO_PLIST"
-"$PLIST_BUDDY" -c "Set :CFBundleVersion 5" "$INFO_PLIST"
+"$PLIST_BUDDY" -c "Set :CFBundleShortVersionString $APP_SHORT_VERSION" "$INFO_PLIST"
+"$PLIST_BUDDY" -c "Set :CFBundleVersion $APP_BUILD_VERSION" "$INFO_PLIST"
 "$PLIST_BUDDY" -c "Set :CFBundleIconFile electron.icns" "$INFO_PLIST"
 "$PLIST_BUDDY" -c "Set :LSMinimumSystemVersion 12.0" "$INFO_PLIST"
 "$PLIST_BUDDY" -c "Delete :ElectronAsarIntegrity" "$INFO_PLIST" 2>/dev/null || true
