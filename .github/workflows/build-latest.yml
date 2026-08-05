@@ -116,13 +116,18 @@ jobs:
         shell: bash
         env:
           CAM_VERSION: ${{ env.CAM_VERSION }}
-          WIN_HASH: ${{ hashFiles('release-assets/CodexAccountManager-Windows-latest.zip') }}
-          MAC_HASH: ${{ hashFiles('release-assets/CodexAccountManager-macOS-latest.zip') }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json, os, pathlib
+          import json, os, pathlib, re
           root = pathlib.Path('release-assets')
+
+          def read_sha256(name):
+              value = (root / name).read_text(encoding='ascii').strip().split()[0]
+              if not re.fullmatch(r'[0-9a-fA-F]{64}', value):
+                  raise SystemExit(f'invalid SHA256 file: {name}')
+              return value.lower()
+
           payload = {
               'schemaVersion': 1,
               'version': os.environ['CAM_VERSION'],
@@ -131,11 +136,11 @@ jobs:
               'assets': {
                   'windows': {
                       'name': 'CodexAccountManager-Windows-latest.zip',
-                      'sha256': os.environ['WIN_HASH'],
+                      'sha256': read_sha256('CodexAccountManager-Windows-latest.zip.sha256'),
                   },
                   'macos': {
                       'name': 'CodexAccountManager-macOS-latest.zip',
-                      'sha256': os.environ['MAC_HASH'],
+                      'sha256': read_sha256('CodexAccountManager-macOS-latest.zip.sha256'),
                   },
               },
           }
