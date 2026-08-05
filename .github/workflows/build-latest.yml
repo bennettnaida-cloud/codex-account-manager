@@ -44,6 +44,7 @@ jobs:
         run: |
           $env:CODEX_ACCOUNT_MANAGER_DOTNET = (Get-Command dotnet).Source
           $env:CODEX_ACCOUNT_MANAGER_CODEX_RUNTIME = (Resolve-Path '.tools/codex-cli/node_modules').Path
+          $env:CODEX_ACCOUNT_MANAGER_SKIP_WINDOWS_CLIENT_SELF_TEST = '1'
           & .\Build-CodexAccountManager.ps1
           if ($LASTEXITCODE -ne 0) { throw 'Windows application build failed.' }
           & .\Build-OneClickInstallerPackage.ps1 -OutputPath (Join-Path $PWD 'CodexAccountManager-Windows-latest.zip')

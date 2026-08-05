@@ -194,7 +194,19 @@ static class Program
             NativeWindowTheme.ValidateRedrawPolicy();
             SharedHistoryMerger.ValidateHistoryFileMerge();
             SharedHistoryMerger.ValidateDeletedThreadTombstones();
-            CodexCliService.ValidateWindowsClientResolution();
+            // GitHub's clean Windows runners do not have the Microsoft Store
+            // Codex desktop package installed. Keep the integration check strict
+            // for normal local self-tests, while allowing the release workflow to
+            // validate the rest of the package without pretending that package is
+            // present.
+            if (!IsWindowsClientSelfTestSkipped())
+            {
+                CodexCliService.ValidateWindowsClientResolution();
+            }
+            else
+            {
+                Console.WriteLine("Windows Codex desktop client self-test skipped by build environment.");
+            }
             CodexCliService.ValidateOfficialCodexActivation();
             CodexDreamSkinService.ValidateBundledRuntime();
 
@@ -213,6 +225,13 @@ static class Program
             Console.Error.WriteLine(ex.Message);
             return 1;
         }
+    }
+
+    private static bool IsWindowsClientSelfTestSkipped()
+    {
+        var value = Environment.GetEnvironmentVariable("CODEX_ACCOUNT_MANAGER_SKIP_WINDOWS_CLIENT_SELF_TEST");
+        return string.Equals(value?.Trim(), "1", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(value?.Trim(), "true", StringComparison.OrdinalIgnoreCase);
     }
 
     private static async Task<int> RunOAuthLinkProbeAsync()
