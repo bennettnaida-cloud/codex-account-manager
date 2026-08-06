@@ -17,6 +17,7 @@ const { LocalPatGateway, createPatGatewayUpstreamPreparer } = require('./service
 const { DAEMON_ARGUMENT, PatGatewayController } = require('./services/pat-gateway-controller');
 const { loadGatewaySecret, loadOrCreateGatewaySecret } = require('./services/gateway-secret');
 const { ThemeService, buildCustomThemeCss, normalizeCustomTheme } = require('./services/theme-service');
+const { checkAndSaveOfficialCatalog } = require('./services/model-catalog');
 const {
   checkForUpdate,
   downloadAndScheduleInstall,
@@ -1044,6 +1045,11 @@ function installIpcHandlers() {
   });
   handleIpc('settings:open-path', (_event, target) => openPath(target));
   handleIpc('settings:detect-proxy', (_event, options) => detectAndSaveLocalProxy(options || {}));
+  handleIpc('settings:model-catalog-check', async () => {
+    const result = await checkAndSaveOfficialCatalog({ userDataPath: app.getPath('userData') });
+    store.migrateAccessTokenConfigs(store.loadAccounts());
+    return result;
+  });
   handleIpc('codex-theme:list', () => getCodexThemes());
   handleIpc('codex-theme:apply', (_event, themeId) => applyCodexTheme(themeId));
   handleIpc('codex-theme:restore', () => restoreCodexTheme());

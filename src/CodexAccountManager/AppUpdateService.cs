@@ -161,7 +161,6 @@ internal sealed class AppUpdateService
                 throw new InvalidOperationException("更新包缺少 Windows 安装脚本。");
             }
 
-            await LocalPatGateway.ShutdownIfRunningAsync().ConfigureAwait(false);
             var helperPath = Path.Combine(updateRoot, "apply-update.ps1");
             await File.WriteAllTextAsync(helperPath, BuildHelperScript(), new UTF8Encoding(false), cancellationToken)
                 .ConfigureAwait(false);
@@ -197,7 +196,7 @@ internal sealed class AppUpdateService
             startInfo.ArgumentList.Add("-CleanupRoot");
             startInfo.ArgumentList.Add(updateRoot);
             startInfo.ArgumentList.Add("-InstallPath");
-            startInfo.ArgumentList.Add(Path.GetFullPath(AppContext.BaseDirectory));
+            startInfo.ArgumentList.Add(GetVersionedInstallPath(update.Version));
             startInfo.ArgumentList.Add("-WorkingDirectory");
             startInfo.ArgumentList.Add(Directory.Exists(Environment.CurrentDirectory)
                 ? Environment.CurrentDirectory
@@ -213,6 +212,20 @@ internal sealed class AppUpdateService
             try { Directory.Delete(updateRoot, recursive: true); } catch { }
             throw;
         }
+    }
+
+    private static string GetVersionedInstallPath(string version)
+    {
+        var currentPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(AppContext.BaseDirectory));
+        var parent = Directory.GetParent(currentPath)?.FullName
+            ?? throw new InvalidOperationException("无法确定更新安装目录。");
+        var safeVersion = string.Concat(version.Select(character =>
+            char.IsAsciiLetterOrDigit(character) || character is '.' or '-' ? character : '-'));
+        if (string.IsNullOrWhiteSpace(safeVersion))
+        {
+            throw new InvalidOperationException("更新版本号无效。");
+        }
+        return Path.Combine(parent, $"CodexAccountManager-{safeVersion}");
     }
 
     private static HttpClient CreateHttpClient()
@@ -348,7 +361,7 @@ try {
     if ($null -ne (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
         throw 'Codex Account Manager 未能在规定时间内退出。'
     }
-    & $InstallerPath -Quiet -NoLaunch -NoShortcuts -InstallPath $InstallPath
+    & $InstallerPath -Quiet -NoLaunch -InstallPath $InstallPath -ManagerWorkingDirectory $WorkingDirectory
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     $installedExe = Join-Path $InstallPath 'CodexAccountManager.exe'
     Start-Process -FilePath $installedExe -WorkingDirectory $WorkingDirectory | Out-Null

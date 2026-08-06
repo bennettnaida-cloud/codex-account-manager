@@ -2,8 +2,12 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
+const {
+  configureModelCatalog,
+  defaultModel,
+  defaultReasoningEffort,
+} = require('./model-catalog');
 
-const DEFAULT_MODEL = 'gpt-5.6-terra';
 const ACCESS_TOKEN_BASE_URL = 'http://127.0.0.1:8317/backend-api/codex';
 const ACCESS_TOKEN_CHATGPT_BASE_URL = 'http://127.0.0.1:8317/backend-api';
 const AUTH_KIND_ACCESS_TOKEN = 'access_token';
@@ -53,9 +57,10 @@ function atomicWriteText(filePath, text, mode = 0o600) {
 }
 
 function buildAccessTokenConfig() {
-  return `model = "${DEFAULT_MODEL}"
-review_model = "${DEFAULT_MODEL}"
-model_reasoning_effort = "medium"
+  const model = defaultModel();
+  return `model = "${model}"
+review_model = "${model}"
+model_reasoning_effort = "${defaultReasoningEffort()}"
 chatgpt_base_url = "${ACCESS_TOKEN_CHATGPT_BASE_URL}"
 disable_response_storage = true
 model_provider = "codex_account_manager"
@@ -152,7 +157,7 @@ function isOfficialOAuthAuthFile(authPath) {
 
 function buildCompatibleApiConfig(account) {
   const providerName = account.apiProviderName || 'OpenAI Compatible';
-  const model = account.apiModel || DEFAULT_MODEL;
+  const model = account.apiModel || defaultModel();
   const wireApi = 'responses';
   return `model_provider = "codex_account_manager"
 model = ${tomlString(model)}
@@ -187,6 +192,7 @@ class AccountStore {
     oauthDraftTtlMs = DEFAULT_OAUTH_DRAFT_TTL_MS,
   } = {}) {
     this.userDataPath = userDataPath;
+    configureModelCatalog(userDataPath);
     this.accountsPath = path.join(userDataPath, 'accounts.json');
     this.accountsBackupPath = path.join(userDataPath, 'accounts.json.bak');
     this.settingsPath = path.join(userDataPath, 'settings.json');
@@ -678,7 +684,7 @@ class AccountStore {
       authKind,
       apiProviderName: String(value.apiProviderName || 'OpenAI'),
       apiBaseUrl: String(value.apiBaseUrl || ''),
-      apiModel: String(value.apiModel || DEFAULT_MODEL),
+      apiModel: String(value.apiModel || defaultModel()),
       apiWireApi: 'responses',
       createdAt: value.createdAt || new Date().toISOString(),
       updatedAt: new Date().toISOString(),

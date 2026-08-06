@@ -9,6 +9,8 @@ const { spawn } = require('node:child_process');
 const REPOSITORY = 'bennettnaida-cloud/codex-account-manager';
 const RELEASE_URL = `https://api.github.com/repos/${REPOSITORY}/releases/tags/latest`;
 const MAX_DOWNLOAD_BYTES = 800 * 1024 * 1024;
+const MAX_REDIRECTS = 5;
+const TRUSTED_DOWNLOAD_HOSTS = new Set(['api.github.com', 'github.com']);
 
 const UPDATE_CHECK_STATUS = Object.freeze({
   UP_TO_DATE: 'up-to-date',
@@ -35,9 +37,31 @@ function compareVersions(left, right) {
   return 0;
 }
 
-function requestBuffer(url, { maxBytes = 2 * 1024 * 1024, accept = 'application/json' } = {}) {
+function trustedDownloadUrl(value) {
+  const url = new URL(value);
+  const host = url.hostname.toLowerCase();
+  if (url.protocol !== 'https:' ||
+      (!TRUSTED_DOWNLOAD_HOSTS.has(host) && !host.endsWith('.githubusercontent.com'))) {
+    throw new Error(`拒绝访问非 GitHub 更新地址：${url.origin}`);
+  }
+  return url;
+}
+
+function requestBuffer(url, {
+  maxBytes = 2 * 1024 * 1024,
+  accept = 'application/json',
+  redirects = 0,
+  requestImpl = https.get,
+} = {}) {
   return new Promise((resolve, reject) => {
-    const request = https.get(url, {
+    let requestUrl;
+    try {
+      requestUrl = trustedDownloadUrl(url);
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    const request = requestImpl(requestUrl, {
       headers: {
         Accept: accept,
         'User-Agent': 'CodexAccountManager/' + (process.versions.electron || process.versions.node),
@@ -45,7 +69,16 @@ function requestBuffer(url, { maxBytes = 2 * 1024 * 1024, accept = 'application/
     }, (response) => {
       if ([301, 302, 303, 307, 308].includes(response.statusCode) && response.headers.location) {
         response.resume();
-        requestBuffer(new URL(response.headers.location, url).toString(), { maxBytes, accept })
+        if (redirects >= MAX_REDIRECTS) {
+          reject(new Error('GitHub 更新地址重定向次数过多。'));
+          return;
+        }
+        requestBuffer(new URL(response.headers.location, requestUrl).toString(), {
+          maxBytes,
+          accept,
+          redirects: redirects + 1,
+          requestImpl,
+        })
           .then(resolve, reject);
         return;
       }
@@ -89,63 +122,66 @@ function isInvalidJson(error) {
   return error instanceof SyntaxError || /JSON/i.test(String(error?.message || error));
 }
 
-async function downloadFile(url, destination, expectedSha256) {
+async function downloadFile(url, destination, expectedSha256, { requestImpl = https.get } = {}) {
   await fsp.mkdir(path.dirname(destination), { recursive: true });
-  await new Promise((resolve, reject) => {
-    const hash = crypto.createHash('sha256');
-    let total = 0;
-    const output = fs.createWriteStream(destination, { flags: 'wx' });
-    const request = https.get(url, {
-      headers: {
-        Accept: 'application/octet-stream',
-        'User-Agent': 'CodexAccountManager/' + (process.versions.electron || process.versions.node),
-      },
-    }, (response) => {
-      if ([301, 302, 303, 307, 308].includes(response.statusCode) && response.headers.location) {
-        response.resume();
-        output.destroy();
-        fs.rm(destination, { force: true }, () => {
-          downloadFile(new URL(response.headers.location, url).toString(), destination, expectedSha256)
-            .then(resolve, reject);
+  const partialPath = `${destination}.partial-${process.pid}-${Date.now()}`;
+  try {
+    let currentUrl = trustedDownloadUrl(url);
+    for (let redirects = 0; ; redirects += 1) {
+      const result = await new Promise((resolve, reject) => {
+        const request = requestImpl(currentUrl, {
+          headers: {
+            Accept: 'application/octet-stream',
+            'User-Agent': 'CodexAccountManager/' + (process.versions.electron || process.versions.node),
+          },
+        }, (response) => {
+          if ([301, 302, 303, 307, 308].includes(response.statusCode) && response.headers.location) {
+            response.resume();
+            resolve({ redirect: new URL(response.headers.location, currentUrl).toString() });
+            return;
+          }
+          if (response.statusCode !== 200) {
+            response.resume();
+            reject(new Error(`下载更新包失败（HTTP ${response.statusCode || '未知状态'}）。`));
+            return;
+          }
+
+          const hash = crypto.createHash('sha256');
+          let total = 0;
+          const output = fs.createWriteStream(partialPath, { flags: 'wx' });
+          response.on('data', (chunk) => {
+            total += chunk.length;
+            if (total > MAX_DOWNLOAD_BYTES) {
+              response.destroy(new Error('更新包超过安全大小限制。'));
+              return;
+            }
+            hash.update(chunk);
+          });
+          response.on('error', (error) => output.destroy(error));
+          output.on('error', reject);
+          output.on('finish', () => resolve({ total, sha256: hash.digest('hex') }));
+          response.pipe(output);
         });
-        return;
-      }
-      if (response.statusCode !== 200) {
-        response.resume();
-        output.destroy();
-        reject(new Error(`下载更新包失败（HTTP ${response.statusCode || '未知状态'}）。`));
-        return;
-      }
-      response.on('data', (chunk) => {
-        total += chunk.length;
-        if (total > MAX_DOWNLOAD_BYTES) {
-          response.destroy(new Error('更新包超过安全大小限制。'));
-          return;
-        }
-        hash.update(chunk);
+        request.setTimeout(120_000, () => request.destroy(new Error('下载更新包超时。')));
+        request.on('error', reject);
       });
-      response.on('error', (error) => output.destroy(error));
-      output.on('error', reject);
-      output.on('close', () => {
-        if (total > MAX_DOWNLOAD_BYTES) {
-          reject(new Error('更新包超过安全大小限制。'));
-          return;
-        }
-        const actual = hash.digest('hex');
-        if (actual.toLowerCase() !== String(expectedSha256).toLowerCase()) {
-          reject(new Error('更新包 SHA256 校验失败，已拒绝安装。'));
-          return;
-        }
-        resolve();
-      });
-      response.pipe(output);
-    });
-    request.setTimeout(120_000, () => request.destroy(new Error('下载更新包超时。')));
-    request.on('error', (error) => {
-      output.destroy();
-      reject(error);
-    });
-  });
+
+      if (result.redirect) {
+        if (redirects >= MAX_REDIRECTS) throw new Error('更新包重定向次数过多。');
+        currentUrl = trustedDownloadUrl(result.redirect);
+        continue;
+      }
+      if (result.total > MAX_DOWNLOAD_BYTES) throw new Error('更新包超过安全大小限制。');
+      if (result.sha256.toLowerCase() !== String(expectedSha256).toLowerCase()) {
+        throw new Error('更新包 SHA256 校验失败，已拒绝安装。');
+      }
+      await fsp.rename(partialPath, destination);
+      break;
+    }
+  } catch (error) {
+    await fsp.rm(partialPath, { force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 async function checkForUpdate({ currentVersion, platform = process.platform } = {}) {
@@ -254,4 +290,5 @@ module.exports = {
   compareVersions,
   checkForUpdate,
   downloadAndScheduleInstall,
+  _test: { downloadFile, requestBuffer, trustedDownloadUrl },
 };

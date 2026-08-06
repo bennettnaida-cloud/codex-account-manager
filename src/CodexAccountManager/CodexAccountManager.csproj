@@ -17,6 +17,7 @@
   <ItemGroup>
     <Content Include="..\..\assets\CodexAccountManager.ico" Link="assets\CodexAccountManager.ico" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="..\..\assets\CodexAccountManager.png" Link="assets\CodexAccountManager.png" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\assets\model-catalog.json" Link="assets\model-catalog.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
     <Content Include="..\..\tools\CodexDreamSkin\**\*">
       <Link>CodexDreamSkin\%(RecursiveDir)%(Filename)%(Extension)</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>

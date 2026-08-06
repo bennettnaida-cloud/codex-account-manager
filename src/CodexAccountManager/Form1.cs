@@ -25,12 +25,6 @@ public partial class Form1 : Form
         Monitoring
     }
 
-    private enum UsagePricingPolicy
-    {
-        AccessTokenSub2ApiParity,
-        CompatibleApiProvider
-    }
-
     private sealed record QuotaUsageLoadResult(
         UsageReport? Report,
         DateTime LatestWriteTimeUtc,
@@ -323,6 +317,7 @@ public partial class Form1 : Form
 
     public Form1()
     {
+        ModelCatalogService.Initialize(_store.RootPath);
         _themeService = new ThemeService(_store.RootPath);
         _usageTracker = new UsageTracker(_store.RootPath);
         _passiveQuotaMonitoring = new PassiveQuotaMonitoringService(_store.RootPath);
@@ -3392,6 +3387,7 @@ public partial class Form1 : Form
         if (_activeView == WorkspaceView.SystemConfig)
         {
             _cardsPanel.Controls.Add(CreateSystemConfigPanel(workspaceWidth));
+            _cardsPanel.Controls.Add(CreateModelCatalogPanel(workspaceWidth));
             _cardsPanel.ResumeLayout();
             return;
         }
@@ -5308,7 +5304,7 @@ public partial class Form1 : Form
         var panel = new RoundedPanel
         {
             Width = width,
-            Height = 466,
+            Height = 478,
             Radius = 16,
             BorderColor = _palette.BorderColor,
             BackColor = _palette.CardColor,
@@ -5823,7 +5819,7 @@ public partial class Form1 : Form
         ? "模型：Codex 官方默认"
         : account.IsCompatibleApi
             ? $"模型：{account.ApiModel} / xhigh"
-            : "模型：gpt-5.6-terra / medium";
+            : $"模型：{ModelCatalogService.DefaultModel} / {ModelCatalogService.DefaultReasoningEffort}";
 
     private void AttachAccountSelection(Control control, string accountName)
     {
@@ -6288,7 +6284,7 @@ public partial class Form1 : Form
             ? $"账号目录：{account.CodexHome}；由官方 Codex 自动续期 ChatGPT 登录"
             : account.IsCompatibleApi
             ? $"API 地址：{account.ApiBaseUrl}；模型：{account.ApiModel} / xhigh"
-            : $"账号目录：{account.CodexHome}；模型：gpt-5.6-terra / medium";
+            : $"账号目录：{account.CodexHome}；模型：{ModelCatalogService.DefaultModel} / {ModelCatalogService.DefaultReasoningEffort}";
         var geometry = CalculateStatusTokenRowGeometry(width);
         var row = new RoundedPanel
         {
@@ -6488,7 +6484,7 @@ public partial class Form1 : Form
             ? $"账号目录：{account.CodexHome}；由官方 Codex 自动续期 ChatGPT 登录"
             : account.IsCompatibleApi
             ? $"API 地址：{account.ApiBaseUrl}；模型：{account.ApiModel} / xhigh"
-            : $"账号目录：{account.CodexHome}；模型：gpt-5.6-terra / medium";
+            : $"账号目录：{account.CodexHome}；模型：{ModelCatalogService.DefaultModel} / {ModelCatalogService.DefaultReasoningEffort}";
 
         var geometry = CalculateTokenRowGeometry(width);
         var row = new RoundedPanel
@@ -10398,7 +10394,7 @@ public partial class Form1 : Form
             sub2ApiCsvTerraFixture,
             compatibleApiFallback);
         const double expectedShort = 2.1888D;
-        const double expectedLong = 13.628D;
+        const double expectedLong = 19.728D;
         var resetUsage = new AccountUsageSummary
         {
             RateLimitUsedPercent = 10D,
@@ -10711,40 +10707,40 @@ public partial class Form1 : Form
             Math.Abs(officialShortByModel["gpt-5.6-terra"] - 0.608D) > 0.000_001D ||
             Math.Abs(officialShortByModel["gpt-5.6-luna"] - 0.0608D) > 0.000_001D ||
             Math.Abs(officialShortByModel["gpt-5.5"] - 1.42D) > 0.000_001D ||
-            Math.Abs(officialLongByModel["gpt-5.6-sol"] - 7.6D) > 0.000_001D ||
+            Math.Abs(officialLongByModel["gpt-5.6-sol"] - 13.7D) > 0.000_001D ||
             Math.Abs(officialLongByModel["gpt-5.6-terra"] - 5.48D) > 0.000_001D ||
             Math.Abs(officialLongByModel["gpt-5.6-luna"] - 0.548D) > 0.000_001D ||
-            Math.Abs(officialLongByModel["gpt-5.5"] - 7.1D) > 0.000_001D ||
-            Math.Abs(compatibleLongByModel["gpt-5.6-sol"] - 7.6D) > 0.000_001D ||
+            Math.Abs(officialLongByModel["gpt-5.5"] - 12.7D) > 0.000_001D ||
+            Math.Abs(compatibleLongByModel["gpt-5.6-sol"] - 13.7D) > 0.000_001D ||
             Math.Abs(compatibleLongByModel["gpt-5.6-terra"] - 5.48D) > 0.000_001D ||
             Math.Abs(compatibleLongByModel["gpt-5.6-luna"] - 0.548D) > 0.000_001D ||
-            Math.Abs(compatibleLongByModel["gpt-5.5"] - 7.1D) > 0.000_001D ||
-            Math.Abs(officialMiniCost - 1.42D) > 0.000_001D ||
-            Math.Abs(compatibleMiniCost - 1.42D) > 0.000_001D ||
+            Math.Abs(compatibleLongByModel["gpt-5.5"] - 12.7D) > 0.000_001D ||
+            Math.Abs(officialMiniCost - 0.213D) > 0.000_001D ||
+            Math.Abs(compatibleMiniCost - 0.213D) > 0.000_001D ||
             Math.Abs(officialCsvTerraCost - 0.219_204_8D) > 0.000_001D ||
             Math.Abs(compatibleCsvTerraCost - 0.219_204_8D) > 0.000_001D ||
             Math.Abs((officialShortByModel["gpt-5.6-terra"] * 2.5D) - officialShortByModel["gpt-5.6-sol"]) > 0.000_001D ||
             Math.Abs((officialShortByModel["gpt-5.6-luna"] * 25D) - officialShortByModel["gpt-5.6-sol"]) > 0.000_001D ||
             Math.Abs(EstimateTotalCost(gpt55ShortUsage, fallback) - 1.42D) > 0.000_001D ||
-            Math.Abs(EstimateTotalCost(gpt55LongUsage, fallback) - 7.1D) > 0.000_001D ||
-            accessTokenFallback.DisplayName != "gpt-5.6-terra Access Token（sub2api 实际口径）" ||
+            Math.Abs(EstimateTotalCost(gpt55LongUsage, fallback) - 12.7D) > 0.000_001D ||
+            accessTokenFallback.DisplayName != "gpt-5.6-sol Access Token 官网单价" ||
             accessTokenFallback.PricingPolicy != UsagePricingPolicy.AccessTokenSub2ApiParity ||
             !accessTokenFallback.UsesLongContextPricing ||
-            Math.Abs(accessTokenFallback.GetCacheWriteRate(false) - 2.5D) > 0.000_001D ||
-            Math.Abs(accessTokenFallback.GetInputRate(true) - 4D) > 0.000_001D ||
-            Math.Abs(accessTokenFallback.GetCachedInputRate(true) - 0.4D) > 0.000_001D ||
-            Math.Abs(accessTokenFallback.GetOutputRate(true) - 18D) > 0.000_001D ||
-            Math.Abs(accessTokenFallback.GetCacheWriteRate(true) - 5D) > 0.000_001D ||
-            compatibleApiFallback.DisplayName != "gpt-5.6-sol 兼容 API 账单单价" ||
+            Math.Abs(accessTokenFallback.GetCacheWriteRate(false) - 6.25D) > 0.000_001D ||
+            Math.Abs(accessTokenFallback.GetInputRate(true) - 10D) > 0.000_001D ||
+            Math.Abs(accessTokenFallback.GetCachedInputRate(true) - 1D) > 0.000_001D ||
+            Math.Abs(accessTokenFallback.GetOutputRate(true) - 45D) > 0.000_001D ||
+            Math.Abs(accessTokenFallback.GetCacheWriteRate(true) - 12.5D) > 0.000_001D ||
+            compatibleApiFallback.DisplayName != "gpt-5.6-sol 兼容 API 官网单价" ||
             compatibleApiFallback.PricingPolicy != UsagePricingPolicy.CompatibleApiProvider ||
-            compatibleApiFallback.UsesLongContextPricing ||
-            Math.Abs(compatibleApiFallback.GetInputRate(true) - 5D) > 0.000_001D ||
-            Math.Abs(compatibleApiFallback.GetCachedInputRate(true) - 0.5D) > 0.000_001D ||
-            Math.Abs(compatibleApiFallback.GetOutputRate(true) - 30D) > 0.000_001D ||
-            Math.Abs(compatibleApiFallback.GetCacheWriteRate(true) - 6.25D) > 0.000_001D ||
+            !compatibleApiFallback.UsesLongContextPricing ||
+            Math.Abs(compatibleApiFallback.GetInputRate(true) - 10D) > 0.000_001D ||
+            Math.Abs(compatibleApiFallback.GetCachedInputRate(true) - 1D) > 0.000_001D ||
+            Math.Abs(compatibleApiFallback.GetOutputRate(true) - 45D) > 0.000_001D ||
+            Math.Abs(compatibleApiFallback.GetCacheWriteRate(true) - 12.5D) > 0.000_001D ||
             spacedCompatibleSolProfile.DisplayName != compatibleApiFallback.DisplayName ||
             spacedCompatibleSolProfile.PricingPolicy != UsagePricingPolicy.CompatibleApiProvider ||
-            Math.Abs(EstimateTotalCost(unknownModelUsage, accessTokenFallback) - 0.568D) > 0.000_001D ||
+            Math.Abs(EstimateTotalCost(unknownModelUsage, accessTokenFallback) - 1.42D) > 0.000_001D ||
             unknownCacheWriteUsage.CacheWriteKnownEvents != 0 ||
             unknownCacheWriteUsage.CacheWriteUnknownEvents != 1 ||
             unknownCacheWriteUsage.CacheWriteUnknownInputTokens != 160_000L ||
@@ -10842,7 +10838,11 @@ public partial class Form1 : Form
             !QuotaChartSamplesEqual(structurallyEqualFirst, structurallyEqualSecond))
         {
             throw new InvalidOperationException(
-                $"Usage price or weekly reset-row validation failed. Short={shortEstimate}, long={longEstimate}, weekly={weeklyRowDetail}.");
+                $"Usage price or weekly reset-row validation failed. Short={shortEstimate}, long={longEstimate}, " +
+                $"mini={officialMiniCost}/{compatibleMiniCost}, gpt55={officialShortByModel["gpt-5.5"]}/{officialLongByModel["gpt-5.5"]}, " +
+                $"access={accessTokenFallback.DisplayName}:{accessTokenFallback.GetInputRate(true)}/" +
+                $"{accessTokenFallback.GetCachedInputRate(true)}/{accessTokenFallback.GetCacheWriteRate(false)}/" +
+                $"{accessTokenFallback.GetCacheWriteRate(true)}/{accessTokenFallback.GetOutputRate(true)}, weekly={weeklyRowDetail}.");
         }
     }
 
@@ -10953,178 +10953,14 @@ public partial class Form1 : Form
         }
     }
 
-    private static UsagePriceProfile GetUsagePriceProfile(AccountRecord account)
-    {
-        var gpt56Terra = new UsagePriceProfile(
-            "gpt-5.6-terra Access Token（sub2api 实际口径）",
-            2D,
-            0.2D,
-            12D,
-            4D,
-            0.4D,
-            18D,
-            CacheWriteUsdPerMillion: 2.5D,
-            LongCacheWriteUsdPerMillion: 5D,
-            UsesLongContextPricing: true);
-        if (!account.IsCompatibleApi)
-        {
-            // Access Token accounts are launched with gpt-5.6-terra by default. Most
-            // token_count records carry their own model and override this fallback; this
-            // value is only used for legacy/truncated records with no preceding turn_context.
-            return gpt56Terra;
-        }
-
-        var gpt55 = new UsagePriceProfile(
-            "gpt-5.5 兼容 API 账单单价",
-            5D,
-            0.5D,
-            30D,
-            10D,
-            1D,
-            45D,
-            PricingPolicy: UsagePricingPolicy.CompatibleApiProvider);
-        return GetUsagePriceProfile(account.ApiModel, gpt55);
-    }
+    private static UsagePriceProfile GetUsagePriceProfile(AccountRecord account) =>
+        UsagePricingCatalog.Resolve(account);
 
     private static UsagePriceProfile GetUsagePriceProfile(
         string? modelName,
-        UsagePriceProfile fallback)
-    {
-        if (string.IsNullOrWhiteSpace(modelName))
-        {
-            return fallback;
-        }
+        UsagePriceProfile fallback) =>
+        UsagePricingCatalog.Resolve(modelName, fallback);
 
-        // Compatible API profiles are user-entered and older configurations accepted
-        // display-style model names such as "gpt-5.6 sol". Normalize separators before
-        // resolving the price table so those profiles do not silently fall back to gpt-5.5.
-        var model = modelName.Trim().ToLowerInvariant().Replace(' ', '-').Replace('_', '-');
-        var compatibleApiPricing =
-            fallback.PricingPolicy == UsagePricingPolicy.CompatibleApiProvider;
-        if (model.Contains("gpt-5.6-terra", StringComparison.OrdinalIgnoreCase))
-        {
-            return new UsagePriceProfile(
-                compatibleApiPricing
-                    ? "gpt-5.6-terra 兼容 API 账单单价"
-                    : "gpt-5.6-terra Access Token（sub2api 实际口径）",
-                2D,
-                0.2D,
-                12D,
-                4D,
-                0.4D,
-                18D,
-                CacheWriteUsdPerMillion: 2.5D,
-                LongCacheWriteUsdPerMillion: 5D,
-                UsesLongContextPricing: true,
-                PricingPolicy: fallback.PricingPolicy);
-        }
-
-        if (model.Contains("gpt-5.6-luna", StringComparison.OrdinalIgnoreCase))
-        {
-            return new UsagePriceProfile(
-                compatibleApiPricing
-                    ? "gpt-5.6-luna 兼容 API 账单单价"
-                    : "gpt-5.6-luna Access Token（sub2api 实际口径）",
-                0.2D,
-                0.02D,
-                1.2D,
-                0.4D,
-                0.04D,
-                1.8D,
-                CacheWriteUsdPerMillion: 0.25D,
-                LongCacheWriteUsdPerMillion: 0.5D,
-                UsesLongContextPricing: true,
-                PricingPolicy: fallback.PricingPolicy);
-        }
-
-        if (model.Contains("gpt-5.6-sol", StringComparison.OrdinalIgnoreCase) ||
-            model.Equals("gpt-5.6", StringComparison.OrdinalIgnoreCase))
-        {
-            return new UsagePriceProfile(
-                compatibleApiPricing
-                    ? "gpt-5.6-sol 兼容 API 账单单价"
-                    : "gpt-5.6-sol Access Token（sub2api 实际口径）",
-                5D,
-                0.5D,
-                30D,
-                10D,
-                1D,
-                45D,
-                CacheWriteUsdPerMillion: 6.25D,
-                LongCacheWriteUsdPerMillion: 12.5D,
-                PricingPolicy: fallback.PricingPolicy);
-        }
-
-        if (model.Contains("chat-latest", StringComparison.OrdinalIgnoreCase) ||
-            model.Contains("gpt-5.5", StringComparison.OrdinalIgnoreCase))
-        {
-            return new UsagePriceProfile(
-                compatibleApiPricing
-                    ? "gpt-5.5 / chat-latest 兼容 API 账单单价"
-                    : "gpt-5.5 / chat-latest Access Token（sub2api 实际口径）",
-                5D,
-                0.5D,
-                30D,
-                10D,
-                1D,
-                45D,
-                PricingPolicy: fallback.PricingPolicy);
-        }
-
-        if (model.Contains("gpt-5.4-mini", StringComparison.OrdinalIgnoreCase))
-        {
-            // The supplied sub2api CSV bills this wire-model alias with the sol table.
-            // Apply the same observed mapping to both compatible API and Access Token
-            // histories so an identical usage tuple cannot receive two different prices.
-            return new UsagePriceProfile(
-                compatibleApiPricing
-                    ? "gpt-5.4-mini 兼容 API 账单映射（按 sol）"
-                    : "gpt-5.4-mini Access Token（sub2api 实测按 sol）",
-                5D,
-                0.5D,
-                30D,
-                PricingPolicy: fallback.PricingPolicy);
-        }
-
-        if (model.Contains("gpt-5.4-nano", StringComparison.OrdinalIgnoreCase))
-        {
-            return new UsagePriceProfile(
-                compatibleApiPricing
-                    ? "gpt-5.4-nano 兼容 API 账单单价"
-                    : "gpt-5.4-nano Access Token（sub2api 平价口径）",
-                0.2D,
-                0.02D,
-                1.25D,
-                PricingPolicy: fallback.PricingPolicy);
-        }
-
-        if (model.Contains("gpt-5.4", StringComparison.OrdinalIgnoreCase))
-        {
-            return new UsagePriceProfile(
-                compatibleApiPricing
-                    ? "gpt-5.4 兼容 API 账单单价"
-                    : "gpt-5.4 Access Token（sub2api 平价口径）",
-                2.5D,
-                0.25D,
-                15D,
-                5D,
-                0.5D,
-                22.5D,
-                PricingPolicy: fallback.PricingPolicy);
-        }
-
-        if (model.Contains("codex", StringComparison.OrdinalIgnoreCase))
-        {
-            return new UsagePriceProfile(
-                compatibleApiPricing ? "Codex 兼容 API 账单单价" : "Codex Access Token（sub2api 平价口径）",
-                1.75D,
-                0.175D,
-                14D,
-                PricingPolicy: fallback.PricingPolicy);
-        }
-
-        return fallback;
-    }
 
     private static string GetUsagePricingLabel(UsageBucket usage, UsagePriceProfile fallback)
     {
@@ -12237,7 +12073,7 @@ public partial class Form1 : Form
             ? "Codex 官方默认 / ChatGPT 登录"
             : account.IsCompatibleApi
                 ? $"{account.ApiModel} / 极高"
-                : "gpt-5.6-terra / 中等";
+                : $"{ModelCatalogService.DefaultModel} / 中等";
         if (_appSettings.WindowsClientMode != mode)
         {
             // Remember the last explicit button for future defaults without hiding either
@@ -13518,39 +13354,6 @@ public partial class Form1 : Form
         string? RuntimePresetId = null,
         string? StaticPreviewAssetName = null);
 
-    private sealed record UsagePriceProfile(
-        string DisplayName,
-        double InputUsdPerMillion,
-        double CachedInputUsdPerMillion,
-        double OutputUsdPerMillion,
-        double? LongInputUsdPerMillion = null,
-        double? LongCachedInputUsdPerMillion = null,
-        double? LongOutputUsdPerMillion = null,
-        double? CacheWriteUsdPerMillion = null,
-        double? LongCacheWriteUsdPerMillion = null,
-        UsagePricingPolicy PricingPolicy = UsagePricingPolicy.AccessTokenSub2ApiParity,
-        bool UsesLongContextPricing = false)
-    {
-        public double GetInputRate(bool isLongContext) =>
-            isLongContext && UsesLongContextPricing
-                ? LongInputUsdPerMillion ?? InputUsdPerMillion
-                : InputUsdPerMillion;
-
-        public double GetCachedInputRate(bool isLongContext) =>
-            isLongContext && UsesLongContextPricing
-                ? LongCachedInputUsdPerMillion ?? CachedInputUsdPerMillion
-                : CachedInputUsdPerMillion;
-
-        public double GetCacheWriteRate(bool isLongContext) =>
-            isLongContext && UsesLongContextPricing
-                ? LongCacheWriteUsdPerMillion ?? CacheWriteUsdPerMillion ?? GetInputRate(true)
-                : CacheWriteUsdPerMillion ?? InputUsdPerMillion;
-
-        public double GetOutputRate(bool isLongContext) =>
-            isLongContext && UsesLongContextPricing
-                ? LongOutputUsdPerMillion ?? OutputUsdPerMillion
-                : OutputUsdPerMillion;
-    }
 }
 
 internal sealed class CircleIconButton : Button

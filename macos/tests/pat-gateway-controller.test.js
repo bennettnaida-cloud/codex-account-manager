@@ -37,7 +37,7 @@ async function listen(server) {
   return server.address().port;
 }
 
-test('health probing verifies both protocol ownership and the exact app version', async () => {
+test('health probing verifies authenticated protocol ownership and reports the app version', async () => {
   let proxyReady = false;
   const gateway = new LocalPatGateway({
     gatewaySecret: TEST_GATEWAY_SECRET,
@@ -209,24 +209,25 @@ test('foreign listener is rejected instead of being trusted or replaced', async 
   await assert.rejects(controller.ensureRunning(), (error) => error?.code === 'PAT_GATEWAY_PORT_IN_USE');
 });
 
-test('same protocol with a stale build version is diagnosed explicitly', async () => {
+test('same authenticated protocol can remain active during a rolling app update', async () => {
   const controller = new PatGatewayController({
     gatewaySecret: TEST_GATEWAY_SECRET,
     execPath: '/Applications/Codex Account Manager.app/Contents/MacOS/Codex Account Manager',
     platform: 'darwin',
     probeImpl: async () => ({
       reachable: true,
-      owned: false,
-      incompatible: true,
-      ready: false,
+      owned: true,
+      incompatible: false,
+      ready: true,
       version: '1.1.4',
       statusCode: 200,
     }),
   });
-  await assert.rejects(
-    controller.ensureRunning(),
-    (error) => error?.code === 'PAT_GATEWAY_VERSION_MISMATCH' && /1\.1\.4/.test(error.message),
-  );
+  assert.deepEqual(await controller.ensureRunning(), {
+    host: '127.0.0.1',
+    port: 8317,
+    baseUrl: 'http://127.0.0.1:8317',
+  });
 });
 
 test('development daemon receives the app path before its dedicated argument', async () => {

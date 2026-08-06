@@ -179,7 +179,6 @@ BACKUP_APP="$INSTALL_ROOT/.codex-account-manager-backup-$$.app"
 TARGET_REPLACED=0
 BACKUP_CREATED=0
 INSTALL_COMMITTED=0
-DAEMON_STOPPED=0
 MANAGER_STOPPED=0
 
 quit_running_managers() {
@@ -213,69 +212,6 @@ quit_running_managers() {
   done
 }
 
-process_matches_current_user_command() {
-  local pid="$1"
-  local expected_command="$2"
-  local caller_uid="$3"
-  local record
-  record="$(/bin/ps -ww -p "$pid" -o uid=,command= 2>/dev/null || true)"
-  record="${record#"${record%%[![:space:]]*}"}"
-  [[ "$record" =~ ^([0-9]+)[[:space:]]+(.+)$ && \
-     "${BASH_REMATCH[1]}" == "$caller_uid" && \
-     "${BASH_REMATCH[2]}" == "$expected_command" ]]
-}
-
-stop_gateway_daemon_for_app() {
-  local app_path="$1"
-  local daemon_executable="$app_path/Contents/MacOS/$APP_DISPLAY_NAME"
-  local expected_command="$daemon_executable --local-pat-gateway-daemon"
-  local pid owner_uid command current attempt
-  local caller_uid="$(/usr/bin/id -u)"
-  local matched_pids=()
-  while read -r pid owner_uid command; do
-    if [[ "$pid" =~ ^[0-9]+$ && "$owner_uid" == "$caller_uid" && "$command" == "$expected_command" ]]; then
-      matched_pids+=("$pid")
-    fi
-  done < <(/bin/ps -ww -axo pid=,uid=,command=)
-  for pid in "${matched_pids[@]}"; do
-    if process_matches_current_user_command "$pid" "$expected_command" "$caller_uid"; then
-      /bin/kill -TERM "$pid" 2>/dev/null || true
-    fi
-  done
-  for pid in "${matched_pids[@]}"; do
-    for attempt in {1..50}; do
-      /bin/kill -0 "$pid" 2>/dev/null || break
-      /bin/sleep 0.1
-    done
-    if /bin/kill -0 "$pid" 2>/dev/null; then
-      if process_matches_current_user_command "$pid" "$expected_command" "$caller_uid"; then
-        /bin/kill -KILL "$pid" 2>/dev/null || true
-        for attempt in {1..20}; do
-          /bin/kill -0 "$pid" 2>/dev/null || break
-          /bin/sleep 0.1
-        done
-        if process_matches_current_user_command "$pid" "$expected_command" "$caller_uid"; then
-          echo "旧版 Access Token 网关无法停止，安装已中止。" >&2
-          exit 1
-        fi
-      fi
-    fi
-    DAEMON_STOPPED=1
-  done
-}
-
-require_gateway_port_available() {
-  local attempt
-  for attempt in {1..50}; do
-    if ! /usr/sbin/lsof -nP -iTCP:8317 -sTCP:LISTEN -t >/dev/null 2>&1; then
-      return
-    fi
-    /bin/sleep 0.1
-  done
-  echo "本地端口 8317 仍被占用。请先完全退出旧版 Codex Account Manager 后重新安装；安装器不会结束其它程序。" >&2
-  exit 1
-}
-
 assert_safe_app_path() {
   case "$1" in
     "/Applications/$APP_DISPLAY_NAME.app"|"$HOME/Applications/$APP_DISPLAY_NAME.app"|\
@@ -305,7 +241,7 @@ rollback() {
     if [[ $BACKUP_CREATED -eq 1 && -e "$BACKUP_APP" ]]; then
       mv "$BACKUP_APP" "$TARGET_APP"
     fi
-    if [[ ( $DAEMON_STOPPED -eq 1 || $MANAGER_STOPPED -eq 1 ) && -d "$TARGET_APP" ]]; then
+    if [[ $MANAGER_STOPPED -eq 1 && -d "$TARGET_APP" ]]; then
       /usr/bin/open "$TARGET_APP" >/dev/null 2>&1 || true
     fi
   elif [[ $status -ne 0 && $INSTALL_COMMITTED -eq 1 ]]; then
@@ -384,9 +320,6 @@ echo "正在执行本机 ad-hoc 签名……"
 rm -rf "$TEMP_APP" "$BACKUP_APP"
 /usr/bin/ditto "$CUSTOM_APP" "$TEMP_APP"
 quit_running_managers
-stop_gateway_daemon_for_app "/Applications/$APP_DISPLAY_NAME.app"
-stop_gateway_daemon_for_app "$HOME/Applications/$APP_DISPLAY_NAME.app"
-require_gateway_port_available
 if [[ -e "$TARGET_APP" ]]; then
   BACKUP_CREATED=1
   mv "$TARGET_APP" "$BACKUP_APP"

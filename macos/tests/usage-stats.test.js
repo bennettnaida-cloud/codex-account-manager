@@ -56,11 +56,11 @@ test('known model API-equivalent rates match the Windows price table', () => {
   assert.equal(costFor('gpt-5.6-luna'), 0.02);
   assert.equal(costFor('gpt-5.5'), 0.5);
   assert.equal(costFor('gpt-5.4'), 0.25);
-  assert.equal(costFor('gpt-5.4-mini'), 0.5);
+  assert.equal(costFor('gpt-5.4-mini'), 0.075);
   assert.equal(costFor('gpt-5.4-nano'), 0.02);
   assert.equal(costFor('codex-mini-latest'), 0.175);
-  assert.equal(costFor('gpt-5.4', 300_000), 0.75);
-  assert.equal(costFor('gpt-5.4-mini', 300_000), 1.5);
+  assert.equal(costFor('gpt-5.4', 300_000), 1.5);
+  assert.equal(costFor('gpt-5.4-mini', 300_000), 0.225);
   assert.equal(costFor('codex-mini-latest', 300_000), 0.525);
   assert.equal(costFor('private-model'), null);
   assert.equal(costFor(''), null);

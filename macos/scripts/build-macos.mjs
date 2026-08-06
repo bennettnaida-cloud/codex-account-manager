@@ -120,6 +120,7 @@ async function assertSourceReady() {
     path.join(MACOS_DIR, 'src', 'preload.js'),
     path.join(MACOS_DIR, 'src', 'renderer.html'),
     path.join(MACOS_DIR, 'assets', 'AppIcon.icns'),
+    path.join(PROJECT_DIR, 'assets', 'model-catalog.json'),
   ];
   for (const file of required) {
     const details = await stat(file).catch(() => null);
@@ -137,6 +138,7 @@ async function buildAppAsar(workRoot) {
     recursive: true,
     dereference: true,
   });
+  await copyFile(path.join(PROJECT_DIR, 'assets', 'model-catalog.json'), path.join(sourceRoot, 'model-catalog.json'));
   await writeFile(path.join(sourceRoot, 'package.json'), `${JSON.stringify({
     name: 'codex-account-manager-macos',
     productName: APP_NAME,

@@ -89,13 +89,16 @@ function probePatGateway({
           const proof = String(response.headers?.[GATEWAY_PROOF_HEADER] || '');
           const statusCode = Number(response.statusCode) || 0;
           const authenticated = gatewayProofMatches(secret, challenge, marker, version, pid, statusCode, proof);
-          const owned = authenticated && protocolMatched && versionMatched;
+          // The authenticated marker is the compatibility boundary. Build versions may
+          // differ during a rolling app update while the existing daemon keeps serving.
+          const owned = authenticated && protocolMatched;
           const body = Buffer.concat(chunks, total).toString('utf8');
           finish({
             reachable: true,
             owned,
             authenticated,
-            incompatible: authenticated && protocolMatched && !versionMatched,
+            versionMatched,
+            incompatible: false,
             pid: Number.isSafeInteger(pid) && pid > 0 ? pid : null,
             version,
             ready: owned && statusCode >= 200 && statusCode < 300,

@@ -27,6 +27,7 @@ contextBridge.exposeInMainWorld('codexManager', {
   chooseLaunchDirectory: () => ipcRenderer.invoke('settings:choose-launch-directory'),
   chooseCodexApp: () => ipcRenderer.invoke('settings:choose-codex-app'),
   detectLocalProxy: (options) => ipcRenderer.invoke('settings:detect-proxy', options || {}),
+  checkOfficialModelCatalog: () => ipcRenderer.invoke('settings:model-catalog-check'),
   openPath: (targetPath) => ipcRenderer.invoke('settings:open-path', targetPath),
   getCodexThemes: () => ipcRenderer.invoke('codex-theme:list'),
   applyCodexTheme: (themeId) => ipcRenderer.invoke('codex-theme:apply', themeId),

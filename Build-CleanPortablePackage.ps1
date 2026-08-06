@@ -24,6 +24,7 @@ foreach ($required in @(
     $dreamSkinRuntime,
     (Join-Path $assetsRoot 'CodexAccountManager.ico'),
     (Join-Path $assetsRoot 'CodexAccountManager.png'),
+    (Join-Path $assetsRoot 'model-catalog.json'),
     (Join-Path $defaultsRoot 'accounts.json'),
     (Join-Path $defaultsRoot 'appsettings.json'),
     (Join-Path $defaultsRoot 'token-metadata.json'),
@@ -44,6 +45,7 @@ try {
     New-Item -ItemType Directory -Force -Path $packageAssets | Out-Null
     Copy-Item -LiteralPath (Join-Path $assetsRoot 'CodexAccountManager.ico') -Destination $packageAssets -Force
     Copy-Item -LiteralPath (Join-Path $assetsRoot 'CodexAccountManager.png') -Destination $packageAssets -Force
+    Copy-Item -LiteralPath (Join-Path $assetsRoot 'model-catalog.json') -Destination $packageAssets -Force
     Copy-Item -LiteralPath (Join-Path $defaultsRoot 'accounts.json') -Destination $packageRoot -Force
     Copy-Item -LiteralPath (Join-Path $defaultsRoot 'appsettings.json') -Destination $packageRoot -Force
     Copy-Item -LiteralPath (Join-Path $defaultsRoot 'token-metadata.json') -Destination $packageRoot -Force

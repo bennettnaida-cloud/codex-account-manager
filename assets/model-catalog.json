@@ -1,0 +1,121 @@
+{
+  "schemaVersion": 1,
+  "defaultModel": "gpt-5.6",
+  "defaultReasoningEffort": "medium",
+  "catalogSource": "bundled",
+  "verifiedAtUtc": "2026-08-06T00:00:00Z",
+  "sources": [
+    "https://developers.openai.com/api/docs/models",
+    "https://developers.openai.com/api/docs/models/compare"
+  ],
+  "models": [
+    {
+      "id": "gpt-5.6-sol",
+      "aliases": ["gpt-5.6"],
+      "inputUsdPerMillion": 5.0,
+      "cachedInputUsdPerMillion": 0.5,
+      "outputUsdPerMillion": 30.0,
+      "cacheWriteMultiplier": 1.25,
+      "usesLongContextPricing": true,
+      "longContextThreshold": 272000,
+      "longInputMultiplier": 2.0,
+      "longOutputMultiplier": 1.5
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "aliases": [],
+      "inputUsdPerMillion": 2.0,
+      "cachedInputUsdPerMillion": 0.2,
+      "outputUsdPerMillion": 12.0,
+      "cacheWriteMultiplier": 1.25,
+      "usesLongContextPricing": true,
+      "longContextThreshold": 272000,
+      "longInputMultiplier": 2.0,
+      "longOutputMultiplier": 1.5
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "aliases": [],
+      "inputUsdPerMillion": 0.2,
+      "cachedInputUsdPerMillion": 0.02,
+      "outputUsdPerMillion": 1.2,
+      "cacheWriteMultiplier": 1.25,
+      "usesLongContextPricing": true,
+      "longContextThreshold": 272000,
+      "longInputMultiplier": 2.0,
+      "longOutputMultiplier": 1.5
+    },
+    {
+      "id": "gpt-5.5",
+      "aliases": [],
+      "inputUsdPerMillion": 5.0,
+      "cachedInputUsdPerMillion": 0.5,
+      "outputUsdPerMillion": 30.0,
+      "cacheWriteMultiplier": 1.0,
+      "usesLongContextPricing": true,
+      "longContextThreshold": 272000,
+      "longInputMultiplier": 2.0,
+      "longOutputMultiplier": 1.5
+    },
+    {
+      "id": "gpt-5.5-pro",
+      "aliases": [],
+      "inputUsdPerMillion": 30.0,
+      "cachedInputUsdPerMillion": 30.0,
+      "outputUsdPerMillion": 180.0,
+      "cacheWriteMultiplier": 1.0,
+      "usesLongContextPricing": false,
+      "longContextThreshold": 272000,
+      "longInputMultiplier": 2.0,
+      "longOutputMultiplier": 1.5
+    },
+    {
+      "id": "gpt-5.4",
+      "aliases": [],
+      "inputUsdPerMillion": 2.5,
+      "cachedInputUsdPerMillion": 0.25,
+      "outputUsdPerMillion": 15.0,
+      "cacheWriteMultiplier": 1.0,
+      "usesLongContextPricing": true,
+      "longContextThreshold": 272000,
+      "longInputMultiplier": 2.0,
+      "longOutputMultiplier": 1.5
+    },
+    {
+      "id": "gpt-5.4-pro",
+      "aliases": [],
+      "inputUsdPerMillion": 30.0,
+      "cachedInputUsdPerMillion": 30.0,
+      "outputUsdPerMillion": 180.0,
+      "cacheWriteMultiplier": 1.0,
+      "usesLongContextPricing": true,
+      "longContextThreshold": 272000,
+      "longInputMultiplier": 2.0,
+      "longOutputMultiplier": 1.5
+    },
+    {
+      "id": "gpt-5.4-mini",
+      "aliases": [],
+      "inputUsdPerMillion": 0.75,
+      "cachedInputUsdPerMillion": 0.075,
+      "outputUsdPerMillion": 4.5,
+      "cacheWriteMultiplier": 1.0,
+      "usesLongContextPricing": false,
+      "longContextThreshold": 272000,
+      "longInputMultiplier": 2.0,
+      "longOutputMultiplier": 1.5
+    },
+    {
+      "id": "gpt-5.4-nano",
+      "aliases": [],
+      "inputUsdPerMillion": 0.2,
+      "cachedInputUsdPerMillion": 0.02,
+      "outputUsdPerMillion": 1.25,
+      "cacheWriteMultiplier": 1.0,
+      "usesLongContextPricing": false,
+      "longContextThreshold": 272000,
+      "longInputMultiplier": 2.0,
+      "longOutputMultiplier": 1.5
+    }
+  ]
+}

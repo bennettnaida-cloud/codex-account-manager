@@ -31,7 +31,7 @@ internal sealed class CodexDreamSkinApplyException : InvalidOperationException
     public bool OfficialClientRelaunched { get; }
 }
 
-public sealed class CodexCliService
+public sealed partial class CodexCliService
 {
     private static readonly Regex ApiKeyPattern = new("sk-[A-Za-z0-9_-]{8,}", RegexOptions.Compiled);
     private static readonly Regex PersonalAccessTokenPattern = new("at-[A-Za-z0-9_-]{8,}", RegexOptions.Compiled);
@@ -63,12 +63,6 @@ public sealed class CodexCliService
     private const string ChatGptAuthMode = "chatgpt";
     private const string ApiKeyAuthMode = "apikey";
     private const string CompatibleApiPreflightCacheFileName = ".codex-account-manager-api-preflight.json";
-    private const string AccessTokenModel = "gpt-5.6-terra";
-    private const string AccessTokenReasoningEffort = "medium";
-    private const string CompatibleApiDefaultModel = "gpt-5.5";
-    private const string CompatibleApiReasoningEffort = "xhigh";
-    private const string DesktopServiceTier = "default";
-    private const int DesktopAutoCompactTokenLimit = 1_000_000_000;
     private const string SitesPluginHeader = "[plugins.\"sites@openai-bundled\"]";
     private const int MaxPluginDefaultPromptLength = 128;
     private const uint PrintWindowClientOnly = 0x00000001;

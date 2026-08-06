@@ -103,6 +103,7 @@
       "customThemeBackground", "saveCustomThemeButton", "settingsForm", "projectRootInput", "launchDirectoryInput",
       "codexAppPathInput", "codexAppPathHint", "chooseCodexAppButton", "autoDetectCodexAppButton",
       "proxyHostInput", "proxyPortInput", "proxyAutoDetectInput", "detectProxyButton", "detectedProxyStatus",
+      "checkOfficialModelsButton", "officialModelsStatus",
       "openProjectRootButton", "openLaunchDirectoryButton", "saveSystemSettingsButton", "toastStack", "accountModal",
       "accountForm", "accountModalEyebrow", "accountModalTitle", "accountNameInput", "authKindInput",
       "modelField", "modelInput", "codexHomeInput", "apiFields", "oauthFields", "providerNameInput", "baseUrlInput", "wireApiInput",
@@ -204,6 +205,7 @@
 
     el.settingsForm.addEventListener("submit", saveSettings);
     el.detectProxyButton.addEventListener("click", detectProxy);
+    el.checkOfficialModelsButton.addEventListener("click", checkOfficialModels);
     el.chooseCodexAppButton.addEventListener("click", chooseCodexApp);
     el.autoDetectCodexAppButton.addEventListener("click", useAutomaticCodexAppDetection);
     el.openProjectRootButton.addEventListener("click", () => openConfiguredPath(el.projectRootInput.value));
@@ -1485,6 +1487,24 @@
       el.proxyPortInput.value = String(result.port);
       el.detectedProxyStatus.textContent = `检测到 ${result.scheme || "http"}://${el.proxyHostInput.value}:${result.port}`;
       showToast("已检测到本地代理", `${el.proxyHostInput.value}:${result.port}`);
+    });
+  }
+
+  async function checkOfficialModels() {
+    await withButtonBusy(el.checkOfficialModelsButton, "检查中…", async () => {
+      try {
+        const result = await invoke("checkOfficialModelCatalog");
+        const changes = Array.isArray(result?.changes) ? result.changes : [];
+        el.officialModelsStatus.textContent = changes.length ? `已更新 ${changes.length} 项` : "官网数据一致";
+        showToast(
+          changes.length ? "模型与价格已更新" : "模型与价格已核验",
+          changes.length ? changes.join("；") : `默认模型：${result?.catalog?.defaultModel || "已核验"}`,
+        );
+        await loadUsage(false);
+      } catch (error) {
+        el.officialModelsStatus.textContent = "检查失败，本地未修改";
+        showToast("无法检查官网模型与价格", friendlyError(error), "error");
+      }
     });
   }
 

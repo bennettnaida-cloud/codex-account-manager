@@ -5,8 +5,12 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: rolling-latest-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
-  contents: write
+  contents: read
 
 env:
   # The run number is monotonic for this workflow, so every push produces a
@@ -21,15 +25,15 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout source
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Set up .NET
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
         with:
           dotnet-version: 10.0.x
 
       - name: Set up Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
 
@@ -53,7 +57,7 @@ jobs:
             Set-Content -LiteralPath 'CodexAccountManager-Windows-latest.zip.sha256' -Encoding ascii
 
       - name: Upload Windows artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-package
           path: |
@@ -66,10 +70,10 @@ jobs:
     runs-on: macos-14
     steps:
       - name: Checkout source
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Set up Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
           cache: npm
@@ -82,6 +86,9 @@ jobs:
           mkdir -p dist
           npm pack --prefix macos '@openai/codex@0.144.1-darwin-arm64' --pack-destination dist
 
+      - name: Run macOS tests
+        run: npm --prefix macos test
+
       - name: Build and verify macOS
         shell: bash
         env:
@@ -93,7 +100,7 @@ jobs:
           npm --prefix macos run verify:mac -- "$PWD/CodexAccountManager-macOS-latest.zip"
 
       - name: Upload macOS artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-package
           path: |
@@ -105,9 +112,11 @@ jobs:
     name: Publish rolling latest release
     needs: [build-windows, build-macos]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Download built packages
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: release-assets
           merge-multiple: true
@@ -148,7 +157,7 @@ jobs:
           PY
 
       - name: Publish or replace the latest release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: latest
           target_commitish: ${{ github.sha }}

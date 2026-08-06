@@ -10,22 +10,16 @@ const releaseVerifier = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'v
 const releaseBuilder = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'build-macos.mjs'), 'utf8');
 const rendererSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer.js'), 'utf8');
 
-test('installer quits the manager and precisely stops the daemon before replacing the app', () => {
+test('installer replaces the manager without interrupting the authenticated PAT gateway', () => {
   assert.match(installer, /tell application id \"com\.codexaccountmanager\.desktop\" to quit/);
-  assert.match(installer, /expected_command="\$daemon_executable --local-pat-gateway-daemon"/);
-  assert.match(installer, /lsof -nP -iTCP:8317 -sTCP:LISTEN/);
-  assert.match(installer, /process_matches_current_user_command/);
-  assert.match(installer, /ps -ww/);
   assert.match(installer, /getconf DARWIN_USER_TEMP_DIR/);
   assert.match(installer, /acquire_maintenance_lock/);
   assert.match(installer, /release_maintenance_lock/);
   assert.match(installer, /INSTALL_COMMITTED=1/);
   assert.doesNotMatch(installer, /\b(?:pkill|killall)\b/);
-  assert.ok(installer.indexOf('quit_running_managers') < installer.indexOf('stop_gateway_daemon_for_app'));
+  assert.doesNotMatch(installer, /stop_gateway_daemon_for_app|require_gateway_port_available/);
   const installActions = installer.slice(installer.lastIndexOf('/usr/bin/ditto "$CUSTOM_APP" "$TEMP_APP"'));
-  assert.ok(installActions.indexOf('quit_running_managers') < installActions.indexOf('stop_gateway_daemon_for_app'));
-  assert.ok(installActions.indexOf('stop_gateway_daemon_for_app') < installActions.indexOf('require_gateway_port_available'));
-  assert.ok(installActions.indexOf('require_gateway_port_available') < installActions.indexOf('mv "$TARGET_APP" "$BACKUP_APP"'));
+  assert.ok(installActions.indexOf('quit_running_managers') < installActions.indexOf('mv "$TARGET_APP" "$BACKUP_APP"'));
   assert.ok(installActions.indexOf('BACKUP_CREATED=1') < installActions.indexOf('mv "$TARGET_APP" "$BACKUP_APP"'));
   assert.ok(installActions.indexOf('TARGET_REPLACED=1') < installActions.indexOf('mv "$TEMP_APP" "$TARGET_APP"'));
   assert.ok(installActions.indexOf('INSTALL_COMMITTED=1') < installActions.indexOf('rm -rf "$BACKUP_APP"'));

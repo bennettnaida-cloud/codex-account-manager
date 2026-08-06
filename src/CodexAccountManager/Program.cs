@@ -187,6 +187,27 @@ static class Program
             Form1.ValidateStableWorkspaceGutter();
             Form1.ValidateResponsiveAccountCardLayouts();
             Form1.ValidateCodexAppearanceLayouts();
+            ModelCatalogService.ValidatePersistenceAndProxy();
+            var officialCatalogProxy = Environment.GetEnvironmentVariable(
+                "CODEX_ACCOUNT_MANAGER_SELF_TEST_MODEL_CATALOG_PROXY");
+            if (!string.IsNullOrWhiteSpace(officialCatalogProxy))
+            {
+                ModelCatalogService.Initialize(store.RootPath);
+                var officialCatalog = ModelCatalogService
+                    .CheckAndSaveOfficialAsync(officialCatalogProxy)
+                    .GetAwaiter()
+                    .GetResult()
+                    .Current;
+                if (officialCatalog.Models.Count < 9 ||
+                    !officialCatalog.CatalogSource.Equals("official", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        "Official model-catalog network self-test returned an incomplete catalog.");
+                }
+                Console.WriteLine(
+                    $"Official model catalog verified through proxy. Models={officialCatalog.Models.Count}; " +
+                    $"Default={officialCatalog.DefaultModel}");
+            }
             SharedHistoryService.ValidateReader();
             SharedThreadTranscriptService.ValidateReader();
             ThreadPreviewDialog.ValidateFormatting();

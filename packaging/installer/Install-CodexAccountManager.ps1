@@ -1,5 +1,6 @@
 ﻿param(
     [string]$InstallPath,
+    [string]$ManagerWorkingDirectory,
     [string]$LogPath,
     [switch]$NoLaunch,
     [switch]$NoShortcuts,
@@ -253,11 +254,23 @@ try {
     }
     $installRoot = [IO.Path]::GetFullPath(
         [Environment]::ExpandEnvironmentVariables($InstallPath))
+    $usesInstallRootAsManagerRoot = [string]::IsNullOrWhiteSpace($ManagerWorkingDirectory)
+    $managerRoot = if ($usesInstallRootAsManagerRoot) {
+        $installRoot
+    }
+    else {
+        [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($ManagerWorkingDirectory))
+    }
+    if (-not $usesInstallRootAsManagerRoot -and
+        -not (Test-Path -LiteralPath $managerRoot -PathType Container)) {
+        throw "管理器工作目录不存在：$managerRoot"
+    }
     $installedExe = Join-Path $installRoot 'CodexAccountManager.exe'
 
     foreach ($required in @(
         (Join-Path $payloadRoot 'CodexAccountManager.exe'),
         (Join-Path $payloadRoot 'assets\CodexAccountManager.ico'),
+        (Join-Path $payloadRoot 'assets\model-catalog.json'),
         (Join-Path $payloadRoot '.tools\codex-cli\node_modules'),
         (Join-Path $payloadRoot 'CodexDreamSkin\bundle-version.txt'),
         (Join-Path $payloadRoot 'CodexDreamSkin\scripts\install-account-manager-theme.ps1'),
@@ -332,8 +345,8 @@ try {
     $startMenuShortcut = Join-Path $startMenuFolder 'Codex Account Manager.lnk'
     if (-not $NoShortcuts) {
         Write-InstallerProgress -Status '正在创建桌面和开始菜单快捷方式。' -Percent 80
-        New-ManagerShortcut -ShortcutPath $desktopShortcut -ExecutablePath $installedExe -WorkingDirectory $installRoot
-        New-ManagerShortcut -ShortcutPath $startMenuShortcut -ExecutablePath $installedExe -WorkingDirectory $installRoot
+        New-ManagerShortcut -ShortcutPath $desktopShortcut -ExecutablePath $installedExe -WorkingDirectory $managerRoot
+        New-ManagerShortcut -ShortcutPath $startMenuShortcut -ExecutablePath $installedExe -WorkingDirectory $managerRoot
         Copy-Item -LiteralPath (Join-Path $installRoot '卸载 Codex Account Manager.cmd') -Destination $startMenuFolder -Force
     }
 
@@ -360,7 +373,7 @@ try {
 
     if (-not $NoLaunch) {
         Write-InstallerProgress -Status '正在启动 Codex Account Manager。' -Percent 96
-        Start-Process -FilePath $installedExe -WorkingDirectory $installRoot | Out-Null
+        Start-Process -FilePath $installedExe -WorkingDirectory $managerRoot | Out-Null
     }
 
     Write-InstallerProgress -Status '安装完成。' -Percent 100

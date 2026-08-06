@@ -308,6 +308,7 @@ foreach ($required in @(
     $dreamSkinRuntime,
     (Join-Path $assetsRoot 'CodexAccountManager.ico'),
     (Join-Path $assetsRoot 'CodexAccountManager.png'),
+    (Join-Path $assetsRoot 'model-catalog.json'),
     (Join-Path $defaultsRoot 'accounts.json'),
     (Join-Path $defaultsRoot 'appsettings.json'),
     (Join-Path $defaultsRoot 'token-metadata.json'),
@@ -357,6 +358,7 @@ try {
     Copy-Item -LiteralPath $dreamSkinRuntime -Destination (Join-Path $payloadRoot 'CodexDreamSkin') -Recurse -Force
     Copy-Item -LiteralPath (Join-Path $assetsRoot 'CodexAccountManager.ico') -Destination $packageAssets -Force
     Copy-Item -LiteralPath (Join-Path $assetsRoot 'CodexAccountManager.png') -Destination $packageAssets -Force
+    Copy-Item -LiteralPath (Join-Path $assetsRoot 'model-catalog.json') -Destination $packageAssets -Force
     Copy-Item -LiteralPath $codexRuntime -Destination $portableCliRoot -Recurse -Force
 
     foreach ($defaultName in @(
@@ -393,6 +395,7 @@ try {
         -Context 'Staged CodexAccountManager.exe'
     $hashLines = @(
         ('{0}  {1}' -f $packageAppHash, $packageAppRelativePath),
+        ('{0}  {1}' -f (Get-FileHash -LiteralPath (Join-Path $packageRoot 'payload\assets\model-catalog.json') -Algorithm SHA256).Hash, 'payload\assets\model-catalog.json'),
         ('{0}  {1}' -f (Get-FileHash -LiteralPath (Join-Path $packageRoot $packageCliRelativePath) -Algorithm SHA256).Hash, $packageCliRelativePath),
         ('{0}  {1}' -f (Get-FileHash -LiteralPath (Join-Path $packageRoot $packageDreamSkinRelativePath) -Algorithm SHA256).Hash, $packageDreamSkinRelativePath),
         ('{0}  {1}' -f (Get-FileHash -LiteralPath (Join-Path $packageRoot 'payload\CodexDreamSkin\assets\renderer-inject.js') -Algorithm SHA256).Hash, 'payload\CodexDreamSkin\assets\renderer-inject.js'),
@@ -559,6 +562,7 @@ try {
     foreach ($installedRequired in @(
         (Join-Path $testInstallRoot 'CodexAccountManager.exe'),
         (Join-Path $testInstallRoot 'assets\CodexAccountManager.ico'),
+        (Join-Path $testInstallRoot 'assets\model-catalog.json'),
         (Join-Path $testInstallRoot '.tools\codex-cli\node_modules'),
         (Join-Path $testInstallRoot 'CodexDreamSkin\bundle-version.txt'),
         (Join-Path $testInstallRoot 'CodexDreamSkin\assets\renderer-inject.js'),
@@ -660,6 +664,7 @@ try {
     $requiredArchiveEntries = @(
         "$archivePrefix/payload/CodexAccountManager.exe",
         "$archivePrefix/payload/assets/CodexAccountManager.ico",
+        "$archivePrefix/payload/assets/model-catalog.json",
         "$archivePrefix/payload/.tools/codex-cli/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe",
         "$archivePrefix/payload/CodexDreamSkin/bundle-version.txt",
         "$archivePrefix/payload/CodexDreamSkin/assets/account-manager-nebula.jpg",

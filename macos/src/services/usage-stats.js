@@ -3,6 +3,7 @@ const fsp = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const readline = require('node:readline');
+const { officialRates } = require('./model-catalog');
 
 const ALLOWED_RANGES = new Set(['today', '7d', '30d', 'all']);
 const COLORS = ['#7967ff', '#2ec5ce', '#ff7a90', '#ffb44a', '#4f8cff', '#42cf8d', '#b86cff'];
@@ -32,20 +33,12 @@ function resolveUsageArguments(rangeOrOptions, maybeOptions) {
 // Official API rates are USD per million:
 // [regular input, cached input, cache write, output].
 const PRICE = {
-  sol: [5, 0.5, 6.25, 30],
-  terra: [2, 0.2, 2.5, 12],
-  luna: [0.2, 0.02, 0.25, 1.2],
   gpt55: [5, 0.5, 5, 30],
   gpt54: [2.5, 0.25, 2.5, 15],
   // The supplied sub2api CSV bills the gpt-5.4-mini wire alias as sol.
   gpt54mini: [5, 0.5, 5, 30],
   gpt54nano: [0.2, 0.02, 0.2, 1.25],
   codex: [1.75, 0.175, 1.75, 14],
-};
-const LONG_CONTEXT_INPUT_THRESHOLD = 272_000;
-const LONG_CONTEXT_PRICE = {
-  terra: [4, 0.4, 5, 18],
-  luna: [0.4, 0.04, 0.5, 1.8],
 };
 
 function nonNegativeInteger(value) {
@@ -195,9 +188,6 @@ function cumulativeDelta(previous, current) {
 
 function priceKey(model) {
   const value = String(model || '').trim().toLowerCase();
-  if (value.includes('gpt-5.6-sol') || value === 'gpt-5.6') return 'sol';
-  if (value.includes('gpt-5.6-terra')) return 'terra';
-  if (value.includes('gpt-5.6-luna')) return 'luna';
   if (value.includes('gpt-5.5') || value.includes('chat-latest')) return 'gpt55';
   if (value.includes('gpt-5.4-mini')) return 'gpt54mini';
   if (value.includes('gpt-5.4-nano')) return 'gpt54nano';
@@ -257,15 +247,15 @@ function hasTokenUsage(event) {
 function eventCost(rawEvent) {
   const event = normalizeUsageEvent(rawEvent);
   if (!hasTokenUsage(event)) return 0;
-  const key = priceKey(event.model);
-  if (!key) return null;
   const input = event.inputTokens;
+  const officialRate = officialRates(event.model, input);
+  const key = priceKey(event.model);
+  if (!officialRate && !key) return null;
   const cached = event.cachedInputTokens;
   const cacheWrite = event.cacheWriteTokens ?? 0;
   const regular = input - cached - cacheWrite;
-  const rate = input > LONG_CONTEXT_INPUT_THRESHOLD && LONG_CONTEXT_PRICE[key]
-    ? LONG_CONTEXT_PRICE[key]
-    : PRICE[key];
+  const rate = officialRate || PRICE[key];
+  if (!rate) return null;
   return (regular * rate[0] + cached * rate[1] + cacheWrite * rate[2] + event.outputTokens * rate[3]) / 1_000_000;
 }
 
