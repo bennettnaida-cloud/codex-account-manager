@@ -763,7 +763,11 @@ public partial class Form1 : Form
         controlsRow.Controls.Add(_searchShell);
 
         _checkUpdatesButton.Text = "检查更新";
-        _checkUpdatesButton.Width = 128;
+        // The button now lives in the persistent sidebar footer. Keep its
+        // configured width in sync with that footer instead of the old compact
+        // header width, otherwise the later control initialization clips the
+        // label back to an ellipsis.
+        _checkUpdatesButton.Width = 228;
         _checkUpdatesButton.Height = 44;
         _checkUpdatesButton.Margin = new Padding(0, 0, 0, 0);
         _checkUpdatesButton.Tag = "app-update";
@@ -4424,7 +4428,11 @@ public partial class Form1 : Form
     {
         var panel = new RoundedPanel
         {
-            Width = Math.Max(320, width),
+            // Keep the empty-state copy readable even when the workspace is
+            // temporarily narrow (for example while the window is restoring).
+            // The previous 320px minimum clipped the Chinese explanation on
+            // high-DPI displays.
+            Width = Math.Max(520, width),
             Height = 180,
             Radius = 18,
             BorderColor = _palette.BorderColor,
@@ -4438,7 +4446,7 @@ public partial class Form1 : Form
             Text = "没有匹配的账号",
             Left = 0,
             Top = 8,
-            Width = 200,
+            Width = Math.Max(420, panel.Width - panel.Padding.Horizontal),
             Height = 28,
             Font = new Font(Font.FontFamily, 12F, FontStyle.Bold)
         };
@@ -4450,8 +4458,11 @@ public partial class Form1 : Form
             Text = "你可以清空搜索条件，或者先新增一个账号。",
             Left = 0,
             Top = 48,
-            Width = 320,
-            Height = 22
+            Width = Math.Max(420, panel.Width - panel.Padding.Horizontal),
+            Height = 30,
+            AutoEllipsis = false,
+            UseCompatibleTextRendering = true,
+            UseMnemonic = false
         };
         ThemeStyler.ApplyLabel(text, _palette, true);
         panel.Controls.Add(text);
