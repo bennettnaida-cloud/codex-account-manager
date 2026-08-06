@@ -215,6 +215,7 @@ public partial class Form1 : Form
     private readonly Label _patGatewayProxyDetectionLabel = new();
     private readonly Label _statusBox = new();
     private readonly ThemePicker _themeModePicker = new();
+    private readonly ModernButton _updateAvailableButton = new();
     private readonly ModernButton _addAccountNavButton = new();
     private readonly ModernButton _accountSwitchNavButton = new();
     private readonly ModernButton _unifiedHistoryNavButton = new();
@@ -222,7 +223,6 @@ public partial class Form1 : Form
     private readonly ModernButton _quotaUsageNavButton = new();
     private readonly ModernButton _themeSettingsNavButton = new();
     private readonly ModernButton _systemConfigNavButton = new();
-    private readonly ModernButton _checkUpdatesButton = new();
     private readonly AppUpdateService _updateService = new();
     private readonly Label _headerTitle = new();
     private readonly Label _headerSubtitle = new();
@@ -308,6 +308,8 @@ public partial class Form1 : Form
         new(StringComparer.Ordinal);
     private bool _formClosed;
     private bool _updateCheckRunning;
+    private bool _automaticUpdateCheckStarted;
+    private AppUpdateInfo? _availableUpdate;
     private CancellationTokenSource? _proxyDetectionCancellation;
     private ModernInputShell? _searchShell;
     private ModernInputShell? _projectPathShell;
@@ -316,6 +318,8 @@ public partial class Form1 : Form
     private RoundedPanel? _headerPanel;
     private BufferedTableLayoutPanel? _contentLayout;
     private BufferedFlowLayoutPanel? _controlsRow;
+    private Panel? _sidebarFooter;
+    private Label? _managerAppearanceLabel;
 
     public Form1()
     {
@@ -574,7 +578,7 @@ public partial class Form1 : Form
             Left = 16,
             Top = 440,
             Width = 228,
-            Height = 122,
+            Height = 92,
             Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom,
             Name = "SidebarFooter",
             BackColor = Color.Transparent,
@@ -582,57 +586,47 @@ public partial class Form1 : Form
         };
         var managerAppearanceLabel = new Label
         {
-            Text = "管理器外观",
+            Text = "外观设置",
             Left = 2,
-            Top = 44,
-            Width = 224,
-            Height = 24,
-            Font = new Font(Font.FontFamily, 9F, FontStyle.Bold),
+            Top = 0,
+            Width = 228,
+            Height = 28,
+            Font = new Font(Font.FontFamily, 9F, FontStyle.Regular),
             TextAlign = ContentAlignment.MiddleLeft,
             Name = "ThemeLabel",
+            Padding = new Padding(4, 0, 4, 0),
+            AutoSize = false,
+            AutoEllipsis = false,
+            UseCompatibleTextRendering = true,
             UseMnemonic = false
         };
-        _themeModePicker.SetBounds(0, 74, 228, 42);
+        _sidebarFooter = managerAppearanceFooter;
+        _managerAppearanceLabel = managerAppearanceLabel;
+        _updateAvailableButton.SetBounds(0, 0, 228, 40);
+        _updateAvailableButton.Text = "有可用更新";
+        _updateAvailableButton.Tag = "primary";
+        _updateAvailableButton.Font = new Font(Font.FontFamily, 8.9F, FontStyle.Bold);
+        _updateAvailableButton.Padding = new Padding(10, 0, 10, 0);
+        _updateAvailableButton.Radius = 12;
+        _updateAvailableButton.IconText = "↻";
+        _updateAvailableButton.IconWidth = 22;
+        _updateAvailableButton.ShowIconTile = true;
+        _updateAvailableButton.AccessibleName = "安装可用更新";
+        _updateAvailableButton.Visible = false;
+        _updateAvailableButton.Click += async (_, _) => await InstallAvailableUpdateButtonAsync();
+        ThemeStyler.ApplyPrimaryButton(_updateAvailableButton, _palette);
+        _themeModePicker.SetBounds(0, 34, 228, 42);
         _themeModePicker.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
         managerAppearanceFooter.Resize += (_, _) =>
         {
-            _checkUpdatesButton.SetBounds(
-                0,
-                0,
-                Math.Max(160, managerAppearanceFooter.ClientSize.Width),
-                40);
-            managerAppearanceLabel.Top = _checkUpdatesButton.Bottom + 4;
-            managerAppearanceLabel.Width = Math.Max(120, managerAppearanceFooter.ClientSize.Width - 4);
-            _themeModePicker.Width = Math.Max(160, managerAppearanceFooter.ClientSize.Width);
-            _themeModePicker.Top = Math.Max(
-                managerAppearanceLabel.Bottom + 4,
-                managerAppearanceFooter.ClientSize.Height - _themeModePicker.Height - 6);
+            UpdateSidebarFooterLayout();
         };
+        managerAppearanceFooter.Controls.Add(_updateAvailableButton);
         managerAppearanceFooter.Controls.Add(managerAppearanceLabel);
         managerAppearanceFooter.Controls.Add(_themeModePicker);
-        managerAppearanceFooter.Controls.Add(_checkUpdatesButton);
         sidebar.Controls.Add(managerAppearanceFooter);
-        void UpdateManagerAppearanceFooterLayout()
-        {
-            // Reuse the already DPI-scaled navigation geometry. Scaling these constants a
-            // second time made the footer narrower than the buttons at 200% DPI and turned
-            // short names such as “深海夜色” into an unnecessary ellipsis.
-            var sideInset = _systemConfigNavButton.Left;
-            var bottomInset = Math.Max(8, sidebar.Padding.Bottom);
-            var navGap = Math.Max(8, sidebar.Padding.Bottom * 2 / 3);
-            var footerWidth = Math.Max(160, _systemConfigNavButton.Width);
-            var footerTop = Math.Max(
-                _systemConfigNavButton.Bottom + navGap,
-                sidebar.ClientSize.Height - managerAppearanceFooter.Height - bottomInset);
-            managerAppearanceFooter.SetBounds(
-                sideInset,
-                footerTop,
-                footerWidth,
-                managerAppearanceFooter.Height);
-            managerAppearanceFooter.BringToFront();
-        }
-        sidebar.Resize += (_, _) => UpdateManagerAppearanceFooterLayout();
-        UpdateManagerAppearanceFooterLayout();
+        sidebar.Resize += (_, _) => UpdateSidebarFooterLayout();
+        UpdateSidebarFooterLayout();
         _toolTip.SetToolTip(managerAppearanceLabel, "只切换 Account Manager 的四套内置外观，也可跟随系统。");
         _toolTip.SetToolTip(_themeModePicker, "管理器外观与 Codex 主题相互独立，选择后立即保存并应用。");
 
@@ -761,24 +755,6 @@ public partial class Form1 : Form
             Radius = 10
         };
         controlsRow.Controls.Add(_searchShell);
-
-        _checkUpdatesButton.Text = "检查更新";
-        // The button now lives in the persistent sidebar footer. Keep its
-        // configured width in sync with that footer instead of the old compact
-        // header width, otherwise the later control initialization clips the
-        // label back to an ellipsis.
-        _checkUpdatesButton.Width = 228;
-        _checkUpdatesButton.Height = 44;
-        _checkUpdatesButton.Margin = new Padding(0, 0, 0, 0);
-        _checkUpdatesButton.Tag = "app-update";
-        _checkUpdatesButton.Radius = 12;
-        _checkUpdatesButton.Padding = new Padding(9, 0, 9, 0);
-        _checkUpdatesButton.Font = new Font(Font.FontFamily, 9.1F, FontStyle.Bold);
-        _checkUpdatesButton.IconText = "↻";
-        _checkUpdatesButton.IconWidth = 24;
-        _checkUpdatesButton.ShowIconTile = true;
-        _checkUpdatesButton.AccessibleName = "检查应用更新";
-        _checkUpdatesButton.Click += async (_, _) => await CheckForUpdatesAsync(manual: true);
 
         controlsRow.SizeChanged += (_, _) => UpdateHeaderControlLayout();
 
@@ -1088,6 +1064,39 @@ public partial class Form1 : Form
         }
     }
 
+    private void UpdateSidebarFooterLayout()
+    {
+        if (_sidebarFooter == null ||
+            _managerAppearanceLabel == null ||
+            _sidebarFooter.Parent == null)
+        {
+            return;
+        }
+
+        var footer = _sidebarFooter;
+        var sidebar = footer.Parent;
+        var hasUpdate = _updateAvailableButton.Visible;
+        footer.Height = hasUpdate ? 122 : 92;
+
+        var width = Math.Max(160, footer.ClientSize.Width);
+        _updateAvailableButton.SetBounds(0, 0, width, 40);
+        _managerAppearanceLabel.SetBounds(2, hasUpdate ? 44 : 0, Math.Max(120, width - 4), 28);
+        _themeModePicker.SetBounds(0, hasUpdate ? 76 : 34, width, 42);
+
+        // Reuse the already DPI-scaled navigation geometry. Scaling these constants a
+        // second time made the footer narrower than the buttons at 200% DPI and turned
+        // short names such as “深海夜色” into an unnecessary ellipsis.
+        var sideInset = _systemConfigNavButton.Left;
+        var bottomInset = Math.Max(8, sidebar.Padding.Bottom);
+        var navGap = Math.Max(8, sidebar.Padding.Bottom * 2 / 3);
+        var footerWidth = Math.Max(160, _systemConfigNavButton.Width);
+        var footerTop = Math.Max(
+            _systemConfigNavButton.Bottom + navGap,
+            sidebar.ClientSize.Height - footer.Height - bottomInset);
+        footer.SetBounds(sideInset, footerTop, footerWidth, footer.Height);
+        footer.BringToFront();
+    }
+
     private void ApplyTheme()
     {
         _palette = _themeService.GetPalette(_appSettings.ThemeMode);
@@ -1107,6 +1116,7 @@ public partial class Form1 : Form
             ThemeStyler.ApplyInputShell(_projectPathShell, _palette);
         }
         _themeModePicker.ApplyPalette(_palette);
+        ThemeStyler.ApplyPrimaryButton(_updateAvailableButton, _palette);
         _statusBox.BackColor = _palette.StatusBackColor;
         _statusBox.ForeColor = _palette.MutedTextColor;
         UpdateWorkspaceChrome();
@@ -1225,10 +1235,6 @@ public partial class Form1 : Form
                 else if (Equals(button.Tag, "token-update"))
                 {
                     ApplyTokenUpdateButtonStyle(button);
-                }
-                else if (Equals(button.Tag, "app-update"))
-                {
-                    ApplyUpdateButtonStyle(button);
                 }
                 else if (Equals(button.Tag, "primary"))
                 {
@@ -2702,25 +2708,6 @@ public partial class Form1 : Form
         }
     }
 
-    private void ApplyUpdateButtonStyle(Button button)
-    {
-        ThemeStyler.ApplyPrimaryButton(button, _palette);
-        if (button is not ModernButton modern)
-        {
-            return;
-        }
-
-        modern.IconText = "↻";
-        modern.IconWidth = 24;
-        modern.ShowIconTile = true;
-        modern.IconTileColor = Color.FromArgb(58, _palette.SecondaryAccentColor);
-        modern.IconTileBorderColor = Color.FromArgb(112, _palette.SecondaryAccentColor);
-        modern.Radius = 12;
-        modern.Padding = new Padding(9, 0, 9, 0);
-        modern.Font = new Font(Font.FontFamily, 9.1F, FontStyle.Bold);
-        modern.Invalidate();
-    }
-
     private void ChangeThemeMode()
     {
         ClearWorkspaceViewCache();
@@ -2977,16 +2964,17 @@ public partial class Form1 : Form
 
     private async Task CheckForUpdatesAsync(bool manual)
     {
-        if (_formClosed || _updateCheckRunning)
+        if (_formClosed || _updateCheckRunning || (!manual && _automaticUpdateCheckStarted))
         {
             return;
         }
 
-        _updateCheckRunning = true;
-        if (!_checkUpdatesButton.IsDisposed)
+        if (!manual)
         {
-            _checkUpdatesButton.Enabled = false;
+            _automaticUpdateCheckStarted = true;
         }
+
+        _updateCheckRunning = true;
 
         try
         {
@@ -2994,6 +2982,7 @@ public partial class Form1 : Form
             var update = checkResult.Update;
             if (update is null)
             {
+                SetUpdateAvailabilityState(null);
                 if (manual && !_formClosed)
                 {
                     MessageBox.Show(
@@ -3006,23 +2995,65 @@ public partial class Form1 : Form
                 return;
             }
 
-            var answer = MessageBox.Show(
-                this,
-                $"发现新版本 {update.Version}。\r\n\r\n现在下载并安装吗？安装会保留已有账号和本地配置。",
-                "Codex Account Manager 更新",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Information,
-                MessageBoxDefaultButton.Button1);
-            if (answer != DialogResult.Yes)
+            SetUpdateAvailabilityState(update);
+            if (!manual)
             {
                 return;
             }
 
-            _statusBox.Text = "正在下载并校验更新包，请稍候……";
-            await _updateService.ScheduleInstallAsync(update);
-            _statusBox.Text = "更新包已准备完成，程序即将关闭并安装新版本。";
-            await Task.Delay(350);
-            Application.Exit();
+            await PromptAndInstallUpdateAsync(update);
+        }
+        catch (Exception ex)
+        {
+            if (manual && !_formClosed)
+            {
+                MessageBox.Show(
+                    this,
+                    $"更新失败，当前版本未被修改。\r\n\r\n{ex.Message}",
+                    "Codex Account Manager 更新",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
+        }
+        finally
+        {
+            _updateCheckRunning = false;
+        }
+    }
+
+    private async Task PromptAndInstallUpdateAsync(AppUpdateInfo update)
+    {
+        var answer = MessageBox.Show(
+            this,
+            $"发现新版本 {update.Version}。\r\n\r\n现在下载并安装吗？安装会保留已有账号和本地配置。",
+            "Codex Account Manager 更新",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Information,
+            MessageBoxDefaultButton.Button1);
+        if (answer != DialogResult.Yes)
+        {
+            return;
+        }
+
+        _statusBox.Text = "正在下载并校验更新包，请稍候……";
+        await _updateService.ScheduleInstallAsync(update);
+        _statusBox.Text = "更新包已准备完成，程序即将关闭并安装新版本。";
+        await Task.Delay(350);
+        Application.Exit();
+    }
+
+    private async Task InstallAvailableUpdateButtonAsync()
+    {
+        var update = _availableUpdate;
+        if (update == null || _formClosed || _updateCheckRunning)
+        {
+            return;
+        }
+
+        _updateCheckRunning = true;
+        try
+        {
+            await PromptAndInstallUpdateAsync(update);
         }
         catch (Exception ex)
         {
@@ -3039,11 +3070,23 @@ public partial class Form1 : Form
         finally
         {
             _updateCheckRunning = false;
-            if (!_formClosed && !_checkUpdatesButton.IsDisposed)
-            {
-                _checkUpdatesButton.Enabled = true;
-            }
         }
+    }
+
+    private void SetUpdateAvailabilityState(AppUpdateInfo? update)
+    {
+        _availableUpdate = update;
+        if (_updateAvailableButton.IsDisposed)
+        {
+            return;
+        }
+
+        _updateAvailableButton.Text = update is null
+            ? "有可用更新"
+            : $"更新到 {update.Version}";
+        _updateAvailableButton.Visible = update is not null;
+        UpdateSidebarFooterLayout();
+        _updateAvailableButton.Invalidate();
     }
 
     private static string DescribeUpdateCheckResult(AppUpdateCheckResult result)
@@ -5446,7 +5489,7 @@ public partial class Form1 : Form
             Text = "自动检测只探测本机回环地址；地址默认 127.0.0.1，端口会显示并回填检测结果。手动编辑任一项后使用手动设置。",
             Left = innerLeft,
             Top = 354,
-            Width = innerWidth,
+            Width = Math.Max(260, innerWidth - configActionWidth - 18),
             Height = 70,
             Font = new Font(Font.FontFamily, 8.5F),
             AutoEllipsis = false,
@@ -5457,6 +5500,11 @@ public partial class Form1 : Form
             note,
             "检测只连接 127.0.0.1 的本地监听端口并执行 HTTP 代理握手，不访问外网；本地 PAT 网关端口 8317 会被排除。");
         panel.Controls.Add(note);
+
+        var manualUpdate = MakeActionButton("检查更新", configActionLeft, 414, configActionWidth, false);
+        manualUpdate.AccessibleName = "手动检查应用更新";
+        manualUpdate.Click += async (_, _) => await CheckForUpdatesAsync(manual: true);
+        panel.Controls.Add(manualUpdate);
 
         return panel;
     }

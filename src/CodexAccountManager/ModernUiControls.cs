@@ -754,7 +754,7 @@ internal sealed class ThemePicker : Control
     private bool _hovered;
     private bool _pressed;
     private bool _menuOpen;
-    private bool _suppressNextClick;
+    private long _skipClickUntil;
     private Color _fillColor = Color.White;
     private Color _hoverColor = Color.WhiteSmoke;
     private Color _pressedColor = Color.Gainsboro;
@@ -788,10 +788,20 @@ internal sealed class ThemePicker : Control
             _menuOpen = true;
             Invalidate();
         };
-        _menu.Closed += (_, _) =>
+        _menu.Closed += (_, args) =>
         {
             _menuOpen = false;
             _pressed = false;
+            // When the popup closes because the user clicked the owner (which is
+            // common when it opens upward at the bottom of the sidebar), WinForms
+            // raises the owner's Click after Closed. Ignore only that immediate
+            // follow-up click so the menu does not reopen by itself.
+            _skipClickUntil = args.CloseReason is
+                ToolStripDropDownCloseReason.AppFocusChange or
+                ToolStripDropDownCloseReason.AppClicked or
+                ToolStripDropDownCloseReason.CloseCalled
+                ? Environment.TickCount64 + 350
+                : 0;
             Invalidate();
         };
     }
@@ -886,11 +896,7 @@ internal sealed class ThemePicker : Control
         {
             if (_menuOpen || _menu.Visible)
             {
-                // ContextMenuStrip closes itself before the owner's Click event is
-                // raised. Remember this click so it does not immediately reopen the
-                // popup after it has just been dismissed.
-                _suppressNextClick = true;
-                _menu.Close(ToolStripDropDownCloseReason.Keyboard);
+                _menu.Close(ToolStripDropDownCloseReason.CloseCalled);
                 _pressed = false;
                 Invalidate();
                 return;
@@ -912,11 +918,12 @@ internal sealed class ThemePicker : Control
     protected override void OnClick(EventArgs e)
     {
         base.OnClick(e);
-        if (_suppressNextClick)
+        if (_skipClickUntil > Environment.TickCount64)
         {
-            _suppressNextClick = false;
+            _skipClickUntil = 0;
             return;
         }
+        _skipClickUntil = 0;
         if (_menu.Visible)
         {
             // The popup can open upward when the picker is in the bottom sidebar.

@@ -50,6 +50,8 @@ const SHARED_HISTORY_ACCOUNT_ID = 'shared';
 let oauthShutdownPromise = null;
 let oauthShutdownComplete = false;
 let updateCheckInFlight = null;
+let automaticUpdateCheckStarted = false;
+let pendingUpdate = null;
 const isPatGatewayDaemon = process.argv.includes(DAEMON_ARGUMENT);
 
 app.setName('Codex Account Manager');
@@ -1062,7 +1064,10 @@ function installIpcHandlers() {
 }
 
 async function promptForUpdate(manual = false) {
-  if (updateCheckInFlight) return updateCheckInFlight;
+  if (updateCheckInFlight || (!manual && automaticUpdateCheckStarted)) {
+    return updateCheckInFlight;
+  }
+  if (!manual) automaticUpdateCheckStarted = true;
   updateCheckInFlight = (async () => {
     try {
       const checkResult = await checkForUpdate({
@@ -1071,6 +1076,8 @@ async function promptForUpdate(manual = false) {
       });
       const update = checkResult?.update || null;
       if (!update) {
+        pendingUpdate = null;
+        createMenu();
         if (manual) {
           await dialog.showMessageBox(mainWindow, {
             type: 'info',
@@ -1079,6 +1086,17 @@ async function promptForUpdate(manual = false) {
           });
         }
         return null;
+      }
+
+      pendingUpdate = update;
+      createMenu();
+      if (!manual) {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('app:update-available', {
+            version: update.version,
+          });
+        }
+        return update;
       }
 
       const answer = await dialog.showMessageBox(mainWindow, {
@@ -1141,7 +1159,10 @@ function createMenu() {
       label: 'Codex Account Manager',
       submenu: [
         { role: 'about', label: '关于 Codex Account Manager' },
-        { label: '检查更新', click: () => { promptForUpdate(true).catch(() => {}); } },
+        {
+          label: pendingUpdate ? `可更新（${pendingUpdate.version}）` : '检查更新',
+          click: () => { promptForUpdate(true).catch(() => {}); },
+        },
         { type: 'separator' },
         { role: 'hide', label: '隐藏' },
         { role: 'hideOthers', label: '隐藏其他' },
