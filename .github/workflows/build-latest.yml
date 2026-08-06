@@ -1,4 +1,4 @@
-name: Build and publish latest packages
+name: Build and publish latest Windows package
 
 on:
   push:
@@ -65,52 +65,9 @@ jobs:
             CodexAccountManager-Windows-latest.zip.sha256
           if-no-files-found: error
 
-  build-macos:
-    name: Build macOS package
-    runs-on: macos-14
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-
-      - name: Set up Node.js
-        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: macos/package-lock.json
-
-      - name: Install macOS build dependencies
-        shell: bash
-        run: |
-          npm ci --prefix macos
-          mkdir -p dist
-          npm pack --prefix macos '@openai/codex@0.144.1-darwin-arm64' --pack-destination dist
-
-      - name: Run macOS tests
-        run: npm --prefix macos test
-
-      - name: Build and verify macOS
-        shell: bash
-        env:
-          CAM_VERSION: ${{ env.CAM_VERSION }}
-        run: |
-          set -euo pipefail
-          export CODEX_CLI_PAYLOAD_PATH="$PWD/dist/openai-codex-0.144.1-darwin-arm64.tgz"
-          npm --prefix macos run build:mac -- --date "$(date +%Y%m%d)" --output "$PWD/CodexAccountManager-macOS-latest.zip"
-          npm --prefix macos run verify:mac -- "$PWD/CodexAccountManager-macOS-latest.zip"
-
-      - name: Upload macOS artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: macos-package
-          path: |
-            CodexAccountManager-macOS-latest.zip
-            CodexAccountManager-macOS-latest.zip.sha256
-          if-no-files-found: error
-
   publish:
     name: Publish rolling latest release
-    needs: [build-windows, build-macos]
+    needs: build-windows
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -147,10 +104,6 @@ jobs:
                       'name': 'CodexAccountManager-Windows-latest.zip',
                       'sha256': read_sha256('CodexAccountManager-Windows-latest.zip.sha256'),
                   },
-                  'macos': {
-                      'name': 'CodexAccountManager-macOS-latest.zip',
-                      'sha256': read_sha256('CodexAccountManager-macOS-latest.zip.sha256'),
-                  },
               },
           }
           (root / 'update-manifest.json').write_text(json.dumps(payload, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
@@ -165,13 +118,11 @@ jobs:
           body: |
             自动构建版本 `${{ env.CAM_VERSION }}`。
 
-            推送到 `main` 的源码会自动构建 Windows/macOS 安装包；已安装的软件会检查此 Release 并提示更新。
+            推送到 `main` 的源码会自动构建 Windows 安装包；已安装的软件会检查此 Release 并提示更新。
           prerelease: true
           make_latest: false
           files: |
             release-assets/CodexAccountManager-Windows-latest.zip
             release-assets/CodexAccountManager-Windows-latest.zip.sha256
-            release-assets/CodexAccountManager-macOS-latest.zip
-            release-assets/CodexAccountManager-macOS-latest.zip.sha256
             release-assets/update-manifest.json
           fail_on_unmatched_files: true

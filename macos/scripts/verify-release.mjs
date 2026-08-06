@@ -205,6 +205,7 @@ async function verifyInternalRelease(zipPath) {
     const sourceRoot = path.resolve(SCRIPT_DIR, '..', 'src');
     const sourceTree = await collectTree(sourceRoot);
     const expectedAsarEntries = [
+      '/model-catalog.json',
       '/package.json',
       '/src',
       ...sourceTree.directories.map((relative) => `/src/${relative}`),
@@ -218,6 +219,9 @@ async function verifyInternalRelease(zipPath) {
       const source = await readFile(path.join(sourceRoot, ...relative.split('/')));
       if (!packed.equals(source)) throw new Error(`app.asar 与当前源码不一致：src/${relative}`);
     }
+    const packedCatalog = extractFile(appAsar, 'model-catalog.json');
+    const sourceCatalog = await readFile(path.resolve(SCRIPT_DIR, '..', '..', 'assets', 'model-catalog.json'));
+    if (!packedCatalog.equals(sourceCatalog)) throw new Error('app.asar 与当前内置模型目录不一致。');
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }

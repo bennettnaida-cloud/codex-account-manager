@@ -13,11 +13,11 @@ Codex Account Manager 是一个在本机运行的 Codex 多账号管理器。它
 | 平台 | 安装包 | 校验文件 | 要求 |
 | --- | --- | --- | --- |
 | Windows | [下载最新一键安装包](https://github.com/bennettnaida-cloud/codex-account-manager/releases/download/latest/CodexAccountManager-Windows-latest.zip) | [SHA-256](https://github.com/bennettnaida-cloud/codex-account-manager/releases/download/latest/CodexAccountManager-Windows-latest.zip.sha256) | Windows 10/11 x64 |
-| macOS | [下载最新一键安装包](https://github.com/bennettnaida-cloud/codex-account-manager/releases/download/latest/CodexAccountManager-macOS-latest.zip) | [SHA-256](https://github.com/bennettnaida-cloud/codex-account-manager/releases/download/latest/CodexAccountManager-macOS-latest.zip.sha256) | Apple Silicon，macOS 12+ |
+| macOS | [下载 Apple Silicon 安装包](https://github.com/bennettnaida-cloud/codex-account-manager/releases/download/latest/CodexAccountManager-macOS-latest.zip) | [SHA-256](https://github.com/bennettnaida-cloud/codex-account-manager/releases/download/latest/CodexAccountManager-macOS-latest.zip.sha256) | Apple Silicon，macOS 12+ |
 
 也可以打开 [Latest Release](https://github.com/bennettnaida-cloud/codex-account-manager/releases/tag/latest) 查看版本、发布时间和全部文件。
 
-安装包内置运行所需的 Codex CLI。Windows 版不要求另装 .NET，macOS 版不要求另装 Node.js。
+安装包内置运行所需的 Codex CLI。Windows 不要求另装 .NET，macOS 不要求另装 Node.js。
 
 ## 这个项目解决什么问题
 
@@ -64,7 +64,7 @@ flowchart LR
 
 ### 1. 凭据隔离与聊天共享
 
-账号目录只保存该账号的登录凭据和账号配置。真正启动 Codex 时，管理器会先备份需要保护的现有登录状态，再把当前账号的必要配置原子投放到共享 `%USERPROFILE%\.codex`（macOS 为对应用户目录）。历史会话不会随账号切换，也不会因为切换凭据而删除。
+账号目录只保存该账号的登录凭据和账号配置。真正启动 Codex 时，管理器会先备份需要保护的现有登录状态，再把当前账号的必要配置原子投放到共享 `%USERPROFILE%\.codex`。历史会话不会随账号切换，也不会因为切换凭据而删除。
 
 ### 2. Access Token 本机网关
 
@@ -101,21 +101,12 @@ Access Token 模式使用只监听回环地址的本机网关。网关校验当�
 
 默认安装目录是 `%LOCALAPPDATA%\Programs\CodexAccountManager`，不需要管理员权限。程序没有商业代码签名证书；SmartScreen 提示时，请先确认下载地址和 SHA-256，再选择“更多信息 → 仍要运行”。
 
-## macOS 安装与使用
-
-1. 下载 `CodexAccountManager-macOS-latest.zip`，并核对 SHA-256。
-2. 解压整个 ZIP，双击 `一键安装.command`。
-3. 如果系统首次阻止脚本运行，按住 Control 点击脚本并选择“打开”。
-4. 安装程序优先安装到 `/Applications`，没有写入权限时使用 `~/Applications`。
-
-当前 macOS 包面向 Apple Silicon。安装包未经过 Apple Developer ID 签名和公证，会在本机执行 ad-hoc 签名，不会关闭 Gatekeeper 或修改系统安全策略。
-
 ## 更新与卸载
 
 - 软件会检查 GitHub `latest` Release；确认有新版本后，可在界面中下载并安装。
 - Windows 更新安装到新的版本目录，继续使用原工作目录，因此账号、设置和本地统计不会被安装包覆盖。
 - 也可以重新下载并运行一键安装包完成覆盖升级。
-- Windows 可从“设置 → 应用 → 已安装的应用”卸载；macOS 可运行安装包中的 `卸载.command`。
+- 可从 Windows“设置 → 应用 → 已安装的应用”卸载，或运行安装目录中的卸载脚本。
 - 卸载默认保留账号配置、凭据目录和聊天记录，避免误删用户数据。
 
 ## 数据与安全边界
@@ -140,14 +131,6 @@ Windows：
 .\Build-OneClickInstallerPackage.ps1
 ```
 
-macOS：
-
-```bash
-npm ci --prefix macos
-npm --prefix macos test
-npm --prefix macos run build:mac
-```
-
 构建脚本会下载或使用固定版本的 Codex CLI 运行组件。第三方组件说明见 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)。
 
 ## 发布方式
@@ -155,7 +138,7 @@ npm --prefix macos run build:mac
 仓库使用 [Build and publish latest packages](https://github.com/bennettnaida-cloud/codex-account-manager/actions/workflows/build-latest.yml) 自动发布：
 
 1. 将经过测试的源码和 README 推送到 `main`。
-2. GitHub Actions 同时构建并验证 Windows 与 macOS 安装包。
+2. GitHub Actions 构建并验证 Windows 安装包；macOS 安装包作为独立发布资产维护，不阻塞 Windows CI。
 3. 工作流覆盖 `latest` Release 中固定名称的 ZIP、SHA-256 和 `update-manifest.json`。
 4. README 的下载链接始终指向 `latest`，以后无需修改下载地址，也不要把大型 ZIP 提交到 Git 仓库。
 
