@@ -754,13 +754,17 @@ public partial class Form1 : Form
         controlsRow.Controls.Add(_searchShell);
 
         _checkUpdatesButton.Text = "检查更新";
-        _checkUpdatesButton.Width = 112;
-        _checkUpdatesButton.Height = 42;
-        _checkUpdatesButton.Margin = new Padding(0, 1, 0, 0);
+        _checkUpdatesButton.Width = 128;
+        _checkUpdatesButton.Height = 44;
+        _checkUpdatesButton.Margin = new Padding(0, 0, 0, 0);
         _checkUpdatesButton.Tag = "app-update";
-        _checkUpdatesButton.Radius = 11;
-        _checkUpdatesButton.Padding = new Padding(10, 0, 10, 0);
-        _checkUpdatesButton.Font = new Font(Font.FontFamily, 8.9F);
+        _checkUpdatesButton.Radius = 12;
+        _checkUpdatesButton.Padding = new Padding(9, 0, 9, 0);
+        _checkUpdatesButton.Font = new Font(Font.FontFamily, 9.1F, FontStyle.Bold);
+        _checkUpdatesButton.IconText = "↻";
+        _checkUpdatesButton.IconWidth = 24;
+        _checkUpdatesButton.ShowIconTile = true;
+        _checkUpdatesButton.AccessibleName = "检查应用更新";
         _checkUpdatesButton.Click += async (_, _) => await CheckForUpdatesAsync(manual: true);
         controlsRow.Controls.Add(_checkUpdatesButton);
 
@@ -1209,6 +1213,10 @@ public partial class Form1 : Form
                 else if (Equals(button.Tag, "token-update"))
                 {
                     ApplyTokenUpdateButtonStyle(button);
+                }
+                else if (Equals(button.Tag, "app-update"))
+                {
+                    ApplyUpdateButtonStyle(button);
                 }
                 else if (Equals(button.Tag, "primary"))
                 {
@@ -2680,6 +2688,25 @@ public partial class Form1 : Form
             modern.ShowAccent = selected;
             modern.Invalidate();
         }
+    }
+
+    private void ApplyUpdateButtonStyle(Button button)
+    {
+        ThemeStyler.ApplyPrimaryButton(button, _palette);
+        if (button is not ModernButton modern)
+        {
+            return;
+        }
+
+        modern.IconText = "↻";
+        modern.IconWidth = 24;
+        modern.ShowIconTile = true;
+        modern.IconTileColor = Color.FromArgb(58, _palette.SecondaryAccentColor);
+        modern.IconTileBorderColor = Color.FromArgb(112, _palette.SecondaryAccentColor);
+        modern.Radius = 12;
+        modern.Padding = new Padding(9, 0, 9, 0);
+        modern.Font = new Font(Font.FontFamily, 9.1F, FontStyle.Bold);
+        modern.Invalidate();
     }
 
     private void ChangeThemeMode()
