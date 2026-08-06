@@ -10,6 +10,16 @@ const REPOSITORY = 'bennettnaida-cloud/codex-account-manager';
 const RELEASE_URL = `https://api.github.com/repos/${REPOSITORY}/releases/tags/latest`;
 const MAX_DOWNLOAD_BYTES = 800 * 1024 * 1024;
 
+const UPDATE_CHECK_STATUS = Object.freeze({
+  UP_TO_DATE: 'up-to-date',
+  UPDATE_AVAILABLE: 'update-available',
+  NETWORK_UNAVAILABLE: 'network-unavailable',
+  RELEASE_UNAVAILABLE: 'release-unavailable',
+  MANIFEST_MISSING: 'manifest-missing',
+  MANIFEST_INVALID: 'manifest-invalid',
+  PLATFORM_ASSET_MISSING: 'platform-asset-missing',
+});
+
 function normalizeVersion(value) {
   const match = String(value || '').trim().replace(/^v/i, '').match(/^\d+(?:\.\d+){0,3}$/);
   return match ? match[0] : null;
@@ -65,6 +75,18 @@ function requestBuffer(url, { maxBytes = 2 * 1024 * 1024, accept = 'application/
 async function requestJson(url) {
   const payload = await requestBuffer(url);
   return JSON.parse(payload.toString('utf8'));
+}
+
+function checkResult(status, update = null) {
+  return { status, update };
+}
+
+function isHttpNotFound(error) {
+  return /HTTP\s+404\b/i.test(String(error?.message || error));
+}
+
+function isInvalidJson(error) {
+  return error instanceof SyntaxError || /JSON/i.test(String(error?.message || error));
 }
 
 async function downloadFile(url, destination, expectedSha256) {
@@ -128,26 +150,57 @@ async function downloadFile(url, destination, expectedSha256) {
 
 async function checkForUpdate({ currentVersion, platform = process.platform } = {}) {
   const normalizedCurrent = normalizeVersion(currentVersion) || '0.0.0';
-  const release = await requestJson(RELEASE_URL);
+  let release;
+  try {
+    release = await requestJson(RELEASE_URL);
+  } catch (error) {
+    return checkResult(
+      isHttpNotFound(error)
+        ? UPDATE_CHECK_STATUS.RELEASE_UNAVAILABLE
+        : UPDATE_CHECK_STATUS.NETWORK_UNAVAILABLE);
+  }
+
   const releaseAssets = Array.isArray(release?.assets) ? release.assets : [];
   const manifestAsset = releaseAssets.find((asset) => asset?.name === 'update-manifest.json');
-  if (!manifestAsset?.browser_download_url) return null;
-  const manifest = await requestJson(manifestAsset.browser_download_url);
+  if (!manifestAsset?.browser_download_url) {
+    return checkResult(UPDATE_CHECK_STATUS.MANIFEST_MISSING);
+  }
+
+  let manifest;
+  try {
+    manifest = await requestJson(manifestAsset.browser_download_url);
+  } catch (error) {
+    return checkResult(
+      isHttpNotFound(error)
+        ? UPDATE_CHECK_STATUS.MANIFEST_MISSING
+        : isInvalidJson(error)
+          ? UPDATE_CHECK_STATUS.MANIFEST_INVALID
+          : UPDATE_CHECK_STATUS.NETWORK_UNAVAILABLE);
+  }
+
   const remoteVersion = normalizeVersion(manifest?.version);
-  if (!remoteVersion || compareVersions(remoteVersion, normalizedCurrent) <= 0) return null;
+  if (!remoteVersion) return checkResult(UPDATE_CHECK_STATUS.MANIFEST_INVALID);
+  if (compareVersions(remoteVersion, normalizedCurrent) <= 0) {
+    return checkResult(UPDATE_CHECK_STATUS.UP_TO_DATE);
+  }
+
   const platformKey = platform === 'darwin' ? 'macos' : platform === 'win32' ? 'windows' : null;
   const descriptor = platformKey ? manifest?.assets?.[platformKey] : null;
-  if (!descriptor?.name || !/^[a-f0-9]{64}$/i.test(String(descriptor.sha256 || ''))) return null;
+  if (!descriptor?.name) return checkResult(UPDATE_CHECK_STATUS.PLATFORM_ASSET_MISSING);
+  if (!/^[a-f0-9]{64}$/i.test(String(descriptor.sha256 || ''))) {
+    return checkResult(UPDATE_CHECK_STATUS.MANIFEST_INVALID);
+  }
+
   const asset = releaseAssets.find((candidate) => candidate?.name === descriptor.name);
-  if (!asset?.browser_download_url) return null;
-  return {
+  if (!asset?.browser_download_url) return checkResult(UPDATE_CHECK_STATUS.PLATFORM_ASSET_MISSING);
+  return checkResult(UPDATE_CHECK_STATUS.UPDATE_AVAILABLE, {
     version: remoteVersion,
     commit: String(manifest.commit || ''),
     releaseUrl: String(release.html_url || `https://github.com/${REPOSITORY}/releases`),
     assetName: descriptor.name,
     assetUrl: asset.browser_download_url,
     sha256: String(descriptor.sha256).toLowerCase(),
-  };
+  });
 }
 
 function buildInstallerHelper() {
@@ -196,6 +249,7 @@ async function downloadAndScheduleInstall(update, { currentPid = process.pid } =
 
 module.exports = {
   REPOSITORY,
+  UPDATE_CHECK_STATUS,
   normalizeVersion,
   compareVersions,
   checkForUpdate,

@@ -754,6 +754,7 @@ internal sealed class ThemePicker : Control
     private bool _hovered;
     private bool _pressed;
     private bool _menuOpen;
+    private bool _suppressNextClick;
     private Color _fillColor = Color.White;
     private Color _hoverColor = Color.WhiteSmoke;
     private Color _pressedColor = Color.Gainsboro;
@@ -883,6 +884,18 @@ internal sealed class ThemePicker : Control
         base.OnMouseDown(e);
         if (e.Button == MouseButtons.Left)
         {
+            if (_menuOpen || _menu.Visible)
+            {
+                // ContextMenuStrip closes itself before the owner's Click event is
+                // raised. Remember this click so it does not immediately reopen the
+                // popup after it has just been dismissed.
+                _suppressNextClick = true;
+                _menu.Close(ToolStripDropDownCloseReason.Keyboard);
+                _pressed = false;
+                Invalidate();
+                return;
+            }
+
             _pressed = true;
             Focus();
             Invalidate();
@@ -899,6 +912,19 @@ internal sealed class ThemePicker : Control
     protected override void OnClick(EventArgs e)
     {
         base.OnClick(e);
+        if (_suppressNextClick)
+        {
+            _suppressNextClick = false;
+            return;
+        }
+        if (_menu.Visible)
+        {
+            // The popup can open upward when the picker is in the bottom sidebar.
+            // Treat a second click on the picker as an explicit toggle so it never
+            // appears stuck open behind the control.
+            _menu.Close(ToolStripDropDownCloseReason.Keyboard);
+            return;
+        }
         ShowMenu();
     }
 
@@ -1018,7 +1044,7 @@ internal sealed class ThemePicker : Control
 
     private void ShowMenu()
     {
-        if (_items.Count == 0 || _menu.Visible)
+        if (_items.Count == 0)
         {
             return;
         }

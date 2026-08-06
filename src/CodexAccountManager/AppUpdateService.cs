@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO.Compression;
+using System.Net;
 using System.Net.Http.Headers;
 using System.Reflection;
 using System.Security.Cryptography;
@@ -16,6 +17,21 @@ internal sealed record AppUpdateInfo(
     string AssetUrl,
     string Sha256);
 
+internal enum AppUpdateCheckStatus
+{
+    UpToDate,
+    UpdateAvailable,
+    NetworkUnavailable,
+    ReleaseUnavailable,
+    ManifestMissing,
+    ManifestInvalid,
+    PlatformAssetMissing
+}
+
+internal sealed record AppUpdateCheckResult(
+    AppUpdateInfo? Update,
+    AppUpdateCheckStatus Status);
+
 /// <summary>
 /// Reads the rolling "latest" GitHub Release and schedules the trusted package
 /// installer after the current process has exited. The release workflow publishes
@@ -31,75 +47,93 @@ internal sealed class AppUpdateService
     internal static string CurrentVersion =>
         NormalizeVersion(Assembly.GetEntryAssembly()?.GetName().Version?.ToString()) ?? "0.0.0.0";
 
-    internal async Task<AppUpdateInfo?> CheckAsync(CancellationToken cancellationToken = default)
+    internal async Task<AppUpdateCheckResult> CheckAsync(CancellationToken cancellationToken = default)
     {
-        using var releaseDocument = await GetJsonAsync(ReleaseApiUrl, cancellationToken).ConfigureAwait(false);
-        if (releaseDocument is null)
+        try
         {
-            return null;
-        }
+            using var releaseDocument = await GetJsonAsync(
+                ReleaseApiUrl,
+                cancellationToken,
+                networkFailureStatus: AppUpdateCheckStatus.NetworkUnavailable,
+                httpFailureStatus: AppUpdateCheckStatus.ReleaseUnavailable,
+                invalidJsonStatus: AppUpdateCheckStatus.ReleaseUnavailable).ConfigureAwait(false);
 
-        var release = releaseDocument.RootElement;
-        var releaseUrl = ReadString(release, "html_url") ?? "https://github.com/" + Repository + "/releases";
-        var releaseAssets = ReadAssets(release);
-        var manifestAsset = releaseAssets.FirstOrDefault(asset =>
-            string.Equals(asset.Name, "update-manifest.json", StringComparison.OrdinalIgnoreCase));
-        if (manifestAsset is null)
-        {
-            return null;
-        }
+            var release = releaseDocument.RootElement;
+            var releaseUrl = ReadString(release, "html_url") ?? "https://github.com/" + Repository + "/releases";
+            var releaseAssets = ReadAssets(release);
+            var manifestAsset = releaseAssets.FirstOrDefault(asset =>
+                string.Equals(asset.Name, "update-manifest.json", StringComparison.OrdinalIgnoreCase));
+            if (manifestAsset is null)
+            {
+                return new AppUpdateCheckResult(null, AppUpdateCheckStatus.ManifestMissing);
+            }
 
-        using var manifestDocument = await GetJsonAsync(manifestAsset.Url, cancellationToken).ConfigureAwait(false);
-        if (manifestDocument is null)
-        {
-            return null;
-        }
+            using var manifestDocument = await GetJsonAsync(
+                manifestAsset.Url,
+                cancellationToken,
+                networkFailureStatus: AppUpdateCheckStatus.NetworkUnavailable,
+                httpFailureStatus: AppUpdateCheckStatus.ManifestMissing,
+                invalidJsonStatus: AppUpdateCheckStatus.ManifestInvalid).ConfigureAwait(false);
 
-        var manifest = manifestDocument.RootElement;
-        var remoteVersion = NormalizeVersion(ReadString(manifest, "version"));
-        if (remoteVersion is null || !IsNewer(remoteVersion, CurrentVersion))
-        {
-            return null;
-        }
+            var manifest = manifestDocument.RootElement;
+            var remoteVersion = NormalizeVersion(ReadString(manifest, "version"));
+            if (remoteVersion is null)
+            {
+                return new AppUpdateCheckResult(null, AppUpdateCheckStatus.ManifestInvalid);
+            }
 
-        var commit = ReadString(manifest, "commit") ?? string.Empty;
-        var platformName = "windows";
-        if (!manifest.TryGetProperty("assets", out var manifestAssets) ||
-            !manifestAssets.TryGetProperty(platformName, out var platformAsset))
-        {
-            return null;
-        }
+            if (!IsNewer(remoteVersion, CurrentVersion))
+            {
+                return new AppUpdateCheckResult(null, AppUpdateCheckStatus.UpToDate);
+            }
 
-        var assetName = ReadString(platformAsset, "name");
-        if (string.IsNullOrWhiteSpace(assetName))
-        {
-            return null;
-        }
+            var commit = ReadString(manifest, "commit") ?? string.Empty;
+            var platformName = "windows";
+            if (!manifest.TryGetProperty("assets", out var manifestAssets) ||
+                manifestAssets.ValueKind != JsonValueKind.Object ||
+                !manifestAssets.TryGetProperty(platformName, out var platformAsset) ||
+                platformAsset.ValueKind != JsonValueKind.Object)
+            {
+                return new AppUpdateCheckResult(null, AppUpdateCheckStatus.PlatformAssetMissing);
+            }
 
-        var releaseAsset = releaseAssets.FirstOrDefault(asset =>
-            string.Equals(asset.Name, assetName, StringComparison.OrdinalIgnoreCase));
-        if (releaseAsset is null)
-        {
-            return null;
-        }
+            var assetName = ReadString(platformAsset, "name");
+            if (string.IsNullOrWhiteSpace(assetName))
+            {
+                return new AppUpdateCheckResult(null, AppUpdateCheckStatus.PlatformAssetMissing);
+            }
 
-        var sha256 = NormalizeSha256(ReadString(platformAsset, "sha256"));
-        if (sha256 is null)
-        {
-            sha256 = NormalizeSha256(releaseAsset.Digest?.Replace("sha256:", string.Empty, StringComparison.OrdinalIgnoreCase));
-        }
-        if (sha256 is null)
-        {
-            return null;
-        }
+            var releaseAsset = releaseAssets.FirstOrDefault(asset =>
+                string.Equals(asset.Name, assetName, StringComparison.OrdinalIgnoreCase));
+            if (releaseAsset is null)
+            {
+                return new AppUpdateCheckResult(null, AppUpdateCheckStatus.PlatformAssetMissing);
+            }
 
-        return new AppUpdateInfo(
-            remoteVersion,
-            commit,
-            releaseUrl,
-            releaseAsset.Name,
-            releaseAsset.Url,
-            sha256);
+            var sha256 = NormalizeSha256(ReadString(platformAsset, "sha256"));
+            if (sha256 is null)
+            {
+                sha256 = NormalizeSha256(releaseAsset.Digest?.Replace("sha256:", string.Empty, StringComparison.OrdinalIgnoreCase));
+            }
+            if (sha256 is null)
+            {
+                return new AppUpdateCheckResult(null, AppUpdateCheckStatus.ManifestInvalid);
+            }
+
+            return new AppUpdateCheckResult(
+                new AppUpdateInfo(
+                    remoteVersion,
+                    commit,
+                    releaseUrl,
+                    releaseAsset.Name,
+                    releaseAsset.Url,
+                    sha256),
+                AppUpdateCheckStatus.UpdateAvailable);
+        }
+        catch (UpdateCheckException error)
+        {
+            return new AppUpdateCheckResult(null, error.Status);
+        }
     }
 
     internal async Task ScheduleInstallAsync(
@@ -189,30 +223,47 @@ internal sealed class AppUpdateService
         return client;
     }
 
-    private static async Task<JsonDocument?> GetJsonAsync(string url, CancellationToken cancellationToken)
+    private static async Task<JsonDocument> GetJsonAsync(
+        string url,
+        CancellationToken cancellationToken,
+        AppUpdateCheckStatus networkFailureStatus,
+        AppUpdateCheckStatus httpFailureStatus,
+        AppUpdateCheckStatus invalidJsonStatus)
     {
         try
         {
             using var response = await Http.GetAsync(url, cancellationToken).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
             {
-                return null;
+                var failureStatus = response.StatusCode == HttpStatusCode.NotFound
+                    ? httpFailureStatus
+                    : networkFailureStatus;
+                throw new UpdateCheckException(failureStatus, response.StatusCode == HttpStatusCode.NotFound
+                    ? "GitHub 未找到请求的 Release 资源。"
+                    : $"GitHub 返回 HTTP {(int)response.StatusCode}。");
             }
 
             await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-            return await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false);
+            try
+            {
+                return await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false);
+            }
+            catch (JsonException error)
+            {
+                throw new UpdateCheckException(invalidJsonStatus, "GitHub 返回的 JSON 格式无效。", error);
+            }
         }
-        catch (HttpRequestException)
+        catch (UpdateCheckException)
         {
-            return null;
+            throw;
         }
-        catch (TaskCanceledException)
+        catch (HttpRequestException error)
         {
-            return null;
+            throw new UpdateCheckException(networkFailureStatus, "无法连接 GitHub。", error);
         }
-        catch (JsonException)
+        catch (TaskCanceledException error)
         {
-            return null;
+            throw new UpdateCheckException(networkFailureStatus, "连接 GitHub 超时。", error);
         }
     }
 
@@ -353,4 +404,12 @@ finally {
     }
 
     private sealed record ReleaseAsset(string Name, string Url, string? Digest);
+
+    private sealed class UpdateCheckException(
+        AppUpdateCheckStatus status,
+        string message,
+        Exception? innerException = null) : Exception(message, innerException)
+    {
+        internal AppUpdateCheckStatus Status { get; } = status;
+    }
 }

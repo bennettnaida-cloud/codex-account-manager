@@ -574,7 +574,7 @@ public partial class Form1 : Form
             Left = 16,
             Top = 440,
             Width = 228,
-            Height = 92,
+            Height = 122,
             Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom,
             Name = "SidebarFooter",
             BackColor = Color.Transparent,
@@ -584,24 +584,33 @@ public partial class Form1 : Form
         {
             Text = "管理器外观",
             Left = 2,
-            Top = 0,
+            Top = 44,
             Width = 224,
-            Height = 30,
+            Height = 24,
             Font = new Font(Font.FontFamily, 9F, FontStyle.Bold),
             TextAlign = ContentAlignment.MiddleLeft,
             Name = "ThemeLabel",
             UseMnemonic = false
         };
-        _themeModePicker.SetBounds(0, 34, 228, 46);
+        _themeModePicker.SetBounds(0, 74, 228, 42);
         _themeModePicker.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
         managerAppearanceFooter.Resize += (_, _) =>
         {
+            _checkUpdatesButton.SetBounds(
+                0,
+                0,
+                Math.Max(160, managerAppearanceFooter.ClientSize.Width),
+                40);
+            managerAppearanceLabel.Top = _checkUpdatesButton.Bottom + 4;
             managerAppearanceLabel.Width = Math.Max(120, managerAppearanceFooter.ClientSize.Width - 4);
             _themeModePicker.Width = Math.Max(160, managerAppearanceFooter.ClientSize.Width);
-            _themeModePicker.Top = Math.Max(32, managerAppearanceFooter.ClientSize.Height - _themeModePicker.Height - 8);
+            _themeModePicker.Top = Math.Max(
+                managerAppearanceLabel.Bottom + 4,
+                managerAppearanceFooter.ClientSize.Height - _themeModePicker.Height - 6);
         };
         managerAppearanceFooter.Controls.Add(managerAppearanceLabel);
         managerAppearanceFooter.Controls.Add(_themeModePicker);
+        managerAppearanceFooter.Controls.Add(_checkUpdatesButton);
         sidebar.Controls.Add(managerAppearanceFooter);
         void UpdateManagerAppearanceFooterLayout()
         {
@@ -766,7 +775,6 @@ public partial class Form1 : Form
         _checkUpdatesButton.ShowIconTile = true;
         _checkUpdatesButton.AccessibleName = "检查应用更新";
         _checkUpdatesButton.Click += async (_, _) => await CheckForUpdatesAsync(manual: true);
-        controlsRow.Controls.Add(_checkUpdatesButton);
 
         controlsRow.SizeChanged += (_, _) => UpdateHeaderControlLayout();
 
@@ -2960,8 +2968,7 @@ public partial class Form1 : Form
         }
 
         var available = Math.Max(260, _controlsRow.ClientSize.Width - _controlsRow.Padding.Horizontal);
-        var updateButtonWidth = _checkUpdatesButton.Visible ? _checkUpdatesButton.Width + _checkUpdatesButton.Margin.Horizontal : 0;
-        _searchShell.Width = Math.Max(260, Math.Min(500, available - updateButtonWidth));
+        _searchShell.Width = Math.Max(260, Math.Min(500, available));
     }
 
     private async Task CheckForUpdatesAsync(bool manual)
@@ -2979,14 +2986,15 @@ public partial class Form1 : Form
 
         try
         {
-            var update = await _updateService.CheckAsync();
+            var checkResult = await _updateService.CheckAsync();
+            var update = checkResult.Update;
             if (update is null)
             {
                 if (manual && !_formClosed)
                 {
                     MessageBox.Show(
                         this,
-                        "当前已经是最新版本，或暂时无法连接 GitHub。",
+                        DescribeUpdateCheckResult(checkResult),
                         "检查更新",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Information);
@@ -3032,6 +3040,20 @@ public partial class Form1 : Form
                 _checkUpdatesButton.Enabled = true;
             }
         }
+    }
+
+    private static string DescribeUpdateCheckResult(AppUpdateCheckResult result)
+    {
+        return result.Status switch
+        {
+            AppUpdateCheckStatus.UpToDate => $"当前已是最新版本（{AppUpdateService.CurrentVersion}）。",
+            AppUpdateCheckStatus.NetworkUnavailable => "无法连接 GitHub，请检查网络或代理设置。",
+            AppUpdateCheckStatus.ReleaseUnavailable => "GitHub 暂未发布可用版本。",
+            AppUpdateCheckStatus.ManifestMissing => "GitHub Release 缺少更新清单（update-manifest.json）。",
+            AppUpdateCheckStatus.ManifestInvalid => "GitHub Release 的更新清单格式无效，暂时无法确认版本。",
+            AppUpdateCheckStatus.PlatformAssetMissing => "GitHub Release 缺少 Windows 更新包，暂时无法更新。",
+            _ => "当前没有可用更新。"
+        };
     }
 
     private void UpdateStatusBarLayout()
@@ -4323,8 +4345,13 @@ public partial class Form1 : Form
                 Size.Empty,
                 TextFormatFlags.SingleLine | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix).Width);
             var pickerAvailableWidth = Math.Max(1, 228 - (int)Math.Ceiling(52F * scale));
-            var sidebarFooterTop = (int)Math.Round((560 - 18 - 92) * scale);
             var lastNavBottom = (int)Math.Round((378 + 44) * scale);
+            var sidebarFooterHeight = (int)Math.Round(122 * scale);
+            var sidebarBottomInset = (int)Math.Round(18 * scale);
+            var sidebarNavGap = Math.Max(8, (int)Math.Round(12 * scale));
+            var sidebarFooterTop = Math.Max(
+                lastNavBottom + sidebarNavGap,
+                (int)Math.Round((560 * scale) - sidebarBottomInset - sidebarFooterHeight));
             if (pickerTextWidth > pickerAvailableWidth || sidebarFooterTop <= lastNavBottom)
             {
                 throw new InvalidOperationException(

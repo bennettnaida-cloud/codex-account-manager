@@ -17,7 +17,11 @@ const { LocalPatGateway, createPatGatewayUpstreamPreparer } = require('./service
 const { DAEMON_ARGUMENT, PatGatewayController } = require('./services/pat-gateway-controller');
 const { loadGatewaySecret, loadOrCreateGatewaySecret } = require('./services/gateway-secret');
 const { ThemeService, buildCustomThemeCss, normalizeCustomTheme } = require('./services/theme-service');
-const { checkForUpdate, downloadAndScheduleInstall } = require('./services/update-service');
+const {
+  checkForUpdate,
+  downloadAndScheduleInstall,
+  UPDATE_CHECK_STATUS,
+} = require('./services/update-service');
 const {
   applyProxyEnvironment,
   detectLocalProxy,
@@ -1061,16 +1065,17 @@ async function promptForUpdate(manual = false) {
   if (updateCheckInFlight) return updateCheckInFlight;
   updateCheckInFlight = (async () => {
     try {
-      const update = await checkForUpdate({
+      const checkResult = await checkForUpdate({
         currentVersion: app.getVersion(),
         platform: process.platform,
       });
+      const update = checkResult?.update || null;
       if (!update) {
         if (manual) {
           await dialog.showMessageBox(mainWindow, {
             type: 'info',
             title: '检查更新',
-            message: '当前已经是最新版本，或暂时无法连接 GitHub。',
+            message: describeUpdateCheckStatus(checkResult?.status),
           });
         }
         return null;
@@ -1109,6 +1114,25 @@ async function promptForUpdate(manual = false) {
     }
   })();
   return updateCheckInFlight;
+}
+
+function describeUpdateCheckStatus(status) {
+  switch (status) {
+    case UPDATE_CHECK_STATUS.UP_TO_DATE:
+      return `当前已是最新版本（${app.getVersion()}）。`;
+    case UPDATE_CHECK_STATUS.NETWORK_UNAVAILABLE:
+      return '无法连接 GitHub，请检查网络或代理设置。';
+    case UPDATE_CHECK_STATUS.RELEASE_UNAVAILABLE:
+      return 'GitHub 暂未发布可用版本。';
+    case UPDATE_CHECK_STATUS.MANIFEST_MISSING:
+      return 'GitHub Release 缺少更新清单（update-manifest.json）。';
+    case UPDATE_CHECK_STATUS.MANIFEST_INVALID:
+      return 'GitHub Release 的更新清单格式无效，暂时无法确认版本。';
+    case UPDATE_CHECK_STATUS.PLATFORM_ASSET_MISSING:
+      return 'GitHub Release 缺少 macOS 更新包，暂时无法更新。';
+    default:
+      return '当前没有可用更新。';
+  }
 }
 
 function createMenu() {
