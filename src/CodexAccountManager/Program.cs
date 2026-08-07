@@ -216,6 +216,7 @@ static class Program
             Form1.ValidateStableWorkspaceGutter();
             Form1.ValidateResponsiveAccountCardLayouts();
             Form1.ValidateCodexAppearanceLayouts();
+            AppUpdateService.ValidateUpdateHelperScript();
             ModelCatalogService.ValidatePersistenceAndProxy();
             var officialCatalogProxy = Environment.GetEnvironmentVariable(
                 "CODEX_ACCOUNT_MANAGER_SELF_TEST_MODEL_CATALOG_PROXY");

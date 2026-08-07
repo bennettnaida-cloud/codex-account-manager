@@ -352,6 +352,7 @@ public partial class Form1 : Form
         ConfigureQuotaAutoRefresh();
         Shown += (_, _) =>
         {
+            ShowPendingUpdateFailure();
             UpdateStatusBarLayout();
             QueueCardsAnimationVisibilityRefresh();
             RefreshOfficialQuotaIfNeeded();
@@ -3175,11 +3176,35 @@ public partial class Form1 : Form
             return;
         }
 
-        _statusBox.Text = "正在下载并校验更新包，请稍候……";
-        await _updateService.ScheduleInstallAsync(update);
+        _statusBox.Text = "正在连接 GitHub 并准备下载更新包……";
+        var progress = new Progress<AppUpdateProgress>(value =>
+        {
+            if (!_formClosed && !_statusBox.IsDisposed)
+            {
+                _statusBox.Text = value.Message;
+            }
+        });
+        await _updateService.ScheduleInstallAsync(update, progress);
         _statusBox.Text = "更新包已准备完成，程序即将关闭并安装新版本。";
         await Task.Delay(350);
         Application.Exit();
+    }
+
+    private void ShowPendingUpdateFailure()
+    {
+        var failure = AppUpdateService.ConsumePendingFailure();
+        if (string.IsNullOrWhiteSpace(failure) || _formClosed)
+        {
+            return;
+        }
+
+        MessageBox.Show(
+            this,
+            $"上次自动更新未能完成，已重新打开原版本。\r\n\r\n{failure}\r\n\r\n" +
+            "详细日志位于：%LOCALAPPDATA%\\CodexAccountManager\\UpdaterLogs",
+            "Codex Account Manager 更新",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Warning);
     }
 
     private async Task InstallAvailableUpdateButtonAsync()

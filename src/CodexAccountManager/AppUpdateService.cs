@@ -32,6 +32,8 @@ internal sealed record AppUpdateCheckResult(
     AppUpdateInfo? Update,
     AppUpdateCheckStatus Status);
 
+internal sealed record AppUpdateProgress(string Message);
+
 /// <summary>
 /// Reads the rolling "latest" GitHub Release and schedules the trusted package
 /// installer after the current process has exited. The release workflow publishes
@@ -138,6 +140,7 @@ internal sealed class AppUpdateService
 
     internal async Task ScheduleInstallAsync(
         AppUpdateInfo update,
+        IProgress<AppUpdateProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
         var updateRoot = Path.Combine(
@@ -147,11 +150,27 @@ internal sealed class AppUpdateService
         Directory.CreateDirectory(updateRoot);
         var zipPath = Path.Combine(updateRoot, Path.GetFileName(update.AssetName));
         var extractRoot = Path.Combine(updateRoot, "extracted");
+        var updateStateRoot = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "CodexAccountManager",
+            "UpdaterLogs");
+        Directory.CreateDirectory(updateStateRoot);
+        var logSuffix = DateTime.Now.ToString("yyyyMMdd-HHmmss") + "-" + Environment.ProcessId;
+        var updaterLogPath = Path.Combine(updateStateRoot, $"Update-{logSuffix}.log");
+        var installerLogPath = Path.Combine(updateStateRoot, $"Install-{logSuffix}.log");
+        var failureMarkerPath = Path.Combine(updateStateRoot, "last-update-error.txt");
 
         try
         {
-            await DownloadAndVerifyAsync(update.AssetUrl, zipPath, update.Sha256, cancellationToken)
+            progress?.Report(new AppUpdateProgress("正在连接 GitHub 并下载更新包……"));
+            await DownloadAndVerifyAsync(
+                    update.AssetUrl,
+                    zipPath,
+                    update.Sha256,
+                    progress,
+                    cancellationToken)
                 .ConfigureAwait(false);
+            progress?.Report(new AppUpdateProgress("下载与校验完成，正在解压更新包……"));
             ExtractZipSafely(zipPath, extractRoot);
             var installerPath = Directory
                 .GetFiles(extractRoot, "Install-CodexAccountManager.ps1", SearchOption.AllDirectories)
@@ -162,7 +181,9 @@ internal sealed class AppUpdateService
             }
 
             var helperPath = Path.Combine(updateRoot, "apply-update.ps1");
-            await File.WriteAllTextAsync(helperPath, BuildHelperScript(), new UTF8Encoding(false), cancellationToken)
+            // Windows PowerShell 5.1 treats BOM-less UTF-8 as the active ANSI code page.
+            // A BOM keeps paths and localized text parseable on every supported Windows locale.
+            await File.WriteAllTextAsync(helperPath, BuildHelperScript(), new UTF8Encoding(true), cancellationToken)
                 .ConfigureAwait(false);
 
             var powershell = Path.Combine(
@@ -196,16 +217,26 @@ internal sealed class AppUpdateService
             startInfo.ArgumentList.Add("-CleanupRoot");
             startInfo.ArgumentList.Add(updateRoot);
             startInfo.ArgumentList.Add("-InstallPath");
-            startInfo.ArgumentList.Add(GetVersionedInstallPath(update.Version));
+            startInfo.ArgumentList.Add(GetCurrentInstallPath());
             startInfo.ArgumentList.Add("-WorkingDirectory");
             startInfo.ArgumentList.Add(Directory.Exists(Environment.CurrentDirectory)
                 ? Environment.CurrentDirectory
                 : AppContext.BaseDirectory);
+            startInfo.ArgumentList.Add("-CurrentExecutablePath");
+            startInfo.ArgumentList.Add(Environment.ProcessPath
+                ?? Path.Combine(AppContext.BaseDirectory, "CodexAccountManager.exe"));
+            startInfo.ArgumentList.Add("-UpdaterLogPath");
+            startInfo.ArgumentList.Add(updaterLogPath);
+            startInfo.ArgumentList.Add("-InstallerLogPath");
+            startInfo.ArgumentList.Add(installerLogPath);
+            startInfo.ArgumentList.Add("-FailureMarkerPath");
+            startInfo.ArgumentList.Add(failureMarkerPath);
 
             if (Process.Start(startInfo) is null)
             {
                 throw new InvalidOperationException("无法启动更新安装程序。");
             }
+            progress?.Report(new AppUpdateProgress("更新包已准备完成，正在关闭旧版本并安装……"));
         }
         catch
         {
@@ -214,19 +245,191 @@ internal sealed class AppUpdateService
         }
     }
 
-    private static string GetVersionedInstallPath(string version)
+    internal static string? ConsumePendingFailure()
     {
-        var currentPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(AppContext.BaseDirectory));
-        var parent = Directory.GetParent(currentPath)?.FullName
-            ?? throw new InvalidOperationException("无法确定更新安装目录。");
-        var safeVersion = string.Concat(version.Select(character =>
-            char.IsAsciiLetterOrDigit(character) || character is '.' or '-' ? character : '-'));
-        if (string.IsNullOrWhiteSpace(safeVersion))
+        var markerPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "CodexAccountManager",
+            "UpdaterLogs",
+            "last-update-error.txt");
+        if (!File.Exists(markerPath))
         {
-            throw new InvalidOperationException("更新版本号无效。");
+            return null;
         }
-        return Path.Combine(parent, $"CodexAccountManager-{safeVersion}");
+
+        try
+        {
+            var message = File.ReadAllText(markerPath).Trim();
+            File.Delete(markerPath);
+            return string.IsNullOrWhiteSpace(message) ? "更新安装程序未能完成安装。" : message;
+        }
+        catch
+        {
+            return "更新安装程序未能完成安装，请查看更新日志。";
+        }
     }
+
+    internal static void ValidateUpdateHelperScript()
+    {
+        var script = BuildHelperScript();
+        var failures = new List<string>();
+        if (script.Any(character => character > 0x7f)) failures.Add("non-ascii-content");
+        if (!script.Contains("powershell.exe", StringComparison.Ordinal)) failures.Add("child-powershell");
+        if (!script.Contains("$InstallerLogPath", StringComparison.Ordinal)) failures.Add("installer-log");
+        if (!script.Contains("--shutdown-local-pat-gateway", StringComparison.Ordinal)) failures.Add("gateway-shutdown");
+        if (!script.Contains("Start-Process -FilePath $installedExe", StringComparison.Ordinal)) failures.Add("restart");
+        if (!GetCurrentInstallPath().Equals(
+                Path.TrimEndingDirectorySeparator(Path.GetFullPath(AppContext.BaseDirectory)),
+                StringComparison.OrdinalIgnoreCase))
+        {
+            failures.Add("install-path");
+        }
+        if (failures.Count > 0)
+        {
+            throw new InvalidOperationException(
+                "Updater helper script validation failed: " + string.Join(", ", failures));
+        }
+
+        var probeRoot = Path.Combine(
+            Path.GetTempPath(),
+            "codex-account-manager-updater-probe-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(probeRoot);
+        try
+        {
+            var cleanupRoot = Path.Combine(probeRoot, "download");
+            Directory.CreateDirectory(cleanupRoot);
+            var probePath = Path.Combine(cleanupRoot, "apply-update.ps1");
+            File.WriteAllText(probePath, script, new UTF8Encoding(true));
+            var powershell = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+                "System32",
+                "WindowsPowerShell",
+                "v1.0",
+                "powershell.exe");
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = File.Exists(powershell) ? powershell : "powershell.exe",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            startInfo.Environment["CAM_UPDATE_HELPER_PROBE"] = probePath;
+            startInfo.ArgumentList.Add("-NoLogo");
+            startInfo.ArgumentList.Add("-NoProfile");
+            startInfo.ArgumentList.Add("-NonInteractive");
+            startInfo.ArgumentList.Add("-Command");
+            startInfo.ArgumentList.Add(
+                "$tokens=$null;$errors=$null;" +
+                "[System.Management.Automation.Language.Parser]::ParseFile(" +
+                "$env:CAM_UPDATE_HELPER_PROBE,[ref]$tokens,[ref]$errors)|Out-Null;" +
+                "if($errors.Count -gt 0){$errors|ForEach-Object{$_.Message};exit 1}");
+
+            using var process = Process.Start(startInfo)
+                ?? throw new InvalidOperationException("Updater parser probe could not start PowerShell.");
+            if (!process.WaitForExit(10_000))
+            {
+                try { process.Kill(entireProcessTree: true); } catch { }
+                throw new InvalidOperationException("Updater parser probe timed out.");
+            }
+            var standardOutput = process.StandardOutput.ReadToEnd();
+            var standardError = process.StandardError.ReadToEnd();
+            if (process.ExitCode != 0)
+            {
+                throw new InvalidOperationException(
+                    "Updater helper script does not parse in Windows PowerShell 5.1: " +
+                    (string.IsNullOrWhiteSpace(standardError) ? standardOutput : standardError).Trim());
+            }
+
+            var fakeInstallerPath = Path.Combine(probeRoot, "fake-installer.ps1");
+            File.WriteAllText(
+                fakeInstallerPath,
+                @"
+param(
+    [switch]$Quiet,
+    [switch]$NoLaunch,
+    [string]$InstallPath,
+    [string]$ManagerWorkingDirectory,
+    [string]$LogPath
+)
+$ErrorActionPreference = 'Stop'
+New-Item -ItemType Directory -Force -Path $InstallPath | Out-Null
+$testExe = Join-Path $env:WINDIR 'System32\where.exe'
+Copy-Item -LiteralPath $testExe -Destination (Join-Path $InstallPath 'CodexAccountManager.exe') -Force
+Set-Content -LiteralPath (Join-Path $InstallPath 'installer-ran.txt') -Value 'ok' -Encoding ASCII
+exit 0
+",
+                new UTF8Encoding(true));
+
+            var installPath = Path.Combine(probeRoot, "installed");
+            var updaterLogPath = Path.Combine(probeRoot, "logs", "update.log");
+            var installerLogPath = Path.Combine(probeRoot, "logs", "install.log");
+            var failureMarkerPath = Path.Combine(probeRoot, "logs", "failure.txt");
+            var executionInfo = new ProcessStartInfo
+            {
+                FileName = startInfo.FileName,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            executionInfo.ArgumentList.Add("-NoLogo");
+            executionInfo.ArgumentList.Add("-NoProfile");
+            executionInfo.ArgumentList.Add("-NonInteractive");
+            executionInfo.ArgumentList.Add("-ExecutionPolicy");
+            executionInfo.ArgumentList.Add("Bypass");
+            executionInfo.ArgumentList.Add("-File");
+            executionInfo.ArgumentList.Add(probePath);
+            executionInfo.ArgumentList.Add("-ProcessId");
+            executionInfo.ArgumentList.Add(int.MaxValue.ToString());
+            executionInfo.ArgumentList.Add("-InstallerPath");
+            executionInfo.ArgumentList.Add(fakeInstallerPath);
+            executionInfo.ArgumentList.Add("-CleanupRoot");
+            executionInfo.ArgumentList.Add(cleanupRoot);
+            executionInfo.ArgumentList.Add("-InstallPath");
+            executionInfo.ArgumentList.Add(installPath);
+            executionInfo.ArgumentList.Add("-WorkingDirectory");
+            executionInfo.ArgumentList.Add(probeRoot);
+            executionInfo.ArgumentList.Add("-CurrentExecutablePath");
+            executionInfo.ArgumentList.Add(Path.Combine(probeRoot, "missing-current.exe"));
+            executionInfo.ArgumentList.Add("-UpdaterLogPath");
+            executionInfo.ArgumentList.Add(updaterLogPath);
+            executionInfo.ArgumentList.Add("-InstallerLogPath");
+            executionInfo.ArgumentList.Add(installerLogPath);
+            executionInfo.ArgumentList.Add("-FailureMarkerPath");
+            executionInfo.ArgumentList.Add(failureMarkerPath);
+
+            using var execution = Process.Start(executionInfo)
+                ?? throw new InvalidOperationException("Updater execution probe could not start PowerShell.");
+            if (!execution.WaitForExit(30_000))
+            {
+                try { execution.Kill(entireProcessTree: true); } catch { }
+                throw new InvalidOperationException("Updater execution probe timed out.");
+            }
+            var executionOutput = execution.StandardOutput.ReadToEnd();
+            var executionError = execution.StandardError.ReadToEnd();
+            var installerMarker = Path.Combine(installPath, "installer-ran.txt");
+            if (execution.ExitCode != 0 ||
+                !File.Exists(installerMarker) ||
+                File.Exists(failureMarkerPath) ||
+                !File.Exists(updaterLogPath) ||
+                !File.ReadAllText(updaterLogPath).Contains(
+                    "Installation completed. Restarting the updated application.",
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "Updater execution probe failed: " +
+                    (string.IsNullOrWhiteSpace(executionError) ? executionOutput : executionError).Trim());
+            }
+        }
+        finally
+        {
+            try { Directory.Delete(probeRoot, recursive: true); } catch { }
+        }
+    }
+
+    private static string GetCurrentInstallPath() =>
+        Path.TrimEndingDirectorySeparator(Path.GetFullPath(AppContext.BaseDirectory));
 
     private static HttpClient CreateHttpClient()
     {
@@ -284,6 +487,7 @@ internal sealed class AppUpdateService
         string url,
         string destination,
         string expectedSha256,
+        IProgress<AppUpdateProgress>? progress,
         CancellationToken cancellationToken)
     {
         using var response = await Http.GetAsync(
@@ -307,6 +511,9 @@ internal sealed class AppUpdateService
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         var buffer = new byte[1024 * 128];
         long total = 0;
+        var contentLength = response.Content.Headers.ContentLength;
+        var lastReportedPercent = -1;
+        long lastReportedBytes = 0;
         while (true)
         {
             var read = await source.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
@@ -318,6 +525,16 @@ internal sealed class AppUpdateService
             }
             await target.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
             hash.AppendData(buffer, 0, read);
+
+            var percent = contentLength is > 0
+                ? (int)Math.Min(100, total * 100 / contentLength.Value)
+                : -1;
+            if (percent != lastReportedPercent || total - lastReportedBytes >= 4L * 1024L * 1024L)
+            {
+                lastReportedPercent = percent;
+                lastReportedBytes = total;
+                progress?.Report(new AppUpdateProgress(FormatDownloadProgress(total, contentLength, percent)));
+            }
         }
 
         var actual = Convert.ToHexString(hash.GetHashAndReset());
@@ -325,6 +542,17 @@ internal sealed class AppUpdateService
         {
             throw new InvalidOperationException("更新包 SHA256 校验失败，已拒绝安装。");
         }
+    }
+
+    private static string FormatDownloadProgress(long received, long? total, int percent)
+    {
+        var receivedMb = received / 1024d / 1024d;
+        if (total is > 0)
+        {
+            var totalMb = total.Value / 1024d / 1024d;
+            return $"正在下载更新包：{receivedMb:0.0} / {totalMb:0.0} MB（{Math.Max(0, percent)}%）";
+        }
+        return $"正在下载更新包：已接收 {receivedMb:0.0} MB";
     }
 
     private static void ExtractZipSafely(string zipPath, string destination)
@@ -349,27 +577,94 @@ param(
     [Parameter(Mandatory = $true)][string]$InstallerPath,
     [Parameter(Mandatory = $true)][string]$CleanupRoot,
     [Parameter(Mandatory = $true)][string]$InstallPath,
-    [Parameter(Mandatory = $true)][string]$WorkingDirectory
+    [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+    [Parameter(Mandatory = $true)][string]$CurrentExecutablePath,
+    [Parameter(Mandatory = $true)][string]$UpdaterLogPath,
+    [Parameter(Mandatory = $true)][string]$InstallerLogPath,
+    [Parameter(Mandatory = $true)][string]$FailureMarkerPath
 )
+Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$exitCode = 0
+
+function Write-UpdaterLog {
+    param([Parameter(Mandatory = $true)][string]$Message)
+    $line = '[{0:yyyy-MM-dd HH:mm:ss}] {1}' -f (Get-Date), $Message
+    Add-Content -LiteralPath $UpdaterLogPath -Value $line -Encoding UTF8
+}
+
 try {
+    $logRoot = Split-Path -Parent $UpdaterLogPath
+    New-Item -ItemType Directory -Force -Path $logRoot | Out-Null
+    Write-UpdaterLog 'Updater started.'
     $deadline = [DateTime]::UtcNow.AddSeconds(45)
     while ([DateTime]::UtcNow -lt $deadline) {
         if ($null -eq (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) { break }
         Start-Sleep -Milliseconds 250
     }
     if ($null -ne (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
-        throw 'Codex Account Manager 未能在规定时间内退出。'
+        throw 'Codex Account Manager did not exit within 45 seconds.'
     }
-    & $InstallerPath -Quiet -NoLaunch -InstallPath $InstallPath -ManagerWorkingDirectory $WorkingDirectory
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    Write-UpdaterLog 'Previous process exited. Starting package installer.'
+    if (Test-Path -LiteralPath $CurrentExecutablePath -PathType Leaf) {
+        try {
+            $shutdownProcess = Start-Process -FilePath $CurrentExecutablePath `
+                -ArgumentList '--shutdown-local-pat-gateway' -Wait -PassThru
+            Write-UpdaterLog ('Gateway shutdown command exited with code {0}.' -f $shutdownProcess.ExitCode)
+        }
+        catch {
+            Write-UpdaterLog ('Gateway shutdown command failed: ' + $_.Exception.Message)
+        }
+    }
+
+    $processPath = [IO.Path]::GetFullPath($CurrentExecutablePath)
+    $remaining = @(
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.ExecutablePath -and
+                [string]::Equals(
+                    [IO.Path]::GetFullPath($_.ExecutablePath),
+                    $processPath,
+                    [StringComparison]::OrdinalIgnoreCase)
+            }
+    )
+    foreach ($item in $remaining) {
+        Write-UpdaterLog ('Stopping remaining process {0} before installation.' -f $item.ProcessId)
+        Stop-Process -Id $item.ProcessId -Force -ErrorAction Stop
+    }
+
+    $childPowerShell = Join-Path $PSHOME 'powershell.exe'
+    & $childPowerShell -NoLogo -NoProfile -ExecutionPolicy Bypass -File $InstallerPath `
+        -Quiet -NoLaunch -InstallPath $InstallPath `
+        -ManagerWorkingDirectory $WorkingDirectory -LogPath $InstallerLogPath
+    $installerExitCode = $LASTEXITCODE
+    if ($installerExitCode -ne 0) {
+        throw ('Package installer exited with code {0}.' -f $installerExitCode)
+    }
+
     $installedExe = Join-Path $InstallPath 'CodexAccountManager.exe'
+    if (-not (Test-Path -LiteralPath $installedExe -PathType Leaf)) {
+        throw 'The updated executable was not found after installation.'
+    }
+    Remove-Item -LiteralPath $FailureMarkerPath -Force -ErrorAction SilentlyContinue
+    Write-UpdaterLog 'Installation completed. Restarting the updated application.'
     Start-Process -FilePath $installedExe -WorkingDirectory $WorkingDirectory | Out-Null
     Start-Sleep -Seconds 2
 }
-finally {
-    Remove-Item -LiteralPath $CleanupRoot -Recurse -Force -ErrorAction SilentlyContinue
+catch {
+    $exitCode = 1
+    $failure = $_.Exception.Message
+    try { Set-Content -LiteralPath $FailureMarkerPath -Value $failure -Encoding UTF8 } catch { }
+    try { Write-UpdaterLog ('Update failed: ' + $failure) } catch { }
+    if (Test-Path -LiteralPath $CurrentExecutablePath -PathType Leaf) {
+        try { Start-Process -FilePath $CurrentExecutablePath -WorkingDirectory $WorkingDirectory | Out-Null } catch { }
+    }
 }
+finally {
+    try { Remove-Item -LiteralPath $CleanupRoot -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+}
+exit $exitCode
 ";
 
     private static IReadOnlyList<ReleaseAsset> ReadAssets(JsonElement release)
