@@ -49,6 +49,22 @@ internal sealed class AppUpdateService
     internal static string CurrentVersion =>
         NormalizeVersion(Assembly.GetEntryAssembly()?.GetName().Version?.ToString()) ?? "0.0.0.0";
 
+    internal static string DisplayVersion
+    {
+        get
+        {
+            if (!Version.TryParse(CurrentVersion, out var version))
+            {
+                return CurrentVersion;
+            }
+
+            return version.Build >= 0
+                ? $"{version.Major}.{version.Minor}.{version.Build}" +
+                  (version.Revision > 0 ? $".{version.Revision}" : string.Empty)
+                : $"{version.Major}.{version.Minor}";
+        }
+    }
+
     internal async Task<AppUpdateCheckResult> CheckAsync(CancellationToken cancellationToken = default)
     {
         try
@@ -273,6 +289,7 @@ internal sealed class AppUpdateService
     {
         var script = BuildHelperScript();
         var failures = new List<string>();
+        if (!Version.TryParse(DisplayVersion, out _) || DisplayVersion.Contains('+')) failures.Add("display-version");
         if (script.Any(character => character > 0x7f)) failures.Add("non-ascii-content");
         if (!script.Contains("powershell.exe", StringComparison.Ordinal)) failures.Add("child-powershell");
         if (!script.Contains("$InstallerLogPath", StringComparison.Ordinal)) failures.Add("installer-log");

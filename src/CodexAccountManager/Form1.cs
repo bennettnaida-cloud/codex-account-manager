@@ -211,6 +211,7 @@ public partial class Form1 : Form
     private readonly Label _statusBox = new();
     private readonly ThemePicker _themeModePicker = new();
     private readonly ModernButton _updateAvailableButton = new();
+    private readonly Label _currentVersionLabel = new();
     private readonly ModernButton _addAccountNavButton = new();
     private readonly ModernButton _accountSwitchNavButton = new();
     private readonly ModernButton _unifiedHistoryNavButton = new();
@@ -601,6 +602,16 @@ public partial class Form1 : Form
         };
         _sidebarFooter = managerAppearanceFooter;
         _managerAppearanceLabel = managerAppearanceLabel;
+        _currentVersionLabel.Text = $"当前版本 {AppUpdateService.DisplayVersion}";
+        _currentVersionLabel.Font = new Font(Font.FontFamily, 8.3F, FontStyle.Regular);
+        _currentVersionLabel.TextAlign = ContentAlignment.MiddleRight;
+        _currentVersionLabel.Name = "CurrentVersionLabel";
+        _currentVersionLabel.Padding = new Padding(2, 0, 4, 0);
+        _currentVersionLabel.AutoSize = false;
+        _currentVersionLabel.AutoEllipsis = true;
+        _currentVersionLabel.UseCompatibleTextRendering = true;
+        _currentVersionLabel.UseMnemonic = false;
+        _currentVersionLabel.AccessibleName = $"当前版本 {AppUpdateService.DisplayVersion}";
         _updateAvailableButton.SetBounds(0, 0, 228, 40);
         _updateAvailableButton.Text = "有可用更新";
         _updateAvailableButton.Tag = "primary";
@@ -622,11 +633,13 @@ public partial class Form1 : Form
         };
         managerAppearanceFooter.Controls.Add(_updateAvailableButton);
         managerAppearanceFooter.Controls.Add(managerAppearanceLabel);
+        managerAppearanceFooter.Controls.Add(_currentVersionLabel);
         managerAppearanceFooter.Controls.Add(_themeModePicker);
         sidebar.Controls.Add(managerAppearanceFooter);
         sidebar.Resize += (_, _) => UpdateSidebarFooterLayout();
         UpdateSidebarFooterLayout();
         _toolTip.SetToolTip(managerAppearanceLabel, "只切换 Account Manager 的四套内置外观，也可跟随系统。");
+        _toolTip.SetToolTip(_currentVersionLabel, $"当前运行版本：{AppUpdateService.DisplayVersion}");
         _toolTip.SetToolTip(_themeModePicker, "管理器外观与 Codex 主题相互独立，选择后立即保存并应用。");
 
         var content = new Panel
@@ -1079,7 +1092,13 @@ public partial class Form1 : Form
 
         var width = Math.Max(160, footer.ClientSize.Width);
         _updateAvailableButton.SetBounds(0, 0, width, 40);
-        _managerAppearanceLabel.SetBounds(2, hasUpdate ? 44 : 0, Math.Max(120, width - 4), 28);
+        var labelTop = hasUpdate ? 44 : 0;
+        var measuredVersionWidth = TextRenderer.MeasureText(
+            _currentVersionLabel.Text,
+            _currentVersionLabel.Font).Width + 8;
+        var versionWidth = Math.Min(Math.Max(80, width - 64), Math.Max(80, measuredVersionWidth));
+        _managerAppearanceLabel.SetBounds(2, labelTop, Math.Max(60, width - versionWidth - 4), 28);
+        _currentVersionLabel.SetBounds(width - versionWidth, labelTop, versionWidth, 28);
         _themeModePicker.SetBounds(0, hasUpdate ? 76 : 34, width, 42);
 
         // Reuse the already DPI-scaled navigation geometry. Scaling these constants a
@@ -1180,7 +1199,7 @@ public partial class Form1 : Form
                 else if (IsInsideNamedControl(label, "Sidebar"))
                 {
                     label.BackColor = Color.Transparent;
-                    label.ForeColor = label.Name is "SidebarSubtitle" or "ThemeLabel"
+                    label.ForeColor = label.Name is "SidebarSubtitle" or "ThemeLabel" or "CurrentVersionLabel"
                         ? _palette.SidebarMutedTextColor
                         : label.Name == "SidebarEnvironment"
                             ? _palette.AccentColor
@@ -3176,6 +3195,24 @@ public partial class Form1 : Form
             return;
         }
 
+        _statusBox.Text = "正在重新确认最新版本与安装包……";
+        var freshCheck = await _updateService.CheckAsync();
+        if (freshCheck.Update is null)
+        {
+            if (freshCheck.Status == AppUpdateCheckStatus.UpToDate)
+            {
+                SetUpdateAvailabilityState(null);
+                _statusBox.Text = $"当前版本 {AppUpdateService.DisplayVersion} 已是最新版。";
+                return;
+            }
+
+            throw new InvalidOperationException(
+                "安装前无法重新确认 GitHub 更新清单，请稍后重试。" +
+                $"（{DescribeUpdateCheckResult(freshCheck)}）");
+        }
+
+        update = freshCheck.Update;
+        SetUpdateAvailabilityState(update);
         _statusBox.Text = "正在连接 GitHub 并准备下载更新包……";
         var progress = new Progress<AppUpdateProgress>(value =>
         {

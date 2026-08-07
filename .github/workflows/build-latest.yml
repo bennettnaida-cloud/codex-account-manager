@@ -53,8 +53,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Windows application build failed.' }
           & .\Build-OneClickInstallerPackage.ps1 -OutputPath (Join-Path $PWD 'CodexAccountManager-Windows-latest.zip')
           if ($LASTEXITCODE -ne 0) { throw 'Windows installer package build failed.' }
-          (Get-FileHash -LiteralPath 'CodexAccountManager-Windows-latest.zip' -Algorithm SHA256).Hash.ToLowerInvariant() |
+          $versionedPackage = 'CodexAccountManager-Windows-{0}.zip' -f $env:CAM_VERSION
+          Copy-Item -LiteralPath 'CodexAccountManager-Windows-latest.zip' -Destination $versionedPackage
+          $packageHash = (Get-FileHash -LiteralPath 'CodexAccountManager-Windows-latest.zip' -Algorithm SHA256).Hash.ToLowerInvariant()
+          $packageHash |
             Set-Content -LiteralPath 'CodexAccountManager-Windows-latest.zip.sha256' -Encoding ascii
+          $packageHash |
+            Set-Content -LiteralPath ($versionedPackage + '.sha256') -Encoding ascii
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -63,6 +68,8 @@ jobs:
           path: |
             CodexAccountManager-Windows-latest.zip
             CodexAccountManager-Windows-latest.zip.sha256
+            CodexAccountManager-Windows-${{ env.CAM_VERSION }}.zip
+            CodexAccountManager-Windows-${{ env.CAM_VERSION }}.zip.sha256
           if-no-files-found: error
 
   publish:
@@ -101,15 +108,17 @@ jobs:
               'releaseTag': 'latest',
               'assets': {
                   'windows': {
-                      'name': 'CodexAccountManager-Windows-latest.zip',
-                      'sha256': read_sha256('CodexAccountManager-Windows-latest.zip.sha256'),
+                      'name': f"CodexAccountManager-Windows-{os.environ['CAM_VERSION']}.zip",
+                      'sha256': read_sha256(f"CodexAccountManager-Windows-{os.environ['CAM_VERSION']}.zip.sha256"),
                   },
               },
           }
           (root / 'update-manifest.json').write_text(json.dumps(payload, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
           PY
 
-      - name: Publish or replace the latest release
+      # Publish the immutable updater package before switching the manifest. Existing
+      # clients can keep using the previous manifest/package pair during this upload.
+      - name: Publish versioned automatic-update package
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: latest
@@ -122,7 +131,31 @@ jobs:
           prerelease: true
           make_latest: false
           files: |
+            release-assets/CodexAccountManager-Windows-${{ env.CAM_VERSION }}.zip
+            release-assets/CodexAccountManager-Windows-${{ env.CAM_VERSION }}.zip.sha256
+          fail_on_unmatched_files: true
+
+      - name: Publish update manifest after versioned package
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: latest
+          target_commitish: ${{ github.sha }}
+          name: Codex Account Manager ${{ env.CAM_VERSION }}
+          prerelease: true
+          make_latest: false
+          files: |
+            release-assets/update-manifest.json
+          fail_on_unmatched_files: true
+
+      - name: Replace stable manual-download package
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: latest
+          target_commitish: ${{ github.sha }}
+          name: Codex Account Manager ${{ env.CAM_VERSION }}
+          prerelease: true
+          make_latest: false
+          files: |
             release-assets/CodexAccountManager-Windows-latest.zip
             release-assets/CodexAccountManager-Windows-latest.zip.sha256
-            release-assets/update-manifest.json
           fail_on_unmatched_files: true
