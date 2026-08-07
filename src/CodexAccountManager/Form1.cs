@@ -540,6 +540,19 @@ public partial class Form1 : Form
         }
         sidebar.Controls.Add(logo);
 
+        _currentVersionLabel.Text = $"当前版本 {AppUpdateService.DisplayVersion}";
+        _currentVersionLabel.SetBounds(62, 8, 182, 44);
+        _currentVersionLabel.Font = new Font(Font.FontFamily, 8.3F, FontStyle.Regular);
+        _currentVersionLabel.TextAlign = ContentAlignment.MiddleLeft;
+        _currentVersionLabel.Name = "CurrentVersionLabel";
+        _currentVersionLabel.Padding = Padding.Empty;
+        _currentVersionLabel.AutoSize = false;
+        _currentVersionLabel.AutoEllipsis = false;
+        _currentVersionLabel.UseCompatibleTextRendering = true;
+        _currentVersionLabel.UseMnemonic = false;
+        _currentVersionLabel.AccessibleName = $"当前版本 {AppUpdateService.DisplayVersion}";
+        sidebar.Controls.Add(_currentVersionLabel);
+
         ConfigureSidebarCommandButton(_addAccountNavButton, "新增账号", 58);
         _addAccountNavButton.Click += (_, _) => AddAccount();
         ConfigureSidebarNavButton(_accountSwitchNavButton, "账号切换", 118, WorkspaceView.AccountSwitch);
@@ -602,16 +615,6 @@ public partial class Form1 : Form
         };
         _sidebarFooter = managerAppearanceFooter;
         _managerAppearanceLabel = managerAppearanceLabel;
-        _currentVersionLabel.Text = $"当前版本 {AppUpdateService.DisplayVersion}";
-        _currentVersionLabel.Font = new Font(Font.FontFamily, 8.3F, FontStyle.Regular);
-        _currentVersionLabel.TextAlign = ContentAlignment.MiddleRight;
-        _currentVersionLabel.Name = "CurrentVersionLabel";
-        _currentVersionLabel.Padding = new Padding(2, 0, 4, 0);
-        _currentVersionLabel.AutoSize = false;
-        _currentVersionLabel.AutoEllipsis = true;
-        _currentVersionLabel.UseCompatibleTextRendering = true;
-        _currentVersionLabel.UseMnemonic = false;
-        _currentVersionLabel.AccessibleName = $"当前版本 {AppUpdateService.DisplayVersion}";
         _updateAvailableButton.SetBounds(0, 0, 228, 40);
         _updateAvailableButton.Text = "有可用更新";
         _updateAvailableButton.Tag = "primary";
@@ -633,7 +636,6 @@ public partial class Form1 : Form
         };
         managerAppearanceFooter.Controls.Add(_updateAvailableButton);
         managerAppearanceFooter.Controls.Add(managerAppearanceLabel);
-        managerAppearanceFooter.Controls.Add(_currentVersionLabel);
         managerAppearanceFooter.Controls.Add(_themeModePicker);
         sidebar.Controls.Add(managerAppearanceFooter);
         sidebar.Resize += (_, _) => UpdateSidebarFooterLayout();
@@ -1093,12 +1095,7 @@ public partial class Form1 : Form
         var width = Math.Max(160, footer.ClientSize.Width);
         _updateAvailableButton.SetBounds(0, 0, width, 40);
         var labelTop = hasUpdate ? 44 : 0;
-        var measuredVersionWidth = TextRenderer.MeasureText(
-            _currentVersionLabel.Text,
-            _currentVersionLabel.Font).Width + 8;
-        var versionWidth = Math.Min(Math.Max(80, width - 64), Math.Max(80, measuredVersionWidth));
-        _managerAppearanceLabel.SetBounds(2, labelTop, Math.Max(60, width - versionWidth - 4), 28);
-        _currentVersionLabel.SetBounds(width - versionWidth, labelTop, versionWidth, 28);
+        _managerAppearanceLabel.SetBounds(2, labelTop, Math.Max(120, width - 4), 28);
         _themeModePicker.SetBounds(0, hasUpdate ? 76 : 34, width, 42);
 
         // Reuse the already DPI-scaled navigation geometry. Scaling these constants a
@@ -5687,9 +5684,10 @@ public partial class Form1 : Form
 
         _patGatewayProxyDetectionLabel.Parent?.Controls.Remove(_patGatewayProxyDetectionLabel);
         _patGatewayProxyDetectionLabel.SetBounds(configActionLeft, 286, configActionWidth, 46);
-        _patGatewayProxyDetectionLabel.Font = new Font(Font.FontFamily, 8.4F, FontStyle.Bold);
+        _patGatewayProxyDetectionLabel.Font = new Font(Font.FontFamily, 8.1F, FontStyle.Bold);
         _patGatewayProxyDetectionLabel.TextAlign = ContentAlignment.MiddleCenter;
-        _patGatewayProxyDetectionLabel.AutoEllipsis = true;
+        _patGatewayProxyDetectionLabel.AutoEllipsis = false;
+        _patGatewayProxyDetectionLabel.UseCompatibleTextRendering = true;
         _patGatewayProxyDetectionLabel.UseMnemonic = false;
         ThemeStyler.ApplyLabel(_patGatewayProxyDetectionLabel, _palette, true);
         panel.Controls.Add(_patGatewayProxyDetectionLabel);
@@ -13275,7 +13273,7 @@ public partial class Form1 : Form
         _proxyDetectionCancellation?.Cancel();
         _proxyDetectionCancellation?.Dispose();
         var cancellation = _proxyDetectionCancellation = new CancellationTokenSource();
-        _patGatewayProxyDetectionLabel.Text = "正在检测本地端口…";
+        _patGatewayProxyDetectionLabel.Text = "自动检测\r\n正在检测本地端口...";
         if (updateStatus)
         {
             _statusBox.Text = "正在检测本机 HTTP 代理端口…";
@@ -13345,8 +13343,8 @@ public partial class Form1 : Form
                     ? $"{retainedAddress}:{retainedPort.Value}"
                     : null;
                 _patGatewayProxyDetectionLabel.Text = retainedEndpoint == null
-                    ? "当前未在线：未检测到本地 HTTP 代理"
-                    : $"当前未在线（保留：{retainedEndpoint}）";
+                    ? "当前未在线\r\n未检测到 HTTP 代理"
+                    : $"当前未在线\r\n保留 {retainedEndpoint}";
                 _toolTip.SetToolTip(
                     _patGatewayProxyDetectionLabel,
                     "自动检测未发现正在监听且支持 HTTP CONNECT 的本地代理；已有设置未被修改。");
@@ -13364,7 +13362,7 @@ public partial class Form1 : Form
             _patGatewayProxyAddressBox.Text = result.Address;
             _patGatewayProxyPortBox.Text = result.Port.ToString(CultureInfo.InvariantCulture);
             SaveEditedPatGatewayProxy(updateStatus: false, markManual: false);
-            _patGatewayProxyDetectionLabel.Text = $"自动：{result.Address}:{result.Port}";
+            _patGatewayProxyDetectionLabel.Text = $"自动检测\r\n{result.Address}:{result.Port}";
             _toolTip.SetToolTip(_patGatewayProxyDetectionLabel, result.Description);
             if (updateStatus)
             {
@@ -13389,9 +13387,9 @@ public partial class Form1 : Form
         var address = _appSettings.PatGatewayProxyAddress ?? "127.0.0.1";
         _patGatewayProxyDetectionLabel.Text = _appSettings.PatGatewayProxyPort is int port
             ? _appSettings.PatGatewayProxyAutoDetect
-                ? $"自动：{address}:{port}"
-                : $"手动：{address}:{port}"
-            : "自动：待检测";
+                ? $"自动检测\r\n{address}:{port}"
+                : $"手动设置\r\n{address}:{port}"
+            : "自动检测\r\n等待检测";
     }
 
     private static bool IsLoopbackProxyAddress(string address)

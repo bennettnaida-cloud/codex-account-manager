@@ -161,7 +161,7 @@ internal sealed class AppUpdateService
     {
         var updateRoot = Path.Combine(
             Path.GetTempPath(),
-            "CodexAccountManager-update",
+            "CAM-update",
             Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(updateRoot);
         var zipPath = Path.Combine(updateRoot, Path.GetFileName(update.AssetName));

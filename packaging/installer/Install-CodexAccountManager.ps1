@@ -211,9 +211,22 @@ function Copy-DirectoryContents {
         [Parameter(Mandatory)][string]$Destination
     )
 
-    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
-    foreach ($item in Get-ChildItem -LiteralPath $Source -Force) {
-        Copy-Item -LiteralPath $item.FullName -Destination $Destination -Recurse -Force
+    $sourcePath = [IO.Path]::GetFullPath($Source)
+    $destinationPath = [IO.Path]::GetFullPath($Destination)
+    if (-not (Test-Path -LiteralPath $sourcePath -PathType Container)) {
+        throw "安装包目录不存在：$sourcePath"
+    }
+
+    New-Item -ItemType Directory -Force -Path $destinationPath | Out-Null
+    $robocopyPath = Join-Path $env:SystemRoot 'System32\robocopy.exe'
+    if (-not (Test-Path -LiteralPath $robocopyPath -PathType Leaf)) {
+        throw 'Windows 文件复制工具 robocopy.exe 不存在。'
+    }
+
+    & $robocopyPath $sourcePath $destinationPath /E /COPY:DAT /DCOPY:DAT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP
+    $copyExitCode = $LASTEXITCODE
+    if ($copyExitCode -gt 7) {
+        throw "安装文件复制失败（robocopy 退出码 $copyExitCode）：$sourcePath"
     }
 }
 

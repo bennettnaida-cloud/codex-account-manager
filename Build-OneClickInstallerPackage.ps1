@@ -564,6 +564,7 @@ try {
         (Join-Path $testInstallRoot 'assets\CodexAccountManager.ico'),
         (Join-Path $testInstallRoot 'assets\model-catalog.json'),
         (Join-Path $testInstallRoot '.tools\codex-cli\node_modules'),
+        (Join-Path $testInstallRoot '.tools\codex-cli\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\codex-resources\codex-command-runner.exe'),
         (Join-Path $testInstallRoot 'CodexDreamSkin\bundle-version.txt'),
         (Join-Path $testInstallRoot 'CodexDreamSkin\assets\renderer-inject.js'),
         (Join-Path $testInstallRoot 'CodexDreamSkin\assets\dream-skin.css'),
