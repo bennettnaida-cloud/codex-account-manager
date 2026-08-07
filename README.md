@@ -35,7 +35,7 @@ Codex Account Manager 是一个在本机运行的 Codex 多账号管理器。它
 
 - 管理多个 Access Token 或兼容 OpenAI API 的 API Key 账号。
 - 在账号之间切换，并启动官方 Codex 桌面应用、Codex++ 或 CLI。
-- 保留共享聊天历史，支持打开、归档、取消归档和永久删除本地任务。
+- 通过当前 Codex app-server 同步共享聊天目录与短标题，支持打开、归档、取消归档和永久删除；Codex 暂不可用时自动退回本地缓存。
 - 按账号读取官方额度窗口、重置时间、Credits 和可重置次数。
 - 从本地 JSONL 与 SQLite 日志统计 Token、缓存写入和逐模型 API 等值成本。
 - 提供 1h、5h、今天、本周、本月趋势、模型分布和 CSV 导出。

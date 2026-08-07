@@ -33,7 +33,8 @@ public partial class Form1 : Form
 
     private sealed record UnifiedHistoryLoadResult(
         IReadOnlyList<UnifiedThreadRecord> Threads,
-        int InvalidationVersion);
+        int InvalidationVersion,
+        bool SyncedWithCodex);
 
     private sealed record UnifiedHistoryContentIndexResult(
         IReadOnlyDictionary<string, string> SearchTextByThreadId,
@@ -277,11 +278,13 @@ public partial class Form1 : Form
     private DateTime _quotaUsageLoadedAtUtc;
     private UsageReport? _quotaUsageCache;
     private IReadOnlyList<UnifiedThreadRecord>? _unifiedHistoryCache;
+    private bool _unifiedHistorySyncedWithCodex;
     private IReadOnlyDictionary<string, string> _unifiedHistoryContentIndex =
         new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _unifiedThreadDeleteGate = new(1, 1);
     private Task<QuotaUsageLoadResult>? _quotaUsageLoadTask;
     private Task<UnifiedHistoryLoadResult>? _unifiedHistoryLoadTask;
+    private Task<IReadOnlyList<CodexThreadSummary>>? _unifiedHistoryCodexSyncTask;
     private Task<UnifiedHistoryContentIndexResult>? _unifiedHistoryContentIndexTask;
     private CancellationTokenSource? _unifiedHistoryContentIndexCancellation;
     private Exception? _quotaUsageLoadError;
@@ -2258,9 +2261,7 @@ public partial class Form1 : Form
         {
             var invalidationVersion = _unifiedHistoryInvalidationVersion;
             var sharedHome = CodexCliService.GetDefaultCodexHome();
-            loadTask = Task.Run(() => new UnifiedHistoryLoadResult(
-                _sharedHistory.Load(sharedHome),
-                invalidationVersion));
+            loadTask = LoadUnifiedHistoryFromCodexAsync(sharedHome, invalidationVersion);
             _unifiedHistoryLoadTask = loadTask;
         }
 
@@ -2272,6 +2273,7 @@ public partial class Form1 : Form
             {
                 _unifiedHistoryCache = result.Threads;
                 _unifiedHistoryCacheVersion = result.InvalidationVersion;
+                _unifiedHistorySyncedWithCodex = result.SyncedWithCodex;
                 _unifiedHistoryLoadError = null;
             }
 
@@ -2312,6 +2314,149 @@ public partial class Form1 : Form
             _unifiedHistoryCacheVersion != _unifiedHistoryInvalidationVersion)
         {
             await RefreshUnifiedHistoryAsync(force: true, loadGeneration);
+        }
+    }
+
+    private async Task<UnifiedHistoryLoadResult> LoadUnifiedHistoryFromCodexAsync(
+        string sharedHome,
+        int invalidationVersion)
+    {
+        var indexedTask = Task.Run(() => _sharedHistory.Load(sharedHome));
+        var codexTask = GetOrStartUnifiedHistoryCodexSync(sharedHome);
+        var timeoutTask = Task.Delay(TimeSpan.FromSeconds(2));
+
+        var completed = await Task.WhenAny(indexedTask, codexTask, timeoutTask);
+        if (completed == codexTask)
+        {
+            try
+            {
+                var codexThreads = await codexTask;
+                var indexedThreads = indexedTask.IsCompletedSuccessfully
+                    ? await indexedTask
+                    : [];
+                _ = ObserveTaskAsync(indexedTask);
+                return new UnifiedHistoryLoadResult(
+                    _sharedHistory.ReconcileWithCodex(sharedHome, indexedThreads, codexThreads),
+                    invalidationVersion,
+                    SyncedWithCodex: true);
+            }
+            catch (Exception codexError)
+            {
+                try
+                {
+                    var indexedThreads = await indexedTask.WaitAsync(TimeSpan.FromSeconds(2));
+                    return new UnifiedHistoryLoadResult(
+                        indexedThreads,
+                        invalidationVersion,
+                        SyncedWithCodex: false);
+                }
+                catch (Exception indexedError)
+                {
+                    throw new AggregateException(
+                        "Codex 与本地聊天目录均读取失败。",
+                        codexError,
+                        indexedError);
+                }
+            }
+        }
+
+        if (completed == indexedTask)
+        {
+            try
+            {
+                var indexedThreads = await indexedTask;
+                _ = CompleteUnifiedHistoryCodexSyncAsync(
+                    sharedHome,
+                    indexedThreads,
+                    codexTask,
+                    invalidationVersion);
+                return new UnifiedHistoryLoadResult(
+                    indexedThreads,
+                    invalidationVersion,
+                    SyncedWithCodex: false);
+            }
+            catch (Exception indexedError)
+            {
+                try
+                {
+                    var codexThreads = await codexTask.WaitAsync(TimeSpan.FromSeconds(2));
+                    return new UnifiedHistoryLoadResult(
+                        _sharedHistory.ReconcileWithCodex(sharedHome, [], codexThreads),
+                        invalidationVersion,
+                        SyncedWithCodex: true);
+                }
+                catch (Exception codexError)
+                {
+                    throw new AggregateException(
+                        "本地与 Codex 聊天目录均读取失败。",
+                        indexedError,
+                        codexError);
+                }
+            }
+        }
+
+        _ = ObserveTaskAsync(indexedTask);
+        _ = CompleteUnifiedHistoryCodexSyncAsync(
+            sharedHome,
+            [],
+            codexTask,
+            invalidationVersion);
+        throw new TimeoutException("聊天目录读取超过 2 秒；请稍后点击刷新重试。");
+    }
+
+    private Task<IReadOnlyList<CodexThreadSummary>> GetOrStartUnifiedHistoryCodexSync(
+        string sharedHome)
+    {
+        if (_unifiedHistoryCodexSyncTask == null || _unifiedHistoryCodexSyncTask.IsCompleted)
+        {
+            _unifiedHistoryCodexSyncTask = _codex.ListThreadsFromCodexAsync(sharedHome);
+        }
+
+        return _unifiedHistoryCodexSyncTask;
+    }
+
+    private async Task CompleteUnifiedHistoryCodexSyncAsync(
+        string sharedHome,
+        IReadOnlyList<UnifiedThreadRecord> indexedThreads,
+        Task<IReadOnlyList<CodexThreadSummary>> codexTask,
+        int invalidationVersion)
+    {
+        try
+        {
+            var codexThreads = await codexTask;
+            if (_formClosed || IsDisposed ||
+                invalidationVersion != _unifiedHistoryInvalidationVersion)
+            {
+                return;
+            }
+
+            _unifiedHistoryCache = _sharedHistory.ReconcileWithCodex(
+                sharedHome,
+                indexedThreads,
+                codexThreads);
+            _unifiedHistoryCacheVersion = invalidationVersion;
+            _unifiedHistorySyncedWithCodex = true;
+            _unifiedHistoryLoadError = null;
+            if (_activeView == WorkspaceView.UnifiedHistory)
+            {
+                RenderCards();
+            }
+        }
+        catch
+        {
+            // The already-rendered local cache remains usable. Refresh starts a clean retry.
+        }
+    }
+
+    private static async Task ObserveTaskAsync<T>(Task<T> task)
+    {
+        try
+        {
+            await task;
+        }
+        catch
+        {
+            // Observe background failures after the loading deadline.
         }
     }
 
@@ -3765,10 +3910,14 @@ public partial class Form1 : Form
         _statusBox.Text =
             contentIndexLoading
                 ? $"已显示 {renderedThreads.Count}/{visibleThreads.Count} 条标题结果；正在索引对话正文…"
-                : $"已显示 {renderedThreads.Count}/{visibleThreads.Count} 条聊天；本地只读对话，不启动或登录 Codex++。";
+                : _unifiedHistorySyncedWithCodex
+                    ? $"已显示 {renderedThreads.Count}/{visibleThreads.Count} 条聊天；目录已与 Codex 同步。"
+                    : $"已显示 {renderedThreads.Count}/{visibleThreads.Count} 条聊天；Codex 同步暂不可用，当前为本地缓存。";
         _toolTip.SetToolTip(
             _statusBox,
-            $"聊天目录：{sharedHome}；总计 {allThreads.Count} 条。可搜索标题与对话正文；系统信息和工具日志已过滤。");
+            $"聊天目录：{sharedHome}；总计 {allThreads.Count} 条；" +
+            (_unifiedHistorySyncedWithCodex ? "已与 Codex 同步。" : "当前为本地缓存。") +
+            "可搜索标题与对话正文；系统信息和工具日志已过滤。");
     }
 
     private Control CreateUnifiedHistorySummary(
@@ -3811,7 +3960,8 @@ public partial class Form1 : Form
 
         var path = new Label
         {
-            Text = $"活动 {total - archived} · 归档 {archived} · 显示 {rendered}/{visible}" +
+            Text = $"活动 {total - archived} · 归档 {archived} · 显示 {rendered}/{visible} · " +
+                   (_unifiedHistorySyncedWithCodex ? "已与 Codex 同步" : "本地缓存") +
                    (string.IsNullOrWhiteSpace(contentSearchStatus) ? "" : $" · {contentSearchStatus}"),
             Left = 20,
             Top = 40,
@@ -4177,6 +4327,8 @@ public partial class Form1 : Form
 
             if (!_formClosed && !IsDisposed)
             {
+                InvalidateUnifiedHistoryCache(clearCachedData: false);
+                await RefreshUnifiedHistoryAsync(force: true, _workspaceLoadGeneration);
                 _statusBox.Text = $"已永久删除聊天记录：{thread.Title}";
             }
         }

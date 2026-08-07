@@ -75,6 +75,10 @@ static class Program
         {
             return RunMergeSharedHistory();
         }
+        if (args.Contains("--history-sync-probe", StringComparer.OrdinalIgnoreCase))
+        {
+            return RunHistorySyncProbe();
+        }
         if (args.Contains("--reset-credits-read", StringComparer.OrdinalIgnoreCase))
         {
             return RunResetCreditsRead(args);
@@ -118,6 +122,31 @@ static class Program
         {
             new CodexCliService().RepairCodexPlusPlusScheduledTask();
             Console.WriteLine("Codex++ hidden scheduled task is current.");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(ex.Message);
+            return 1;
+        }
+    }
+
+    private static int RunHistorySyncProbe()
+    {
+        try
+        {
+            var threads = new CodexCliService()
+                .ListThreadsFromCodexAsync(CodexCliService.GetDefaultCodexHome())
+                .GetAwaiter()
+                .GetResult();
+            Console.WriteLine(
+                $"Codex history sync passed. Threads={threads.Count}; " +
+                $"Active={threads.Count(thread => !thread.Archived)}; " +
+                $"Archived={threads.Count(thread => thread.Archived)}");
+            foreach (var thread in threads.Take(5))
+            {
+                Console.WriteLine($"{thread.Id}\t{thread.Name}");
+            }
             return 0;
         }
         catch (Exception ex)

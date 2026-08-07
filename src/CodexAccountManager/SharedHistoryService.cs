@@ -134,6 +134,52 @@ public sealed class SharedHistoryService
         return result;
     }
 
+    internal IReadOnlyList<UnifiedThreadRecord> ReconcileWithCodex(
+        string codexHome,
+        IReadOnlyList<UnifiedThreadRecord> indexedThreads,
+        IReadOnlyList<CodexThreadSummary> codexThreads)
+    {
+        var deletedThreadIds = LoadDeletedThreadIds(codexHome);
+        var indexedById = indexedThreads.ToDictionary(
+            thread => thread.Id,
+            StringComparer.OrdinalIgnoreCase);
+        var result = new List<UnifiedThreadRecord>(codexThreads.Count);
+        foreach (var codexThread in codexThreads)
+        {
+            if (deletedThreadIds.Contains(codexThread.Id))
+            {
+                continue;
+            }
+
+            indexedById.TryGetValue(codexThread.Id, out var indexed);
+            result.Add(new UnifiedThreadRecord(
+                codexThread.Id,
+                FirstNonEmpty(
+                    codexThread.Name,
+                    indexed?.Title ?? string.Empty,
+                    codexThread.Preview,
+                    "未命名任务"),
+                FirstNonEmptyOrEmpty(codexThread.Preview, indexed?.Preview ?? string.Empty),
+                FirstNonEmptyOrEmpty(
+                    codexThread.WorkingDirectory,
+                    indexed?.WorkingDirectory ?? string.Empty),
+                indexed?.Model ?? string.Empty,
+                FirstNonEmptyOrEmpty(
+                    codexThread.ModelProvider,
+                    indexed?.Provider ?? string.Empty),
+                codexThread.UpdatedAt != DateTimeOffset.MinValue
+                    ? codexThread.UpdatedAt
+                    : indexed?.UpdatedAt ?? DateTimeOffset.MinValue,
+                codexThread.Archived,
+                indexed?.HasUserEvent ?? true));
+        }
+
+        return result
+            .OrderByDescending(thread => thread.UpdatedAt)
+            .ThenByDescending(thread => thread.Id, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
     public bool ContainsThread(string codexHome, string threadId)
     {
         if (!Guid.TryParse(threadId, out _))
@@ -331,6 +377,29 @@ public sealed class SharedHistoryService
             {
                 throw new InvalidOperationException("Unified shared history reader validation failed.");
             }
+
+            var reconciled = new SharedHistoryService().ReconcileWithCodex(
+                root,
+                records,
+                [
+                    new CodexThreadSummary(
+                        records[0].Id,
+                        "Codex display name",
+                        "Current preview",
+                        @"C:\current",
+                        "current-provider",
+                        DateTimeOffset.FromUnixTimeSeconds(1783685901),
+                        false)
+                ]);
+            if (reconciled.Count != 1 ||
+                reconciled[0].Title != "Codex display name" ||
+                reconciled[0].Preview != "Current preview" ||
+                reconciled[0].WorkingDirectory != @"C:\current" ||
+                reconciled[0].Model != "model" ||
+                reconciled[0].Provider != "current-provider")
+            {
+                throw new InvalidOperationException("Codex authoritative history reconciliation failed.");
+            }
         }
         finally
         {
@@ -468,6 +537,11 @@ public sealed class SharedHistoryService
     private static string FirstNonEmpty(params string[] values)
     {
         return values.First(value => !string.IsNullOrWhiteSpace(value));
+    }
+
+    private static string FirstNonEmptyOrEmpty(params string[] values)
+    {
+        return values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)) ?? string.Empty;
     }
 
 }

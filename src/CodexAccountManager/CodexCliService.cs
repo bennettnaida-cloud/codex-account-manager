@@ -33,6 +33,7 @@ internal sealed class CodexDreamSkinApplyException : InvalidOperationException
 
 public sealed partial class CodexCliService
 {
+    private readonly CodexAppServerClient _appServer = new();
     private static readonly Regex ApiKeyPattern = new("sk-[A-Za-z0-9_-]{8,}", RegexOptions.Compiled);
     private static readonly Regex PersonalAccessTokenPattern = new("at-[A-Za-z0-9_-]{8,}", RegexOptions.Compiled);
     private static readonly Regex NamedApiKeyPattern = new("(?i)(OPENAI_API_KEY\\s*[\"':=]+\\s*[\"']?)[^\"'\\s,}]+", RegexOptions.Compiled);
@@ -441,26 +442,85 @@ public sealed partial class CodexCliService
     public async Task SetThreadArchivedAsync(string threadId, bool archived, string codexHome)
     {
         ValidateThreadId(threadId);
-        var command = archived ? "archive" : "unarchive";
-        var result = await RunCodexAsync($"{command} {threadId}", codexHome, null);
-        if (result.ExitCode != 0)
+        try
         {
+            await _appServer.SetThreadArchivedAsync(threadId, archived, codexHome);
+            return;
+        }
+        catch (Exception appServerError) when (appServerError is not OperationCanceledException)
+        {
+            var command = archived ? "archive" : "unarchive";
+            var result = await RunCodexAsync($"{command} {threadId}", codexHome, null);
+            if (result.ExitCode == 0)
+            {
+                return;
+            }
+
             var detail = string.Join(Environment.NewLine, new[] { result.StdErr, result.StdOut }
                 .Where(value => !string.IsNullOrWhiteSpace(value)));
             throw new InvalidOperationException(
-                $"无法{(archived ? "归档" : "取消归档")}任务：{detail.Trim()}");
+                $"无法{(archived ? "归档" : "取消归档")}任务：{detail.Trim()}",
+                appServerError);
         }
     }
 
     public async Task DeleteThreadAsync(string threadId, string codexHome)
     {
         ValidateThreadId(threadId);
-        var result = await RunCodexAsync($"delete --force {threadId}", codexHome, null);
-        if (result.ExitCode != 0)
+        Exception? appServerError = null;
+        try
         {
-            var detail = string.Join(Environment.NewLine, new[] { result.StdErr, result.StdOut }
-                .Where(value => !string.IsNullOrWhiteSpace(value)));
-            throw new InvalidOperationException($"无法删除任务：{detail.Trim()}");
+            await _appServer.DeleteThreadAsync(threadId, codexHome);
+            return;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            appServerError = ex;
+        }
+
+        // Deletion is idempotent. A record already absent from Codex should stay hidden instead
+        // of being resurrected by the manager's SQLite compatibility reader.
+        var exists = await TryThreadExistsInCodexAsync(threadId, codexHome);
+        if (exists == false)
+        {
+            return;
+        }
+
+        var result = await RunCodexAsync($"delete --force {threadId}", codexHome, null);
+        if (result.ExitCode == 0)
+        {
+            return;
+        }
+
+        exists = await TryThreadExistsInCodexAsync(threadId, codexHome);
+        if (exists == false)
+        {
+            return;
+        }
+
+        var detail = string.Join(Environment.NewLine, new[] { result.StdErr, result.StdOut }
+            .Where(value => !string.IsNullOrWhiteSpace(value)));
+        throw new InvalidOperationException(
+            $"无法删除任务：{detail.Trim()}",
+            appServerError);
+    }
+
+    internal Task<IReadOnlyList<CodexThreadSummary>> ListThreadsFromCodexAsync(
+        string codexHome,
+        CancellationToken cancellationToken = default) =>
+        _appServer.ListThreadsAsync(codexHome, cancellationToken);
+
+    private async Task<bool?> TryThreadExistsInCodexAsync(string threadId, string codexHome)
+    {
+        try
+        {
+            var threads = await _appServer.ListThreadsAsync(codexHome);
+            return threads.Any(thread =>
+                thread.Id.Equals(threadId, StringComparison.OrdinalIgnoreCase));
+        }
+        catch
+        {
+            return null;
         }
     }
 
@@ -4065,15 +4125,6 @@ catch {
             return overridePath;
         }
 
-        foreach (var root in GetCandidateManagerRoots())
-        {
-            var localCli = Path.Combine(root, LocalCodexCliRelativePath);
-            if (File.Exists(localCli))
-            {
-                return localCli;
-            }
-        }
-
         var appCliRoot = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "OpenAI",
@@ -4095,6 +4146,17 @@ catch {
             catch
             {
                 // Fall through to the npm shim if the app cache cannot be enumerated.
+            }
+        }
+
+        // Keep the manager aligned with the installed desktop protocol. The packaged CLI is a
+        // compatibility fallback for machines where Codex has not populated its app cache yet.
+        foreach (var root in GetCandidateManagerRoots())
+        {
+            var localCli = Path.Combine(root, LocalCodexCliRelativePath);
+            if (File.Exists(localCli))
+            {
+                return localCli;
             }
         }
 
