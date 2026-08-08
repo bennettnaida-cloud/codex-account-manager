@@ -72,10 +72,8 @@ public partial class Form1 : Form
 
     private readonly record struct StatusTokenRowGeometry(
         int Height,
-        Rectangle Name,
-        Rectangle AuthKind,
-        Rectangle State,
-        Rectangle Detail,
+        Rectangle Primary,
+        Rectangle Secondary,
         Rectangle StatusBadge,
         Rectangle TokenBadge,
         Rectangle Check,
@@ -310,6 +308,7 @@ public partial class Form1 : Form
     private bool _updateCheckRunning;
     private bool _automaticUpdateCheckStarted;
     private AppUpdateInfo? _availableUpdate;
+    private bool _deletedThreadCleanupStarted;
     private bool _patGatewayRuntimeRunning;
     private bool _patGatewayActionRunning;
     private string _patGatewayRuntimeStatus = "等待启动";
@@ -372,6 +371,7 @@ public partial class Form1 : Form
                 _ = RefreshQuotaUsageAsync(force: false, _workspaceLoadGeneration);
             }
             _ = InitializePatGatewayOnStartupAsync();
+            _ = CleanupDeletedThreadArtifactsAsync();
             _ = CheckForUpdatesAsync(manual: false);
         };
     }
@@ -2686,10 +2686,8 @@ public partial class Form1 : Form
                 var rowBounds = new Rectangle(0, 0, width, geometry.Height);
                 var controls = new[]
                 {
-                    geometry.Name,
-                    geometry.AuthKind,
-                    geometry.State,
-                    geometry.Detail,
+                    geometry.Primary,
+                    geometry.Secondary,
                     geometry.StatusBadge,
                     geometry.TokenBadge,
                     geometry.Check,
@@ -2699,10 +2697,8 @@ public partial class Form1 : Form
                         bounds.Width <= 0 ||
                         bounds.Height <= 0 ||
                         !rowBounds.Contains(bounds)) ||
-                    geometry.Name.IntersectsWith(geometry.State) ||
-                    geometry.AuthKind.IntersectsWith(geometry.State) ||
-                    geometry.State.IntersectsWith(geometry.StatusBadge) ||
-                    geometry.Detail.IntersectsWith(geometry.StatusBadge) ||
+                    geometry.Primary.IntersectsWith(geometry.StatusBadge) ||
+                    geometry.Secondary.IntersectsWith(geometry.Check) ||
                     geometry.StatusBadge.IntersectsWith(geometry.TokenBadge) ||
                     geometry.Check.IntersectsWith(geometry.Update) ||
                     geometry.Update.Width - 24 < measuredTextWidth)
@@ -4363,26 +4359,30 @@ public partial class Form1 : Form
         RemoveUnifiedThreadFromCachedView(thread.Id);
         _statusBox.Text = $"正在后台永久删除聊天记录：{thread.Title}";
 
+        var deletionRecorded = false;
         try
         {
             // Record the tombstone before yielding so an account switch cannot merge a legacy
             // source copy back into the shared library while the CLI deletion is still queued.
             _sharedHistory.RecordDeletedThread(sharedHome, thread.Id);
+            deletionRecorded = true;
             await _unifiedThreadDeleteGate.WaitAsync();
+            var cleanupPending = false;
             try
             {
                 var sourceHomesWithThread = await Task.Run(() => sourceHomes
                     .Where(sourceHome => _sharedHistory.ContainsThread(sourceHome, thread.Id))
                     .ToList());
 
-            // Remove legacy source copies first so the next account switch cannot merge the
-            // deleted task back into the shared library.
+                // Remove legacy source copies first so the next account switch cannot merge the
+                // deleted task back into the shared library. One stale source must not prevent
+                // the authoritative shared copy from being deleted.
                 foreach (var sourceHome in sourceHomesWithThread)
                 {
-                    await _codex.DeleteThreadAsync(thread.Id, sourceHome);
+                    cleanupPending |= !await TryDeleteThreadFromHomeAsync(thread.Id, sourceHome);
                 }
 
-                await _codex.DeleteThreadAsync(thread.Id, sharedHome);
+                cleanupPending |= !await TryDeleteThreadFromHomeAsync(thread.Id, sharedHome);
             }
             finally
             {
@@ -4393,16 +4393,71 @@ public partial class Form1 : Form
             {
                 InvalidateUnifiedHistoryCache(clearCachedData: false);
                 await RefreshUnifiedHistoryAsync(force: true, _workspaceLoadGeneration);
-                _statusBox.Text = $"已永久删除聊天记录：{thread.Title}";
+                _statusBox.Text = cleanupPending
+                    ? $"已从聊天记录删除：{thread.Title}；被 Codex 占用的本地文件将在下次启动时重试清理。"
+                    : $"已永久删除聊天记录：{thread.Title}";
             }
         }
         catch (Exception ex)
         {
-            _sharedHistory.RemoveDeletedThreadRecord(sharedHome, thread.Id);
             InvalidateUnifiedHistoryCache(clearCachedData: false);
             await RefreshUnifiedHistoryAsync(force: true, _workspaceLoadGeneration);
-            ShowError($"无法删除聊天记录：{ex.Message}");
+            if (deletionRecorded)
+            {
+                _statusBox.Text = $"已从聊天记录删除：{thread.Title}；本地文件稍后重试清理。";
+            }
+            else
+            {
+                ShowError($"无法记录聊天删除操作：{ex.Message}");
+            }
         }
+    }
+
+    private async Task<bool> TryDeleteThreadFromHomeAsync(string threadId, string codexHome)
+    {
+        try
+        {
+            await _codex.DeleteThreadAsync(threadId, codexHome);
+            return true;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return await Task.Run(() => _sharedHistory.TryDeleteThreadArtifacts(codexHome, threadId));
+        }
+    }
+
+    private async Task CleanupDeletedThreadArtifactsAsync()
+    {
+        if (_deletedThreadCleanupStarted || _formClosed)
+        {
+            return;
+        }
+
+        _deletedThreadCleanupStarted = true;
+        var sharedHome = CodexCliService.GetDefaultCodexHome();
+        var deletedIds = SharedHistoryService.LoadDeletedThreadIds(sharedHome);
+        if (deletedIds.Count == 0)
+        {
+            return;
+        }
+
+        var homes = _accounts
+            .Select(account => account.CodexHome)
+            .Append(sharedHome)
+            .Where(home => !string.IsNullOrWhiteSpace(home))
+            .Select(Path.GetFullPath)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        await Task.Run(() =>
+        {
+            foreach (var threadId in deletedIds)
+            {
+                foreach (var home in homes)
+                {
+                    _sharedHistory.TryDeleteThreadArtifacts(home, threadId);
+                }
+            }
+        });
     }
 
     private void RemoveUnifiedThreadFromCachedView(string threadId)
@@ -5576,14 +5631,15 @@ public partial class Form1 : Form
         ThemeStyler.ApplyLabel(rootLabel, _palette, true);
         panel.Controls.Add(rootLabel);
 
-        const int configActionWidth = 196;
-        var configActionLeft = width - 244;
+        var configActionWidth = width >= 900 ? 224 : 196;
+        var configActionLeft = width - configActionWidth - 48;
+        var configFieldWidth = Math.Max(80, configActionLeft - (innerLeft + 164) - 16);
         var rootValue = new Label
         {
             Text = _store.RootPath,
             Left = innerLeft + 164,
             Top = 112,
-            Width = innerWidth - 400,
+            Width = configFieldWidth,
             Height = 38,
             Font = new Font(Font.FontFamily, 9F),
             AutoEllipsis = true,
@@ -5612,7 +5668,7 @@ public partial class Form1 : Form
         panel.Controls.Add(launchLabel);
 
         _projectPathShell!.Parent?.Controls.Remove(_projectPathShell);
-        _projectPathShell.SetBounds(innerLeft + 164, 164, innerWidth - 400, 46);
+        _projectPathShell.SetBounds(innerLeft + 164, 164, configFieldWidth, 46);
         _projectPathShell.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         _projectPathBox.Font = new Font(Font.FontFamily, 9.5F);
         ThemeStyler.ApplyInput(_projectPathBox, _palette);
@@ -5639,7 +5695,7 @@ public partial class Form1 : Form
         panel.Controls.Add(proxyAddressLabel);
 
         _patGatewayProxyAddressShell!.Parent?.Controls.Remove(_patGatewayProxyAddressShell);
-        _patGatewayProxyAddressShell.SetBounds(innerLeft + 164, 226, innerWidth - 400, 46);
+        _patGatewayProxyAddressShell.SetBounds(innerLeft + 164, 226, configFieldWidth, 46);
         _patGatewayProxyAddressShell.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         _patGatewayProxyAddressBox.Font = new Font(Font.FontFamily, 9.5F);
         ThemeStyler.ApplyInput(_patGatewayProxyAddressBox, _palette);
@@ -5680,7 +5736,7 @@ public partial class Form1 : Form
         panel.Controls.Add(proxyPortLabel);
 
         _patGatewayProxyPortShell!.Parent?.Controls.Remove(_patGatewayProxyPortShell);
-        _patGatewayProxyPortShell.SetBounds(innerLeft + 164, 286, innerWidth - 400, 46);
+        _patGatewayProxyPortShell.SetBounds(innerLeft + 164, 286, configFieldWidth, 46);
         _patGatewayProxyPortShell.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         _patGatewayProxyPortBox.Font = new Font(Font.FontFamily, 9.5F);
         ThemeStyler.ApplyInput(_patGatewayProxyPortBox, _palette);
@@ -5688,8 +5744,8 @@ public partial class Form1 : Form
         panel.Controls.Add(_patGatewayProxyPortShell);
 
         _patGatewayProxyDetectionLabel.Parent?.Controls.Remove(_patGatewayProxyDetectionLabel);
-        _patGatewayProxyDetectionLabel.SetBounds(configActionLeft, 286, configActionWidth, 46);
-        _patGatewayProxyDetectionLabel.Font = new Font(Font.FontFamily, 8.1F, FontStyle.Bold);
+        _patGatewayProxyDetectionLabel.SetBounds(configActionLeft, 282, configActionWidth, 54);
+        _patGatewayProxyDetectionLabel.Font = new Font(Font.FontFamily, 7.8F, FontStyle.Regular);
         _patGatewayProxyDetectionLabel.TextAlign = ContentAlignment.MiddleCenter;
         _patGatewayProxyDetectionLabel.AutoEllipsis = false;
         _patGatewayProxyDetectionLabel.UseCompatibleTextRendering = true;
@@ -5715,7 +5771,7 @@ public partial class Form1 : Form
         _patGatewayRuntimeStatusLabel.SetBounds(
             innerLeft + 164,
             354,
-            Math.Max(180, innerWidth - 400),
+            configFieldWidth,
             42);
         _patGatewayRuntimeStatusLabel.Font = new Font(Font.FontFamily, 8.8F);
         _patGatewayRuntimeStatusLabel.TextAlign = ContentAlignment.MiddleLeft;
@@ -6560,56 +6616,26 @@ public partial class Form1 : Form
         };
         row.Click += (_, _) => SelectAccount(account.Name);
 
-        var name = new Label
+        var primary = new Label
         {
-            Text = account.Name,
-            Bounds = geometry.Name,
-            Font = new Font(Font.FontFamily, 10F, FontStyle.Bold),
+            Text = $"{account.Name}  ·  {stateText}",
+            Bounds = geometry.Primary,
+            Font = new Font(Font.FontFamily, 9.7F, FontStyle.Bold),
             AutoEllipsis = true,
             TextAlign = ContentAlignment.MiddleLeft,
             UseCompatibleTextRendering = true,
             UseMnemonic = false,
             Cursor = Cursors.Hand
         };
-        ThemeStyler.ApplyLabel(name, _palette);
-        _toolTip.SetToolTip(name, account.Name);
-        name.Click += (_, _) => SelectAccount(account.Name);
-        row.Controls.Add(name);
+        ThemeStyler.ApplyLabel(primary, _palette);
+        _toolTip.SetToolTip(primary, $"{account.Name} · {stateText}");
+        primary.Click += (_, _) => SelectAccount(account.Name);
+        row.Controls.Add(primary);
 
-        var authKind = new Label
+        var secondary = new Label
         {
-            Text = account.AuthKindLabel,
-            Bounds = geometry.AuthKind,
-            Font = new Font(Font.FontFamily, 8.7F, FontStyle.Bold),
-            AutoEllipsis = true,
-            TextAlign = ContentAlignment.MiddleLeft,
-            UseCompatibleTextRendering = true,
-            UseMnemonic = false,
-            Cursor = Cursors.Hand
-        };
-        ThemeStyler.ApplyLabel(authKind, _palette, true);
-        authKind.Click += (_, _) => SelectAccount(account.Name);
-        row.Controls.Add(authKind);
-
-        var state = new Label
-        {
-            Text = stateText,
-            Bounds = geometry.State,
-            Font = new Font(Font.FontFamily, 9.2F, FontStyle.Bold),
-            AutoEllipsis = true,
-            TextAlign = ContentAlignment.MiddleLeft,
-            UseCompatibleTextRendering = true,
-            UseMnemonic = false,
-            Cursor = Cursors.Hand
-        };
-        ThemeStyler.ApplyLabel(state, _palette);
-        state.Click += (_, _) => SelectAccount(account.Name);
-        row.Controls.Add(state);
-
-        var detail = new Label
-        {
-            Text = detailText,
-            Bounds = geometry.Detail,
+            Text = $"{account.AuthKindLabel}  ·  {detailText}",
+            Bounds = geometry.Secondary,
             Font = new Font(Font.FontFamily, 8.5F),
             AutoEllipsis = true,
             TextAlign = ContentAlignment.MiddleLeft,
@@ -6617,10 +6643,10 @@ public partial class Form1 : Form
             UseMnemonic = false,
             Cursor = Cursors.Hand
         };
-        ThemeStyler.ApplyLabel(detail, _palette, true);
-        _toolTip.SetToolTip(detail, detailTip);
-        detail.Click += (_, _) => SelectAccount(account.Name);
-        row.Controls.Add(detail);
+        ThemeStyler.ApplyLabel(secondary, _palette, true);
+        _toolTip.SetToolTip(secondary, $"{account.AuthKindLabel} · {detailTip}");
+        secondary.Click += (_, _) => SelectAccount(account.Name);
+        row.Controls.Add(secondary);
 
         var statusBadge = MakeBadge(
             $"{(status == null ? "○" : "●")}  {GetStatusBadgeText(status)}",
@@ -6703,32 +6729,27 @@ public partial class Form1 : Form
         {
             var halfWidth = Math.Max(120, (width - side * 2 - gap) / 2);
             return new StatusTokenRowGeometry(
-                224,
-                new Rectangle(side, 12, width - side * 2, 32),
-                new Rectangle(side, 46, width - side * 2, 26),
-                new Rectangle(side, 78, width - side * 2, 28),
-                new Rectangle(side, 108, width - side * 2, 30),
-                new Rectangle(side, 148, halfWidth, 30),
-                new Rectangle(side + halfWidth + gap, 148, halfWidth, 30),
-                new Rectangle(side, 184, halfWidth, 36),
-                new Rectangle(side + halfWidth + gap, 184, halfWidth, 36));
+                178,
+                new Rectangle(side, 10, width - side * 2, 32),
+                new Rectangle(side, 44, width - side * 2, 30),
+                new Rectangle(side, 84, halfWidth, 30),
+                new Rectangle(side + halfWidth + gap, 84, halfWidth, 30),
+                new Rectangle(side, 124, halfWidth, 38),
+                new Rectangle(side + halfWidth + gap, 124, halfWidth, 38));
         }
 
         var rightLeft = width - side - rightWidth;
         var badgeLeft = width - side - badgeRowWidth;
         var actionLeft = width - side - actionRowWidth;
-        var middleLeft = Math.Max(250, Math.Min(340, width / 3));
-        var middleWidth = Math.Max(180, rightLeft - middleLeft - gap);
+        var summaryWidth = Math.Max(220, rightLeft - side - gap);
         return new StatusTokenRowGeometry(
-            126,
-            new Rectangle(side, 14, Math.Max(180, middleLeft - side - gap), 32),
-            new Rectangle(side, 52, Math.Max(180, middleLeft - side - gap), 26),
-            new Rectangle(middleLeft, 18, middleWidth, 28),
-            new Rectangle(middleLeft, 52, middleWidth, 30),
-            new Rectangle(badgeLeft, 14, badgeWidth, 30),
-            new Rectangle(badgeLeft + badgeWidth + gap, 14, badgeWidth, 30),
-            new Rectangle(actionLeft, 72, actionWidth, 38),
-            new Rectangle(actionLeft + actionWidth + gap, 72, actionWidth, 38));
+            104,
+            new Rectangle(side, 10, summaryWidth, 32),
+            new Rectangle(side, 46, summaryWidth, 30),
+            new Rectangle(badgeLeft, 10, badgeWidth, 30),
+            new Rectangle(badgeLeft + badgeWidth + gap, 10, badgeWidth, 30),
+            new Rectangle(actionLeft, 52, actionWidth, 38),
+            new Rectangle(actionLeft + actionWidth + gap, 52, actionWidth, 38));
     }
 
     private Control CreateTokenRow(AccountRecord account, int width)

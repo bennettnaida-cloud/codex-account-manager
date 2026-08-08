@@ -223,6 +223,103 @@ public sealed class SharedHistoryService
         return command.ExecuteScalar() != null;
     }
 
+    public bool TryDeleteThreadArtifacts(string codexHome, string threadId)
+    {
+        if (!Guid.TryParse(threadId, out _))
+        {
+            return false;
+        }
+
+        try
+        {
+            var home = Path.TrimEndingDirectorySeparator(Path.GetFullPath(codexHome));
+            var databasePath = Path.Combine(home, "state_5.sqlite");
+            var threadIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { threadId };
+            var rolloutPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            if (File.Exists(databasePath))
+            {
+                CodexCliService.EnsureSqliteProvider();
+                using var readConnection = OpenDatabase(databasePath, SqliteOpenMode.ReadOnly);
+                DiscoverSpawnedThreadIds(readConnection, threadIds);
+                ReadRolloutPaths(readConnection, threadIds, rolloutPaths);
+            }
+
+            var historyRoots = new[] { "sessions", "archived_sessions", "account-switcher-conflicts" }
+                .Select(name => Path.Combine(home, name))
+                .ToArray();
+            foreach (var id in threadIds)
+            {
+                foreach (var historyRoot in historyRoots.Where(Directory.Exists))
+                {
+                    foreach (var candidate in Directory.EnumerateFiles(
+                                 historyRoot,
+                                 "*" + id + "*.jsonl",
+                                 SearchOption.AllDirectories))
+                    {
+                        rolloutPaths.Add(candidate);
+                    }
+                }
+            }
+
+            var validatedPaths = new List<string>(rolloutPaths.Count);
+            foreach (var rolloutPath in rolloutPaths)
+            {
+                var candidate = Path.IsPathRooted(rolloutPath)
+                    ? NormalizeFileSystemPath(rolloutPath)
+                    : Path.GetFullPath(Path.Combine(home, rolloutPath));
+                if (!candidate.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase) ||
+                    !historyRoots.Any(root => IsPathInside(candidate, root)))
+                {
+                    return false;
+                }
+
+                validatedPaths.Add(candidate);
+            }
+
+            foreach (var candidate in validatedPaths)
+            {
+                if (File.Exists(candidate))
+                {
+                    File.Delete(candidate);
+                }
+            }
+
+            if (!File.Exists(databasePath))
+            {
+                return true;
+            }
+
+            using var writeConnection = OpenDatabase(databasePath, SqliteOpenMode.ReadWrite);
+            var hasDynamicTools = TableExists(writeConnection, "thread_dynamic_tools");
+            var hasSpawnEdges = TableExists(writeConnection, "thread_spawn_edges");
+            var hasThreads = TableExists(writeConnection, "threads");
+            using var transaction = writeConnection.BeginTransaction();
+            foreach (var id in threadIds)
+            {
+                DeleteThreadMetadata(
+                    writeConnection,
+                    transaction,
+                    id,
+                    hasDynamicTools,
+                    hasSpawnEdges,
+                    hasThreads);
+            }
+            transaction.Commit();
+            return true;
+        }
+        catch (Exception ex) when (
+            ex is IOException or
+            UnauthorizedAccessException or
+            SqliteException or
+            InvalidOperationException or
+            NotSupportedException or
+            ArgumentException)
+        {
+            return false;
+        }
+    }
+
     public void RecordDeletedThread(string codexHome, string threadId)
     {
         if (!Guid.TryParse(threadId, out _))
@@ -234,40 +331,6 @@ public sealed class SharedHistoryService
         {
             var deleted = LoadDeletedThreadIds(codexHome);
             if (!deleted.Add(threadId))
-            {
-                return;
-            }
-
-            var path = Path.Combine(Path.GetFullPath(codexHome), DeletedThreadsFileName);
-            var tempPath = path + ".tmp-" + Guid.NewGuid().ToString("N");
-            try
-            {
-                File.WriteAllText(
-                    tempPath,
-                    JsonSerializer.Serialize(deleted.OrderBy(id => id), new JsonSerializerOptions { WriteIndented = true }));
-                File.Move(tempPath, path, true);
-            }
-            finally
-            {
-                if (File.Exists(tempPath))
-                {
-                    File.Delete(tempPath);
-                }
-            }
-        }
-    }
-
-    public void RemoveDeletedThreadRecord(string codexHome, string threadId)
-    {
-        if (!Guid.TryParse(threadId, out _))
-        {
-            throw new ArgumentException("Codex 任务 ID 无效。", nameof(threadId));
-        }
-
-        lock (DeletedThreadsLock)
-        {
-            var deleted = LoadDeletedThreadIds(codexHome);
-            if (!deleted.Remove(threadId))
             {
                 return;
             }
@@ -434,11 +497,211 @@ public sealed class SharedHistoryService
             {
                 throw new InvalidOperationException("Codex authoritative history reconciliation failed.");
             }
+
+            ValidateThreadArtifactDeletion(root);
         }
         finally
         {
             Directory.Delete(root, recursive: true);
         }
+    }
+
+    private static void ValidateThreadArtifactDeletion(string root)
+    {
+        const string parentId = "019f4be7-aa6e-72b2-84bf-4e35b9c5f270";
+        const string childId = "019f4be7-aa6e-72b2-84bf-4e35b9c5f271";
+        var parentPath = Path.Combine(root, "sessions", "2026", "08", "08", "rollout-" + parentId + ".jsonl");
+        var childPath = Path.Combine(root, "archived_sessions", "rollout-" + childId + ".jsonl");
+        Directory.CreateDirectory(Path.GetDirectoryName(parentPath)!);
+        Directory.CreateDirectory(Path.GetDirectoryName(childPath)!);
+        File.WriteAllText(parentPath, "parent\n");
+        File.WriteAllText(childPath, "child\n");
+
+        var databasePath = Path.Combine(root, "state_5.sqlite");
+        using (var connection = OpenDatabase(databasePath, SqliteOpenMode.ReadWrite))
+        {
+            if (!ReadColumns(connection, "threads").Contains("rollout_path"))
+            {
+                using var alter = connection.CreateCommand();
+                alter.CommandText = "ALTER TABLE threads ADD COLUMN rollout_path TEXT;";
+                alter.ExecuteNonQuery();
+            }
+
+            using var command = connection.CreateCommand();
+            command.CommandText = """
+                DELETE FROM threads;
+                CREATE TABLE IF NOT EXISTS thread_dynamic_tools (
+                    thread_id TEXT NOT NULL,
+                    position INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS thread_spawn_edges (
+                    parent_thread_id TEXT NOT NULL,
+                    child_thread_id TEXT NOT NULL,
+                    status TEXT);
+                DELETE FROM thread_dynamic_tools;
+                DELETE FROM thread_spawn_edges;
+                INSERT INTO threads (id, rollout_path) VALUES ($parent, $parentPath);
+                INSERT INTO threads (id, rollout_path) VALUES ($child, $childPath);
+                INSERT INTO thread_dynamic_tools (thread_id, position) VALUES ($child, 0);
+                INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id, status)
+                VALUES ($parent, $child, 'completed');
+                """;
+            command.Parameters.AddWithValue("$parent", parentId);
+            command.Parameters.AddWithValue("$parentPath", parentPath);
+            command.Parameters.AddWithValue("$child", childId);
+            command.Parameters.AddWithValue("$childPath", childPath);
+            command.ExecuteNonQuery();
+        }
+
+        var service = new SharedHistoryService();
+        if (!service.TryDeleteThreadArtifacts(root, parentId) ||
+            File.Exists(parentPath) ||
+            File.Exists(childPath))
+        {
+            throw new InvalidOperationException("Local thread artifact deletion validation failed.");
+        }
+
+        using var verify = OpenDatabase(databasePath, SqliteOpenMode.ReadOnly);
+        foreach (var table in new[] { "threads", "thread_dynamic_tools", "thread_spawn_edges" })
+        {
+            using var count = verify.CreateCommand();
+            count.CommandText = $"SELECT COUNT(*) FROM {table};";
+            if (Convert.ToInt64(count.ExecuteScalar()) != 0)
+            {
+                throw new InvalidOperationException("Deleted thread metadata remained in " + table + ".");
+            }
+        }
+    }
+
+    private static SqliteConnection OpenDatabase(string databasePath, SqliteOpenMode mode)
+    {
+        var connection = new SqliteConnection(
+            new SqliteConnectionStringBuilder
+            {
+                DataSource = databasePath,
+                Mode = mode,
+                Cache = SqliteCacheMode.Private,
+                Pooling = false,
+                DefaultTimeout = 5
+            }.ToString());
+        connection.Open();
+        using var timeout = connection.CreateCommand();
+        timeout.CommandText = "PRAGMA busy_timeout = 5000;";
+        timeout.ExecuteNonQuery();
+        return connection;
+    }
+
+    private static void DiscoverSpawnedThreadIds(
+        SqliteConnection connection,
+        HashSet<string> threadIds)
+    {
+        if (!TableExists(connection, "thread_spawn_edges"))
+        {
+            return;
+        }
+
+        var pending = new Queue<string>(threadIds);
+        while (pending.Count > 0)
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText =
+                "SELECT child_thread_id FROM thread_spawn_edges WHERE parent_thread_id = $id;";
+            command.Parameters.AddWithValue("$id", pending.Dequeue());
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                var childId = reader.IsDBNull(0) ? string.Empty : reader.GetString(0);
+                if (Guid.TryParse(childId, out _) && threadIds.Add(childId))
+                {
+                    pending.Enqueue(childId);
+                }
+            }
+        }
+    }
+
+    private static void ReadRolloutPaths(
+        SqliteConnection connection,
+        IReadOnlySet<string> threadIds,
+        HashSet<string> rolloutPaths)
+    {
+        if (!TableExists(connection, "threads") ||
+            !ReadColumns(connection, "threads").Contains("rollout_path"))
+        {
+            return;
+        }
+
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT rollout_path FROM threads WHERE id = $id LIMIT 1;";
+        var idParameter = command.Parameters.Add("$id", SqliteType.Text);
+        foreach (var id in threadIds)
+        {
+            idParameter.Value = id;
+            var path = Convert.ToString(command.ExecuteScalar());
+            if (!string.IsNullOrWhiteSpace(path))
+            {
+                rolloutPaths.Add(path);
+            }
+        }
+    }
+
+    private static void DeleteThreadMetadata(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string threadId,
+        bool hasDynamicTools,
+        bool hasSpawnEdges,
+        bool hasThreads)
+    {
+        if (hasDynamicTools)
+        {
+            ExecuteDelete(
+                connection,
+                transaction,
+                "DELETE FROM thread_dynamic_tools WHERE thread_id = $id;",
+                threadId);
+        }
+        if (hasSpawnEdges)
+        {
+            ExecuteDelete(
+                connection,
+                transaction,
+                "DELETE FROM thread_spawn_edges WHERE parent_thread_id = $id OR child_thread_id = $id;",
+                threadId);
+        }
+        if (hasThreads)
+        {
+            ExecuteDelete(connection, transaction, "DELETE FROM threads WHERE id = $id;", threadId);
+        }
+    }
+
+    private static void ExecuteDelete(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sql,
+        string threadId)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = sql;
+        command.Parameters.AddWithValue("$id", threadId);
+        command.ExecuteNonQuery();
+    }
+
+    private static string NormalizeFileSystemPath(string path)
+    {
+        var normalized = path.StartsWith(@"\\?\", StringComparison.Ordinal)
+            ? path[4..]
+            : path;
+        return Path.GetFullPath(normalized);
+    }
+
+    private static bool IsPathInside(string path, string root)
+    {
+        var fullPath = NormalizeFileSystemPath(path);
+        var fullRoot = Path.TrimEndingDirectorySeparator(NormalizeFileSystemPath(root));
+        var relative = Path.GetRelativePath(fullRoot, fullPath);
+        return !Path.IsPathRooted(relative) &&
+               !relative.Equals("..", StringComparison.Ordinal) &&
+               !relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal);
     }
 
     private static string BuildUpdatedMillisecondsExpression(HashSet<string> columns)
