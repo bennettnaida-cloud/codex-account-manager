@@ -14,14 +14,25 @@ internal static class LocalPatGateway
     internal const string ProviderBaseUrl = "http://127.0.0.1:8317/backend-api/codex";
     internal const string ChatGptBaseUrl = "http://127.0.0.1:8317/backend-api";
     internal const string ProcessArgument = "--local-pat-gateway";
+    internal const string RootArgument = "--manager-root";
 
     private const string MarkerHeader = "X-Codex-Account-Manager-Gateway";
     private const string MarkerValue = "pat-v1";
     private const string ProxyKeyHeader = "X-Codex-Account-Manager-Proxy-Key";
     private static readonly SemaphoreSlim StartupLock = new(1, 1);
 
-    internal static int RunProcess()
+    internal static int RunProcess(string[] args)
     {
+        var rootIndex = Array.FindIndex(
+            args,
+            argument => argument.Equals(RootArgument, StringComparison.OrdinalIgnoreCase));
+        if (rootIndex >= 0 && rootIndex + 1 < args.Length && !string.IsNullOrWhiteSpace(args[rootIndex + 1]))
+        {
+            Environment.SetEnvironmentVariable(
+                "CODEX_ACCOUNT_MANAGER_HOME",
+                Path.GetFullPath(args[rootIndex + 1]));
+        }
+
         return new LocalPatGatewayHost(MarkerHeader, MarkerValue)
             .RunAsync()
             .GetAwaiter()
@@ -33,12 +44,36 @@ internal static class LocalPatGateway
         EnsureRunningAsync().GetAwaiter().GetResult();
     }
 
+    internal static bool IsEnabledBySettings()
+    {
+        var store = new AccountStore();
+        return new ThemeService(store.RootPath).LoadSettings().PatGatewayEnabled;
+    }
+
     internal static async Task EnsureRunningAsync(CancellationToken cancellationToken = default)
     {
+        if (!IsEnabledBySettings())
+        {
+            throw new InvalidOperationException(
+                "本地 PAT 网关已在系统配置中关闭，请先打开网关再启动 Access Token 账号。");
+        }
+
         await StartupLock.WaitAsync(cancellationToken);
         try
         {
             var health = await ProbeAsync(cancellationToken);
+            if (health == GatewayHealth.LegacyRootMismatch)
+            {
+                if (!TryLoadLegacyControlSecret(out var legacySecret) ||
+                    !await ShutdownWithSecretAsync(legacySecret, cancellationToken))
+                {
+                    throw new InvalidOperationException(
+                        "检测到旧版本启动的本地 PAT 网关，但无法安全关闭；请退出旧版管理器后重试。");
+                }
+
+                await Task.Delay(120, cancellationToken);
+                health = GatewayHealth.Unavailable;
+            }
             if (health == GatewayHealth.ProxyMismatch)
             {
                 // A gateway is a long-lived child process, so it may have inherited an
@@ -103,10 +138,39 @@ internal static class LocalPatGateway
 
     internal static async Task<bool> ShutdownIfRunningAsync(CancellationToken cancellationToken = default)
     {
+        return await ShutdownWithSecretAsync(
+            LocalPatGatewayControl.LoadOrCreateSecret(),
+            cancellationToken);
+    }
+
+    internal static async Task<bool> ShutdownOwnedGatewayAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var health = await ProbeAsync(cancellationToken);
+        if (health == GatewayHealth.Unavailable)
+        {
+            return true;
+        }
+        if (health is GatewayHealth.Ready or GatewayHealth.ProxyMissing or GatewayHealth.ProxyMismatch)
+        {
+            return await ShutdownIfRunningAsync(cancellationToken);
+        }
+        if (health != GatewayHealth.LegacyRootMismatch ||
+            !TryLoadLegacyControlSecret(out var legacySecret))
+        {
+            return false;
+        }
+
+        return await ShutdownWithSecretAsync(legacySecret, cancellationToken);
+    }
+
+    private static async Task<bool> ShutdownWithSecretAsync(
+        string secret,
+        CancellationToken cancellationToken)
+    {
         using var client = CreateLoopbackClient();
         try
         {
-            var secret = LocalPatGatewayControl.LoadOrCreateSecret();
             var challenge = LocalPatGatewayControl.CreateChallenge();
             using var request = new HttpRequestMessage(HttpMethod.Post, ListenerPrefix + "__shutdown");
             request.Headers.TryAddWithoutValidation(
@@ -138,6 +202,7 @@ internal static class LocalPatGateway
     private static ProcessStartInfo BuildGatewayStartInfo()
     {
         _ = LocalPatGatewayControl.LoadOrCreateSecret();
+        var managerRoot = new AccountStore().RootPath;
         var processPath = Environment.ProcessPath;
         if (string.IsNullOrWhiteSpace(processPath))
         {
@@ -147,7 +212,7 @@ internal static class LocalPatGateway
         var startInfo = new ProcessStartInfo
         {
             FileName = processPath,
-            WorkingDirectory = AppContext.BaseDirectory,
+            WorkingDirectory = managerRoot,
             // ShellExecute gives this long-lived child its own standard handles. A
             // redirected PowerShell caller can then finish after the launcher exits.
             UseShellExecute = true,
@@ -169,6 +234,8 @@ internal static class LocalPatGateway
             startInfo.ArgumentList.Add(assemblyPath);
         }
         startInfo.ArgumentList.Add(ProcessArgument);
+        startInfo.ArgumentList.Add(RootArgument);
+        startInfo.ArgumentList.Add(managerRoot);
         return startInfo;
     }
 
@@ -189,7 +256,9 @@ internal static class LocalPatGateway
             }
             if (!HasExpectedControlProof(response, challenge))
             {
-                return GatewayHealth.ForeignListener;
+                return HasExpectedLegacyControlProof(response, challenge)
+                    ? GatewayHealth.LegacyRootMismatch
+                    : GatewayHealth.ForeignListener;
             }
             if (response.StatusCode == HttpStatusCode.ServiceUnavailable)
             {
@@ -245,12 +314,44 @@ internal static class LocalPatGateway
         return values.Contains(expected, StringComparer.Ordinal);
     }
 
+    private static bool HasExpectedLegacyControlProof(
+        HttpResponseMessage response,
+        string challenge)
+    {
+        if (!response.Headers.TryGetValues(
+                LocalPatGatewayControl.ProofHeader,
+                out var values) ||
+            !TryLoadLegacyControlSecret(out var secret))
+        {
+            return false;
+        }
+
+        var expected = LocalPatGatewayControl.CreateHealthProof(secret, challenge);
+        return values.Contains(expected, StringComparer.Ordinal);
+    }
+
+    private static bool TryLoadLegacyControlSecret(out string secret)
+    {
+        var currentRoot = Path.TrimEndingDirectorySeparator(
+            Path.GetFullPath(new AccountStore().RootPath));
+        var legacyRoot = Path.TrimEndingDirectorySeparator(
+            Path.GetFullPath(AppContext.BaseDirectory));
+        if (currentRoot.Equals(legacyRoot, StringComparison.OrdinalIgnoreCase))
+        {
+            secret = string.Empty;
+            return false;
+        }
+
+        return LocalPatGatewayControl.TryLoadSecretForRoot(legacyRoot, out secret);
+    }
+
     private enum GatewayHealth
     {
         Unavailable,
         Ready,
         ProxyMissing,
         ProxyMismatch,
+        LegacyRootMismatch,
         ForeignListener
     }
 }

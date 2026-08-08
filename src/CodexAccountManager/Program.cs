@@ -7,7 +7,7 @@ static class Program
     {
         if (args.Contains(LocalPatGateway.ProcessArgument, StringComparer.OrdinalIgnoreCase))
         {
-            return LocalPatGateway.RunProcess();
+            return LocalPatGateway.RunProcess(args);
         }
         if (args.Contains("--ensure-local-pat-gateway", StringComparer.OrdinalIgnoreCase))
         {

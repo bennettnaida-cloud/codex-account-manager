@@ -20,6 +20,7 @@ public sealed class AppSettings
     public int? PatGatewayProxyPort { get; set; }
     public bool PatGatewayProxyAutoDetect { get; set; } = true;
     public string? PatGatewayProxyScheme { get; set; } = "http";
+    public bool PatGatewayEnabled { get; set; } = true;
     public int? WindowLeft { get; set; }
     public int? WindowTop { get; set; }
     public int? WindowWidth { get; set; }

@@ -208,6 +208,8 @@ public partial class Form1 : Form
     private readonly TextBox _patGatewayProxyAddressBox = new();
     private readonly TextBox _patGatewayProxyPortBox = new();
     private readonly Label _patGatewayProxyDetectionLabel = new();
+    private readonly Label _patGatewayRuntimeStatusLabel = new();
+    private readonly ModernButton _patGatewayToggleButton = new();
     private readonly Label _statusBox = new();
     private readonly ThemePicker _themeModePicker = new();
     private readonly ModernButton _updateAvailableButton = new();
@@ -308,6 +310,9 @@ public partial class Form1 : Form
     private bool _updateCheckRunning;
     private bool _automaticUpdateCheckStarted;
     private AppUpdateInfo? _availableUpdate;
+    private bool _patGatewayRuntimeRunning;
+    private bool _patGatewayActionRunning;
+    private string _patGatewayRuntimeStatus = "等待启动";
     private CancellationTokenSource? _proxyDetectionCancellation;
     private ModernInputShell? _searchShell;
     private ModernInputShell? _projectPathShell;
@@ -366,10 +371,7 @@ public partial class Form1 : Form
             {
                 _ = RefreshQuotaUsageAsync(force: false, _workspaceLoadGeneration);
             }
-            if (_appSettings.PatGatewayProxyAutoDetect)
-            {
-                _ = DetectLocalPatGatewayProxyAsync(updateStatus: false);
-            }
+            _ = InitializePatGatewayOnStartupAsync();
             _ = CheckForUpdatesAsync(manual: false);
         };
     }
@@ -785,6 +787,7 @@ public partial class Form1 : Form
             SaveEditedProjectPath();
         };
         InitializePatGatewayProxyEditors();
+        _patGatewayToggleButton.Click += async (_, _) => await TogglePatGatewayAsync();
         _patGatewayProxyAddressBox.Validated += (_, _) => SaveEditedPatGatewayProxy();
         _patGatewayProxyAddressBox.KeyDown += (_, eventArgs) =>
         {
@@ -3666,6 +3669,8 @@ public partial class Form1 : Form
         DetachPersistentControl(_patGatewayProxyAddressShell);
         DetachPersistentControl(_patGatewayProxyPortShell);
         DetachPersistentControl(_patGatewayProxyDetectionLabel);
+        DetachPersistentControl(_patGatewayRuntimeStatusLabel);
+        DetachPersistentControl(_patGatewayToggleButton);
     }
 
     private static void DetachPersistentControl(Control? control)
@@ -5515,7 +5520,7 @@ public partial class Form1 : Form
         var panel = new RoundedPanel
         {
             Width = width,
-            Height = 478,
+            Height = 536,
             Radius = 16,
             BorderColor = _palette.BorderColor,
             BackColor = _palette.CardColor,
@@ -5692,13 +5697,52 @@ public partial class Form1 : Form
         ThemeStyler.ApplyLabel(_patGatewayProxyDetectionLabel, _palette, true);
         panel.Controls.Add(_patGatewayProxyDetectionLabel);
 
+        var gatewayLabel = new Label
+        {
+            Text = "PAT 网关",
+            Left = innerLeft,
+            Top = 354,
+            Width = 150,
+            Height = 42,
+            Font = new Font(Font.FontFamily, 9F, FontStyle.Bold),
+            TextAlign = ContentAlignment.MiddleLeft,
+            UseMnemonic = false
+        };
+        ThemeStyler.ApplyLabel(gatewayLabel, _palette, true);
+        panel.Controls.Add(gatewayLabel);
+
+        _patGatewayRuntimeStatusLabel.Parent?.Controls.Remove(_patGatewayRuntimeStatusLabel);
+        _patGatewayRuntimeStatusLabel.SetBounds(
+            innerLeft + 164,
+            354,
+            Math.Max(180, innerWidth - 400),
+            42);
+        _patGatewayRuntimeStatusLabel.Font = new Font(Font.FontFamily, 8.8F);
+        _patGatewayRuntimeStatusLabel.TextAlign = ContentAlignment.MiddleLeft;
+        _patGatewayRuntimeStatusLabel.AutoEllipsis = true;
+        _patGatewayRuntimeStatusLabel.UseMnemonic = false;
+        ThemeStyler.ApplyLabel(_patGatewayRuntimeStatusLabel, _palette);
+        panel.Controls.Add(_patGatewayRuntimeStatusLabel);
+
+        _patGatewayToggleButton.Parent?.Controls.Remove(_patGatewayToggleButton);
+        _patGatewayToggleButton.SetBounds(configActionLeft, 351, configActionWidth, 42);
+        _patGatewayToggleButton.Tag = "soft";
+        _patGatewayToggleButton.Radius = 12;
+        _patGatewayToggleButton.Padding = new Padding(12, 0, 12, 0);
+        _patGatewayToggleButton.Font = new Font(Font.FontFamily, 8.9F);
+        _patGatewayToggleButton.MinimumFontSize = 8F;
+        _patGatewayToggleButton.AccessibleName = "打开或关闭本地 PAT 网关";
+        ThemeStyler.ApplySoftButton(_patGatewayToggleButton, _palette);
+        panel.Controls.Add(_patGatewayToggleButton);
+        UpdatePatGatewayControls();
+
         var note = new Label
         {
             Text = "自动检测只探测本机回环地址；地址默认 127.0.0.1，端口会显示并回填检测结果。手动编辑任一项后使用手动设置。",
             Left = innerLeft,
-            Top = 354,
+            Top = 414,
             Width = Math.Max(260, innerWidth - configActionWidth - 18),
-            Height = 70,
+            Height = 60,
             Font = new Font(Font.FontFamily, 8.5F),
             AutoEllipsis = false,
             UseMnemonic = false
@@ -5709,7 +5753,7 @@ public partial class Form1 : Form
             "检测只连接 127.0.0.1 的本地监听端口并执行 HTTP 代理握手，不访问外网；本地 PAT 网关端口 8317 会被排除。");
         panel.Controls.Add(note);
 
-        var manualUpdate = MakeActionButton("检查更新", configActionLeft, 414, configActionWidth, false);
+        var manualUpdate = MakeActionButton("检查更新", configActionLeft, 476, configActionWidth, false);
         manualUpdate.AccessibleName = "手动检查应用更新";
         manualUpdate.Click += async (_, _) => await CheckForUpdatesAsync(manual: true);
         panel.Controls.Add(manualUpdate);
@@ -13153,6 +13197,123 @@ public partial class Form1 : Form
         }
 
         return true;
+    }
+
+    private async Task InitializePatGatewayOnStartupAsync()
+    {
+        if (_patGatewayActionRunning || _formClosed)
+        {
+            return;
+        }
+
+        _patGatewayActionRunning = true;
+        _patGatewayRuntimeStatus = _appSettings.PatGatewayEnabled
+            ? "正在启动..."
+            : "正在关闭...";
+        UpdatePatGatewayControls();
+        try
+        {
+            if (!_appSettings.PatGatewayEnabled)
+            {
+                _ = await LocalPatGateway.ShutdownOwnedGatewayAsync();
+                _patGatewayRuntimeRunning = false;
+                _patGatewayRuntimeStatus = "已关闭";
+                return;
+            }
+
+            if (_appSettings.PatGatewayProxyAutoDetect)
+            {
+                await DetectLocalPatGatewayProxyAsync(updateStatus: false);
+            }
+
+            await LocalPatGateway.EnsureRunningAsync();
+            _patGatewayRuntimeRunning = true;
+            _patGatewayRuntimeStatus = $"已开启 · 127.0.0.1:{LocalPatGateway.Port}";
+        }
+        catch (Exception ex)
+        {
+            _patGatewayRuntimeRunning = false;
+            _patGatewayRuntimeStatus = "启动失败";
+            if (!_formClosed)
+            {
+                _statusBox.Text = $"PAT 网关启动失败：{ex.Message}";
+            }
+        }
+        finally
+        {
+            _patGatewayActionRunning = false;
+            UpdatePatGatewayControls();
+        }
+    }
+
+    private async Task TogglePatGatewayAsync()
+    {
+        if (_patGatewayActionRunning || _formClosed)
+        {
+            return;
+        }
+
+        var opening = !_patGatewayRuntimeRunning;
+        _patGatewayActionRunning = true;
+        _patGatewayRuntimeStatus = opening ? "正在启动..." : "正在关闭...";
+        UpdatePatGatewayControls();
+        try
+        {
+            if (opening)
+            {
+                if (!SaveEditedPatGatewayProxy(updateStatus: false, markManual: false))
+                {
+                    throw new InvalidOperationException("请先填写有效的 PAT 网关上游代理设置。");
+                }
+
+                _appSettings.PatGatewayEnabled = true;
+                _themeService.SaveSettings(_appSettings);
+                await LocalPatGateway.EnsureRunningAsync();
+                _patGatewayRuntimeRunning = true;
+                _patGatewayRuntimeStatus = $"已开启 · 127.0.0.1:{LocalPatGateway.Port}";
+                _statusBox.Text = "本地 PAT 网关已打开，之后启动软件时会默认自动打开。";
+            }
+            else
+            {
+                if (!await LocalPatGateway.ShutdownIfRunningAsync())
+                {
+                    throw new InvalidOperationException("未能通过安全控制接口关闭本地 PAT 网关。");
+                }
+
+                _appSettings.PatGatewayEnabled = false;
+                _themeService.SaveSettings(_appSettings);
+                _patGatewayRuntimeRunning = false;
+                _patGatewayRuntimeStatus = "已关闭";
+                _statusBox.Text = "本地 PAT 网关已关闭；Access Token 账号启动前需要重新打开。";
+            }
+        }
+        catch (Exception ex)
+        {
+            _patGatewayRuntimeStatus = opening ? "启动失败" : "关闭失败";
+            ShowError(ex.Message);
+        }
+        finally
+        {
+            _patGatewayActionRunning = false;
+            UpdatePatGatewayControls();
+        }
+    }
+
+    private void UpdatePatGatewayControls()
+    {
+        if (!_patGatewayRuntimeStatusLabel.IsDisposed)
+        {
+            _patGatewayRuntimeStatusLabel.Text = _patGatewayRuntimeStatus;
+        }
+        if (!_patGatewayToggleButton.IsDisposed)
+        {
+            _patGatewayToggleButton.Text = _patGatewayActionRunning
+                ? "处理中..."
+                : _patGatewayRuntimeRunning
+                    ? "关闭网关"
+                    : "打开网关";
+            _patGatewayToggleButton.Enabled = !_patGatewayActionRunning;
+        }
     }
 
     private void InitializePatGatewayProxyEditors()

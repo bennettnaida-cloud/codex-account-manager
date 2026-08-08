@@ -143,7 +143,8 @@ public sealed class SharedHistoryService
         var indexedById = indexedThreads.ToDictionary(
             thread => thread.Id,
             StringComparer.OrdinalIgnoreCase);
-        var result = new List<UnifiedThreadRecord>(codexThreads.Count);
+        var reconciledThreadIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result = new List<UnifiedThreadRecord>(codexThreads.Count + indexedThreads.Count);
         foreach (var codexThread in codexThreads)
         {
             if (deletedThreadIds.Contains(codexThread.Id))
@@ -152,6 +153,7 @@ public sealed class SharedHistoryService
             }
 
             indexedById.TryGetValue(codexThread.Id, out var indexed);
+            reconciledThreadIds.Add(codexThread.Id);
             result.Add(new UnifiedThreadRecord(
                 codexThread.Id,
                 FirstNonEmpty(
@@ -173,6 +175,12 @@ public sealed class SharedHistoryService
                 codexThread.Archived,
                 indexed?.HasUserEvent ?? true));
         }
+
+        // The live Codex list can be temporarily incomplete. Keep normal records
+        // already read from the local index unless they were explicitly deleted.
+        result.AddRange(indexedThreads.Where(thread =>
+            !reconciledThreadIds.Contains(thread.Id) &&
+            !deletedThreadIds.Contains(thread.Id)));
 
         return result
             .OrderByDescending(thread => thread.UpdatedAt)
@@ -378,9 +386,31 @@ public sealed class SharedHistoryService
                 throw new InvalidOperationException("Unified shared history reader validation failed.");
             }
 
-            var reconciled = new SharedHistoryService().ReconcileWithCodex(
+            var retainedThread = new UnifiedThreadRecord(
+                "019f4be7-aa6e-72b2-84bf-4e35b9c5f261",
+                "Locally indexed task",
+                "Local preview",
+                @"C:\local",
+                "local-model",
+                "local-provider",
+                DateTimeOffset.FromUnixTimeSeconds(1783685001),
+                false,
+                true);
+            var deletedThread = new UnifiedThreadRecord(
+                "019f4be7-aa6e-72b2-84bf-4e35b9c5f262",
+                "Deleted task",
+                "Deleted preview",
+                @"C:\deleted",
+                "deleted-model",
+                "deleted-provider",
+                DateTimeOffset.FromUnixTimeSeconds(1783685101),
+                false,
+                true);
+            var service = new SharedHistoryService();
+            service.RecordDeletedThread(root, deletedThread.Id);
+            var reconciled = service.ReconcileWithCodex(
                 root,
-                records,
+                [records[0], retainedThread, deletedThread],
                 [
                     new CodexThreadSummary(
                         records[0].Id,
@@ -391,12 +421,16 @@ public sealed class SharedHistoryService
                         DateTimeOffset.FromUnixTimeSeconds(1783685901),
                         false)
                 ]);
-            if (reconciled.Count != 1 ||
-                reconciled[0].Title != "Codex display name" ||
-                reconciled[0].Preview != "Current preview" ||
-                reconciled[0].WorkingDirectory != @"C:\current" ||
-                reconciled[0].Model != "model" ||
-                reconciled[0].Provider != "current-provider")
+            var authoritative = reconciled.SingleOrDefault(thread => thread.Id == records[0].Id);
+            var retained = reconciled.SingleOrDefault(thread => thread.Id == retainedThread.Id);
+            if (reconciled.Count != 2 ||
+                authoritative?.Title != "Codex display name" ||
+                authoritative.Preview != "Current preview" ||
+                authoritative.WorkingDirectory != @"C:\current" ||
+                authoritative.Model != "model" ||
+                authoritative.Provider != "current-provider" ||
+                retained != retainedThread ||
+                reconciled.Any(thread => thread.Id == deletedThread.Id))
             {
                 throw new InvalidOperationException("Codex authoritative history reconciliation failed.");
             }

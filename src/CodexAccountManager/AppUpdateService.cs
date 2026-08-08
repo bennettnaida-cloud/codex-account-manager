@@ -220,6 +220,8 @@ internal sealed class AppUpdateService
                 CreateNoWindow = true,
                 WindowStyle = ProcessWindowStyle.Hidden
             };
+            var managerRoot = Path.GetFullPath(new AccountStore().RootPath);
+            startInfo.Environment["CODEX_ACCOUNT_MANAGER_HOME"] = managerRoot;
             startInfo.ArgumentList.Add("-NoLogo");
             startInfo.ArgumentList.Add("-NoProfile");
             startInfo.ArgumentList.Add("-ExecutionPolicy");
@@ -235,9 +237,9 @@ internal sealed class AppUpdateService
             startInfo.ArgumentList.Add("-InstallPath");
             startInfo.ArgumentList.Add(GetCurrentInstallPath());
             startInfo.ArgumentList.Add("-WorkingDirectory");
-            startInfo.ArgumentList.Add(Directory.Exists(Environment.CurrentDirectory)
-                ? Environment.CurrentDirectory
-                : AppContext.BaseDirectory);
+            startInfo.ArgumentList.Add(managerRoot);
+            startInfo.ArgumentList.Add("-ManagerRoot");
+            startInfo.ArgumentList.Add(managerRoot);
             startInfo.ArgumentList.Add("-CurrentExecutablePath");
             startInfo.ArgumentList.Add(Environment.ProcessPath
                 ?? Path.Combine(AppContext.BaseDirectory, "CodexAccountManager.exe"));
@@ -295,6 +297,8 @@ internal sealed class AppUpdateService
         if (!script.Contains("$InstallerLogPath", StringComparison.Ordinal)) failures.Add("installer-log");
         if (!script.Contains("--shutdown-local-pat-gateway", StringComparison.Ordinal)) failures.Add("gateway-shutdown");
         if (!script.Contains("Start-Process -FilePath $installedExe", StringComparison.Ordinal)) failures.Add("restart");
+        if (!script.Contains("$env:CODEX_ACCOUNT_MANAGER_HOME = $managerRoot", StringComparison.Ordinal)) failures.Add("manager-root-environment");
+        if (!script.Contains("Copy-Item -LiteralPath $rollbackExecutablePath", StringComparison.Ordinal)) failures.Add("rollback-restore");
         if (!GetCurrentInstallPath().Equals(
                 Path.TrimEndingDirectorySeparator(Path.GetFullPath(AppContext.BaseDirectory)),
                 StringComparison.OrdinalIgnoreCase))
@@ -374,6 +378,8 @@ New-Item -ItemType Directory -Force -Path $InstallPath | Out-Null
 $testExe = Join-Path $env:WINDIR 'System32\where.exe'
 Copy-Item -LiteralPath $testExe -Destination (Join-Path $InstallPath 'CodexAccountManager.exe') -Force
 Set-Content -LiteralPath (Join-Path $InstallPath 'installer-ran.txt') -Value 'ok' -Encoding ASCII
+Set-Content -LiteralPath (Join-Path $InstallPath 'manager-root.txt') -Value $env:CODEX_ACCOUNT_MANAGER_HOME -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $InstallPath 'manager-working-directory.txt') -Value $ManagerWorkingDirectory -Encoding UTF8
 exit 0
 ",
                 new UTF8Encoding(true));
@@ -407,6 +413,8 @@ exit 0
             executionInfo.ArgumentList.Add(installPath);
             executionInfo.ArgumentList.Add("-WorkingDirectory");
             executionInfo.ArgumentList.Add(probeRoot);
+            executionInfo.ArgumentList.Add("-ManagerRoot");
+            executionInfo.ArgumentList.Add(probeRoot);
             executionInfo.ArgumentList.Add("-CurrentExecutablePath");
             executionInfo.ArgumentList.Add(Path.Combine(probeRoot, "missing-current.exe"));
             executionInfo.ArgumentList.Add("-UpdaterLogPath");
@@ -426,10 +434,19 @@ exit 0
             var executionOutput = execution.StandardOutput.ReadToEnd();
             var executionError = execution.StandardError.ReadToEnd();
             var installerMarker = Path.Combine(installPath, "installer-ran.txt");
+            var expectedManagerRoot = Path.GetFullPath(probeRoot);
+            var inheritedManagerRoot = File.Exists(Path.Combine(installPath, "manager-root.txt"))
+                ? File.ReadAllText(Path.Combine(installPath, "manager-root.txt")).Trim()
+                : string.Empty;
+            var installerManagerRoot = File.Exists(Path.Combine(installPath, "manager-working-directory.txt"))
+                ? File.ReadAllText(Path.Combine(installPath, "manager-working-directory.txt")).Trim()
+                : string.Empty;
             if (execution.ExitCode != 0 ||
                 !File.Exists(installerMarker) ||
                 File.Exists(failureMarkerPath) ||
                 !File.Exists(updaterLogPath) ||
+                !inheritedManagerRoot.Equals(expectedManagerRoot, StringComparison.OrdinalIgnoreCase) ||
+                !installerManagerRoot.Equals(expectedManagerRoot, StringComparison.OrdinalIgnoreCase) ||
                 !File.ReadAllText(updaterLogPath).Contains(
                     "Installation completed. Restarting the updated application.",
                     StringComparison.Ordinal))
@@ -595,6 +612,7 @@ param(
     [Parameter(Mandatory = $true)][string]$CleanupRoot,
     [Parameter(Mandatory = $true)][string]$InstallPath,
     [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+    [Parameter(Mandatory = $true)][string]$ManagerRoot,
     [Parameter(Mandatory = $true)][string]$CurrentExecutablePath,
     [Parameter(Mandatory = $true)][string]$UpdaterLogPath,
     [Parameter(Mandatory = $true)][string]$InstallerLogPath,
@@ -603,6 +621,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $exitCode = 0
+$managerRoot = [IO.Path]::GetFullPath($ManagerRoot)
+$env:CODEX_ACCOUNT_MANAGER_HOME = $managerRoot
+$rollbackExecutablePath = Join-Path $CleanupRoot 'rollback-CodexAccountManager.exe'
 
 function Write-UpdaterLog {
     param([Parameter(Mandatory = $true)][string]$Message)
@@ -625,9 +646,12 @@ try {
 
     Write-UpdaterLog 'Previous process exited. Starting package installer.'
     if (Test-Path -LiteralPath $CurrentExecutablePath -PathType Leaf) {
+        Copy-Item -LiteralPath $CurrentExecutablePath -Destination $rollbackExecutablePath -Force
+        Write-UpdaterLog 'Saved the previous executable for rollback.'
         try {
             $shutdownProcess = Start-Process -FilePath $CurrentExecutablePath `
-                -ArgumentList '--shutdown-local-pat-gateway' -Wait -PassThru
+                -ArgumentList '--shutdown-local-pat-gateway' -WorkingDirectory $WorkingDirectory `
+                -Wait -PassThru
             Write-UpdaterLog ('Gateway shutdown command exited with code {0}.' -f $shutdownProcess.ExitCode)
         }
         catch {
@@ -654,7 +678,7 @@ try {
     $childPowerShell = Join-Path $PSHOME 'powershell.exe'
     & $childPowerShell -NoLogo -NoProfile -ExecutionPolicy Bypass -File $InstallerPath `
         -Quiet -NoLaunch -InstallPath $InstallPath `
-        -ManagerWorkingDirectory $WorkingDirectory -LogPath $InstallerLogPath
+        -ManagerWorkingDirectory $managerRoot -LogPath $InstallerLogPath
     $installerExitCode = $LASTEXITCODE
     if ($installerExitCode -ne 0) {
         throw ('Package installer exited with code {0}.' -f $installerExitCode)
@@ -674,8 +698,29 @@ catch {
     $failure = $_.Exception.Message
     try { Set-Content -LiteralPath $FailureMarkerPath -Value $failure -Encoding UTF8 } catch { }
     try { Write-UpdaterLog ('Update failed: ' + $failure) } catch { }
-    if (Test-Path -LiteralPath $CurrentExecutablePath -PathType Leaf) {
-        try { Start-Process -FilePath $CurrentExecutablePath -WorkingDirectory $WorkingDirectory | Out-Null } catch { }
+    $fallbackExecutablePath = $null
+    if (Test-Path -LiteralPath $rollbackExecutablePath -PathType Leaf) {
+        try {
+            Copy-Item -LiteralPath $rollbackExecutablePath -Destination $CurrentExecutablePath -Force
+            $fallbackExecutablePath = $CurrentExecutablePath
+            Write-UpdaterLog 'Restored the previous executable after the update failure.'
+        }
+        catch {
+            $fallbackExecutablePath = $rollbackExecutablePath
+            try { Write-UpdaterLog ('Could not restore the previous executable in place: ' + $_.Exception.Message) } catch { }
+        }
+    }
+    elseif (Test-Path -LiteralPath $CurrentExecutablePath -PathType Leaf) {
+        $fallbackExecutablePath = $CurrentExecutablePath
+    }
+    if ($fallbackExecutablePath) {
+        try {
+            Start-Process -FilePath $fallbackExecutablePath -WorkingDirectory $WorkingDirectory | Out-Null
+            Write-UpdaterLog 'Restarted the previous application after the update failure.'
+        }
+        catch {
+            try { Write-UpdaterLog ('Could not restart the previous application: ' + $_.Exception.Message) } catch { }
+        }
     }
 }
 finally {

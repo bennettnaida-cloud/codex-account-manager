@@ -122,10 +122,31 @@ internal static class LocalPatGatewayControl
             Encoding.UTF8.GetBytes(uri.AbsoluteUri)));
     }
 
+    internal static bool TryLoadSecretForRoot(string? rootPath, out string secret)
+    {
+        secret = string.Empty;
+        if (string.IsNullOrWhiteSpace(rootPath))
+        {
+            return false;
+        }
+
+        try
+        {
+            return TryReadSecret(GetSecretPath(Path.GetFullPath(rootPath)), out secret);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;
+        }
+    }
+
     private static string GetSecretPath()
     {
-        return Path.Combine(new AccountStore().RootPath, ".cache", SecretFileName);
+        return GetSecretPath(new AccountStore().RootPath);
     }
+
+    private static string GetSecretPath(string rootPath) =>
+        Path.Combine(rootPath, ".cache", SecretFileName);
 
     private static bool TryReadSecret(string path, out string secret)
     {
