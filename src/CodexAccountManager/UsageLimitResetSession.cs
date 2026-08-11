@@ -157,21 +157,27 @@ public sealed class UsageLimitResetSession : IAsyncDisposable
     {
         long? availableCount = null;
         var credits = new List<UsageLimitResetCredit>();
-        if (result["rateLimitResetCredits"] is JsonObject resetSummary)
+        if (ReadProperty(
+                result,
+                "rateLimitResetCredits",
+                "rate_limit_reset_credits") is JsonObject resetSummary)
         {
-            availableCount = ReadLong(resetSummary["availableCount"]);
-            if (resetSummary["credits"] is JsonArray creditRows)
+            availableCount = ReadLong(ReadProperty(
+                resetSummary,
+                "availableCount",
+                "available_count"));
+            if (ReadProperty(resetSummary, "credits") is JsonArray creditRows)
             {
                 foreach (var node in creditRows.OfType<JsonObject>())
                 {
                     credits.Add(new UsageLimitResetCredit(
-                        ReadString(node["id"]),
-                        ReadString(node["resetType"]),
-                        ReadString(node["status"]),
-                        ReadDateTimeOffset(node["grantedAt"]),
-                        ReadDateTimeOffset(node["expiresAt"]),
-                        ReadString(node["title"]),
-                        ReadString(node["description"])));
+                        ReadString(ReadProperty(node, "id")),
+                        ReadString(ReadProperty(node, "resetType", "reset_type")),
+                        ReadString(ReadProperty(node, "status")),
+                        ReadDateTimeOffset(ReadProperty(node, "grantedAt", "granted_at")),
+                        ReadDateTimeOffset(ReadProperty(node, "expiresAt", "expires_at")),
+                        ReadString(ReadProperty(node, "title")),
+                        ReadString(ReadProperty(node, "description"))));
                 }
             }
         }
@@ -359,6 +365,28 @@ public sealed class UsageLimitResetSession : IAsyncDisposable
             throw new InvalidOperationException("Unavailable reset-credit state was treated as zero.");
         }
 
+        var snakeCase = ParseRateLimits(JsonNode.Parse(
+            """
+            {
+              "rate_limit_reset_credits": {
+                "available_count": 1,
+                "credits": [{
+                  "id": "credit-snake",
+                  "reset_type": "codexRateLimits",
+                  "status": "available",
+                  "granted_at": 1781654400,
+                  "expires_at": 1784246400
+                }]
+              }
+            }
+            """)!.AsObject());
+        if (snakeCase.AvailableCount != 1 ||
+            snakeCase.Credits is not [{ Id: "credit-snake", ResetType: "codexRateLimits" }])
+        {
+            throw new InvalidOperationException(
+                "Usage-limit reset parser did not accept the safe snake_case compatibility shape.");
+        }
+
         var readRequest = BuildRequest(2, "account/rateLimits/read", null);
         var consumeRequest = BuildRequest(
             3,
@@ -466,6 +494,18 @@ public sealed class UsageLimitResetSession : IAsyncDisposable
             ? "辅助进程已退出。"
             : _maskSensitive(stderr.Trim());
         return $"Codex 官方用量接口 {method} 无法继续：{detail}";
+    }
+
+    private static JsonNode? ReadProperty(JsonObject source, params string[] propertyNames)
+    {
+        foreach (var propertyName in propertyNames)
+        {
+            if (source.TryGetPropertyValue(propertyName, out var value))
+            {
+                return value;
+            }
+        }
+        return null;
     }
 
     private static string ReadString(JsonNode? node)

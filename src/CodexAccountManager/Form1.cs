@@ -191,8 +191,10 @@ public partial class Form1 : Form
     // not useful if it repeatedly walks the session tree and rebuilds an already-current report.
     private static readonly TimeSpan QuotaLogRefreshMinimumInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan QuotaRollingWindowRefreshInterval = TimeSpan.FromSeconds(10);
-    private static readonly TimeSpan OfficialQuotaFocusedRefreshInterval = TimeSpan.FromSeconds(15);
-    private static readonly TimeSpan OfficialQuotaBackgroundRefreshInterval = TimeSpan.FromMinutes(1);
+    // Only the account launched during this manager session is eligible for an automatic
+    // official read. Opening the quota workspace and loading an account never opt it in.
+    private static readonly TimeSpan OfficialQuotaActiveRefreshInterval = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan ResetCreditUnavailableRetryDelay = TimeSpan.FromSeconds(1);
     private readonly AccountStore _store = new();
     private readonly CodexCliService _codex = new();
     private readonly SharedHistoryService _sharedHistory = new();
@@ -255,6 +257,8 @@ public partial class Form1 : Form
         new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _officialQuotaRefreshInProgress =
         new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, SemaphoreSlim> _officialQuotaRequestLocks =
+        new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, long> _quotaRuntimeStateGenerations =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _collapsedAccountGroups = new(StringComparer.OrdinalIgnoreCase);
@@ -264,6 +268,7 @@ public partial class Form1 : Form
     private WorkspaceView _activeView = WorkspaceView.AccountSwitch;
     private string? _selectedAccountName;
     private string? _currentAccountName;
+    private string? _launchedOfficialQuotaAccountKey;
     private bool _showAccountDetail;
     private bool _showCodexAppearanceDetail;
     private string _selectedCodexAppearanceId = "preset-midnight-aurora";
@@ -1580,12 +1585,23 @@ public partial class Form1 : Form
             return;
         }
 
-        // Refresh each ChatGPT-backed account independently.  The app's selected account is
-        // only a UI focus; it must never decide which PAT receives the quota request.
-        foreach (var account in _accounts.Where(candidate => !candidate.IsCompatibleApi))
+        if (string.IsNullOrWhiteSpace(_launchedOfficialQuotaAccountKey))
         {
-            StartOfficialQuotaRefreshAfterLaunch(account);
+            return;
         }
+
+        var account = _accounts.FirstOrDefault(candidate =>
+            !candidate.IsCompatibleApi &&
+            QuotaAccountIdentity.CreateKey(candidate).Equals(
+                _launchedOfficialQuotaAccountKey,
+                StringComparison.Ordinal));
+        if (account == null)
+        {
+            _launchedOfficialQuotaAccountKey = null;
+            return;
+        }
+
+        StartOfficialQuotaRefresh(account);
     }
 
     private void RefreshQuotaUsageIfNeeded()
@@ -7192,7 +7208,41 @@ public partial class Form1 : Form
 
     private string GetResetButtonText(AccountRecord account)
     {
-        return $"可重置 {GetAvailableResetCount(account)} 次";
+        if (!_resetCreditState.TryGetValue(QuotaAccountIdentity.CreateKey(account), out var state))
+        {
+            return "重置次数 未查询";
+        }
+
+        return state.Status switch
+        {
+            ResetCreditStatus.Known => $"可重置 {Math.Max(0, state.Count)} 次",
+            ResetCreditStatus.Querying => "正在查询次数…",
+            ResetCreditStatus.Unavailable => "官方未提供次数",
+            ResetCreditStatus.Failed => "重置次数查询失败",
+            ResetCreditStatus.Resetting => "正在执行重置…",
+            _ => "重置次数 未查询"
+        };
+    }
+
+    private string GetResetCreditToolTip(AccountRecord account)
+    {
+        if (!_resetCreditState.TryGetValue(QuotaAccountIdentity.CreateKey(account), out var state))
+        {
+            return "尚未查询；官方未提供与可重置 0 次是两个不同状态。";
+        }
+
+        return state.Status switch
+        {
+            ResetCreditStatus.Known when state.Count > 0 =>
+                "点击后确认并使用一次官方 Codex 用量重置",
+            ResetCreditStatus.Known => "官方明确返回可重置 0 次，不能执行重置。",
+            ResetCreditStatus.Unavailable =>
+                "官方本次没有提供 rateLimitResetCredits；这不等同于可重置 0 次。",
+            ResetCreditStatus.Querying => "正在查询当前账号的重置次数。",
+            ResetCreditStatus.Failed => state.Error ?? "重置次数查询失败，请重试。",
+            ResetCreditStatus.Resetting => "正在执行官方用量重置。",
+            _ => "尚未查询当前账号的重置次数。"
+        };
     }
 
     private bool CanResetUsage(AccountRecord account)
@@ -7237,6 +7287,12 @@ public partial class Form1 : Form
         _officialQuotaRefreshedAt.Remove(accountKey);
         _officialQuotaRefreshAttemptedAt.Remove(accountKey);
         _officialQuotaRefreshInProgress.Remove(accountKey);
+        if (string.Equals(_launchedOfficialQuotaAccountKey, accountKey, StringComparison.Ordinal))
+        {
+            // Re-authentication changes the credential behind this stable directory key.
+            // Require a new successful launch before automatic official reads resume.
+            _launchedOfficialQuotaAccountKey = null;
+        }
         try
         {
             // A token edit reuses the same CODEX_HOME, so the identity key remains stable.
@@ -8175,11 +8231,7 @@ public partial class Form1 : Form
             resetUsage.AccessibleDescription = account.Name;
             resetUsage.Enabled = CanResetUsage(account);
             resetUsage.Click += async (_, _) => await ResetUsageLimitAsync(account);
-            _toolTip.SetToolTip(
-                resetUsage,
-                CanResetUsage(account)
-                    ? "点击后确认并使用一次官方 Codex 用量重置"
-                    : "可重置 0 次；请进入详情查询最新次数");
+            _toolTip.SetToolTip(resetUsage, GetResetCreditToolTip(account));
             row.Controls.Add(resetUsage);
         }
 
@@ -8297,7 +8349,8 @@ public partial class Form1 : Form
             subtitle,
             account.IsCompatibleApi
                 ? "本地 Token 用量按 API 单价估算。"
-                : "官方百分比与重置时间来自手动只读查询；不会调用模型。");
+                : "打开额度页只读本地日志；当前已启动账号每 10 秒自动刷新一次官方百分比，也可以手动查询。"
+        );
         card.Controls.Add(subtitle);
 
         var observed = usage.RateLimitObservedAtUtc.HasValue
@@ -8643,12 +8696,12 @@ public partial class Form1 : Form
 
         var infoLeft = compact ? 18 : 18 + gaugeColumnWidth + 18;
         var infoWidth = compact ? width - 36 : Math.Max(360, width - infoLeft - 18);
-        // The two balanced control rows are intentional: they prevent long
-        // Chinese labels from shrinking and avoid a dense one-line toolbar.
+        // The quota controls use balanced rows so long Chinese labels stay readable. The
+        // explicit real-request test occupies its own row to avoid accidental clicks.
         var stackedActions = !account.IsCompatibleApi;
         var infoBlockHeight = account.IsCompatibleApi
             ? compact ? 224 : 278
-            : compact ? 330 : Math.Clamp(gaugeSize, 390, 420);
+            : compact ? 368 : Math.Clamp(gaugeSize + 88, 478, 508);
         var infoTop = compact
             ? externalStatus.Bottom + 12
             : gauge.Top + Math.Max(0, (gauge.Height - infoBlockHeight) / 2);
@@ -8790,7 +8843,7 @@ public partial class Form1 : Form
             infoCard.Controls.Add(officialQuota);
 
             resetCount = MakeBadge(
-                "可重置 0 次",
+                "重置次数 未查询",
                 officialQuota.Right + actionGap,
                 rowTop,
                 Color.FromArgb(36, _palette.MutedTextColor),
@@ -8830,7 +8883,26 @@ public partial class Form1 : Form
             resetAction.Name = "UsageResetAction";
             resetAction.AccessibleDescription = account.Name;
             resetAction.Click += async (_, _) => await ResetUsageLimitAsync(account);
+            _toolTip.SetToolTip(resetAction, GetResetCreditToolTip(account));
             infoCard.Controls.Add(resetAction);
+
+            var testTop = secondRowTop + controlHeight + (compact ? 8 : 14);
+            var testQuota = MakeActionButton(
+                "测试",
+                horizontalInset,
+                testTop,
+                infoWidth - (horizontalInset * 2),
+                false);
+            testQuota.Height = controlHeight;
+            testQuota.Padding = Padding.Empty;
+            testQuota.TextAlign = ContentAlignment.MiddleCenter;
+            testQuota.UseMnemonic = false;
+            testQuota.Font = new Font(Font.FontFamily, compact ? 8.8F : 9.3F, FontStyle.Bold);
+            testQuota.Click += async (_, _) => await SendMinimalQuotaTestAsync(account);
+            _toolTip.SetToolTip(
+                testQuota,
+                "仅在点击并确认后发送一次真实的最小 Codex 请求；会消耗少量额度，随后只回读当前账号");
+            infoCard.Controls.Add(testQuota);
         }
 
         var binding = new PassiveQuotaMonitorBinding
@@ -9010,18 +9082,23 @@ public partial class Form1 : Form
 
         if (binding.ResetCount != null)
         {
-            var availableCount = GetAvailableResetCount(account);
-            var countColor = availableCount > 0 ? _palette.SuccessColor : _palette.MutedTextColor;
-            UpdateQuotaPill(binding.ResetCount, $"可重置 {availableCount} 次", countColor);
+            var accountKey = QuotaAccountIdentity.CreateKey(account);
+            var hasState = _resetCreditState.TryGetValue(accountKey, out var state);
+            var countText = hasState ? GetResetButtonText(account) : "重置次数 未查询";
+            var countColor = state?.Status switch
+            {
+                ResetCreditStatus.Known when state.Count > 0 => _palette.SuccessColor,
+                ResetCreditStatus.Failed => _palette.WarningColor,
+                ResetCreditStatus.Querying or ResetCreditStatus.Resetting => _palette.PrimaryColor,
+                _ => _palette.MutedTextColor
+            };
+            UpdateQuotaPill(binding.ResetCount, countText, countColor);
+            _toolTip.SetToolTip(binding.ResetCount, GetResetCreditToolTip(account));
         }
         if (binding.ResetAction != null)
         {
             binding.ResetAction.Enabled = CanResetUsage(account);
-            _toolTip.SetToolTip(
-                binding.ResetAction,
-                CanResetUsage(account)
-                    ? "点击后确认并使用一次官方 Codex 用量重置"
-                    : "可重置 0 次，不能执行重置；请先查询最新次数");
+            _toolTip.SetToolTip(binding.ResetAction, GetResetCreditToolTip(account));
         }
     }
 
@@ -10971,8 +11048,7 @@ public partial class Form1 : Form
         ValidateQuotaResetLayoutAtScale(1.5F);
         ValidateQuotaResetLayoutAtScale(2F);
         ModelUsageDistributionControl.ValidateResponsiveLayout();
-        if (OfficialQuotaFocusedRefreshInterval != TimeSpan.FromSeconds(15) ||
-            OfficialQuotaBackgroundRefreshInterval != TimeSpan.FromMinutes(1) ||
+        if (OfficialQuotaActiveRefreshInterval != TimeSpan.FromSeconds(10) ||
             shortUsage.ModelUsage.Count != 3 ||
             longUsage.ModelUsage.Count != 3 ||
             shortUsage.CacheWriteTokens != 240_000L ||
@@ -12471,6 +12547,29 @@ public partial class Form1 : Form
 
     private void StartOfficialQuotaRefreshAfterLaunch(AccountRecord account)
     {
+        if (_formClosed || IsDisposed)
+        {
+            return;
+        }
+
+        // Launching another account immediately removes the previous one from the automatic
+        // refresh scope. Compatible API accounts have no ChatGPT package quota to poll.
+        _launchedOfficialQuotaAccountKey = account.IsCompatibleApi
+            ? null
+            : QuotaAccountIdentity.CreateKey(account);
+        if (account.IsCompatibleApi)
+        {
+            return;
+        }
+
+        // A successful explicit launch deserves one immediate read even if the same account
+        // was launched less than ten seconds ago. Subsequent background reads remain throttled.
+        _officialQuotaRefreshAttemptedAt.Remove(_launchedOfficialQuotaAccountKey!);
+        StartOfficialQuotaRefresh(account);
+    }
+
+    private void StartOfficialQuotaRefresh(AccountRecord account)
+    {
         if (account.IsCompatibleApi || _formClosed || IsDisposed)
         {
             return;
@@ -12478,17 +12577,8 @@ public partial class Form1 : Form
 
         var accountKey = QuotaAccountIdentity.CreateKey(account);
         var now = DateTimeOffset.UtcNow;
-        var focused = IsCurrentAccount(account) ||
-                      (_activeView == WorkspaceView.QuotaUsage &&
-                       string.Equals(
-                           _selectedAccountName,
-                           account.Name,
-                           StringComparison.OrdinalIgnoreCase));
-        var refreshInterval = focused
-            ? OfficialQuotaFocusedRefreshInterval
-            : OfficialQuotaBackgroundRefreshInterval;
         if (_officialQuotaRefreshAttemptedAt.TryGetValue(accountKey, out var lastAttempt) &&
-            now - lastAttempt < refreshInterval)
+            now - lastAttempt < OfficialQuotaActiveRefreshInterval)
         {
             return;
         }
@@ -12510,12 +12600,15 @@ public partial class Form1 : Form
         try
         {
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-            await using var session = await _codex.OpenUsageLimitResetSessionAsync(
+            var info = await ReadUsageLimitResetInfoAsync(
                 account,
                 fastFail: true,
                 cancellationToken: timeout.Token);
-            var info = await session.ReadAsync(timeout.Token);
-            if (!IsQuotaRuntimeStateCurrent(accountKey, generation))
+            if (!IsQuotaRuntimeStateCurrent(accountKey, generation) ||
+                !string.Equals(
+                    _launchedOfficialQuotaAccountKey,
+                    accountKey,
+                    StringComparison.Ordinal))
             {
                 return;
             }
@@ -12565,6 +12658,67 @@ public partial class Form1 : Form
         }
     }
 
+    private SemaphoreSlim GetOfficialQuotaRequestLock(AccountRecord account)
+    {
+        var accountKey = QuotaAccountIdentity.CreateKey(account);
+        lock (_officialQuotaRequestLocks)
+        {
+            if (!_officialQuotaRequestLocks.TryGetValue(accountKey, out var requestLock))
+            {
+                requestLock = new SemaphoreSlim(1, 1);
+                _officialQuotaRequestLocks[accountKey] = requestLock;
+            }
+            return requestLock;
+        }
+    }
+
+    private async Task<UsageLimitResetInfo> ReadUsageLimitResetInfoAsync(
+        AccountRecord account,
+        bool fastFail = false,
+        bool retryUnavailableResetCredits = false,
+        CancellationToken cancellationToken = default)
+    {
+        var requestLock = GetOfficialQuotaRequestLock(account);
+        await requestLock.WaitAsync(cancellationToken);
+        try
+        {
+            await using var session = await _codex.OpenUsageLimitResetSessionAsync(
+                account,
+                fastFail,
+                cancellationToken);
+            var first = await session.ReadAsync(cancellationToken);
+            if (!retryUnavailableResetCredits || first.IsAvailable)
+            {
+                return first;
+            }
+
+            // Some workspaces publish earned-reset metadata shortly after the ordinary
+            // quota windows. Retry only for explicit user actions; the ten-second background
+            // refresh deliberately performs a single read so its request rate never doubles.
+            await Task.Delay(ResetCreditUnavailableRetryDelay, cancellationToken);
+            var retry = await session.ReadAsync(cancellationToken);
+            return MergeUsageLimitResetReads(first, retry);
+        }
+        finally
+        {
+            requestLock.Release();
+        }
+    }
+
+    private static UsageLimitResetInfo MergeUsageLimitResetReads(
+        UsageLimitResetInfo first,
+        UsageLimitResetInfo retry)
+    {
+        return retry with
+        {
+            Primary = retry.Primary ?? first.Primary,
+            Secondary = retry.Secondary ?? first.Secondary,
+            CreditBalance = retry.CreditBalance ?? first.CreditBalance,
+            IndividualLimit = retry.IndividualLimit ?? first.IndividualLimit,
+            PlanType = string.IsNullOrWhiteSpace(retry.PlanType) ? first.PlanType : retry.PlanType
+        };
+    }
+
     private async Task QueryUsageLimitResetAsync(AccountRecord account)
     {
         if (account.IsCompatibleApi)
@@ -12585,19 +12739,23 @@ public partial class Form1 : Form
         await RunBusyAsync(async () =>
         {
             _statusBox.Text = $"正在只读刷新 {account.Name} 的官方额度……";
-            await using var session = await _codex.OpenUsageLimitResetSessionAsync(account);
-            var info = await session.ReadAsync();
+            var info = await ReadUsageLimitResetInfoAsync(
+                account,
+                retryUnavailableResetCredits: true);
             CacheUsageLimitResetInfo(account, info);
 
             if (!info.IsAvailable)
             {
+                var quotaText = FormatOfficialQuotaReadSummary(info);
                 const string unavailable =
-                    "官方接口没有为这个账号返回重置次数信息。账号可能暂不支持该功能，或当前登录凭据无权读取。";
-                _statusBox.Text = $"账号：{account.Name}\r\n{unavailable}";
+                    "本次官方额度查询已成功，但 rateLimitResetCredits 为 null，" +
+                    "客户端已间隔 1 秒重读一次，结果仍为 null，因此官方当前没有为这个账号提供重置次数。" +
+                    "这不等同于 0 次，也不能仅凭此结果判断 PAT 永久不支持。";
+                _statusBox.Text = $"账号：{account.Name}\r\n{quotaText}\r\n{unavailable}";
                 MessageBox.Show(
                     this,
-                    unavailable,
-                    "重置次数不可用",
+                    $"账号：{account.Name}\n{quotaText}\n\n{unavailable}",
+                    "查询完成：官方未提供重置次数",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Information);
                 return;
@@ -12638,11 +12796,84 @@ public partial class Form1 : Form
         RenderCards();
     }
 
+    private async Task SendMinimalQuotaTestAsync(AccountRecord account)
+    {
+        if (account.IsCompatibleApi)
+        {
+            MessageBox.Show(
+                this,
+                "兼容 API/API Key 账号不使用 ChatGPT/Codex 套餐额度测试。",
+                "该账号不适用",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        var confirmation = MessageBox.Show(
+            this,
+            $"将使用账号“{account.Name}”发送一次真实的最小 Codex 请求，只要求回复 OK。\n\n" +
+            "这会消耗少量真实额度，但使用临时会话、只读沙箱，不会生成聊天记录。" +
+            "请求结束后只回读这个账号的官方额度。是否继续？",
+            "确认发送小额测试",
+            MessageBoxButtons.OKCancel,
+            MessageBoxIcon.Warning,
+            MessageBoxDefaultButton.Button2);
+        if (confirmation != DialogResult.OK)
+        {
+            return;
+        }
+
+        await RunBusyAsync(async () =>
+        {
+            _statusBox.Text = $"正在使用 {account.Name} 发送小额测试请求……";
+            var test = await _codex.SendMinimalQuotaTestAsync(account);
+            _statusBox.Text = $"{account.Name} 的测试请求已完成，正在只回读该账号额度……";
+            var info = await ReadUsageLimitResetInfoAsync(
+                account,
+                retryUnavailableResetCredits: true);
+            CacheUsageLimitResetInfo(account, info);
+
+            var tokenText = test.TotalTokens is { } totalTokens
+                ? $"本次 CLI 报告共 {totalTokens:N0} token" +
+                  (test.InputTokens is { } input && test.OutputTokens is { } output
+                      ? $"（输入 {input:N0}，输出 {output:N0}）"
+                      : string.Empty)
+                : "测试请求已成功（当前 CLI 未返回可解析的 token 汇总）";
+            var quotaText = FormatOfficialQuotaReadSummary(info);
+            var resetText = info.AvailableCount is { } count
+                ? $"官方可重置 {Math.Max(0, count)} 次"
+                : "官方本次未提供重置次数（不是 0 次）";
+            var resultText =
+                $"账号：{account.Name}\n{tokenText}\n{quotaText}\n{resetText}\n\n" +
+                "额度百分比按整数返回，本次消耗很小时数值可能暂时看不出变化。";
+            _statusBox.Text = resultText.Replace('\n', ' ');
+            MessageBox.Show(
+                this,
+                resultText,
+                "小额测试完成",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        });
+
+        RenderCards();
+    }
+
+    private static string FormatOfficialQuotaReadSummary(UsageLimitResetInfo info)
+    {
+        var primaryText = info.Primary?.UsedPercent is { } primaryUsed
+            ? $"主额度剩余 {Math.Max(0, 100 - primaryUsed)}%"
+            : "主额度未返回";
+        var secondaryText = info.Secondary?.UsedPercent is { } secondaryUsed
+            ? $"；次额度剩余 {Math.Max(0, 100 - secondaryUsed)}%"
+            : string.Empty;
+        return primaryText + secondaryText;
+    }
+
     private async Task ResetUsageLimitAsync(AccountRecord account)
     {
         if (!CanResetUsage(account))
         {
-            _statusBox.Text = $"账号 {account.Name} 当前可重置 0 次，不能执行重置。请进入详情查询最新次数。";
+            _statusBox.Text = $"账号 {account.Name}：{GetResetCreditToolTip(account)}";
             return;
         }
 
@@ -12653,91 +12884,100 @@ public partial class Form1 : Form
         await RunBusyAsync(async () =>
         {
             _statusBox.Text = $"正在重新确认 {account.Name} 的官方可重置次数……";
-            await using var session = await _codex.OpenUsageLimitResetSessionAsync(account);
-            var info = await session.ReadAsync();
-            CacheUsageLimitResetInfo(account, info);
-
-            var availableCount = info.IsAvailable
-                ? Math.Max(0, info.AvailableCount ?? 0)
-                : 0;
-            if (!info.IsAvailable || availableCount == 0)
-            {
-                var unavailableText = info.IsAvailable
-                    ? $"账号 {account.Name} 当前可重置 0 次，未发送重置请求。"
-                    : "官方接口没有返回可重置次数，未发送重置请求。";
-                _statusBox.Text = unavailableText;
-                MessageBox.Show(
-                    this,
-                    unavailableText,
-                    "不能执行重置",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Information);
-                return;
-            }
-
-            var credit = info.Credits.FirstOrDefault();
-            var expiryText = credit?.ExpiresAtUtc is { } expiresAt
-                ? $"\n该次数到期时间：{expiresAt.ToLocalTime():yyyy-MM-dd HH:mm}"
-                : "";
-            var confirmation = MessageBox.Show(
-                this,
-                $"账号：{account.Name}\n当前可重置：{availableCount} 次{expiryText}\n\n" +
-                "这会消耗一次官方获得的 reset credit，并重置当前符合条件的 Codex 用量窗口。" +
-                "该操作不可撤销，也不是清空本地 Token 统计或重连次数。\n\n确定现在使用一次吗？",
-                "确认使用用量重置次数",
-                MessageBoxButtons.OKCancel,
-                MessageBoxIcon.Warning,
-                MessageBoxDefaultButton.Button2);
-            if (confirmation != DialogResult.OK)
-            {
-                _statusBox.Text = $"已取消；账号 {account.Name} 仍有 {availableCount} 次可用重置。";
-                return;
-            }
-
-            var idempotencyKey = Guid.NewGuid().ToString();
-            SetResetCreditState(account, ResetCreditStatus.Resetting, availableCount);
-            _statusBox.Text = $"正在为 {account.Name} 使用一次官方用量重置……";
-            var outcome = await session.ConsumeAsync(idempotencyKey);
-
-            UsageLimitResetInfo? refreshed = null;
-            string? refreshWarning = null;
+            var requestLock = GetOfficialQuotaRequestLock(account);
+            await requestLock.WaitAsync();
             try
             {
-                refreshed = await session.ReadAsync();
-                CacheUsageLimitResetInfo(account, refreshed);
-            }
-            catch (Exception ex)
-            {
-                refreshWarning = "兑换结果已返回，但重新查询剩余次数失败：" + ex.Message;
-            }
+                await using var session = await _codex.OpenUsageLimitResetSessionAsync(account);
+                var info = await session.ReadAsync();
+                CacheUsageLimitResetInfo(account, info);
 
-            var outcomeText = outcome switch
+                var availableCount = info.IsAvailable
+                    ? Math.Max(0, info.AvailableCount ?? 0)
+                    : 0;
+                if (!info.IsAvailable || availableCount == 0)
+                {
+                    var unavailableText = info.IsAvailable
+                        ? $"账号 {account.Name} 当前可重置 0 次，未发送重置请求。"
+                        : "官方本次没有提供重置次数（不是 0 次），未发送重置请求。";
+                    _statusBox.Text = unavailableText;
+                    MessageBox.Show(
+                        this,
+                        unavailableText,
+                        "不能执行重置",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+                    return;
+                }
+
+                var credit = info.Credits.FirstOrDefault();
+                var expiryText = credit?.ExpiresAtUtc is { } expiresAt
+                    ? $"\n该次数到期时间：{expiresAt.ToLocalTime():yyyy-MM-dd HH:mm}"
+                    : "";
+                var confirmation = MessageBox.Show(
+                    this,
+                    $"账号：{account.Name}\n当前可重置：{availableCount} 次{expiryText}\n\n" +
+                    "这会消耗一次官方获得的 reset credit，并重置当前符合条件的 Codex 用量窗口。" +
+                    "该操作不可撤销，也不是清空本地 Token 统计或重连次数。\n\n确定现在使用一次吗？",
+                    "确认使用用量重置次数",
+                    MessageBoxButtons.OKCancel,
+                    MessageBoxIcon.Warning,
+                    MessageBoxDefaultButton.Button2);
+                if (confirmation != DialogResult.OK)
+                {
+                    _statusBox.Text = $"已取消；账号 {account.Name} 仍有 {availableCount} 次可用重置。";
+                    return;
+                }
+
+                var idempotencyKey = Guid.NewGuid().ToString();
+                SetResetCreditState(account, ResetCreditStatus.Resetting, availableCount);
+                _statusBox.Text = $"正在为 {account.Name} 使用一次官方用量重置……";
+                var outcome = await session.ConsumeAsync(idempotencyKey);
+
+                UsageLimitResetInfo? refreshed = null;
+                string? refreshWarning = null;
+                try
+                {
+                    refreshed = await session.ReadAsync();
+                    CacheUsageLimitResetInfo(account, refreshed);
+                }
+                catch (Exception ex)
+                {
+                    refreshWarning = "兑换结果已返回，但重新查询剩余次数失败：" + ex.Message;
+                }
+
+                var outcomeText = outcome switch
+                {
+                    UsageLimitResetOutcome.Reset => "用量重置成功。",
+                    UsageLimitResetOutcome.AlreadyRedeemed => "同一次重置请求已经成功处理，没有重复扣除次数。",
+                    UsageLimitResetOutcome.NothingToReset => "当前没有符合条件的用量窗口需要重置，因此没有执行重置。",
+                    UsageLimitResetOutcome.NoCredit => "官方返回当前没有可用的重置次数。",
+                    _ => "用量重置请求已结束。"
+                };
+                var remainingText = refreshed?.AvailableCount is { } remaining
+                    ? $"剩余可用：{remaining} 次。"
+                    : "剩余次数暂时未知。";
+                var displayNote = outcome is UsageLimitResetOutcome.Reset or UsageLimitResetOutcome.AlreadyRedeemed
+                    ? "额度卡已采用最新官方结果；本地费用/Token 历史不会被清空。"
+                    : "";
+                var finalText = string.Join(
+                    Environment.NewLine,
+                    new[] { outcomeText, remainingText, displayNote, refreshWarning }
+                        .Where(value => !string.IsNullOrWhiteSpace(value)));
+                _statusBox.Text = $"账号：{account.Name}\r\n{finalText}";
+                MessageBox.Show(
+                    this,
+                    finalText,
+                    "用量重置结果",
+                    MessageBoxButtons.OK,
+                    outcome is UsageLimitResetOutcome.Reset or UsageLimitResetOutcome.AlreadyRedeemed
+                        ? MessageBoxIcon.Information
+                        : MessageBoxIcon.Warning);
+            }
+            finally
             {
-                UsageLimitResetOutcome.Reset => "用量重置成功。",
-                UsageLimitResetOutcome.AlreadyRedeemed => "同一次重置请求已经成功处理，没有重复扣除次数。",
-                UsageLimitResetOutcome.NothingToReset => "当前没有符合条件的用量窗口需要重置，因此没有执行重置。",
-                UsageLimitResetOutcome.NoCredit => "官方返回当前没有可用的重置次数。",
-                _ => "用量重置请求已结束。"
-            };
-            var remainingText = refreshed?.AvailableCount is { } remaining
-                ? $"剩余可用：{remaining} 次。"
-                : "剩余次数暂时未知。";
-            var displayNote = outcome is UsageLimitResetOutcome.Reset or UsageLimitResetOutcome.AlreadyRedeemed
-                ? "额度卡已采用最新官方结果；本地费用/Token 历史不会被清空。"
-                : "";
-            var finalText = string.Join(
-                Environment.NewLine,
-                new[] { outcomeText, remainingText, displayNote, refreshWarning }
-                    .Where(value => !string.IsNullOrWhiteSpace(value)));
-            _statusBox.Text = $"账号：{account.Name}\r\n{finalText}";
-            MessageBox.Show(
-                this,
-                finalText,
-                "用量重置结果",
-                MessageBoxButtons.OK,
-                outcome is UsageLimitResetOutcome.Reset or UsageLimitResetOutcome.AlreadyRedeemed
-                    ? MessageBoxIcon.Information
-                    : MessageBoxIcon.Warning);
+                requestLock.Release();
+            }
         });
 
         if (_resetCreditState.TryGetValue(QuotaAccountIdentity.CreateKey(account), out var state) &&
@@ -12897,10 +13137,9 @@ public partial class Form1 : Form
                     cancellation.Token);
                 CloseLinkDialog();
                 _statusCache[account.Name] = status;
-                var quotaStatus = await QueryQuotaOnceAfterExplicitLoginAsync(account);
-                var quotaSummary = quotaStatus.Replace("\r", " ", StringComparison.Ordinal)
-                    .Replace("\n", " ", StringComparison.Ordinal);
-                _statusBox.Text = $"{account.Name}：已通过 ChatGPT 官方网页登录。 {quotaSummary}";
+                _statusBox.Text =
+                    $"{account.Name}：已通过 ChatGPT 官方网页登录。" +
+                    "登录完成后未查询官方额度；启动该账号时会自动刷新，也可以在额度详情中手动查询。";
                 _toolTip.SetToolTip(
                     _statusBox,
                     $"凭据目录：{account.CodexHome}\n状态：{status.Text}\n官方 Codex 会在使用过程中自动续期登录。"
@@ -12942,40 +13181,14 @@ public partial class Form1 : Form
             var status = await _codex.LoginWithAccessTokenAsync(account, token);
             _store.WriteTokenMetadata(account.Name, expiry);
             _statusCache[account.Name] = status;
-            var quotaStatus = await QueryQuotaOnceAfterExplicitLoginAsync(account);
-            var quotaSummary = quotaStatus.Replace("\r", " ", StringComparison.Ordinal)
-                .Replace("\n", " ", StringComparison.Ordinal);
-            _statusBox.Text = $"{account.Name}：{successMessage.Trim()} {quotaSummary}";
+            _statusBox.Text =
+                $"{account.Name}：{successMessage.Trim()} " +
+                "登录完成后未查询官方额度；启动该账号时会自动刷新，也可以在额度详情中手动查询。";
             _toolTip.SetToolTip(
                 _statusBox,
                 $"凭据目录：{account.CodexHome}\n状态：{status.Text}\nToken 到期：{_store.GetExpiryLabel(account.Name)}");
             RenderCards();
         });
-    }
-
-    private async Task<string> QueryQuotaOnceAfterExplicitLoginAsync(AccountRecord account)
-    {
-        try
-        {
-            await using var session = await _codex.OpenUsageLimitResetSessionAsync(account);
-            var info = await session.ReadAsync();
-            CacheUsageLimitResetInfo(account, info);
-            var detectedType = AccountQuotaLimitType.Detect(
-                info.Primary?.WindowMinutes,
-                info.Secondary?.WindowMinutes);
-            var typeText = detectedType == AccountQuotaLimitType.Unknown
-                ? "待识别（官方本次未返回窗口时长，正常使用后会从本地日志继续识别）"
-                : GetQuotaLimitTypeLabel(detectedType);
-            var resetText = info.AvailableCount.HasValue
-                ? $"；可重置 {Math.Max(0, info.AvailableCount.Value)} 次"
-                : "；可重置次数暂不可用";
-            return $"额度类型：{typeText}{resetText}（登录成功后仅自动查询本次）";
-        }
-        catch (Exception ex)
-        {
-            return "额度类型：待识别（登录成功，但本次只读额度查询失败；不会自动重试）\r\n" +
-                   "查询说明：" + ex.Message;
-        }
     }
 
     private static AccountRecord CreateAccountFromDialog(

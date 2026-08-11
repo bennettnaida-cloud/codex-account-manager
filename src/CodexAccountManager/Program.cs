@@ -193,6 +193,7 @@ static class Program
             AccountStore.ValidateOfficialOAuthAccountStorage();
             AccountStore.ValidatePermanentAccountDeletion();
             UsageLimitResetSession.ValidateProtocolParsing();
+            CodexCliService.ValidateMinimalQuotaTestParsing();
             QuotaSnapshotStore.ValidateAccountIsolation();
             ProbeUsageLedger.ValidateLedger();
             Sub2ApiUsageLedger.ValidateLedger();

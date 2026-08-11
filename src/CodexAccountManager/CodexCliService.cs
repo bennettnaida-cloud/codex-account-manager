@@ -31,6 +31,12 @@ internal sealed class CodexDreamSkinApplyException : InvalidOperationException
     public bool OfficialClientRelaunched { get; }
 }
 
+internal sealed record MinimalQuotaTestResult(
+    long? InputTokens,
+    long? CachedInputTokens,
+    long? OutputTokens,
+    long? TotalTokens);
+
 public sealed partial class CodexCliService
 {
     private readonly CodexAppServerClient _appServer = new();
@@ -91,6 +97,15 @@ public sealed partial class CodexCliService
         "all_proxy"
     ];
     private static readonly string[] ProxyBypassEnvironmentVariableNames = ["NO_PROXY", "no_proxy"];
+    private static readonly string[] CredentialEnvironmentVariableNames =
+    [
+        "OPENAI_API_KEY",
+        "OPENAI_ACCESS_TOKEN",
+        "OPENAI_TOKEN",
+        "CODEX_ACCESS_TOKEN",
+        "CODEX_API_KEY",
+        "AZURE_OPENAI_API_KEY"
+    ];
     private const string CodexLoopbackProxyBypass = "127.0.0.1,localhost,::1";
     private static readonly object SqliteProviderLock = new();
     private static readonly object CompatibleApiPreflightCacheLock = new();
@@ -596,6 +611,139 @@ public sealed partial class CodexCliService
         throw new TimeoutException("Codex 官方用量接口初始化重试后仍然超时。");
     }
 
+    internal async Task<MinimalQuotaTestResult> SendMinimalQuotaTestAsync(AccountRecord account)
+    {
+        ArgumentNullException.ThrowIfNull(account);
+        if (account.IsCompatibleApi)
+        {
+            throw new InvalidOperationException(
+                "兼容 API/API Key 账号不使用 ChatGPT/Codex 套餐额度测试。");
+        }
+
+        if (account.IsOfficialOAuth)
+        {
+            EnsureOfficialOAuthAccountConfig(account);
+            SyncStoredOfficialOAuthAuthToAccount(account);
+        }
+        else
+        {
+            EnsureLocalPatAccountConfig(account);
+            await LocalPatGateway.EnsureRunningAsync();
+        }
+
+        var authPath = Path.Combine(account.CodexHome, AuthFileName);
+        if (!File.Exists(authPath))
+        {
+            throw new FileNotFoundException(
+                $"账号 {account.Name} 没有可用于额度测试的登录凭据。",
+                authPath);
+        }
+
+        const string arguments =
+            "exec --skip-git-repo-check --ephemeral --ignore-rules " +
+            "--sandbox read-only --json --color never " +
+            "-c model_reasoning_effort=low -";
+        var result = await RunCodexAsync(
+            arguments,
+            account.CodexHome,
+            "Reply with exactly OK. Do not call tools.",
+            TimeSpan.FromMinutes(2),
+            clearCredentialEnvironment: true);
+        if (result.ExitCode != 0)
+        {
+            var detail = string.Join(
+                Environment.NewLine,
+                new[] { result.StdErr, result.StdOut }.Where(text => !string.IsNullOrWhiteSpace(text)));
+            if (IsPersonalAccessTokenMetadataRequestFailure(detail))
+            {
+                throw new InvalidOperationException(BuildPersonalAccessTokenNetworkMessage(detail));
+            }
+
+            throw new InvalidOperationException(
+                $"账号 {account.Name} 的小额测试请求失败：" +
+                (string.IsNullOrWhiteSpace(detail) ? "Codex CLI 未返回失败原因。" : detail.Trim()));
+        }
+
+        return ParseMinimalQuotaTestResult(result.StdOut);
+    }
+
+    internal static MinimalQuotaTestResult ParseMinimalQuotaTestResult(string output)
+    {
+        long? inputTokens = null;
+        long? cachedInputTokens = null;
+        long? outputTokens = null;
+        long? totalTokens = null;
+        foreach (var line in (output ?? string.Empty).Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            JsonObject? root;
+            try
+            {
+                root = JsonNode.Parse(line.Trim()) as JsonObject;
+            }
+            catch (JsonException)
+            {
+                continue;
+            }
+
+            var usage = root?["usage"] as JsonObject ??
+                        root?["item"]?["usage"] as JsonObject ??
+                        root?["event"]?["usage"] as JsonObject;
+            if (usage == null)
+            {
+                continue;
+            }
+
+            inputTokens = ReadQuotaTestLong(usage["input_tokens"]) ??
+                          ReadQuotaTestLong(usage["inputTokens"]) ??
+                          inputTokens;
+            cachedInputTokens = ReadQuotaTestLong(usage["cached_input_tokens"]) ??
+                                ReadQuotaTestLong(usage["cachedInputTokens"]) ??
+                                cachedInputTokens;
+            outputTokens = ReadQuotaTestLong(usage["output_tokens"]) ??
+                           ReadQuotaTestLong(usage["outputTokens"]) ??
+                           outputTokens;
+            totalTokens = ReadQuotaTestLong(usage["total_tokens"]) ??
+                          ReadQuotaTestLong(usage["totalTokens"]) ??
+                          totalTokens;
+        }
+
+        totalTokens ??= inputTokens.HasValue || outputTokens.HasValue
+            ? Math.Max(0L, inputTokens ?? 0L) + Math.Max(0L, outputTokens ?? 0L)
+            : null;
+        return new MinimalQuotaTestResult(
+            inputTokens,
+            cachedInputTokens,
+            outputTokens,
+            totalTokens);
+    }
+
+    private static long? ReadQuotaTestLong(JsonNode? node)
+    {
+        if (node is not JsonValue value)
+        {
+            return null;
+        }
+        if (value.TryGetValue<long>(out var longValue))
+        {
+            return longValue;
+        }
+        return value.TryGetValue<int>(out var intValue) ? intValue : null;
+    }
+
+    internal static void ValidateMinimalQuotaTestParsing()
+    {
+        var parsed = ParseMinimalQuotaTestResult(
+            "{\"type\":\"thread.started\",\"thread_id\":\"fixture\"}\n" +
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":120,\"cached_input_tokens\":80,\"output_tokens\":2}}\n");
+        if (parsed.InputTokens != 120 ||
+            parsed.CachedInputTokens != 80 ||
+            parsed.OutputTokens != 2 ||
+            parsed.TotalTokens != 122)
+        {
+            throw new InvalidOperationException("Minimal quota-test usage parsing self-test failed.");
+        }
+    }
+
     internal void EnsureLocalPatAccountConfig(AccountRecord account)
     {
         ArgumentNullException.ThrowIfNull(account);
@@ -646,6 +794,10 @@ public sealed partial class CodexCliService
         };
         startInfo.Environment["CODEX_HOME"] = codexHome;
         startInfo.Environment["CODEX_SQLITE_HOME"] = codexHome;
+        foreach (var variableName in CredentialEnvironmentVariableNames)
+        {
+            startInfo.Environment.Remove(variableName);
+        }
         ApplyProxyEnvironment(startInfo);
 
         var process = new Process { StartInfo = startInfo };
