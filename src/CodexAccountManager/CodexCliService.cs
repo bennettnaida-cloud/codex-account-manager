@@ -722,7 +722,6 @@ public sealed partial class CodexCliService
                 }
             },
             reasoning = new { effort = "low" },
-            max_output_tokens = 256,
             store = false,
             stream = true
         });
@@ -1049,7 +1048,7 @@ public sealed partial class CodexCliService
         if (payload?["model"]?.GetValue<string>() != "gpt-5.6-luna" ||
             payload["stream"]?.GetValue<bool>() != true ||
             payload["store"]?.GetValue<bool>() != false ||
-            payload["max_output_tokens"]?.GetValue<int>() != 256 ||
+            payload["max_output_tokens"] != null ||
             payload["instructions"]?.GetValue<string>() !=
                 "请使用简体中文自然回复用户的问候，并用一句话说明你可以提供什么帮助。不要调用工具，总共不超过三句话。" ||
             payload["input"]?[0]?["content"]?[0]?["text"]?.GetValue<string>() != "你好" ||
