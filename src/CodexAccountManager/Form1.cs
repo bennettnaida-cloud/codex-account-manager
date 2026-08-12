@@ -133,8 +133,8 @@ public partial class Form1 : Form
         public required UsageMetricBinding[] UsageMetrics { get; init; }
         public QuotaProgressBar? MeasurementProgress { get; init; }
         public PillLabel? OfficialQuota { get; init; }
-        public PillLabel? ResetCount { get; init; }
         public Button? ResetAction { get; init; }
+        public Button? TestAction { get; init; }
     }
 
     private sealed class QuotaUsageDetailBinding
@@ -7215,21 +7215,21 @@ public partial class Form1 : Form
             : 0;
     }
 
-    private string GetResetButtonText(AccountRecord account)
+    private string GetResetActionText(AccountRecord account)
     {
         if (!_resetCreditState.TryGetValue(QuotaAccountIdentity.CreateKey(account), out var state))
         {
-            return "重置次数 未查询";
+            return "立即重置（未查询）";
         }
 
         return state.Status switch
         {
-            ResetCreditStatus.Known => $"可重置 {Math.Max(0, state.Count)} 次",
-            ResetCreditStatus.Querying => "正在查询次数…",
-            ResetCreditStatus.Unavailable => "官方未提供次数",
-            ResetCreditStatus.Failed => "重置次数查询失败",
-            ResetCreditStatus.Resetting => "正在执行重置…",
-            _ => "重置次数 未查询"
+            ResetCreditStatus.Known => $"立即重置（{Math.Max(0, state.Count)} 次）",
+            ResetCreditStatus.Querying => "立即重置（查询中）",
+            ResetCreditStatus.Unavailable => "立即重置（次数未知）",
+            ResetCreditStatus.Failed => "立即重置（查询失败）",
+            ResetCreditStatus.Resetting => "正在重置…",
+            _ => "立即重置（未查询）"
         };
     }
 
@@ -8825,8 +8825,8 @@ public partial class Form1 : Form
         }
 
         PillLabel? officialQuota = null;
-        PillLabel? resetCount = null;
         Button? resetAction = null;
+        Button? testAction = null;
         if (!account.IsCompatibleApi)
         {
             var actionGap = compact ? 8 : 12;
@@ -8856,19 +8856,30 @@ public partial class Form1 : Form
             officialQuota.Font = new Font(Font.FontFamily, compact ? 8.6F : 9.2F, FontStyle.Bold);
             infoCard.Controls.Add(officialQuota);
 
-            resetCount = MakeBadge(
-                "重置次数 未查询",
+            var accountKey = QuotaAccountIdentity.CreateKey(account);
+            var testing = _minimalQuotaTestsInProgress.Contains(accountKey);
+            testAction = MakeActionButton(
+                testing ? "测试中…" : "测试",
                 officialQuota.Right + actionGap,
                 rowTop,
-                Color.FromArgb(36, _palette.MutedTextColor),
-                _palette.MutedTextColor);
-            resetCount.Width = countWidth;
-            resetCount.Height = controlHeight;
-            resetCount.Font = new Font(Font.FontFamily, compact ? 8.6F : 9.2F, FontStyle.Bold);
-            infoCard.Controls.Add(resetCount);
+                countWidth,
+                false);
+            testAction.Height = controlHeight;
+            testAction.Padding = Padding.Empty;
+            testAction.TextAlign = ContentAlignment.MiddleCenter;
+            testAction.UseMnemonic = false;
+            testAction.Font = new Font(Font.FontFamily, compact ? 8.9F : 9.4F, FontStyle.Bold);
+            testAction.Name = "MinimalQuotaTestAction";
+            testAction.AccessibleDescription = accountKey;
+            testAction.Enabled = !testing;
+            testAction.Click += async (_, _) => await SendMinimalQuotaTestAsync(account);
+            _toolTip.SetToolTip(
+                testAction,
+                "使用所点账号的独立凭据发送一次轻量问候请求；无需先启动或切换为当前账号，没有凭据时会先引导登录");
+            infoCard.Controls.Add(testAction);
 
             var secondRowTop = stackedActions ? rowTop + controlHeight + (compact ? 8 : 14) : rowTop;
-            var queryLeft = stackedActions ? horizontalInset : resetCount.Right + actionGap;
+            var queryLeft = stackedActions ? horizontalInset : testAction.Right + actionGap;
             var queryResetCount = MakeActionButton(
                 "查询重置次数",
                 queryLeft,
@@ -8887,7 +8898,7 @@ public partial class Form1 : Form
             infoCard.Controls.Add(queryResetCount);
 
             resetAction = MakeActionButton(
-                "立即重置",
+                GetResetActionText(account),
                 queryResetCount.Right + actionGap,
                 secondRowTop,
                 resetWidth,
@@ -8910,8 +8921,8 @@ public partial class Form1 : Form
             UsageMetrics = usageMetricBindings,
             MeasurementProgress = measurementProgress,
             OfficialQuota = officialQuota,
-            ResetCount = resetCount,
-            ResetAction = resetAction
+            ResetAction = resetAction,
+            TestAction = testAction
         };
         panel.Tag = binding;
         UpdatePassiveQuotaMonitor(binding, account, usage, monitoring);
@@ -9076,25 +9087,17 @@ public partial class Form1 : Form
             _toolTip.SetToolTip(binding.OfficialQuota, quotaText);
         }
 
-        if (binding.ResetCount != null)
-        {
-            var accountKey = QuotaAccountIdentity.CreateKey(account);
-            var hasState = _resetCreditState.TryGetValue(accountKey, out var state);
-            var countText = hasState ? GetResetButtonText(account) : "重置次数 未查询";
-            var countColor = state?.Status switch
-            {
-                ResetCreditStatus.Known when state.Count > 0 => _palette.SuccessColor,
-                ResetCreditStatus.Failed => _palette.WarningColor,
-                ResetCreditStatus.Querying or ResetCreditStatus.Resetting => _palette.PrimaryColor,
-                _ => _palette.MutedTextColor
-            };
-            UpdateQuotaPill(binding.ResetCount, countText, countColor);
-            _toolTip.SetToolTip(binding.ResetCount, GetResetCreditToolTip(account));
-        }
         if (binding.ResetAction != null)
         {
             binding.ResetAction.Enabled = CanResetUsage(account);
+            binding.ResetAction.Text = GetResetActionText(account);
             _toolTip.SetToolTip(binding.ResetAction, GetResetCreditToolTip(account));
+        }
+        if (binding.TestAction != null)
+        {
+            var testing = _minimalQuotaTestsInProgress.Contains(QuotaAccountIdentity.CreateKey(account));
+            binding.TestAction.Enabled = !testing;
+            binding.TestAction.Text = testing ? "测试中…" : "测试";
         }
     }
 
@@ -12654,6 +12657,92 @@ public partial class Form1 : Form
         }
     }
 
+    private bool StartOfficialQuotaRefreshAfterMinimalTest(string accountKey, long generation)
+    {
+        if (_formClosed || IsDisposed || !IsQuotaRuntimeStateCurrent(accountKey, generation))
+        {
+            return false;
+        }
+
+        var currentAccount = _accounts.FirstOrDefault(candidate =>
+            QuotaAccountIdentity.CreateKey(candidate).Equals(accountKey, StringComparison.Ordinal));
+        if (currentAccount == null || currentAccount.IsCompatibleApi)
+        {
+            return false;
+        }
+
+        if (!_officialQuotaRefreshInProgress.Add(accountKey))
+        {
+            return true;
+        }
+
+        _officialQuotaRefreshAttemptedAt[accountKey] = DateTimeOffset.UtcNow;
+        _ = RefreshOfficialQuotaAfterMinimalTestAsync(currentAccount, accountKey, generation);
+        return true;
+    }
+
+    private async Task RefreshOfficialQuotaAfterMinimalTestAsync(
+        AccountRecord account,
+        string accountKey,
+        long generation)
+    {
+        try
+        {
+            using var timeout = new CancellationTokenSource(MinimalQuotaPostRefreshTimeout);
+            var info = await ReadUsageLimitResetInfoAsync(
+                account,
+                fastFail: true,
+                retryUnavailableResetCredits: false,
+                preserveRunningGateway: true,
+                cancellationToken: timeout.Token);
+            if (_formClosed || IsDisposed ||
+                !IsQuotaRuntimeStateCurrent(accountKey, generation) ||
+                !_accounts.Any(candidate =>
+                    QuotaAccountIdentity.CreateKey(candidate).Equals(accountKey, StringComparison.Ordinal)))
+            {
+                return;
+            }
+
+            CacheUsageLimitResetInfo(account, info);
+            _officialQuotaRefreshedAt[accountKey] = DateTimeOffset.UtcNow;
+            if (_quotaUsageCache == null || _formClosed || IsDisposed)
+            {
+                return;
+            }
+
+            ApplyLiveRateLimitSnapshots(_quotaUsageCache);
+            UpdateQuotaLimitProfilesFromReport(_quotaUsageCache);
+            RefreshActivePassiveQuotaMonitoring(_quotaUsageCache);
+            if (_activeView != WorkspaceView.QuotaUsage)
+            {
+                return;
+            }
+
+            var updatedInPlace = _showAccountDetail
+                ? TryUpdateQuotaDetailInPlace(_quotaUsageCache)
+                : TryUpdateQuotaUsageInPlace(_quotaUsageCache);
+            if (!updatedInPlace)
+            {
+                RenderCards();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // The model test is already complete; keep the last quota snapshot silently.
+        }
+        catch
+        {
+            // Background quota refresh is best effort. Manual querying remains available.
+        }
+        finally
+        {
+            if (IsQuotaRuntimeStateCurrent(accountKey, generation))
+            {
+                _officialQuotaRefreshInProgress.Remove(accountKey);
+            }
+        }
+    }
+
     private SemaphoreSlim GetOfficialQuotaRequestLock(AccountRecord account)
     {
         var accountKey = QuotaAccountIdentity.CreateKey(account);
@@ -12823,6 +12912,10 @@ public partial class Form1 : Form
             }
 
             await UpdateTokenAsync(account);
+            if (_formClosed || IsDisposed)
+            {
+                return;
+            }
             if (!_codex.HasStoredQuotaTestCredential(account))
             {
                 _statusBox.Text = $"账号 {account.Name} 尚未完成登录，未发送测试请求。";
@@ -12837,7 +12930,7 @@ public partial class Form1 : Form
             "不需要先启动这个账号，也不会切换当前账号。\n\n" +
             "模型会用简体中文自然回复并简单说明可以提供什么帮助，回复最多三句话。" +
             "该请求只发送一次，不调用工具，也不保存会话或生成聊天记录。" +
-            "请求结束后只回读这个账号的官方额度。是否继续？",
+            "模型响应后会立即显示测试结果，并在后台只回读这个账号的官方额度。是否继续？",
             "确认发送小额测试",
             MessageBoxButtons.OKCancel,
             MessageBoxIcon.Warning,
@@ -12852,8 +12945,10 @@ public partial class Form1 : Form
         {
             return;
         }
+        var testGeneration = GetQuotaRuntimeStateGeneration(accountKey);
         RenderCards();
 
+        var testStateCleared = false;
         try
         {
             var progress = new Progress<string>(stage =>
@@ -12864,29 +12959,9 @@ public partial class Form1 : Form
                 }
             });
             var test = await _codex.SendMinimalQuotaTestAsync(account, progress);
-            _statusBox.Text = $"{account.Name}：测试成功，正在快速刷新该账号额度（最多 10 秒）…";
-            UsageLimitResetInfo? info = null;
-            string? quotaWarning = null;
-            try
+            if (_formClosed || IsDisposed)
             {
-                using var refreshTimeout = new CancellationTokenSource(MinimalQuotaPostRefreshTimeout);
-                info = await ReadUsageLimitResetInfoAsync(
-                    account,
-                    fastFail: true,
-                    retryUnavailableResetCredits: false,
-                    preserveRunningGateway: true,
-                    cancellationToken: refreshTimeout.Token);
-                CacheUsageLimitResetInfo(account, info);
-            }
-            catch (OperationCanceledException)
-            {
-                quotaWarning =
-                    $"测试已经成功，但随后刷新官方额度超过 {MinimalQuotaPostRefreshTimeout.TotalSeconds:0} 秒；" +
-                    "额度会由当前账号的后台刷新稍后更新。";
-            }
-            catch (Exception ex)
-            {
-                quotaWarning = "测试已经成功，但随后刷新官方额度失败：" + ex.Message;
+                return;
             }
 
             var tokenText = test.TotalTokens is { } totalTokens
@@ -12895,18 +12970,16 @@ public partial class Form1 : Form
                       ? $"（输入 {input:N0}，输出 {output:N0}）"
                       : string.Empty)
                 : "测试请求已成功（响应未提供 token 汇总）";
-            var quotaText = info == null
-                ? quotaWarning!
-                : FormatOfficialQuotaReadSummary(info);
-            var resetText = info?.AvailableCount is { } count
-                ? $"官方可重置 {Math.Max(0, count)} 次"
-                : info == null
-                    ? "官方重置次数未刷新"
-                    : "官方本次未提供重置次数（不是 0 次）";
+            _minimalQuotaTestsInProgress.Remove(accountKey);
+            testStateCleared = true;
+            RenderCards();
+            var quotaRefreshActive = StartOfficialQuotaRefreshAfterMinimalTest(accountKey, testGeneration);
+            var refreshText = quotaRefreshActive
+                ? "该账号的官方额度正在后台刷新，不会阻塞测试结果，也不会再次发送模型请求。"
+                : "测试期间账号状态发生了变化，因此没有继续回读官方额度。";
             var resultText =
                 $"账号：{account.Name}\n测试模型：{CodexCliService.MinimalQuotaTestModelId}\n" +
-                $"{tokenText}\n{quotaText}\n{resetText}\n\n" +
-                "额度百分比按整数返回，本次消耗很小时数值可能暂时看不出变化。";
+                $"{tokenText}\n\n模型测试已经完成；{refreshText}";
             _statusBox.Text = resultText.Replace('\n', ' ');
             MessageBox.Show(
                 this,
@@ -12917,12 +12990,21 @@ public partial class Form1 : Form
         }
         catch (Exception ex)
         {
-            ShowError(ex.Message);
+            if (!_formClosed && !IsDisposed)
+            {
+                ShowError(ex.Message);
+            }
         }
         finally
         {
-            _minimalQuotaTestsInProgress.Remove(accountKey);
-            RenderCards();
+            if (!testStateCleared)
+            {
+                _minimalQuotaTestsInProgress.Remove(accountKey);
+                if (!_formClosed && !IsDisposed)
+                {
+                    RenderCards();
+                }
+            }
         }
     }
 
