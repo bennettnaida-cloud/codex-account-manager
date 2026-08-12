@@ -49,6 +49,18 @@ internal static partial class ModelCatalogService
     private static ModelCatalogDocument? _current;
 
     internal static string DefaultModel => Current.DefaultModel;
+    internal static string CanonicalDefaultModel
+    {
+        get
+        {
+            var catalog = Current;
+            var configured = catalog.DefaultModel;
+            return catalog.Models.FirstOrDefault(model =>
+                       model.Id.Equals(configured, StringComparison.OrdinalIgnoreCase) ||
+                       model.Aliases.Contains(configured, StringComparer.OrdinalIgnoreCase))
+                   ?.Id ?? configured;
+        }
+    }
     internal static string DefaultReasoningEffort => Current.DefaultReasoningEffort;
 
     internal static ModelCatalogDocument Current
@@ -201,6 +213,7 @@ internal static partial class ModelCatalogService
             RestoreBundled();
             if (File.Exists(_overridePath!) ||
                 Current.CatalogSource.Equals("manual", StringComparison.OrdinalIgnoreCase) ||
+                CanonicalDefaultModel != "gpt-5.6-sol" ||
                 !Current.Models.Take(3).Select(model => model.Id).SequenceEqual(
                     ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
                     StringComparer.OrdinalIgnoreCase))

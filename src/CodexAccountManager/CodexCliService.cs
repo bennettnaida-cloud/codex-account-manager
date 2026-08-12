@@ -69,6 +69,7 @@ public sealed partial class CodexCliService
     private const string DesktopAuthStoreFileName = "auth.json";
     private const string ChatGptAuthMode = "chatgpt";
     private const string ApiKeyAuthMode = "apikey";
+    private const string MinimalQuotaTestModel = "gpt-5.6-luna";
     private const string CompatibleApiPreflightCacheFileName = ".codex-account-manager-api-preflight.json";
     private const string SitesPluginHeader = "[plugins.\"sites@openai-bundled\"]";
     private const int MaxPluginDefaultPromptLength = 128;
@@ -86,6 +87,8 @@ public sealed partial class CodexCliService
     private static readonly TimeSpan CompatibleApiPreflightCacheLifetime = TimeSpan.FromMinutes(30);
     private static readonly TimeSpan CompatibleApiLaunchPreflightTimeout = TimeSpan.FromSeconds(6);
     private static readonly TimeSpan CompatibleApiProxyConnectTimeout = TimeSpan.FromMilliseconds(1200);
+    private static readonly TimeSpan MinimalQuotaTestTimeout = TimeSpan.FromSeconds(25);
+    private const int MinimalQuotaTestResponseMaxBytes = 512 * 1024;
     private const int CompatibleApiModelCatalogMaxBytes = 2 * 1024 * 1024;
     private static readonly string[] ProxyEnvironmentVariableNames =
     [
@@ -149,6 +152,8 @@ public sealed partial class CodexCliService
         return account.IsOfficialOAuth &&
                IsChatGptDesktopAuthJson(Path.Combine(account.CodexHome, AuthFileName));
     }
+
+    internal static string MinimalQuotaTestModelId => MinimalQuotaTestModel;
 
     public bool IsSharedCredentialAlreadySelected(AccountRecord account)
     {
@@ -550,6 +555,7 @@ public sealed partial class CodexCliService
     public async Task<UsageLimitResetSession> OpenUsageLimitResetSessionAsync(
         AccountRecord account,
         bool fastFail = false,
+        bool preserveRunningGateway = false,
         CancellationToken cancellationToken = default)
     {
         if (account.IsCompatibleApi)
@@ -565,7 +571,14 @@ public sealed partial class CodexCliService
         else
         {
             EnsureLocalPatAccountConfig(account);
-            await LocalPatGateway.EnsureRunningAsync(cancellationToken);
+            if (preserveRunningGateway)
+            {
+                await LocalPatGateway.EnsureRunningForLightweightTestAsync(cancellationToken);
+            }
+            else
+            {
+                await LocalPatGateway.EnsureRunningAsync(cancellationToken);
+            }
         }
 
         var authPath = Path.Combine(account.CodexHome, AuthFileName);
@@ -611,7 +624,39 @@ public sealed partial class CodexCliService
         throw new TimeoutException("Codex 官方用量接口初始化重试后仍然超时。");
     }
 
-    internal async Task<MinimalQuotaTestResult> SendMinimalQuotaTestAsync(AccountRecord account)
+    internal bool HasStoredQuotaTestCredential(AccountRecord account)
+    {
+        ArgumentNullException.ThrowIfNull(account);
+        if (account.IsCompatibleApi)
+        {
+            return false;
+        }
+
+        var authPath = Path.Combine(account.CodexHome, AuthFileName);
+        if (account.IsOfficialOAuth)
+        {
+            return IsChatGptDesktopAuthJson(authPath);
+        }
+
+        try
+        {
+            return !string.IsNullOrWhiteSpace(ReadQuotaTestCredential(account, authPath).Token);
+        }
+        catch (Exception ex) when (
+            ex is FileNotFoundException or
+            InvalidDataException or
+            IOException or
+            UnauthorizedAccessException or
+            JsonException)
+        {
+            return false;
+        }
+    }
+
+    internal async Task<MinimalQuotaTestResult> SendMinimalQuotaTestAsync(
+        AccountRecord account,
+        IProgress<string>? progress = null,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(account);
         if (account.IsCompatibleApi)
@@ -628,7 +673,6 @@ public sealed partial class CodexCliService
         else
         {
             EnsureLocalPatAccountConfig(account);
-            await LocalPatGateway.EnsureRunningAsync();
         }
 
         var authPath = Path.Combine(account.CodexHome, AuthFileName);
@@ -639,32 +683,288 @@ public sealed partial class CodexCliService
                 authPath);
         }
 
-        const string arguments =
-            "exec --skip-git-repo-check --ephemeral --ignore-rules " +
-            "--sandbox read-only --json --color never " +
-            "-c model_reasoning_effort=low -";
-        var result = await RunCodexAsync(
-            arguments,
-            account.CodexHome,
-            "Reply with exactly OK. Do not call tools.",
-            TimeSpan.FromMinutes(2),
-            clearCredentialEnvironment: true);
-        if (result.ExitCode != 0)
+        progress?.Report("正在检查本地网关…");
+        await LocalPatGateway.EnsureRunningForLightweightTestAsync(cancellationToken);
+        var credential = ReadQuotaTestCredential(account, authPath);
+        progress?.Report("正在发送轻量测试请求…");
+        try
         {
-            var detail = string.Join(
-                Environment.NewLine,
-                new[] { result.StdErr, result.StdOut }.Where(text => !string.IsNullOrWhiteSpace(text)));
-            if (IsPersonalAccessTokenMetadataRequestFailure(detail))
-            {
-                throw new InvalidOperationException(BuildPersonalAccessTokenNetworkMessage(detail));
-            }
+            using var handler = new HttpClientHandler { UseProxy = false };
+            using var client = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
+            return await SendMinimalQuotaTestRequestAsync(
+                client,
+                new Uri(LocalPatGateway.ProviderBaseUrl, UriKind.Absolute),
+                account,
+                credential.Token,
+                credential.AccountId,
+                cancellationToken);
+        }
+        catch (OperationCanceledException ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw new TimeoutException(
+                $"账号 {account.Name} 的轻量测试在 {MinimalQuotaTestTimeout.TotalSeconds:0} 秒内没有收到模型响应。" +
+                "本地网关仍保持运行；请切换更稳定的代理节点后重试。",
+                ex);
+        }
+    }
 
-            throw new InvalidOperationException(
-                $"账号 {account.Name} 的小额测试请求失败：" +
-                (string.IsNullOrWhiteSpace(detail) ? "Codex CLI 未返回失败原因。" : detail.Trim()));
+    private static string BuildMinimalQuotaTestPayload() =>
+        JsonSerializer.Serialize(new
+        {
+            model = MinimalQuotaTestModel,
+            instructions = "请使用简体中文自然回复用户的问候，并用一句话说明你可以提供什么帮助。不要调用工具，总共不超过三句话。",
+            input = new[]
+            {
+                new
+                {
+                    role = "user",
+                    content = new[] { new { type = "input_text", text = "你好" } }
+                }
+            },
+            reasoning = new { effort = "low" },
+            max_output_tokens = 256,
+            store = false,
+            stream = true
+        });
+
+    private static async Task<MinimalQuotaTestResult> SendMinimalQuotaTestRequestAsync(
+        HttpClient client,
+        Uri endpoint,
+        AccountRecord account,
+        string credential,
+        string? accountId,
+        CancellationToken cancellationToken)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(MinimalQuotaTestTimeout);
+        using var request = new HttpRequestMessage(HttpMethod.Post, endpoint)
+        {
+            Content = new StringContent(
+                BuildMinimalQuotaTestPayload(),
+                Encoding.UTF8,
+                "application/json")
+        };
+        request.Headers.TryAddWithoutValidation("Authorization", "Bearer " + credential);
+        request.Headers.TryAddWithoutValidation("Accept", "text/event-stream");
+        request.Headers.TryAddWithoutValidation(
+            LocalPatGateway.RequestTimeoutHeader,
+            ((int)MinimalQuotaTestTimeout.TotalMilliseconds).ToString(
+                System.Globalization.CultureInfo.InvariantCulture));
+        if (!string.IsNullOrWhiteSpace(accountId))
+        {
+            request.Headers.TryAddWithoutValidation("chatgpt-account-id", accountId);
         }
 
-        return ParseMinimalQuotaTestResult(result.StdOut);
+        using var response = await client.SendAsync(
+            request,
+            HttpCompletionOption.ResponseHeadersRead,
+            timeout.Token);
+        if (!response.IsSuccessStatusCode)
+        {
+            var bytes = await ReadResponseBodyUpToLimitAsync(
+                response.Content,
+                MinimalQuotaTestResponseMaxBytes,
+                timeout.Token);
+            var detail = bytes == null
+                ? $"HTTP {(int)response.StatusCode}（错误内容过长）"
+                : Encoding.UTF8.GetString(bytes);
+            throw new InvalidOperationException(BuildMinimalQuotaTestFailureMessage(
+                account,
+                detail));
+        }
+
+        await using var stream = await response.Content.ReadAsStreamAsync(timeout.Token);
+        using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+        var protocolOutput = new StringBuilder();
+        var observedBytes = 0;
+        while (await reader.ReadLineAsync(timeout.Token) is { } line)
+        {
+            observedBytes += Encoding.UTF8.GetByteCount(line) + 1;
+            if (observedBytes > MinimalQuotaTestResponseMaxBytes)
+            {
+                throw new InvalidDataException("轻量测试响应过长，已停止读取。");
+            }
+
+            var json = line.StartsWith("data:", StringComparison.OrdinalIgnoreCase)
+                ? line["data:".Length..].Trim()
+                : line.Trim();
+            if (json.Length == 0 ||
+                json.Equals("[DONE]", StringComparison.OrdinalIgnoreCase) ||
+                !json.StartsWith('{'))
+            {
+                continue;
+            }
+
+            protocolOutput.AppendLine(json);
+            JsonObject? message;
+            try
+            {
+                message = JsonNode.Parse(json) as JsonObject;
+            }
+            catch (JsonException)
+            {
+                continue;
+            }
+
+            var type = message?["type"]?.GetValue<string>() ?? string.Empty;
+            var status = message?["response"]?["status"]?.GetValue<string>() ??
+                         message?["status"]?.GetValue<string>() ?? string.Empty;
+            if (IsMinimalQuotaTestFailureEvent(type, status))
+            {
+                throw new InvalidOperationException(BuildMinimalQuotaTestFailureMessage(
+                    account,
+                    json));
+            }
+            if (IsMinimalQuotaTestCompletionEvent(type, status))
+            {
+                return ParseMinimalQuotaTestResult(protocolOutput.ToString());
+            }
+        }
+
+        throw new InvalidDataException(
+            protocolOutput.Length == 0
+                ? "轻量测试没有返回可识别的响应。"
+                : "轻量测试连接在模型明确完成响应前结束，请检查代理节点后重试。");
+    }
+
+    private static bool IsMinimalQuotaTestCompletionEvent(string type, string status) =>
+        type.Equals("response.completed", StringComparison.OrdinalIgnoreCase) ||
+        status.Equals("completed", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsMinimalQuotaTestFailureEvent(string type, string status) =>
+        type.Equals("error", StringComparison.OrdinalIgnoreCase) ||
+        type.EndsWith(".failed", StringComparison.OrdinalIgnoreCase) ||
+        type.EndsWith(".incomplete", StringComparison.OrdinalIgnoreCase) ||
+        type.EndsWith(".cancelled", StringComparison.OrdinalIgnoreCase) ||
+        status.Equals("failed", StringComparison.OrdinalIgnoreCase) ||
+        status.Equals("incomplete", StringComparison.OrdinalIgnoreCase) ||
+        status.Equals("cancelled", StringComparison.OrdinalIgnoreCase);
+
+    private static string BuildMinimalQuotaTestFailureMessage(AccountRecord account, string detail)
+    {
+        var diagnostic = ExtractMinimalQuotaTestJsonError(detail) ?? detail.Trim();
+        if (diagnostic.Contains(
+                "model is not supported when using Codex with a ChatGPT account",
+                StringComparison.OrdinalIgnoreCase) ||
+            diagnostic.Contains(
+                "not supported when using Codex with a ChatGPT account",
+                StringComparison.OrdinalIgnoreCase) ||
+            diagnostic.Contains("model_not_supported", StringComparison.OrdinalIgnoreCase))
+        {
+            return $"账号 {account.Name} 当前没有测试模型 {MinimalQuotaTestModel} 的使用权限。" +
+                   "这是该账号或工作区的模型权限结果；未发送第二次测试请求。";
+        }
+
+        if ((diagnostic.Contains("HTTP 401", StringComparison.OrdinalIgnoreCase) &&
+             diagnostic.Contains("local_pat_gateway_error", StringComparison.OrdinalIgnoreCase)) ||
+            diagnostic.Contains("没有携带可用的 Codex PAT", StringComparison.OrdinalIgnoreCase))
+        {
+            return $"账号 {account.Name} 的测试进程没有加载到可识别的 PAT/OAuth 凭据。" +
+                   "请在“状态与凭据”中重新登录或更新 Token 后重试。";
+        }
+
+        if (IsPersonalAccessTokenMetadataRequestFailure(detail))
+        {
+            return BuildPersonalAccessTokenNetworkMessage(diagnostic);
+        }
+
+        if (string.IsNullOrWhiteSpace(diagnostic))
+        {
+            diagnostic = "Codex CLI 未返回失败原因。";
+        }
+        if (diagnostic.Length > 900)
+        {
+            diagnostic = diagnostic[..900] + "…";
+        }
+        return $"账号 {account.Name} 的小额测试请求失败：{diagnostic}";
+    }
+
+    private static string? ExtractMinimalQuotaTestJsonError(string output)
+    {
+        var trimmedOutput = (output ?? string.Empty).Trim();
+        if (trimmedOutput.StartsWith('{'))
+        {
+            try
+            {
+                if (JsonNode.Parse(trimmedOutput) is JsonObject wholeMessage)
+                {
+                    var wholeExtracted = ReadNestedErrorText(wholeMessage["error"]) ??
+                                         ReadNestedErrorText(wholeMessage["response"]?["error"]) ??
+                                         ReadNestedErrorText(wholeMessage["message"]);
+                    if (!string.IsNullOrWhiteSpace(wholeExtracted))
+                    {
+                        return wholeExtracted.Trim();
+                    }
+                }
+            }
+            catch (JsonException)
+            {
+                // Streaming responses are handled one JSON event per line below.
+            }
+        }
+
+        foreach (var line in (output ?? string.Empty)
+                     .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                     .Reverse())
+        {
+            try
+            {
+                if (JsonNode.Parse(line.Trim()) is not JsonObject message)
+                {
+                    continue;
+                }
+
+                var type = message["type"]?.GetValue<string>() ?? string.Empty;
+                if (!type.Contains("error", StringComparison.OrdinalIgnoreCase) &&
+                    !type.EndsWith(".failed", StringComparison.OrdinalIgnoreCase) &&
+                    message["error"] == null &&
+                    message["response"]?["error"] == null)
+                {
+                    continue;
+                }
+
+                var extracted = ReadNestedErrorText(message["error"]) ??
+                                ReadNestedErrorText(message["response"]?["error"]) ??
+                                ReadNestedErrorText(message["message"]) ??
+                                ReadNestedErrorText(message["item"]);
+                if (!string.IsNullOrWhiteSpace(extracted))
+                {
+                    return extracted.Trim();
+                }
+            }
+            catch (Exception ex) when (ex is JsonException or InvalidOperationException)
+            {
+                // Non-protocol diagnostic output is handled by the compact fallback above.
+            }
+        }
+        return null;
+    }
+
+    private static string? ReadNestedErrorText(JsonNode? node)
+    {
+        if (node is JsonValue value && value.TryGetValue<string>(out var text))
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return null;
+            }
+            try
+            {
+                return ReadNestedErrorText(JsonNode.Parse(text)) ?? text;
+            }
+            catch (JsonException)
+            {
+                return text;
+            }
+        }
+
+        if (node is not JsonObject error)
+        {
+            return null;
+        }
+        return ReadNestedErrorText(error["detail"]) ??
+               ReadNestedErrorText(error["message"]) ??
+               ReadNestedErrorText(error["error"]);
     }
 
     internal static MinimalQuotaTestResult ParseMinimalQuotaTestResult(string output)
@@ -686,6 +986,7 @@ public sealed partial class CodexCliService
             }
 
             var usage = root?["usage"] as JsonObject ??
+                        root?["response"]?["usage"] as JsonObject ??
                         root?["item"]?["usage"] as JsonObject ??
                         root?["event"]?["usage"] as JsonObject;
             if (usage == null)
@@ -697,6 +998,7 @@ public sealed partial class CodexCliService
                           ReadQuotaTestLong(usage["inputTokens"]) ??
                           inputTokens;
             cachedInputTokens = ReadQuotaTestLong(usage["cached_input_tokens"]) ??
+                                ReadQuotaTestLong(usage["input_tokens_details"]?["cached_tokens"]) ??
                                 ReadQuotaTestLong(usage["cachedInputTokens"]) ??
                                 cachedInputTokens;
             outputTokens = ReadQuotaTestLong(usage["output_tokens"]) ??
@@ -741,6 +1043,55 @@ public sealed partial class CodexCliService
             parsed.TotalTokens != 122)
         {
             throw new InvalidOperationException("Minimal quota-test usage parsing self-test failed.");
+        }
+
+        var payload = JsonNode.Parse(BuildMinimalQuotaTestPayload()) as JsonObject;
+        if (payload?["model"]?.GetValue<string>() != "gpt-5.6-luna" ||
+            payload["stream"]?.GetValue<bool>() != true ||
+            payload["store"]?.GetValue<bool>() != false ||
+            payload["max_output_tokens"]?.GetValue<int>() != 256 ||
+            payload["instructions"]?.GetValue<string>() !=
+                "请使用简体中文自然回复用户的问候，并用一句话说明你可以提供什么帮助。不要调用工具，总共不超过三句话。" ||
+            payload["input"]?[0]?["content"]?[0]?["text"]?.GetValue<string>() != "你好" ||
+            payload["reasoning"]?["effort"]?.GetValue<string>() != "low" ||
+            payload["reasoning"]?["summary"] != null)
+        {
+            throw new InvalidOperationException("Minimal quota-test payload self-test failed.");
+        }
+
+        var directParsed = ParseMinimalQuotaTestResult(
+            "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":3},\"output_tokens\":2,\"total_tokens\":14}}}\n");
+        if (directParsed.InputTokens != 12 ||
+            directParsed.CachedInputTokens != 3 ||
+            directParsed.OutputTokens != 2 ||
+            directParsed.TotalTokens != 14)
+        {
+            throw new InvalidOperationException("Minimal quota-test direct response parsing self-test failed.");
+        }
+        if (!IsMinimalQuotaTestCompletionEvent("response.completed", "") ||
+            IsMinimalQuotaTestCompletionEvent("response.created", "in_progress") ||
+            !IsMinimalQuotaTestFailureEvent("error", "") ||
+            !IsMinimalQuotaTestFailureEvent("response.incomplete", "") ||
+            !IsMinimalQuotaTestFailureEvent("", "cancelled"))
+        {
+            throw new InvalidOperationException("Minimal quota-test terminal event self-test failed.");
+        }
+
+        var unsupportedModel = BuildMinimalQuotaTestFailureMessage(
+            new AccountRecord { Name = "fixture" },
+            "{\"type\":\"turn.failed\",\"error\":{\"message\":\"{\\\"detail\\\":\\\"The model is not supported when using Codex with a ChatGPT account.\\\"}\"}}");
+        if (!unsupportedModel.Contains("gpt-5.6-luna", StringComparison.Ordinal) ||
+            unsupportedModel.Contains("turn.failed", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("Minimal quota-test error diagnostics self-test failed.");
+        }
+        var prettyJsonError = BuildMinimalQuotaTestFailureMessage(
+            new AccountRecord { Name = "fixture" },
+            "{\n  \"error\": {\n    \"message\": \"Invalid value: none\",\n    \"type\": \"invalid_request_error\"\n  }\n}");
+        if (!prettyJsonError.Contains("Invalid value: none", StringComparison.Ordinal) ||
+            prettyJsonError.Contains("\"error\"", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("Minimal quota-test pretty JSON error self-test failed.");
         }
     }
 
@@ -8471,11 +8822,28 @@ catch {
         {
             try
             {
-                process.Kill();
+                process.Kill(entireProcessTree: true);
             }
             catch
             {
                 // The process may already have exited between the timeout and kill attempt.
+            }
+
+            try
+            {
+                await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(3));
+            }
+            catch
+            {
+                // Timeout cleanup is best-effort; the original timeout remains the useful error.
+            }
+            try
+            {
+                await Task.WhenAll(stdoutTask, stderrTask).WaitAsync(TimeSpan.FromSeconds(2));
+            }
+            catch
+            {
+                // Child-pipe cleanup must not delay reporting the command timeout.
             }
 
             throw new TimeoutException(
@@ -8560,11 +8928,16 @@ catch {
     private static string BuildPersonalAccessTokenNetworkMessage(string detail)
     {
         var proxy = GetConfiguredProxyUri() ?? "未检测到系统代理";
+        var diagnostic = ExtractMinimalQuotaTestJsonError(detail) ?? detail.Trim();
+        if (diagnostic.Length > 600)
+        {
+            diagnostic = diagnostic[..600] + "…";
+        }
         return
             "Codex 无法请求 Access Token 元数据，但这不等于令牌已失效。\n\n" +
             "网页版显示有效时，通常是本机 Codex CLI 访问 auth.openai.com 的网络或代理不稳定。请确认本地 HTTP 代理（如 v2rayN、Clash 或 Mihomo）正在运行，然后重试。\n\n" +
             $"当前检测到的系统代理：{proxy}\n\n" +
-            detail;
+            diagnostic;
     }
 
     internal static string? GetConfiguredProxyUri()
@@ -9311,6 +9684,88 @@ catch {
             "Access Token auth.json does not contain a usable access token.");
     }
 
+    private static QuotaTestCredential ReadQuotaTestCredential(
+        AccountRecord account,
+        string authPath)
+    {
+        ArgumentNullException.ThrowIfNull(account);
+        _ = BuildCanonicalJsonSha256(authPath);
+        using var input = new FileStream(
+            authPath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete);
+        using var document = JsonDocument.Parse(input);
+        var root = document.RootElement;
+        if (root.ValueKind != JsonValueKind.Object)
+        {
+            throw new InvalidDataException("账号 auth.json 必须包含 JSON 对象。");
+        }
+
+        if (account.IsOfficialOAuth)
+        {
+            if (!IsChatGptDesktopAuthJson(authPath) ||
+                !root.TryGetProperty("tokens", out var tokens) ||
+                tokens.ValueKind != JsonValueKind.Object ||
+                !TryReadJsonString(tokens, "access_token", out var oauthToken) ||
+                !TryReadJsonString(tokens, "account_id", out var accountId) ||
+                !IsSafeChatGptAccountId(accountId))
+            {
+                throw new InvalidDataException(
+                    $"账号 {account.Name} 没有完整的官方 OAuth 凭据或工作区标识，请重新登录该账号。");
+            }
+            if (IsJwtExpiredOrExpiring(oauthToken, TimeSpan.FromMinutes(1)))
+            {
+                throw new InvalidDataException(
+                    $"账号 {account.Name} 的 OAuth access token 已过期或即将过期。" +
+                    "为避免误用其他账号凭据，本次未发送测试；请在“状态与凭据”中重新登录该账号后再试。");
+            }
+            return new QuotaTestCredential(oauthToken, accountId);
+        }
+
+        if (!account.IsAccessToken || root.TryGetProperty("tokens", out _))
+        {
+            throw new InvalidDataException(
+                $"账号 {account.Name} 的凭据类型与 Access Token 账号不匹配，本次未发送测试。");
+        }
+        var hasPersonalAccessToken =
+            TryReadJsonString(root, "personal_access_token", out var pat);
+        if (!hasPersonalAccessToken)
+        {
+            _ = TryReadJsonString(root, "OPENAI_API_KEY", out pat);
+        }
+        if (GetAccessTokenInputError(pat) is { } patError)
+        {
+            throw new InvalidDataException($"账号 {account.Name} 的 PAT 无效：{patError}");
+        }
+        return new QuotaTestCredential(pat, null);
+    }
+
+    private static bool IsSafeChatGptAccountId(string value) =>
+        value.Length <= 128 &&
+        value.All(character => char.IsLetterOrDigit(character) || character is '-' or '_');
+
+    private static bool IsJwtExpiredOrExpiring(string token, TimeSpan margin)
+    {
+        try
+        {
+            var parts = token.Split('.');
+            if (parts.Length != 3)
+            {
+                return false;
+            }
+            var payload = DecodeBase64Url(parts[1]);
+            using var document = JsonDocument.Parse(payload);
+            return document.RootElement.TryGetProperty("exp", out var exp) &&
+                   exp.TryGetInt64(out var unix) &&
+                   DateTimeOffset.FromUnixTimeSeconds(unix) <= DateTimeOffset.UtcNow + margin;
+        }
+        catch (Exception ex) when (ex is FormatException or JsonException or ArgumentOutOfRangeException)
+        {
+            return false;
+        }
+    }
+
     private static bool TryReadJsonString(
         JsonElement objectElement,
         string propertyName,
@@ -9859,6 +10314,7 @@ catch {
         string Fingerprint,
         DateTimeOffset CompletedAtUtc,
         LoginStatus Status);
+    private sealed record QuotaTestCredential(string Token, string? AccountId);
 }
 
 public sealed record ChatGptDeviceAuthorization(

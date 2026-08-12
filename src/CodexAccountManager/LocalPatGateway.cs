@@ -13,6 +13,7 @@ internal static class LocalPatGateway
     internal const string ListenerPrefix = "http://127.0.0.1:8317/";
     internal const string ProviderBaseUrl = "http://127.0.0.1:8317/backend-api/codex";
     internal const string ChatGptBaseUrl = "http://127.0.0.1:8317/backend-api";
+    internal const string RequestTimeoutHeader = "X-Codex-Account-Manager-Request-Timeout-Ms";
     internal const string ProcessArgument = "--local-pat-gateway";
     internal const string RootArgument = "--manager-root";
 
@@ -44,13 +45,19 @@ internal static class LocalPatGateway
         EnsureRunningAsync().GetAwaiter().GetResult();
     }
 
+    internal static Task EnsureRunningForLightweightTestAsync(
+        CancellationToken cancellationToken = default) =>
+        EnsureRunningAsync(cancellationToken, restartOnProxyMismatch: false);
+
     internal static bool IsEnabledBySettings()
     {
         var store = new AccountStore();
         return new ThemeService(store.RootPath).LoadSettings().PatGatewayEnabled;
     }
 
-    internal static async Task EnsureRunningAsync(CancellationToken cancellationToken = default)
+    internal static async Task EnsureRunningAsync(
+        CancellationToken cancellationToken = default,
+        bool restartOnProxyMismatch = true)
     {
         if (!IsEnabledBySettings())
         {
@@ -64,6 +71,12 @@ internal static class LocalPatGateway
             var health = await ProbeAsync(cancellationToken);
             if (health == GatewayHealth.LegacyRootMismatch)
             {
+                if (!restartOnProxyMismatch)
+                {
+                    throw new InvalidOperationException(
+                        "当前运行的是旧版本地 PAT 网关。为避免中断正在运行的账号，轻量测试没有重启网关；" +
+                        "请保留网关运行并重新打开新版管理器后再试。");
+                }
                 if (!TryLoadLegacyControlSecret(out var legacySecret) ||
                     !await ShutdownWithSecretAsync(legacySecret, cancellationToken))
                 {
@@ -76,6 +89,13 @@ internal static class LocalPatGateway
             }
             if (health == GatewayHealth.ProxyMismatch)
             {
+                if (!restartOnProxyMismatch)
+                {
+                    // A quota test must never interrupt an already-running account. The
+                    // existing gateway can safely finish the request through its inherited
+                    // proxy; the next explicit gateway start may apply the new proxy choice.
+                    return;
+                }
                 // A gateway is a long-lived child process, so it may have inherited an
                 // older proxy choice. Restart it before any PAT-bearing request is sent.
                 if (!await ShutdownIfRunningAsync(cancellationToken))
@@ -630,6 +650,8 @@ internal sealed class LocalPatGatewayHost
                 await WriteErrorAsync(response, HttpStatusCode.MethodNotAllowed, "本地 PAT 网关不支持这个请求方法。");
                 return;
             }
+            using var requestDeadline = CreateRequestDeadline(context.Request);
+            var requestCancellationToken = requestDeadline?.Token ?? CancellationToken.None;
 
             var credential = ReadBearerCredential(context.Request);
             if (credential == null)
@@ -656,7 +678,10 @@ internal sealed class LocalPatGatewayHost
             {
                 try
                 {
-                    identity = await GetIdentityAsync(client, credential.Token);
+                    identity = await GetIdentityAsync(
+                        client,
+                        credential.Token,
+                        requestCancellationToken);
                 }
                 catch (PatRejectedException ex)
                 {
@@ -683,7 +708,8 @@ internal sealed class LocalPatGatewayHost
             {
                 upstreamResponse = await client.SendAsync(
                     upstreamRequest,
-                    HttpCompletionOption.ResponseHeadersRead);
+                    HttpCompletionOption.ResponseHeadersRead,
+                    requestCancellationToken);
             }
             catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
             {
@@ -709,7 +735,10 @@ internal sealed class LocalPatGatewayHost
                         return;
                     }
                 }
-                await CopyUpstreamResponseAsync(upstreamResponse, response);
+                await CopyUpstreamResponseAsync(
+                    upstreamResponse,
+                    response,
+                    requestCancellationToken);
             }
         }
         catch (Exception ex) when (
@@ -773,7 +802,10 @@ internal sealed class LocalPatGatewayHost
             });
     }
 
-    private async Task<PatIdentity> GetIdentityAsync(HttpClient client, string token)
+    private async Task<PatIdentity> GetIdentityAsync(
+        HttpClient client,
+        string token,
+        CancellationToken cancellationToken = default)
     {
         var key = HashToken(token);
         if (_identityCache.TryGetValue(key, out var cached) &&
@@ -787,7 +819,8 @@ internal sealed class LocalPatGatewayHost
         request.Headers.TryAddWithoutValidation("Accept", "application/json");
         request.Headers.TryAddWithoutValidation("originator", DefaultOriginator);
         request.Headers.TryAddWithoutValidation("User-Agent", DefaultUserAgent);
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(20));
         using var response = await client.SendAsync(
             request,
             HttpCompletionOption.ResponseHeadersRead,
@@ -938,7 +971,8 @@ internal sealed class LocalPatGatewayHost
 
     private static async Task CopyUpstreamResponseAsync(
         HttpResponseMessage upstream,
-        HttpListenerResponse downstream)
+        HttpListenerResponse downstream,
+        CancellationToken cancellationToken = default)
     {
         downstream.StatusCode = (int)upstream.StatusCode;
         // Content-Type is a restricted HttpListener response header. Set the typed
@@ -958,8 +992,18 @@ internal sealed class LocalPatGatewayHost
         {
             downstream.SendChunked = true;
         }
-        await upstream.Content.CopyToAsync(downstream.OutputStream);
-        await downstream.OutputStream.FlushAsync();
+        await upstream.Content.CopyToAsync(downstream.OutputStream, cancellationToken);
+        await downstream.OutputStream.FlushAsync(cancellationToken);
+    }
+
+    private static CancellationTokenSource? CreateRequestDeadline(HttpListenerRequest request)
+    {
+        var raw = request.Headers[LocalPatGateway.RequestTimeoutHeader]?.Trim();
+        if (!int.TryParse(raw, out var milliseconds) || milliseconds is < 1_000 or > 120_000)
+        {
+            return null;
+        }
+        return new CancellationTokenSource(TimeSpan.FromMilliseconds(milliseconds));
     }
 
     private static void CopyResponseHeaders(

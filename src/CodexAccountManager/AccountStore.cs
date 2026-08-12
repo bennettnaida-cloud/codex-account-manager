@@ -599,8 +599,8 @@ sandbox = "unelevated"
     internal static string BuildAccessTokenConfig()
     {
         return $"""
-model = {TomlString(ModelCatalogService.DefaultModel)}
-review_model = {TomlString(ModelCatalogService.DefaultModel)}
+model = {TomlString(ModelCatalogService.CanonicalDefaultModel)}
+review_model = {TomlString(ModelCatalogService.CanonicalDefaultModel)}
 model_reasoning_effort = {TomlString(ModelCatalogService.DefaultReasoningEffort)}
 chatgpt_base_url = {TomlString(LocalPatGateway.ChatGptBaseUrl)}
 disable_response_storage = true

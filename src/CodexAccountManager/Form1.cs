@@ -121,6 +121,7 @@ public partial class Form1 : Form
         public PillLabel? SecondaryQuota { get; set; }
         public QuotaProgressBar? PrimaryProgress { get; set; }
         public QuotaProgressBar? SecondaryProgress { get; set; }
+        public Button? TestAction { get; init; }
     }
 
     private sealed class PassiveQuotaMonitorBinding
@@ -195,6 +196,7 @@ public partial class Form1 : Form
     // official read. Opening the quota workspace and loading an account never opt it in.
     private static readonly TimeSpan OfficialQuotaActiveRefreshInterval = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan ResetCreditUnavailableRetryDelay = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan MinimalQuotaPostRefreshTimeout = TimeSpan.FromSeconds(10);
     private readonly AccountStore _store = new();
     private readonly CodexCliService _codex = new();
     private readonly SharedHistoryService _sharedHistory = new();
@@ -316,6 +318,7 @@ public partial class Form1 : Form
     private bool _deletedThreadCleanupStarted;
     private bool _patGatewayRuntimeRunning;
     private bool _patGatewayActionRunning;
+    private readonly HashSet<string> _minimalQuotaTestsInProgress = new(StringComparer.Ordinal);
     private string _patGatewayRuntimeStatus = "等待启动";
     private CancellationTokenSource? _proxyDetectionCancellation;
     private ModernInputShell? _searchShell;
@@ -2258,6 +2261,12 @@ public partial class Form1 : Form
                 ? "基于本地 Token 日志和当前模型单价估算。"
                 : "仅显示官方额度百分比与重置时间；不会调用模型。"
         );
+        if (binding.TestAction != null)
+        {
+            var testing = _minimalQuotaTestsInProgress.Contains(QuotaAccountIdentity.CreateKey(account));
+            binding.TestAction.Enabled = !testing;
+            binding.TestAction.Text = testing ? "测试中…" : "测试";
+        }
     }
 
     private static void UpdateQuotaPill(PillLabel? pill, string text, Color color)
@@ -8223,16 +8232,21 @@ public partial class Form1 : Form
 
         var rightContentEdge = stacked ? width - 18 : width - 26;
         var actionLeft = rightContentEdge - 290;
+        Button? testAction = null;
         if (!account.IsCompatibleApi)
         {
-            var resetUsage = MakeActionButton(GetResetButtonText(account), actionLeft, actionTop, 180, false);
-            resetUsage.Height = actionHeight;
-            resetUsage.Name = "UsageResetAction";
-            resetUsage.AccessibleDescription = account.Name;
-            resetUsage.Enabled = CanResetUsage(account);
-            resetUsage.Click += async (_, _) => await ResetUsageLimitAsync(account);
-            _toolTip.SetToolTip(resetUsage, GetResetCreditToolTip(account));
-            row.Controls.Add(resetUsage);
+            var accountKey = QuotaAccountIdentity.CreateKey(account);
+            var testing = _minimalQuotaTestsInProgress.Contains(accountKey);
+            testAction = MakeActionButton(testing ? "测试中…" : "测试", actionLeft, actionTop, 180, false);
+            testAction.Height = actionHeight;
+            testAction.Name = "MinimalQuotaTestAction";
+            testAction.AccessibleDescription = accountKey;
+            testAction.Enabled = !testing;
+            testAction.Click += async (_, _) => await SendMinimalQuotaTestAsync(account);
+            _toolTip.SetToolTip(
+                testAction,
+                "使用所点账号的独立凭据发送一次最小请求；无需先启动或切换为当前账号，没有凭据时会先引导登录");
+            row.Controls.Add(testAction);
         }
 
         var detailLeft = account.IsCompatibleApi ? rightContentEdge - 104 : actionLeft + 190;
@@ -8255,7 +8269,8 @@ public partial class Form1 : Form
             PrimaryQuota = primaryQuota,
             SecondaryQuota = secondaryQuota,
             PrimaryProgress = primaryProgress,
-            SecondaryProgress = secondaryProgress
+            SecondaryProgress = secondaryProgress,
+            TestAction = testAction
         };
 
         return row;
@@ -8696,12 +8711,11 @@ public partial class Form1 : Form
 
         var infoLeft = compact ? 18 : 18 + gaugeColumnWidth + 18;
         var infoWidth = compact ? width - 36 : Math.Max(360, width - infoLeft - 18);
-        // The quota controls use balanced rows so long Chinese labels stay readable. The
-        // explicit real-request test occupies its own row to avoid accidental clicks.
+        // The quota controls use balanced rows so long Chinese labels stay readable.
         var stackedActions = !account.IsCompatibleApi;
         var infoBlockHeight = account.IsCompatibleApi
             ? compact ? 224 : 278
-            : compact ? 368 : Math.Clamp(gaugeSize + 88, 478, 508);
+            : compact ? 318 : Math.Clamp(gaugeSize + 20, 410, 440);
         var infoTop = compact
             ? externalStatus.Bottom + 12
             : gauge.Top + Math.Max(0, (gauge.Height - infoBlockHeight) / 2);
@@ -8885,24 +8899,6 @@ public partial class Form1 : Form
             resetAction.Click += async (_, _) => await ResetUsageLimitAsync(account);
             _toolTip.SetToolTip(resetAction, GetResetCreditToolTip(account));
             infoCard.Controls.Add(resetAction);
-
-            var testTop = secondRowTop + controlHeight + (compact ? 8 : 14);
-            var testQuota = MakeActionButton(
-                "测试",
-                horizontalInset,
-                testTop,
-                infoWidth - (horizontalInset * 2),
-                false);
-            testQuota.Height = controlHeight;
-            testQuota.Padding = Padding.Empty;
-            testQuota.TextAlign = ContentAlignment.MiddleCenter;
-            testQuota.UseMnemonic = false;
-            testQuota.Font = new Font(Font.FontFamily, compact ? 8.8F : 9.3F, FontStyle.Bold);
-            testQuota.Click += async (_, _) => await SendMinimalQuotaTestAsync(account);
-            _toolTip.SetToolTip(
-                testQuota,
-                "仅在点击并确认后发送一次真实的最小 Codex 请求；会消耗少量额度，随后只回读当前账号");
-            infoCard.Controls.Add(testQuota);
         }
 
         var binding = new PassiveQuotaMonitorBinding
@@ -12676,6 +12672,7 @@ public partial class Form1 : Form
         AccountRecord account,
         bool fastFail = false,
         bool retryUnavailableResetCredits = false,
+        bool preserveRunningGateway = false,
         CancellationToken cancellationToken = default)
     {
         var requestLock = GetOfficialQuotaRequestLock(account);
@@ -12685,6 +12682,7 @@ public partial class Form1 : Form
             await using var session = await _codex.OpenUsageLimitResetSessionAsync(
                 account,
                 fastFail,
+                preserveRunningGateway,
                 cancellationToken);
             var first = await session.ReadAsync(cancellationToken);
             if (!retryUnavailableResetCredits || first.IsAvailable)
@@ -12809,10 +12807,36 @@ public partial class Form1 : Form
             return;
         }
 
+        if (!_codex.HasStoredQuotaTestCredential(account))
+        {
+            var loginFirst = MessageBox.Show(
+                this,
+                $"账号“{account.Name}”当前没有可用于真实测试的本地登录凭据。\n\n" +
+                "点击“是”会先打开该账号的登录/Token 输入；登录成功后会自动继续测试。",
+                "先登录再测试",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Information,
+                MessageBoxDefaultButton.Button1);
+            if (loginFirst != DialogResult.Yes)
+            {
+                return;
+            }
+
+            await UpdateTokenAsync(account);
+            if (!_codex.HasStoredQuotaTestCredential(account))
+            {
+                _statusBox.Text = $"账号 {account.Name} 尚未完成登录，未发送测试请求。";
+                return;
+            }
+        }
+
         var confirmation = MessageBox.Show(
             this,
-            $"将使用账号“{account.Name}”发送一次真实的最小 Codex 请求，只要求回复 OK。\n\n" +
-            "这会消耗少量真实额度，但使用临时会话、只读沙箱，不会生成聊天记录。" +
+            $"将直接使用账号“{account.Name}”的独立凭据，通过低成本模型 " +
+            $"{CodexCliService.MinimalQuotaTestModelId} 发送一次真实的轻量问候请求，内容为“你好”。\n\n" +
+            "不需要先启动这个账号，也不会切换当前账号。\n\n" +
+            "模型会用简体中文自然回复并简单说明可以提供什么帮助，最多三句话、输出上限 256 token。" +
+            "该请求只发送一次，不调用工具，也不保存会话或生成聊天记录。" +
             "请求结束后只回读这个账号的官方额度。是否继续？",
             "确认发送小额测试",
             MessageBoxButtons.OKCancel,
@@ -12823,28 +12847,65 @@ public partial class Form1 : Form
             return;
         }
 
-        await RunBusyAsync(async () =>
+        var accountKey = QuotaAccountIdentity.CreateKey(account);
+        if (!_minimalQuotaTestsInProgress.Add(accountKey))
         {
-            _statusBox.Text = $"正在使用 {account.Name} 发送小额测试请求……";
-            var test = await _codex.SendMinimalQuotaTestAsync(account);
-            _statusBox.Text = $"{account.Name} 的测试请求已完成，正在只回读该账号额度……";
-            var info = await ReadUsageLimitResetInfoAsync(
-                account,
-                retryUnavailableResetCredits: true);
-            CacheUsageLimitResetInfo(account, info);
+            return;
+        }
+        RenderCards();
+
+        try
+        {
+            var progress = new Progress<string>(stage =>
+            {
+                if (!_formClosed && !IsDisposed)
+                {
+                    _statusBox.Text = $"{account.Name}：{stage}";
+                }
+            });
+            var test = await _codex.SendMinimalQuotaTestAsync(account, progress);
+            _statusBox.Text = $"{account.Name}：测试成功，正在快速刷新该账号额度（最多 10 秒）…";
+            UsageLimitResetInfo? info = null;
+            string? quotaWarning = null;
+            try
+            {
+                using var refreshTimeout = new CancellationTokenSource(MinimalQuotaPostRefreshTimeout);
+                info = await ReadUsageLimitResetInfoAsync(
+                    account,
+                    fastFail: true,
+                    retryUnavailableResetCredits: false,
+                    preserveRunningGateway: true,
+                    cancellationToken: refreshTimeout.Token);
+                CacheUsageLimitResetInfo(account, info);
+            }
+            catch (OperationCanceledException)
+            {
+                quotaWarning =
+                    $"测试已经成功，但随后刷新官方额度超过 {MinimalQuotaPostRefreshTimeout.TotalSeconds:0} 秒；" +
+                    "额度会由当前账号的后台刷新稍后更新。";
+            }
+            catch (Exception ex)
+            {
+                quotaWarning = "测试已经成功，但随后刷新官方额度失败：" + ex.Message;
+            }
 
             var tokenText = test.TotalTokens is { } totalTokens
-                ? $"本次 CLI 报告共 {totalTokens:N0} token" +
+                ? $"本次轻量请求共 {totalTokens:N0} token" +
                   (test.InputTokens is { } input && test.OutputTokens is { } output
                       ? $"（输入 {input:N0}，输出 {output:N0}）"
                       : string.Empty)
-                : "测试请求已成功（当前 CLI 未返回可解析的 token 汇总）";
-            var quotaText = FormatOfficialQuotaReadSummary(info);
-            var resetText = info.AvailableCount is { } count
+                : "测试请求已成功（响应未提供 token 汇总）";
+            var quotaText = info == null
+                ? quotaWarning!
+                : FormatOfficialQuotaReadSummary(info);
+            var resetText = info?.AvailableCount is { } count
                 ? $"官方可重置 {Math.Max(0, count)} 次"
-                : "官方本次未提供重置次数（不是 0 次）";
+                : info == null
+                    ? "官方重置次数未刷新"
+                    : "官方本次未提供重置次数（不是 0 次）";
             var resultText =
-                $"账号：{account.Name}\n{tokenText}\n{quotaText}\n{resetText}\n\n" +
+                $"账号：{account.Name}\n测试模型：{CodexCliService.MinimalQuotaTestModelId}\n" +
+                $"{tokenText}\n{quotaText}\n{resetText}\n\n" +
                 "额度百分比按整数返回，本次消耗很小时数值可能暂时看不出变化。";
             _statusBox.Text = resultText.Replace('\n', ' ');
             MessageBox.Show(
@@ -12853,9 +12914,16 @@ public partial class Form1 : Form
                 "小额测试完成",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
-        });
-
-        RenderCards();
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex.Message);
+        }
+        finally
+        {
+            _minimalQuotaTestsInProgress.Remove(accountKey);
+            RenderCards();
+        }
     }
 
     private static string FormatOfficialQuotaReadSummary(UsageLimitResetInfo info)
@@ -13253,6 +13321,11 @@ public partial class Form1 : Form
                         button.AccessibleDescription ?? "",
                         StringComparison.OrdinalIgnoreCase));
                 button.Enabled = account != null && CanResetUsage(account);
+            }
+            else if (button.Name.Equals("MinimalQuotaTestAction", StringComparison.Ordinal))
+            {
+                button.Enabled = !_minimalQuotaTestsInProgress.Contains(
+                    button.AccessibleDescription ?? string.Empty);
             }
             else
             {
