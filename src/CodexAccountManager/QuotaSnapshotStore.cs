@@ -250,8 +250,49 @@ internal sealed class QuotaSnapshotStore
                     "Renaming an account must retain its identity-keyed quota snapshot.");
             }
 
-            // Older writes must never replace a newer account-local observation.
+            var durableObservedAt = observedAt.AddMinutes(1);
+            var durablePrimaryReset = durableObservedAt.AddDays(7);
+            var durableSecondaryReset = durableObservedAt.AddHours(5);
+            var durableSpendReset = durableObservedAt.AddDays(30);
             store.Save(
+                first,
+                new UsageLimitResetInfo(
+                    5,
+                    [],
+                    new UsageRateLimitWindow(13, 10_080, durablePrimaryReset),
+                    new UsageRateLimitWindow(17, 300, durableSecondaryReset),
+                    new UsageCreditsSnapshot(true, false, "12.34"),
+                    new UsageSpendControl("100", "25", 75D, durableSpendReset),
+                    "durable-team"),
+                durableObservedAt);
+
+            void AssertDurableSnapshot(QuotaSnapshotStore restartedStore, string restartLabel)
+            {
+                var restartedLoad = restartedStore.LoadForAccounts([first]);
+                if (!restartedLoad.TryGetValue(firstKey, out var restartedSnapshot) ||
+                    restartedSnapshot.ObservedAtUtc != durableObservedAt.ToUniversalTime() ||
+                    restartedSnapshot.AvailableCount != 5 ||
+                    restartedSnapshot.Primary?.UsedPercent != 13 ||
+                    restartedSnapshot.Primary?.WindowMinutes != 10_080 ||
+                    restartedSnapshot.Primary?.ResetsAtUtc != durablePrimaryReset ||
+                    restartedSnapshot.Secondary?.UsedPercent != 17 ||
+                    restartedSnapshot.Secondary?.WindowMinutes != 300 ||
+                    restartedSnapshot.Secondary?.ResetsAtUtc != durableSecondaryReset ||
+                    restartedSnapshot.CreditBalance?.Balance != "12.34" ||
+                    restartedSnapshot.IndividualLimit?.RemainingPercent != 75D ||
+                    restartedSnapshot.IndividualLimit?.ResetsAtUtc != durableSpendReset ||
+                    !string.Equals(restartedSnapshot.PlanType, "durable-team", StringComparison.Ordinal))
+                {
+                    throw new InvalidOperationException(
+                        $"The official quota snapshot must survive {restartLabel} with every field intact.");
+                }
+            }
+
+            AssertDurableSnapshot(new QuotaSnapshotStore(root), "the next process start");
+            AssertDurableSnapshot(new QuotaSnapshotStore(root), "a later process start");
+
+            // Older writes must never replace a newer account-local observation.
+            new QuotaSnapshotStore(root).Save(
                 first,
                 new UsageLimitResetInfo(
                     99,
@@ -262,8 +303,9 @@ internal sealed class QuotaSnapshotStore
                     null,
                     "stale"),
                 observedAt.AddMinutes(-1));
-            var afterStaleWrite = store.LoadForAccounts([first]);
-            if (afterStaleWrite[firstKey].Primary?.UsedPercent != 11)
+            var afterStaleWrite = new QuotaSnapshotStore(root).LoadForAccounts([first]);
+            if (afterStaleWrite[firstKey].Primary?.UsedPercent != 13 ||
+                afterStaleWrite[firstKey].ObservedAtUtc != durableObservedAt.ToUniversalTime())
             {
                 throw new InvalidOperationException(
                     "An older quota observation must not overwrite the current account snapshot.");

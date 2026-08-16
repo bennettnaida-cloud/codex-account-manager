@@ -6963,30 +6963,30 @@ public partial class Form1 : Form
         ApplyLiveRateLimitSnapshots(
             report,
             _accounts,
-            _liveRateLimitCache,
-            DateTimeOffset.UtcNow);
+            _liveRateLimitCache);
     }
 
     private static void ApplyLiveRateLimitSnapshots(
         UsageReport report,
         IReadOnlyList<AccountRecord> accounts,
-        IReadOnlyDictionary<string, LiveRateLimitSnapshot> snapshots,
-        DateTimeOffset nowUtc)
+        IReadOnlyDictionary<string, LiveRateLimitSnapshot> snapshots)
     {
         var accountKeysByName = accounts.ToDictionary(
             account => account.Name,
             QuotaAccountIdentity.CreateKey,
             StringComparer.OrdinalIgnoreCase);
-        var cutoff = nowUtc.AddMinutes(-30);
         foreach (var usage in report.Accounts)
         {
             if (!accountKeysByName.TryGetValue(usage.AccountName, out var accountKey) ||
-                !snapshots.TryGetValue(accountKey, out var snapshot) ||
-                snapshot.ObservedAtUtc < cutoff)
+                !snapshots.TryGetValue(accountKey, out var snapshot))
             {
                 continue;
             }
 
+            // This is the latest persisted official observation for the account, not a
+            // short-lived UI cache.  Its wall-clock age must not make a later restart fall
+            // back to an older rollout-log value.  ApplyLiveRateLimitSnapshot compares
+            // ObservedAtUtc, so a genuinely newer official log still wins.
             ApplyLiveRateLimitSnapshot(usage, snapshot);
         }
     }
@@ -6995,6 +6995,8 @@ public partial class Form1 : Form
         AccountUsageSummary usage,
         LiveRateLimitSnapshot snapshot)
     {
+        var snapshotIsNotOlder = !usage.RateLimitObservedAtUtc.HasValue ||
+                                 snapshot.ObservedAtUtc >= usage.RateLimitObservedAtUtc.Value;
         var hasPrimarySnapshot = snapshot.UsedPercent.HasValue ||
                                  snapshot.WindowMinutes.HasValue ||
                                  snapshot.ResetsAtUtc.HasValue;
@@ -7031,9 +7033,12 @@ public partial class Form1 : Form
             usage.RateLimitObservedAtUtc = snapshot.ObservedAtUtc;
         }
 
-        usage.CreditBalance = snapshot.CreditBalance ?? usage.CreditBalance;
-        usage.IndividualLimit = snapshot.IndividualLimit ?? usage.IndividualLimit;
-        usage.PlanType = snapshot.PlanType ?? usage.PlanType;
+        if (snapshotIsNotOlder)
+        {
+            usage.CreditBalance = snapshot.CreditBalance ?? usage.CreditBalance;
+            usage.IndividualLimit = snapshot.IndividualLimit ?? usage.IndividualLimit;
+            usage.PlanType = snapshot.PlanType ?? usage.PlanType;
+        }
     }
 
     private static bool LiveQuotaWindowConflicts(
@@ -11245,6 +11250,106 @@ public partial class Form1 : Form
             throw new InvalidOperationException(
                 "A newer official quota refresh must replace an older model-log snapshot across reset cycles.");
         }
+
+        var persistedAt = now.AddHours(-2);
+        var persistedWeeklyReset = now.AddDays(7);
+        var persistedFiveHourReset = now.AddHours(5);
+        var persistedAccount = new AccountRecord
+        {
+            Name = "persisted-official-restart",
+            CodexHome = Path.Combine(Path.GetTempPath(), "persisted-official-restart"),
+            AuthKind = AccountAuthKind.AccessToken
+        };
+        var persistedAccountKey = QuotaAccountIdentity.CreateKey(persistedAccount);
+        var persistedSnapshots = new Dictionary<string, LiveRateLimitSnapshot>(StringComparer.OrdinalIgnoreCase)
+        {
+            [persistedAccountKey] = new LiveRateLimitSnapshot(
+                0D,
+                10_080,
+                persistedWeeklyReset,
+                12D,
+                300,
+                persistedFiveHourReset,
+                null,
+                null,
+                "team",
+                persistedAt)
+        };
+
+        UsageReport BuildOlderLogReport() => new()
+        {
+            Accounts =
+            [
+                new AccountUsageSummary
+                {
+                    AccountName = persistedAccount.Name,
+                    RateLimitUsedPercent = 25D,
+                    RateLimitWindowMinutes = 10_080,
+                    RateLimitResetAtUtc = now.AddDays(3),
+                    SecondaryRateLimitUsedPercent = 40D,
+                    SecondaryRateLimitWindowMinutes = 300,
+                    SecondaryRateLimitResetAtUtc = now.AddHours(3),
+                    RateLimitObservedAtUtc = now.AddDays(-1),
+                    PlanType = "older-log"
+                }
+            ]
+        };
+
+        void AssertPersistedSnapshotRestored(UsageReport restartReport, string restartLabel)
+        {
+            var restored = restartReport.Accounts.Single();
+            if (restored.RateLimitUsedPercent != 0D ||
+                restored.RateLimitWindowMinutes != 10_080 ||
+                restored.RateLimitResetAtUtc != persistedWeeklyReset ||
+                restored.SecondaryRateLimitUsedPercent != 12D ||
+                restored.SecondaryRateLimitWindowMinutes != 300 ||
+                restored.SecondaryRateLimitResetAtUtc != persistedFiveHourReset ||
+                restored.RateLimitObservedAtUtc != persistedAt ||
+                !string.Equals(restored.PlanType, "team", StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"A persisted official quota snapshot must survive {restartLabel} even when it is older than 30 minutes.");
+            }
+        }
+
+        var firstRestart = BuildOlderLogReport();
+        ApplyLiveRateLimitSnapshots(firstRestart, [persistedAccount], persistedSnapshots);
+        AssertPersistedSnapshotRestored(firstRestart, "the next restart");
+
+        // Use a fresh report to model a separate process start. Reusing firstRestart would
+        // only prove that the already-mutated in-memory object retained its values.
+        var secondRestart = BuildOlderLogReport();
+        ApplyLiveRateLimitSnapshots(secondRestart, [persistedAccount], persistedSnapshots);
+        AssertPersistedSnapshotRestored(secondRestart, "a later restart");
+
+        var newerLogReport = new UsageReport
+        {
+            Accounts =
+            [
+                new AccountUsageSummary
+                {
+                    AccountName = persistedAccount.Name,
+                    RateLimitUsedPercent = 3D,
+                    RateLimitWindowMinutes = 10_080,
+                    RateLimitResetAtUtc = now.AddDays(8),
+                    SecondaryRateLimitUsedPercent = 4D,
+                    SecondaryRateLimitWindowMinutes = 300,
+                    SecondaryRateLimitResetAtUtc = now.AddHours(6),
+                    RateLimitObservedAtUtc = now.AddHours(-1),
+                    PlanType = "newer-log"
+                }
+            ]
+        };
+        ApplyLiveRateLimitSnapshots(newerLogReport, [persistedAccount], persistedSnapshots);
+        var newerLog = newerLogReport.Accounts.Single();
+        if (newerLog.RateLimitUsedPercent != 3D ||
+            newerLog.SecondaryRateLimitUsedPercent != 4D ||
+            newerLog.RateLimitObservedAtUtc != now.AddHours(-1) ||
+            !string.Equals(newerLog.PlanType, "newer-log", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "An older persisted quota snapshot must never overwrite a newer official log observation.");
+        }
     }
 
     internal static void ValidateQuotaRuntimeAccountIsolation()
@@ -11289,7 +11394,7 @@ public partial class Form1 : Form
                 "team",
                 now)
         };
-        ApplyLiveRateLimitSnapshots(report, [replacementAccount], snapshots, now);
+        ApplyLiveRateLimitSnapshots(report, [replacementAccount], snapshots);
         if (report.Accounts[0].RateLimitUsedPercent.HasValue)
         {
             throw new InvalidOperationException(
@@ -11297,7 +11402,7 @@ public partial class Form1 : Form
         }
 
         snapshots[replacementKey] = snapshots[originalKey] with { UsedPercent = 23D };
-        ApplyLiveRateLimitSnapshots(report, [replacementAccount], snapshots, now);
+        ApplyLiveRateLimitSnapshots(report, [replacementAccount], snapshots);
         if (report.Accounts[0].RateLimitUsedPercent != 23D)
         {
             throw new InvalidOperationException(
