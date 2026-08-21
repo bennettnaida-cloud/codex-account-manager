@@ -2006,6 +2006,38 @@ public partial class Form1 : Form
             // three-column layout only when cache-write tokens actually appear or disappear.
             return false;
         }
+        var subtitleText = GetQuotaDetailSubtitle(account);
+        var observed = usage.RateLimitObservedAtUtc.HasValue
+            ? $"更新 {usage.RateLimitObservedAtUtc.Value.ToLocalTime():MM-dd HH:mm}"
+            : "更新 暂无";
+        var resetSummary = account.IsCompatibleApi
+            ? string.Empty
+            : GetQuotaResetSummary(quotaLimitType, usage);
+        var metaText = account.IsCompatibleApi
+            ? "余额请到服务商账单查看"
+            : $"{resetSummary} · {observed}";
+        var requiredSubtitleHeight = MeasureThemeTextHeight(
+            subtitleText,
+            binding.Subtitle.Font,
+            binding.Subtitle.Width,
+            minimumHeight: 34,
+            verticalPadding: 8,
+            wrap: true);
+        var requiredMetaHeight = MeasureThemeTextHeight(
+            metaText,
+            binding.Meta.Font,
+            binding.Meta.Width,
+            minimumHeight: 28,
+            verticalPadding: 8,
+            wrap: true);
+        if (requiredSubtitleHeight > binding.Subtitle.Height ||
+            requiredMetaHeight > binding.Meta.Height)
+        {
+            // Reset metadata can appear after the first refresh. Rebuild once when the new
+            // text needs another line so the monitor below is moved down instead of clipping
+            // the freshly-added header content.
+            return false;
+        }
         var monitoring = GetPassiveQuotaMonitoringResult(account, usage);
         var trendData = GetQuotaTrendData(account, usage, priceProfile, monitoring);
         var modelDistributionItems = BuildModelUsageDistribution(trendData.Points);
@@ -2032,24 +2064,7 @@ public partial class Form1 : Form
                     $"{FormatTokens(metrics[index].Bucket.TotalTokens)} token");
             }
 
-            var usageSummary = account.IsCompatibleApi
-                ? "按 API 账单计费"
-                : "仅显示官方额度百分比";
-            var officialSummary = account.IsCompatibleApi ? null : GetOfficialFinancialSummary(usage);
-            var subtitleText = string.IsNullOrWhiteSpace(officialSummary)
-                ? $"{account.AuthKindLabel} · {usageSummary}"
-                : $"{account.AuthKindLabel} · {usageSummary} · {officialSummary}";
             SetLabelText(binding.Subtitle, subtitleText);
-
-            var observed = usage.RateLimitObservedAtUtc.HasValue
-                ? $"更新 {usage.RateLimitObservedAtUtc.Value.ToLocalTime():MM-dd HH:mm}"
-                : "更新 暂无";
-            var resetSummary = account.IsCompatibleApi
-                ? string.Empty
-                : GetQuotaResetSummary(quotaLimitType, usage);
-            var metaText = account.IsCompatibleApi
-                ? "余额请到服务商账单查看"
-                : $"{resetSummary} · {observed}";
             SetLabelText(binding.Meta, metaText);
 
             UpdatePassiveQuotaMonitor(binding.Monitor, account, usage, monitoring);
@@ -4594,6 +4609,87 @@ public partial class Form1 : Form
             {
                 throw new InvalidOperationException(
                     $"Compact account-card layout is invalid at {width}px: {geometry}.");
+            }
+        }
+
+        var oauthQuotaDetailSubtitle = GetQuotaDetailSubtitle(new AccountRecord
+        {
+            AuthKind = AccountAuthKind.OfficialOAuth
+        });
+        var accessTokenQuotaDetailSubtitle = GetQuotaDetailSubtitle(new AccountRecord
+        {
+            AuthKind = AccountAuthKind.AccessToken
+        });
+        var compatibleApiQuotaDetailSubtitle = GetQuotaDetailSubtitle(new AccountRecord
+        {
+            AuthKind = AccountAuthKind.CompatibleApi
+        });
+        if (oauthQuotaDetailSubtitle !=
+                "通过 ChatGPT 登录（官方） · 仅显示官方额度百分比" ||
+            accessTokenQuotaDetailSubtitle !=
+                "Access Token · 仅显示官方额度百分比" ||
+            compatibleApiQuotaDetailSubtitle !=
+                "兼容 API · 按 API 账单计费" ||
+            oauthQuotaDetailSubtitle.Contains("官方 Credits", StringComparison.Ordinal) ||
+            oauthQuotaDetailSubtitle.Contains("个人限额", StringComparison.Ordinal) ||
+            oauthQuotaDetailSubtitle.Contains("个人剩余", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "Quota detail subtitles must stay concise for every authentication type.");
+        }
+
+        var quotaDetailSubtitle = oauthQuotaDetailSubtitle;
+        const string quotaDetailMeta =
+            "5h重置：12-31 23:59 · 周重置：12-31 23:59 · 更新 12-31 23:59";
+        foreach (var scale in new[] { 1F, 1.5F, 2F })
+        {
+            using var subtitleFont = new Font(
+                SystemFonts.DefaultFont.FontFamily,
+                8.7F * scale,
+                FontStyle.Bold);
+            using var metaFont = new Font(
+                SystemFonts.DefaultFont.FontFamily,
+                8.6F * scale);
+            foreach (var width in new[] { 650, 980, 1_280 })
+            {
+                const int innerLeft = 22;
+                var innerWidth = width - 44;
+                var header = CalculateQuotaDetailHeaderGeometry(
+                    innerLeft,
+                    innerWidth,
+                    titleBottom: 68,
+                    quotaDetailSubtitle,
+                    quotaDetailMeta,
+                    subtitleFont,
+                    metaFont);
+                var requiredSubtitleHeight = MeasureThemeTextHeight(
+                    quotaDetailSubtitle,
+                    subtitleFont,
+                    innerWidth,
+                    minimumHeight: 34,
+                    verticalPadding: 8,
+                    wrap: true);
+                var requiredMetaHeight = MeasureThemeTextHeight(
+                    quotaDetailMeta,
+                    metaFont,
+                    innerWidth,
+                    minimumHeight: 28,
+                    verticalPadding: 8,
+                    wrap: true);
+                if (header.Subtitle.Top < 70 ||
+                    header.Subtitle.Left != innerLeft ||
+                    header.Subtitle.Right > width - innerLeft ||
+                    header.Subtitle.Height < requiredSubtitleHeight ||
+                    header.Meta.Top < header.Subtitle.Bottom + 2 ||
+                    header.Meta.Left != innerLeft ||
+                    header.Meta.Right > width - innerLeft ||
+                    header.Meta.Height < requiredMetaHeight ||
+                    header.Subtitle.IntersectsWith(header.Meta) ||
+                    header.MonitorTop < header.Meta.Bottom + 12)
+                {
+                    throw new InvalidOperationException(
+                        $"Quota detail header clips at {width}px/{scale:P0} DPI: {header}.");
+                }
             }
         }
     }
@@ -7739,6 +7835,16 @@ public partial class Form1 : Form
             : "重置时间待查询";
         return $"{windowLabel}官方额度：{remainingText}；{resetText}。只读查询不会调用模型。";
     }
+
+    private static string GetQuotaDetailSubtitle(AccountRecord account)
+    {
+        ArgumentNullException.ThrowIfNull(account);
+        var usageSummary = account.IsCompatibleApi
+            ? "按 API 账单计费"
+            : "仅显示官方额度百分比";
+        return $"{account.AuthKindLabel} · {usageSummary}";
+    }
+
     private static string? GetOfficialFinancialSummary(AccountUsageSummary usage)
     {
         var parts = new List<string>();
@@ -8344,21 +8450,32 @@ public partial class Form1 : Form
         ThemeStyler.ApplyLabel(title, _palette);
         card.Controls.Add(title);
 
-        var subtitleLeft = innerLeft;
-        var usageSummary = account.IsCompatibleApi
-            ? "按 API 账单计费"
-            : "仅显示官方额度百分比";
-        var officialSummary = account.IsCompatibleApi ? null : GetOfficialFinancialSummary(usage);
+        var subtitleText = GetQuotaDetailSubtitle(account);
+        var observed = usage.RateLimitObservedAtUtc.HasValue
+            ? $"更新 {usage.RateLimitObservedAtUtc.Value.ToLocalTime():MM-dd HH:mm}"
+            : "更新 暂无";
+        var pricingLabel = GetUsagePricingLabel(usage.Month, priceProfile);
+        var resetSummary = account.IsCompatibleApi
+            ? ""
+            : GetQuotaResetSummary(quotaLimitType, usage);
+        var visibleMeta = account.IsCompatibleApi
+            ? "余额请到服务商账单查看"
+            : $"{resetSummary} · {observed}";
+        var subtitleFont = new Font(Font.FontFamily, 8.7F, FontStyle.Bold);
+        var metaFont = new Font(Font.FontFamily, 8.6F);
+        var headerGeometry = CalculateQuotaDetailHeaderGeometry(
+            innerLeft,
+            innerWidth,
+            title.Bottom,
+            subtitleText,
+            visibleMeta,
+            subtitleFont,
+            metaFont);
         var subtitle = new Label
         {
-            Text = string.IsNullOrWhiteSpace(officialSummary)
-                ? $"{account.AuthKindLabel} · {usageSummary}"
-                : $"{account.AuthKindLabel} · {usageSummary} · {officialSummary}",
-            Left = subtitleLeft,
-            Top = compact ? 68 : 66,
-            Width = compact ? innerWidth : Math.Min(580, Math.Max(280, innerWidth / 2)),
-            Height = 38,
-            Font = new Font(Font.FontFamily, 8.7F, FontStyle.Bold),
+            Text = subtitleText,
+            Bounds = headerGeometry.Subtitle,
+            Font = subtitleFont,
             AutoEllipsis = false,
             TextAlign = ContentAlignment.MiddleLeft,
             UseCompatibleTextRendering = true,
@@ -8373,16 +8490,6 @@ public partial class Form1 : Form
         );
         card.Controls.Add(subtitle);
 
-        var observed = usage.RateLimitObservedAtUtc.HasValue
-            ? $"更新 {usage.RateLimitObservedAtUtc.Value.ToLocalTime():MM-dd HH:mm}"
-            : "更新 暂无";
-        var pricingLabel = GetUsagePricingLabel(usage.Month, priceProfile);
-        var resetSummary = account.IsCompatibleApi
-            ? ""
-            : GetQuotaResetSummary(quotaLimitType, usage);
-        var visibleMeta = account.IsCompatibleApi
-            ? "余额请到服务商账单查看"
-            : $"{resetSummary} · {observed}";
         var cacheWriteStatus = GetCacheWriteReportingLabel(usage.Month);
         var metaDetail = account.IsCompatibleApi
             ? $"兼容 API 按量计费，本软件只能从本地会话统计用量，无法读取服务商余额或重置时间；费用按 {pricingLabel} 估算；{cacheWriteStatus}"
@@ -8390,12 +8497,12 @@ public partial class Form1 : Form
         var meta = new Label
         {
             Text = visibleMeta,
-            Left = compact ? innerLeft : innerLeft + Math.Min(610, innerWidth - 250),
-            Top = compact ? 106 : 70,
-            Width = compact ? innerWidth : Math.Max(240, innerWidth - Math.Min(610, innerWidth - 250)),
-            Height = 28,
-            Font = new Font(Font.FontFamily, 8.6F),
-            AutoEllipsis = true
+            Bounds = headerGeometry.Meta,
+            Font = metaFont,
+            AutoEllipsis = false,
+            TextAlign = ContentAlignment.MiddleLeft,
+            UseCompatibleTextRendering = true,
+            UseMnemonic = false
         };
         ThemeStyler.ApplyLabel(meta, _palette, true);
         _toolTip.SetToolTip(meta, metaDetail);
@@ -8404,7 +8511,7 @@ public partial class Form1 : Form
         // The 今天 / 本周 / 本月 summaries belong to the monitoring composition
         // itself. Keeping them inside the right information card removes the
         // detached duplicate strip and gives the card a coherent hierarchy.
-        var monitorTop = compact ? 146 : 112;
+        var monitorTop = headerGeometry.MonitorTop;
         var passiveMonitoring = GetPassiveQuotaMonitoringResult(account, usage);
         var monitor = MakePassiveQuotaMonitor(
             account,
@@ -8529,6 +8636,38 @@ public partial class Form1 : Form
         };
 
         return card;
+    }
+
+    private static (Rectangle Subtitle, Rectangle Meta, int MonitorTop)
+        CalculateQuotaDetailHeaderGeometry(
+            int innerLeft,
+            int innerWidth,
+            int titleBottom,
+            string subtitleText,
+            string metaText,
+            Font subtitleFont,
+            Font metaFont)
+    {
+        innerWidth = Math.Max(1, innerWidth);
+        var subtitleTop = titleBottom + 2;
+        var subtitleHeight = MeasureThemeTextHeight(
+            subtitleText,
+            subtitleFont,
+            innerWidth,
+            minimumHeight: 34,
+            verticalPadding: 8,
+            wrap: true);
+        var subtitle = new Rectangle(innerLeft, subtitleTop, innerWidth, subtitleHeight);
+        var metaTop = subtitle.Bottom + 2;
+        var metaHeight = MeasureThemeTextHeight(
+            metaText,
+            metaFont,
+            innerWidth,
+            minimumHeight: 28,
+            verticalPadding: 8,
+            wrap: true);
+        var meta = new Rectangle(innerLeft, metaTop, innerWidth, metaHeight);
+        return (subtitle, meta, meta.Bottom + 12);
     }
 
     private int GetQuotaTrendChartHeight(int innerWidth)
@@ -11813,7 +11952,7 @@ public partial class Form1 : Form
         return badge;
     }
 
-    private int MeasureThemeTextHeight(
+    private static int MeasureThemeTextHeight(
         string text,
         Font font,
         int width,
@@ -12381,6 +12520,9 @@ public partial class Form1 : Form
                 StringComparison.OrdinalIgnoreCase);
             try
             {
+                // Save the native Codex Fast/Standard choice before a Token/API-key edit
+                // changes the account credential used to prove ownership of the shared profile.
+                _codex.CaptureActiveServiceTier();
                 _store.SaveAccount(
                     updatedAccount,
                     account.Name,

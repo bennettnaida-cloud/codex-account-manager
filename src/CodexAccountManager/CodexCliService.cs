@@ -64,6 +64,16 @@ public sealed partial class CodexCliService
     private const string ConfigFileName = "config.toml";
     private const string GlobalStateFileName = ".codex-global-state.json";
     private const string DesktopSelectionFileName = ".codex-account-manager-desktop-selection.json";
+    // This sidecar identifies the account whose credentials currently own the shared
+    // desktop profile.  It contains no credential material and is separate from the
+    // OAuth-only selection file above so direct PAT/API projections cannot affect OAuth
+    // restore semantics.
+    private const string ActiveAccountStateFileName = ".codex-account-manager-active-account.json";
+    private const string DesktopSelectionModeOfficialOAuth = "chatgpt-official-oauth";
+    private const string DesktopSelectionModeChatGptAccessToken = "chatgpt-app-plus-personal-access-token";
+    private const string DesktopSelectionModeChatGptCompatibleApi = "chatgpt-app-plus-compatible-api";
+    private const string DesktopSelectionModeDirectAccessToken = "api-compatible-personal-access-token";
+    private const string DesktopSelectionModeDirectCompatibleApi = "api-compatible-compatible-api";
     private const string DesktopAuthStoreDirectoryName = "account-switcher-desktop-auth";
     private const string DesktopGlobalAuthDirectoryName = "global";
     private const string DesktopAuthStoreFileName = "auth.json";
@@ -90,6 +100,18 @@ public sealed partial class CodexCliService
     private static readonly TimeSpan MinimalQuotaTestTimeout = TimeSpan.FromSeconds(25);
     private const int MinimalQuotaTestResponseMaxBytes = 512 * 1024;
     private const int CompatibleApiModelCatalogMaxBytes = 2 * 1024 * 1024;
+    // Dream Skin owns 9335-9435. Native Fast uses a disjoint range so either feature can
+    // fail or recover independently without ever attaching to the other feature's browser.
+    private const int OfficialNativeFastCdpPortBase = 19335;
+    private const int OfficialNativeFastCdpPortCount = 32;
+    private const int DreamSkinCdpPortBase = 9335;
+    private const int DreamSkinCdpPortCount = 101;
+    private const int OfficialNativeFastCdpMaxResponseBytes = 512 * 1024;
+    private static readonly TimeSpan OfficialNativeFastRendererReadyTimeout =
+        TimeSpan.FromSeconds(40);
+    private const uint ErrorInsufficientBuffer = 122;
+    private const int AddressFamilyInterNetwork = 2;
+    private const int TcpTableOwnerPidListener = 3;
     private static readonly string[] ProxyEnvironmentVariableNames =
     [
         "HTTP_PROXY",
@@ -118,6 +140,9 @@ public sealed partial class CodexCliService
     private static readonly Dictionary<string, AccessTokenSwitchValidationCacheEntry> AccessTokenSwitchValidationCache =
         new(StringComparer.OrdinalIgnoreCase);
     private static readonly object CodexPlusPlusLaunchDiagnosticLock = new();
+    private static readonly Regex CdpIdentityPattern = new(
+        "^[A-Za-z0-9._-]{1,200}$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
     private static readonly SemaphoreSlim OfficialOAuthLoginLock = new(1, 1);
     private static long _windowsClientLaunchGeneration;
     private static readonly SemaphoreSlim CodexPlusPlusTaskOperationLock = new(1, 1);
@@ -166,25 +191,41 @@ public sealed partial class CodexCliService
     public bool IsSharedProfileAlreadySelected(AccountRecord account)
     {
         ArgumentNullException.ThrowIfNull(account);
+        PersistSharedServiceTierToSelectedAccount();
         return CanReuseSharedProfileWithoutNetwork(
             account,
             Path.Combine(account.CodexHome, ConfigFileName),
             AccessTokenSharedProfileMode.ApiCompatible);
     }
 
+    public void CaptureActiveServiceTier()
+    {
+        PersistSharedServiceTierToSelectedAccount();
+    }
+
     public bool DeleteSharedCredentialIfSelected(AccountRecord account)
     {
         ArgumentNullException.ThrowIfNull(account);
-        var sharedCredentialSelected = IsSharedCredentialAlreadySelected(account);
-
+        PersistSharedServiceTierToSelectedAccount();
         var sharedHome = GetDefaultCodexHome();
+        var accountKey = GetDesktopAccountKey(account);
+        var hasActiveAccountState = TryReadActiveAccountState(
+            sharedHome,
+            out var activeAccountKey,
+            out _,
+            out _);
+        var sharedCredentialSelected = hasActiveAccountState
+            ? activeAccountKey.Equals(accountKey, StringComparison.OrdinalIgnoreCase)
+            : IsSharedCredentialAlreadySelected(account);
+
         if (sharedCredentialSelected)
         {
             foreach (var fileName in new[]
                      {
                          AuthFileName,
                          CockpitAuthFileName,
-                         DesktopSelectionFileName
+                         DesktopSelectionFileName,
+                         ActiveAccountStateFileName
                      })
             {
                 var path = Path.Combine(sharedHome, fileName);
@@ -272,6 +313,7 @@ public sealed partial class CodexCliService
             throw new InvalidOperationException(validationError);
         }
 
+        PersistSharedServiceTierToSelectedAccount();
         EnsureLocalPatAccountConfig(account);
         await LocalPatGateway.EnsureRunningAsync();
         var result = await RunCodexAsync("login --with-access-token", account.CodexHome, accessToken);
@@ -307,6 +349,7 @@ public sealed partial class CodexCliService
         IProgress<ChatGptOAuthAuthorization>? authorizationProgress = null,
         CancellationToken cancellationToken = default)
     {
+        PersistSharedServiceTierToSelectedAccount();
         if (!await OfficialOAuthLoginLock.WaitAsync(0, cancellationToken))
         {
             throw new InvalidOperationException(
@@ -1176,6 +1219,7 @@ public sealed partial class CodexCliService
 
     public async Task<WindowsClientAccountProjection> PrepareWindowsClientAccountAsync(AccountRecord account)
     {
+        PersistSharedServiceTierToSelectedAccount();
         var status = await ValidateWindowsClientAccountAsync(
             account,
             accessTokenMode: AccessTokenSharedProfileMode.ApiCompatible);
@@ -1247,6 +1291,11 @@ public sealed partial class CodexCliService
         {
             throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unsupported Windows client mode.");
         }
+
+        // Capture the native picker value before the validation/reuse decision.  The shared
+        // config belongs to the account that is currently running, not necessarily the account
+        // represented by this click.
+        PersistSharedServiceTierToSelectedAccount();
 
         // A normal desktop switch only validates local files. Running login status, debug
         // models, or a minimal model request here could consume quota and block this click for
@@ -1552,6 +1601,7 @@ public sealed partial class CodexCliService
 
         try
         {
+            var targetServiceTier = ReadDesktopServiceTier(File.ReadAllText(sourceConfigPath));
             var sharedConfig = File.ReadAllText(sharedConfigPath);
             var projectedSharedConfig = accessTokenMode == AccessTokenSharedProfileMode.ChatGptDesktop
                 ? account.IsCompatibleApi
@@ -1559,27 +1609,31 @@ public sealed partial class CodexCliService
                         sharedConfig,
                         account,
                         requiresOpenAiAuth: true,
-                        providerBearerToken: ReadAccessTokenCredential(
-                            Path.Combine(account.CodexHome, AuthFileName)),
-                        forceFileAuthStore: true)
+                            providerBearerToken: ReadAccessTokenCredential(
+                                Path.Combine(account.CodexHome, AuthFileName)),
+                        forceFileAuthStore: true,
+                        serviceTier: targetServiceTier)
                     : ProjectWindowsClientConfigText(
                         sharedConfig,
                         requiresOpenAiAuth: true,
                         desktopProviderName: account.Name,
                         providerBearerToken: ReadAccessTokenCredential(
                             Path.Combine(account.CodexHome, AuthFileName)),
-                        forceFileAuthStore: true)
+                        forceFileAuthStore: true,
+                        serviceTier: targetServiceTier)
                 : account.IsCompatibleApi
                     ? ProjectCompatibleApiConfigText(
                         sharedConfig,
                         account,
                         requiresOpenAiAuth: true,
-                        forceFileAuthStore: true)
+                        forceFileAuthStore: true,
+                        serviceTier: targetServiceTier)
                     : ProjectWindowsClientConfigText(
                         sharedConfig,
                         requiresOpenAiAuth: true,
                         desktopProviderName: account.Name,
-                        forceFileAuthStore: true);
+                        forceFileAuthStore: true,
+                        serviceTier: targetServiceTier);
             projectedSharedConfig = PreserveSharedMcpServerSections(
                 sharedConfig,
                 projectedSharedConfig);
@@ -1714,6 +1768,7 @@ public sealed partial class CodexCliService
     private static bool CanReuseOfficialOAuthSharedProfile(AccountRecord account)
     {
         var profileHome = Path.GetFullPath(GetDefaultCodexHome());
+        var targetServiceTier = ReadAccountServiceTier(account.CodexHome);
         var sharedAuthPath = Path.Combine(profileHome, AuthFileName);
         var sharedConfigPath = Path.Combine(profileHome, ConfigFileName);
         if (!IsDesktopSelectionForAccount(profileHome, account) ||
@@ -1729,7 +1784,7 @@ public sealed partial class CodexCliService
             var current = File.ReadAllText(sharedConfigPath);
             return string.Equals(
                 current,
-                ProjectOfficialOAuthConfigText(current),
+                ProjectOfficialOAuthConfigText(current, targetServiceTier),
                 StringComparison.Ordinal);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -1752,6 +1807,7 @@ public sealed partial class CodexCliService
         var cockpitAuthPath = Path.Combine(profileHome, CockpitAuthFileName);
         var sharedConfigPath = Path.Combine(profileHome, ConfigFileName);
         var selectionPath = Path.Combine(profileHome, DesktopSelectionFileName);
+        var activeAccountStatePath = Path.Combine(profileHome, ActiveAccountStateFileName);
 
         // Before replacing the shared profile, preserve a refresh-token rotation made by
         // the official App for the account that is currently selected. The snapshot is
@@ -1771,19 +1827,25 @@ public sealed partial class CodexCliService
         var cockpitAuthExisted = File.Exists(cockpitAuthPath);
         var configExisted = File.Exists(sharedConfigPath);
         var selectionExisted = File.Exists(selectionPath);
+        var activeAccountStateExisted = File.Exists(activeAccountStatePath);
         var authBackupPath = authFileReused
             ? null
             : BackupFileIfPresent(sharedAuthPath, backupDirectory);
         var cockpitBackupPath = BackupFileIfPresent(cockpitAuthPath, backupDirectory);
         var configBackupPath = BackupFileIfPresent(sharedConfigPath, backupDirectory);
         var selectionBackupPath = BackupFileIfPresent(selectionPath, backupDirectory);
+        var activeAccountStateBackupPath = BackupFileIfPresent(
+            activeAccountStatePath,
+            backupDirectory);
 
         try
         {
             var currentConfig = File.Exists(sharedConfigPath)
                 ? File.ReadAllText(sharedConfigPath)
                 : "";
-            var projectedConfig = ProjectOfficialOAuthConfigText(currentConfig);
+            var projectedConfig = ProjectOfficialOAuthConfigText(
+                currentConfig,
+                ReadAccountServiceTier(accountHome));
             if (!string.Equals(currentConfig, projectedConfig, StringComparison.Ordinal))
             {
                 WriteTextAtomically(sharedConfigPath, projectedConfig);
@@ -1814,6 +1876,10 @@ public sealed partial class CodexCliService
             }
 
             WriteDesktopSelection(profileHome, account);
+            WriteActiveAccountState(
+                profileHome,
+                account,
+                AccessTokenSharedProfileMode.ChatGptDesktop);
         }
         catch
         {
@@ -1821,6 +1887,10 @@ public sealed partial class CodexCliService
             RestoreFile(cockpitAuthPath, cockpitBackupPath, cockpitAuthExisted);
             RestoreFile(sharedConfigPath, configBackupPath, configExisted);
             RestoreFile(selectionPath, selectionBackupPath, selectionExisted);
+            RestoreFile(
+                activeAccountStatePath,
+                activeAccountStateBackupPath,
+                activeAccountStateExisted);
             throw;
         }
 
@@ -1834,10 +1904,12 @@ public sealed partial class CodexCliService
             CockpitAuthBackupPath = cockpitBackupPath,
             ConfigBackupPath = configBackupPath,
             DesktopSelectionBackupPath = selectionBackupPath,
+            ActiveAccountStateBackupPath = activeAccountStateBackupPath,
             AuthExisted = authExisted,
             CockpitAuthExisted = cockpitAuthExisted,
             ConfigExisted = configExisted,
             DesktopSelectionExisted = selectionExisted,
+            ActiveAccountStateExisted = activeAccountStateExisted,
             SharedCredentialsReused = sharedProfileReused,
             ProfileChanged = !sharedProfileReused,
             DesktopLoginRequired = false
@@ -1863,6 +1935,7 @@ public sealed partial class CodexCliService
             PersistSelectedDesktopChatGptAuth(profileHome, authPath);
             PersistGlobalDesktopChatGptAuth(profileHome, authPath);
         }
+        WriteActiveAccountState(profileHome, account, mode);
         return new WindowsClientAccountProjection
         {
             Status = status,
@@ -1898,6 +1971,7 @@ public sealed partial class CodexCliService
         var cockpitAuthPath = Path.Combine(profileHome, CockpitAuthFileName);
         var configPath = Path.Combine(profileHome, ConfigFileName);
         var selectionPath = Path.Combine(profileHome, DesktopSelectionFileName);
+        var activeAccountStatePath = Path.Combine(profileHome, ActiveAccountStateFileName);
         var useChatGptDesktopAuth =
             accessTokenMode == AccessTokenSharedProfileMode.ChatGptDesktop;
 
@@ -1917,12 +1991,16 @@ public sealed partial class CodexCliService
         var cockpitAuthExisted = File.Exists(cockpitAuthPath);
         var configExisted = File.Exists(configPath);
         var selectionExisted = File.Exists(selectionPath);
+        var activeAccountStateExisted = File.Exists(activeAccountStatePath);
         var authBackupPath = authFileReused
             ? null
             : BackupFileIfPresent(authPath, backupDirectory);
         var cockpitBackupPath = BackupFileIfPresent(cockpitAuthPath, backupDirectory);
         var configBackupPath = BackupFileIfPresent(configPath, backupDirectory);
         var selectionBackupPath = BackupFileIfPresent(selectionPath, backupDirectory);
+        var activeAccountStateBackupPath = BackupFileIfPresent(
+            activeAccountStatePath,
+            backupDirectory);
 
         try
         {
@@ -1940,7 +2018,8 @@ public sealed partial class CodexCliService
                     providerBearerToken: useChatGptDesktopAuth
                         ? ReadAccessTokenCredential(sourceAuthPath)
                         : null,
-                    forceFileAuthStore: true);
+                    forceFileAuthStore: true,
+                    serviceTier: ReadDesktopServiceTier(sourceConfig));
                 var currentConfig = File.Exists(configPath) ? File.ReadAllText(configPath) : "";
                 projectedConfig = PreserveSharedMcpServerSections(currentConfig, projectedConfig);
                 if (!string.Equals(currentConfig, projectedConfig, StringComparison.Ordinal))
@@ -1958,12 +2037,14 @@ public sealed partial class CodexCliService
                         requiresOpenAiAuth: true,
                         desktopProviderName: account.Name,
                         providerBearerToken: ReadAccessTokenCredential(sourceAuthPath),
-                        forceFileAuthStore: true)
+                        forceFileAuthStore: true,
+                        serviceTier: ReadDesktopServiceTier(sourceConfig))
                     : ProjectWindowsClientConfigText(
                         sourceConfig,
                         requiresOpenAiAuth: true,
                         desktopProviderName: account.Name,
-                        forceFileAuthStore: true);
+                        forceFileAuthStore: true,
+                        serviceTier: ReadDesktopServiceTier(sourceConfig));
                 var currentConfig = File.Exists(configPath) ? File.ReadAllText(configPath) : "";
                 projectedConfig = PreserveSharedMcpServerSections(currentConfig, projectedConfig);
                 if (!string.Equals(currentConfig, projectedConfig, StringComparison.Ordinal))
@@ -2023,6 +2104,8 @@ public sealed partial class CodexCliService
                 ClearReadOnlyAttribute(selectionPath);
                 File.Delete(selectionPath);
             }
+
+            WriteActiveAccountState(profileHome, account, accessTokenMode);
         }
         catch
         {
@@ -2030,6 +2113,10 @@ public sealed partial class CodexCliService
             RestoreFile(cockpitAuthPath, cockpitBackupPath, cockpitAuthExisted);
             RestoreFile(configPath, configBackupPath, configExisted);
             RestoreFile(selectionPath, selectionBackupPath, selectionExisted);
+            RestoreFile(
+                activeAccountStatePath,
+                activeAccountStateBackupPath,
+                activeAccountStateExisted);
             throw;
         }
 
@@ -2043,10 +2130,12 @@ public sealed partial class CodexCliService
             CockpitAuthBackupPath = cockpitBackupPath,
             ConfigBackupPath = configBackupPath,
             DesktopSelectionBackupPath = selectionBackupPath,
+            ActiveAccountStateBackupPath = activeAccountStateBackupPath,
             AuthExisted = authExisted,
             CockpitAuthExisted = cockpitAuthExisted,
             ConfigExisted = configExisted,
             DesktopSelectionExisted = selectionExisted,
+            ActiveAccountStateExisted = activeAccountStateExisted,
             SharedCredentialsReused = sharedProfileReused,
             ProfileChanged = !sharedProfileReused,
             DesktopLoginRequired = useChatGptDesktopAuth && !IsChatGptDesktopAuthJson(authPath)
@@ -2173,7 +2262,8 @@ public sealed partial class CodexCliService
             !useDreamSkin &&
             HasWindowsClientMainWindowSince(DateTime.MinValue))
         {
-            if (IsWindowsClientRuntimeHealthySince(DateTime.MinValue))
+            if (IsWindowsClientRuntimeHealthySince(DateTime.MinValue) &&
+                TryAttachNativeFastBridgeToExistingOfficialCodex())
             {
                 Process.Start(new ProcessStartInfo(BuildNewThreadDeepLink(projectPath))
                 {
@@ -2182,9 +2272,12 @@ public sealed partial class CodexCliService
                 return true;
             }
 
-            // A visible Electron shell is not sufficient evidence that the renderer and
-            // bundled app-server survived.  Re-activating a blank shell simply keeps it
-            // blank, so a same-account retry must first drain that unhealthy process tree.
+            // This branch is reached only from an explicit "start account" operation. A
+            // healthy same-account client is preserved when its listener, owning packaged
+            // process, browser identity and reviewed app://codex target all validate live.
+            // Otherwise Electron cannot enable CDP after startup, so one controlled restart is
+            // required to make the native Standard/Fast picker available. A merely visible or
+            // spoofed shell is never reused.
             StopWindowsClientProcesses(CaptureWindowsClientProcessSnapshots());
         }
 
@@ -2214,7 +2307,16 @@ public sealed partial class CodexCliService
         bool switchRequired,
         long launchGeneration)
     {
-        if (IsCodexPlusPlusReady())
+        // Apply the Codex++ service-tier control preference before the ready fast path too.
+        // Existing Codex++ processes otherwise skip the settings sync and can keep the picker
+        // hidden after an older manager build wrote `codexAppServiceTierControls=false`.
+        var clientPathForInjection = ResolveCodexWindowsClientPath();
+        var clientAppDir = string.IsNullOrWhiteSpace(clientPathForInjection)
+            ? null
+            : Path.GetDirectoryName(clientPathForInjection);
+        var serviceTierControlsChanged = EnsureCodexPlusPlusSafeSettings(clientAppDir);
+
+        if (IsCodexPlusPlusReady() && !serviceTierControlsChanged)
         {
             Process.Start(new ProcessStartInfo(BuildNewThreadDeepLink(projectPath))
             {
@@ -2222,18 +2324,19 @@ public sealed partial class CodexCliService
             });
             return true;
         }
+        if (serviceTierControlsChanged && IsCodexPlusPlusReady())
+        {
+            // Codex++ loads backend settings only during startup. This one-time restart is
+            // required when upgrading from an older manager that persisted the control as off.
+            StopWindowsClientProcesses(CaptureWindowsClientProcessSnapshots());
+        }
 
         var codexPlusPlusPath = ResolveCodexPlusPlusLauncherPath();
         if (!string.IsNullOrWhiteSpace(codexPlusPlusPath))
         {
-            var clientPathForInjection = ResolveCodexWindowsClientPath();
-            var clientAppDir = string.IsNullOrWhiteSpace(clientPathForInjection)
-                ? null
-                : Path.GetDirectoryName(clientPathForInjection);
             // Codex++ 1.2.34 does not reliably forward the launcher's --app-path to its
             // manager.  Persisting the already resolved package app directory avoids a slow
             // Get-AppxPackage discovery path that has taken 52-66 seconds on this machine.
-            EnsureCodexPlusPlusSafeSettings(clientAppDir);
             var launchStartedUtc = DateTime.UtcNow;
             if (TryLaunchCodexPlusPlusViaScheduledTask(
                     codexPlusPlusPath,
@@ -2331,6 +2434,15 @@ public sealed partial class CodexCliService
                 appearancePresetId,
                 appearanceLabel,
                 projectPath);
+            if (!TryAttachNativeFastBridgeToExistingOfficialCodex(
+                    DreamSkinCdpPortCandidates(),
+                    out var dreamSkinFastReady) ||
+                !dreamSkinFastReady)
+            {
+                WriteCodexPlusPlusLaunchDiagnostic(
+                    "dream-skin-native-fast-unavailable",
+                    "no verified Dream Skin Codex renderer accepted the native Fast bridge");
+            }
             // Start() has already opened a verified Codex process. The deep link only selects
             // the requested project/task, so its failure must not report the successful theme
             // activation as a failed client launch.
@@ -2344,12 +2456,32 @@ public sealed partial class CodexCliService
         var launchStartedUtc = DateTime.UtcNow;
         try
         {
-            var activationIdentity = ActivateOfficialCodexPackage();
+            WindowsClientActivationIdentity activationIdentity;
+            Task<bool>? nativeFastReadyTask = null;
+            try
+            {
+                var nativeFastPort = SelectOfficialNativeFastCdpPort();
+                activationIdentity = ActivateOfficialCodexPackage(nativeFastPort);
+                nativeFastReadyTask = AttachNativeFastBridgeWhenOfficialCodexIsReady(
+                    nativeFastPort,
+                    activationIdentity,
+                    launchGeneration);
+            }
+            catch (Exception nativeFastError)
+            {
+                // Fast is an additive renderer feature. Port selection, bridge process startup,
+                // or CDP activation must never prevent the signed official client from opening.
+                WriteCodexPlusPlusLaunchDiagnostic(
+                    "official-native-fast-unavailable",
+                    MaskSensitive(nativeFastError.Message));
+                activationIdentity = ActivateOfficialCodexPackage();
+            }
             OpenNewTaskAfterOfficialCodexLaunchInBackground(
                 projectPath,
                 launchStartedUtc,
                 activationIdentity,
-                launchGeneration);
+                launchGeneration,
+                nativeFastReadyTask);
             return true;
         }
         catch (Exception packageActivationError)
@@ -2507,7 +2639,8 @@ public sealed partial class CodexCliService
         string projectPath,
         DateTime launchStartedUtc,
         WindowsClientActivationIdentity activationIdentity,
-        long launchGeneration)
+        long launchGeneration,
+        Task<bool>? nativeFastReadyTask = null)
     {
         _ = Task.Run(() =>
         {
@@ -2531,6 +2664,21 @@ public sealed partial class CodexCliService
                             "renderer/app-server did not become stable before the deep-link deadline");
                     }
                     return;
+                }
+
+                if (nativeFastReadyTask != null)
+                {
+                    try
+                    {
+                        // The deep link mounts a fresh native composer. Deliver it only after the
+                        // reviewed renderer response substitution is ready, so PAT/API users see Standard/Fast
+                        // without focus/visibility events that could trigger network refetches.
+                        _ = nativeFastReadyTask.Wait(OfficialNativeFastRendererReadyTimeout);
+                    }
+                    catch
+                    {
+                        // The bridge is additive and records its own local diagnostic.
+                    }
                 }
 
                 // Runtime health has already remained stable for several seconds. Give the
@@ -2557,7 +2705,8 @@ public sealed partial class CodexCliService
         });
     }
 
-    private static WindowsClientActivationIdentity ActivateOfficialCodexPackage()
+    private static WindowsClientActivationIdentity ActivateOfficialCodexPackage(
+        int? nativeFastCdpPort = null)
     {
         var appUserModelId = ResolveCodexWindowsClientAppUserModelId();
         if (string.IsNullOrWhiteSpace(appUserModelId))
@@ -2572,7 +2721,9 @@ public sealed partial class CodexCliService
         {
             var result = activationManager.ActivateApplication(
                 appUserModelId,
-                string.Empty,
+                nativeFastCdpPort.HasValue
+                    ? BuildOfficialNativeFastActivationArguments(nativeFastCdpPort.Value)
+                    : string.Empty,
                 ApplicationActivationOptions.None,
                 out var processId);
             Marshal.ThrowExceptionForHR(result);
@@ -2626,6 +2777,499 @@ public sealed partial class CodexCliService
         } while (DateTime.UtcNow < deadline);
 
         return new WindowsClientActivationIdentity(managedProcessId, StartTimeUtcTicks: null);
+    }
+
+    internal static string BuildOfficialNativeFastActivationArguments(int port)
+    {
+        if (port < OfficialNativeFastCdpPortBase ||
+            port >= OfficialNativeFastCdpPortBase + OfficialNativeFastCdpPortCount)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(port),
+                port,
+                "Official Codex native Fast CDP port is outside the manager-owned range.");
+        }
+
+        return "--remote-debugging-address=127.0.0.1 " +
+               "--remote-debugging-port=" +
+               port.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    private static IReadOnlyList<int> OfficialNativeFastCdpPortCandidates()
+    {
+        return Enumerable.Range(OfficialNativeFastCdpPortBase, OfficialNativeFastCdpPortCount).ToArray();
+    }
+
+    private static IReadOnlyList<int> DreamSkinCdpPortCandidates()
+    {
+        var candidates = Enumerable.Range(DreamSkinCdpPortBase, DreamSkinCdpPortCount).ToList();
+        if (CodexDreamSkinService.TryGetRecordedCdpPort(out var recordedPort) &&
+            !candidates.Contains(recordedPort))
+        {
+            candidates.Insert(0, recordedPort);
+        }
+        return candidates;
+    }
+
+    private static int SelectOfficialNativeFastCdpPort()
+    {
+        return SelectOfficialNativeFastCdpPort(IsOfficialNativeFastCdpPortAvailable);
+    }
+
+    private static int SelectOfficialNativeFastCdpPort(Func<int, bool> isAvailable)
+    {
+        ArgumentNullException.ThrowIfNull(isAvailable);
+        foreach (var port in OfficialNativeFastCdpPortCandidates())
+        {
+            if (isAvailable(port))
+            {
+                return port;
+            }
+        }
+
+        throw new InvalidOperationException(
+            $"No free loopback port is available for native Fast between " +
+            $"{OfficialNativeFastCdpPortBase} and " +
+            $"{OfficialNativeFastCdpPortBase + OfficialNativeFastCdpPortCount - 1}.");
+    }
+
+    private static bool IsOfficialNativeFastCdpPortAvailable(int port)
+    {
+        TcpListener? listener = null;
+        try
+        {
+            listener = new TcpListener(IPAddress.Loopback, port);
+            listener.Server.ExclusiveAddressUse = true;
+            listener.Start();
+            return true;
+        }
+        catch (SocketException)
+        {
+            // Another listener owns this candidate. Never attach the bridge to it; try the
+            // next manager-owned port and verify the eventual listener owner before attaching.
+            return false;
+        }
+        finally
+        {
+            listener?.Stop();
+        }
+    }
+
+    private static Task<bool> AttachNativeFastBridgeWhenOfficialCodexIsReady(
+        int port,
+        WindowsClientActivationIdentity activationIdentity,
+        long launchGeneration)
+    {
+        return Task.Run(() =>
+        {
+            try
+            {
+                var deadline = DateTime.UtcNow.AddSeconds(45);
+                while (DateTime.UtcNow < deadline &&
+                       IsCurrentWindowsClientLaunchGeneration(launchGeneration))
+                {
+                    if (TryCaptureOfficialNativeFastEndpoint(
+                            port,
+                            out var browserId,
+                            out var listenerIdentity) &&
+                        listenerIdentity.ProcessId == activationIdentity.ProcessId &&
+                        (!activationIdentity.StartTimeUtcTicks.HasValue ||
+                         listenerIdentity.StartTimeUtcTicks == activationIdentity.StartTimeUtcTicks))
+                    {
+                        if (CodexNativeFastBridge.WaitForRendererPatch(
+                                port,
+                                browserId,
+                                listenerIdentity.ProcessId,
+                                listenerIdentity.StartTimeUtcTicks ?? 0,
+                                TimeSpan.Zero))
+                        {
+                            return true;
+                        }
+                        using var bridgeProcess = CodexNativeFastBridge.StartDetached(
+                            port,
+                            browserId,
+                            listenerIdentity.ProcessId,
+                            listenerIdentity.StartTimeUtcTicks ?? 0,
+                            GetCodexWindowsClientAppDirectory() ??
+                            throw new InvalidOperationException(
+                                "The installed Codex application directory could not be verified."),
+                            allowRendererReload: true);
+                        if (CodexNativeFastBridge.WaitForRendererPatch(
+                                port,
+                                browserId,
+                                listenerIdentity.ProcessId,
+                                listenerIdentity.StartTimeUtcTicks ?? 0,
+                                OfficialNativeFastRendererReadyTimeout))
+                        {
+                            return true;
+                        }
+                        WriteCodexPlusPlusLaunchDiagnostic(
+                            "official-native-fast-renderer-timeout",
+                            $"verified bridge did not report a patched renderer on port {port}");
+                        return false;
+                    }
+
+                    Thread.Sleep(250);
+                }
+                if (IsCurrentWindowsClientLaunchGeneration(launchGeneration))
+                {
+                    WriteCodexPlusPlusLaunchDiagnostic(
+                        "official-native-fast-endpoint-timeout",
+                        $"no verified official Codex app page CDP endpoint appeared on port {port}");
+                }
+                return false;
+            }
+            catch (Exception ex)
+            {
+                // Fast remains additive. A validation or bridge-process failure must not affect
+                // the already running signed official client.
+                WriteCodexPlusPlusLaunchDiagnostic(
+                    "official-native-fast-attach-unavailable",
+                    MaskSensitive(ex.Message));
+                return false;
+            }
+        });
+    }
+
+    private static bool TryAttachNativeFastBridgeToExistingOfficialCodex()
+    {
+        return TryAttachNativeFastBridgeToExistingOfficialCodex(
+            OfficialNativeFastCdpPortCandidates(),
+            out _);
+    }
+
+    private static bool TryAttachNativeFastBridgeToExistingOfficialCodex(
+        IEnumerable<int> portCandidates,
+        out bool rendererReady)
+    {
+        ArgumentNullException.ThrowIfNull(portCandidates);
+        rendererReady = false;
+        foreach (var port in portCandidates)
+        {
+            if (!TryCaptureOfficialNativeFastEndpoint(
+                    port,
+                    out var browserId,
+                    out var listenerIdentity))
+            {
+                continue;
+            }
+
+            try
+            {
+                if (CodexNativeFastBridge.WaitForRendererPatch(
+                        port,
+                        browserId,
+                        listenerIdentity.ProcessId,
+                        listenerIdentity.StartTimeUtcTicks ?? 0,
+                        TimeSpan.Zero))
+                {
+                    rendererReady = true;
+                    return true;
+                }
+                using var bridgeProcess = CodexNativeFastBridge.StartDetached(
+                    port,
+                    browserId,
+                    listenerIdentity.ProcessId,
+                    listenerIdentity.StartTimeUtcTicks ?? 0,
+                    GetCodexWindowsClientAppDirectory() ??
+                    throw new InvalidOperationException(
+                        "The installed Codex application directory could not be verified."),
+                    allowRendererReload: false);
+                rendererReady = CodexNativeFastBridge.WaitForRendererPatch(
+                        port,
+                        browserId,
+                        listenerIdentity.ProcessId,
+                        listenerIdentity.StartTimeUtcTicks ?? 0,
+                        TimeSpan.FromSeconds(5));
+                if (!rendererReady)
+                {
+                    WriteCodexPlusPlusLaunchDiagnostic(
+                        "official-native-fast-existing-renderer-timeout",
+                        $"verified bridge did not report a patched renderer on port {port}");
+                }
+            }
+            catch (Exception ex)
+            {
+                // A healthy CDP-enabled Codex is still preferable to restarting a same-account
+                // client merely because the optional bridge child could not be created. A later
+                // explicit start operation will retry the idempotent, identity-scoped bridge.
+                WriteCodexPlusPlusLaunchDiagnostic(
+                    "official-native-fast-existing-attach-unavailable",
+                    MaskSensitive(ex.Message));
+            }
+            // The endpoint and owning Codex process were verified even when the optional
+            // renderer patch was unavailable. Preserve that healthy same-account client;
+            // restarting it cannot make an unknown renderer version satisfy the patch contract.
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryCaptureOfficialNativeFastEndpoint(
+        int port,
+        out string browserId,
+        out WindowsClientActivationIdentity listenerIdentity)
+    {
+        browserId = "";
+        listenerIdentity = null!;
+        if (!TryGetOfficialCodexLoopbackListenerIdentity(port, out var before) ||
+            !TryReadOfficialCodexCdpIdentity(port, expectedBrowserId: null, out browserId) ||
+            !TryGetOfficialCodexLoopbackListenerIdentity(port, out var after) ||
+            before.ProcessId != after.ProcessId ||
+            before.StartTimeUtcTicks != after.StartTimeUtcTicks)
+        {
+            browserId = "";
+            return false;
+        }
+
+        listenerIdentity = after;
+        return true;
+    }
+
+    private static bool TryGetOfficialCodexLoopbackListenerIdentity(
+        int port,
+        out WindowsClientActivationIdentity identity)
+    {
+        identity = null!;
+        var bufferSize = 0;
+        var result = GetExtendedTcpTable(
+            IntPtr.Zero,
+            ref bufferSize,
+            order: false,
+            AddressFamilyInterNetwork,
+            TcpTableOwnerPidListener,
+            reserved: 0);
+        if (result != ErrorInsufficientBuffer || bufferSize <= sizeof(uint))
+        {
+            return false;
+        }
+
+        var buffer = Marshal.AllocHGlobal(bufferSize);
+        try
+        {
+            result = GetExtendedTcpTable(
+                buffer,
+                ref bufferSize,
+                order: false,
+                AddressFamilyInterNetwork,
+                TcpTableOwnerPidListener,
+                reserved: 0);
+            if (result != 0)
+            {
+                return false;
+            }
+
+            var rowCount = Marshal.ReadInt32(buffer);
+            if (rowCount is < 0 or > 65535)
+            {
+                return false;
+            }
+
+            var rowSize = Marshal.SizeOf<NativeTcpRowOwnerPid>();
+            var rowPointer = IntPtr.Add(buffer, sizeof(uint));
+            for (var index = 0; index < rowCount; index++)
+            {
+                var row = Marshal.PtrToStructure<NativeTcpRowOwnerPid>(rowPointer);
+                rowPointer = IntPtr.Add(rowPointer, rowSize);
+                var localPort = unchecked((ushort)IPAddress.NetworkToHostOrder(
+                    unchecked((short)row.LocalPort)));
+                if (localPort != port ||
+                    !new IPAddress(BitConverter.GetBytes(row.LocalAddress)).Equals(IPAddress.Loopback) ||
+                    row.OwningProcessId is 0 or > int.MaxValue)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    using var process = Process.GetProcessById((int)row.OwningProcessId);
+                    var clientPath = ResolveCodexWindowsClientPath();
+                    var packageRoot = string.IsNullOrWhiteSpace(clientPath)
+                        ? null
+                        : Path.GetDirectoryName(clientPath);
+                    if (process.HasExited || !IsCodexWindowsClientProcess(process, packageRoot))
+                    {
+                        return false;
+                    }
+
+                    identity = new WindowsClientActivationIdentity(
+                        process.Id,
+                        process.StartTime.ToUniversalTime().Ticks);
+                    return true;
+                }
+                catch (Exception ex) when (
+                    ex is ArgumentException or InvalidOperationException or Win32Exception or NotSupportedException)
+                {
+                    return false;
+                }
+            }
+
+            return false;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
+    private static bool TryReadOfficialCodexCdpIdentity(
+        int port,
+        string? expectedBrowserId,
+        out string browserId)
+    {
+        browserId = "";
+        try
+        {
+            using var handler = new SocketsHttpHandler
+            {
+                AllowAutoRedirect = false,
+                UseProxy = false,
+                ConnectTimeout = TimeSpan.FromMilliseconds(400)
+            };
+            using var client = new HttpClient(handler)
+            {
+                Timeout = TimeSpan.FromMilliseconds(900),
+                MaxResponseContentBufferSize = OfficialNativeFastCdpMaxResponseBytes
+            };
+            using var version = ReadOfficialCodexCdpJson(client, port, "/json/version");
+            var versionSocket = version.RootElement.TryGetProperty(
+                "webSocketDebuggerUrl",
+                out var versionSocketValue)
+                ? versionSocketValue.GetString()
+                : null;
+            if (!TryValidateOfficialCodexCdpSocket(
+                    versionSocket,
+                    port,
+                    "browser",
+                    expectedId: expectedBrowserId,
+                    out browserId))
+            {
+                return false;
+            }
+
+            using var targets = ReadOfficialCodexCdpJson(client, port, "/json/list");
+            if (targets.RootElement.ValueKind != JsonValueKind.Array)
+            {
+                return false;
+            }
+
+            foreach (var target in targets.RootElement.EnumerateArray())
+            {
+                var type = target.TryGetProperty("type", out var typeValue)
+                    ? typeValue.GetString()
+                    : null;
+                var pageUrl = target.TryGetProperty("url", out var urlValue)
+                    ? urlValue.GetString()
+                    : null;
+                var targetId = target.TryGetProperty("id", out var idValue)
+                    ? idValue.GetString()
+                    : null;
+                var targetSocket = target.TryGetProperty("webSocketDebuggerUrl", out var socketValue)
+                    ? socketValue.GetString()
+                    : null;
+                if (string.Equals(type, "page", StringComparison.Ordinal) &&
+                    IsReviewedOfficialCodexPageUrl(pageUrl) &&
+                    !string.IsNullOrWhiteSpace(targetId) &&
+                    CdpIdentityPattern.IsMatch(targetId) &&
+                    TryValidateOfficialCodexCdpSocket(
+                        targetSocket,
+                        port,
+                        "page",
+                        targetId,
+                        out _))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+        catch (Exception ex) when (
+            ex is HttpRequestException or TaskCanceledException or IOException or
+            JsonException or InvalidOperationException or NotSupportedException)
+        {
+            browserId = "";
+            return false;
+        }
+    }
+
+    private static bool IsReviewedOfficialCodexPageUrl(string? value)
+    {
+        return CodexNativeFastBridge.IsReviewedOfficialCodexPageUrl(value);
+    }
+
+    private static JsonDocument ReadOfficialCodexCdpJson(
+        HttpClient client,
+        int port,
+        string resource)
+    {
+        using var readTimeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(900));
+        var readToken = readTimeout.Token;
+        using var response = client.GetAsync(
+                new Uri($"http://127.0.0.1:{port}{resource}", UriKind.Absolute),
+                HttpCompletionOption.ResponseHeadersRead,
+                readToken)
+            .GetAwaiter()
+            .GetResult();
+        response.EnsureSuccessStatusCode();
+        if (response.Content.Headers.ContentLength is > OfficialNativeFastCdpMaxResponseBytes)
+        {
+            throw new InvalidOperationException("Codex CDP response exceeded the safety limit.");
+        }
+
+        using var stream = response.Content.ReadAsStreamAsync(readToken)
+            .GetAwaiter()
+            .GetResult();
+        using var bounded = new MemoryStream();
+        var buffer = new byte[16 * 1024];
+        while (true)
+        {
+            var read = stream.ReadAsync(buffer, 0, buffer.Length, readToken)
+                .GetAwaiter()
+                .GetResult();
+            if (read == 0)
+            {
+                break;
+            }
+            if (bounded.Length + read > OfficialNativeFastCdpMaxResponseBytes)
+            {
+                throw new InvalidOperationException("Codex CDP response exceeded the safety limit.");
+            }
+            bounded.Write(buffer, 0, read);
+        }
+        bounded.Position = 0;
+        return JsonDocument.Parse(bounded);
+    }
+
+    private static bool TryValidateOfficialCodexCdpSocket(
+        string? value,
+        int port,
+        string targetKind,
+        string? expectedId,
+        out string actualId)
+    {
+        actualId = "";
+        if (!Uri.TryCreate(value, UriKind.Absolute, out var uri) ||
+            !uri.Scheme.Equals("ws", StringComparison.OrdinalIgnoreCase) ||
+            !uri.Host.Equals("127.0.0.1", StringComparison.OrdinalIgnoreCase) ||
+            uri.Port != port ||
+            !string.IsNullOrEmpty(uri.UserInfo) ||
+            !string.IsNullOrEmpty(uri.Query) ||
+            !string.IsNullOrEmpty(uri.Fragment))
+        {
+            return false;
+        }
+
+        var prefix = "/devtools/" + targetKind + "/";
+        if (!uri.AbsolutePath.StartsWith(prefix, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        actualId = uri.AbsolutePath[prefix.Length..];
+        return CdpIdentityPattern.IsMatch(actualId) &&
+               (expectedId == null || actualId.Equals(expectedId, StringComparison.Ordinal));
     }
 
     private static long BeginWindowsClientLaunchGeneration()
@@ -2693,6 +3337,91 @@ public sealed partial class CodexCliService
         {
             throw new InvalidOperationException(
                 "Official Codex must be activated through the registered codex:// protocol.");
+        }
+
+        var nativeFastCandidates = OfficialNativeFastCdpPortCandidates();
+        var firstNativeFastPort = nativeFastCandidates[0];
+        var lastNativeFastPort = nativeFastCandidates[^1];
+        var nativeFastArguments = BuildOfficialNativeFastActivationArguments(firstNativeFastPort);
+        var dreamSkinOwnedPorts = Enumerable.Range(DreamSkinCdpPortBase, DreamSkinCdpPortCount).ToArray();
+        var dreamSkinCandidates = DreamSkinCdpPortCandidates();
+        var dreamSkinLastPort = DreamSkinCdpPortBase + DreamSkinCdpPortCount - 1;
+        var selectedAfterTwoOccupiedPorts = SelectOfficialNativeFastCdpPort(
+            port => port == firstNativeFastPort + 2);
+        if (nativeFastCandidates.Count != OfficialNativeFastCdpPortCount ||
+            nativeFastCandidates.Distinct().Count() != nativeFastCandidates.Count ||
+            dreamSkinOwnedPorts[0] != DreamSkinCdpPortBase ||
+            dreamSkinOwnedPorts[^1] != dreamSkinLastPort ||
+            dreamSkinOwnedPorts.Except(dreamSkinCandidates).Any() ||
+            dreamSkinCandidates.Distinct().Count() != dreamSkinCandidates.Count ||
+            dreamSkinOwnedPorts.Intersect(nativeFastCandidates).Any() ||
+            firstNativeFastPort != OfficialNativeFastCdpPortBase ||
+            lastNativeFastPort != OfficialNativeFastCdpPortBase + OfficialNativeFastCdpPortCount - 1 ||
+            firstNativeFastPort <= dreamSkinLastPort ||
+            selectedAfterTwoOccupiedPorts != firstNativeFastPort + 2 ||
+            nativeFastArguments !=
+                $"--remote-debugging-address=127.0.0.1 --remote-debugging-port={firstNativeFastPort}" ||
+            !IsReviewedOfficialCodexPageUrl("app://codex/") ||
+            !IsReviewedOfficialCodexPageUrl("app://-/index.html") ||
+            !IsReviewedOfficialCodexPageUrl(
+                "app://-/index.html?initialRoute=%2Favatar-overlay") ||
+            IsReviewedOfficialCodexPageUrl(null) ||
+            IsReviewedOfficialCodexPageUrl("") ||
+            IsReviewedOfficialCodexPageUrl(" app://-/index.html") ||
+            IsReviewedOfficialCodexPageUrl("APP://-/index.html") ||
+            IsReviewedOfficialCodexPageUrl("app://fs/") ||
+            IsReviewedOfficialCodexPageUrl("app://codex/settings") ||
+            IsReviewedOfficialCodexPageUrl("app://codex/?changed=1") ||
+            IsReviewedOfficialCodexPageUrl("app://user@codex/") ||
+            IsReviewedOfficialCodexPageUrl("app://codex/#fragment") ||
+            IsReviewedOfficialCodexPageUrl("app://codex/%2e") ||
+            IsReviewedOfficialCodexPageUrl("app://user@-/index.html") ||
+            IsReviewedOfficialCodexPageUrl("app://-:19335/index.html") ||
+            IsReviewedOfficialCodexPageUrl("app://-/index.html/") ||
+            IsReviewedOfficialCodexPageUrl("app://-/index.html/extra") ||
+            IsReviewedOfficialCodexPageUrl("app://-/./index.html") ||
+            IsReviewedOfficialCodexPageUrl("app://-/foo/../index.html") ||
+            IsReviewedOfficialCodexPageUrl("app://-/%69ndex.html") ||
+            IsReviewedOfficialCodexPageUrl("app://-/index%2Ehtml") ||
+            IsReviewedOfficialCodexPageUrl("app://-:0/index.html") ||
+            IsReviewedOfficialCodexPageUrl("app://-/index.html#fragment") ||
+            IsReviewedOfficialCodexPageUrl("app://-/index.html?changed=1") ||
+            IsReviewedOfficialCodexPageUrl(
+                "app://-/index.html?initialRoute=/avatar-overlay") ||
+            IsReviewedOfficialCodexPageUrl("app://-/index.html?initialRoute=%2Fsettings") ||
+            IsReviewedOfficialCodexPageUrl(
+                "app://-/index.html?initialRoute=%2favatar-overlay") ||
+            IsReviewedOfficialCodexPageUrl(
+                "app://-/index.html?initialRoute=%2Favatar-overlay&changed=1") ||
+            IsReviewedOfficialCodexPageUrl("http://-/index.html") ||
+            IsReviewedOfficialCodexPageUrl("https://codex/") ||
+            !TryValidateOfficialCodexCdpSocket(
+                $"ws://127.0.0.1:{firstNativeFastPort}/devtools/browser/test-browser",
+                firstNativeFastPort,
+                "browser",
+                "test-browser",
+                out var validatedBrowserId) ||
+            validatedBrowserId != "test-browser" ||
+            TryValidateOfficialCodexCdpSocket(
+                $"ws://localhost:{firstNativeFastPort}/devtools/browser/test-browser",
+                firstNativeFastPort,
+                "browser",
+                "test-browser",
+                out _))
+        {
+            throw new InvalidOperationException(
+                "Official native Fast activation ports or loopback CDP validation are unsafe.");
+        }
+
+        try
+        {
+            _ = BuildOfficialNativeFastActivationArguments(OfficialNativeFastCdpPortBase - 1);
+            throw new InvalidOperationException(
+                "Official native Fast activation accepted a port outside its owned range.");
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            // Expected: package activation may only receive a manager-selected port.
         }
 
         var supersededGeneration = BeginWindowsClientLaunchGeneration();
@@ -4382,6 +5111,37 @@ catch {
         }
     }
 
+    private static string? GetCodexWindowsClientAppDirectory()
+    {
+        var clientPath = ResolveCodexWindowsClientPath();
+        if (string.IsNullOrWhiteSpace(clientPath) || !File.Exists(clientPath))
+        {
+            return null;
+        }
+
+        try
+        {
+            var appDirectory = Path.GetDirectoryName(Path.GetFullPath(clientPath));
+            if (string.IsNullOrWhiteSpace(appDirectory) ||
+                !Directory.Exists(appDirectory))
+            {
+                return null;
+            }
+
+            var fileName = Path.GetFileName(clientPath);
+            return fileName.Equals("ChatGPT.exe", StringComparison.OrdinalIgnoreCase) ||
+                   fileName.Equals("Codex.exe", StringComparison.OrdinalIgnoreCase) ||
+                   fileName.Equals("codex.exe", StringComparison.OrdinalIgnoreCase)
+                ? appDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                : null;
+        }
+        catch (Exception ex) when (
+            ex is ArgumentException or IOException or UnauthorizedAccessException or NotSupportedException)
+        {
+            return null;
+        }
+    }
+
     internal static string? ResolveCodexWindowsClientAppUserModelId()
     {
         var clientPath = ResolveCodexWindowsClientPath();
@@ -4493,7 +5253,7 @@ catch {
         return candidates.FirstOrDefault(File.Exists);
     }
 
-    private static void EnsureCodexPlusPlusSafeSettings(string? resolvedCodexAppDirectory)
+    private static bool EnsureCodexPlusPlusSafeSettings(string? resolvedCodexAppDirectory)
     {
         var settingsPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
@@ -4504,6 +5264,7 @@ catch {
             ? JsonNode.Parse(File.ReadAllText(settingsPath)) as JsonObject ?? new JsonObject()
             : new JsonObject();
         var changed = false;
+        var serviceTierControlsChanged = root["codexAppServiceTierControls"]?.GetValue<bool>() != true;
         void SetBoolean(string key, bool value)
         {
             if (root[key]?.GetValue<bool>() == value)
@@ -4539,7 +5300,10 @@ catch {
         SetBoolean("codexAppModelWhitelistUnlock", false);
         SetBoolean("codexAppPluginMarketplaceUnlock", false);
         SetBoolean("codexAppPluginAutoExpand", false);
-        SetBoolean("codexAppServiceTierControls", false);
+        // Codex++ already implements its own Standard/Fast UI and priority request rewrite.
+        // Keep that native page control enabled; the CDP response bridge is reserved for the
+        // unmodified official client and is not launched on the Codex++ path.
+        SetBoolean("codexAppServiceTierControls", true);
         SetBoolean("codexAppStepwiseEnabled", false);
         if (!string.IsNullOrWhiteSpace(resolvedCodexAppDirectory) &&
             Directory.Exists(resolvedCodexAppDirectory))
@@ -4548,12 +5312,13 @@ catch {
         }
         if (!changed)
         {
-            return;
+            return serviceTierControlsChanged;
         }
 
         WriteTextAtomically(
             settingsPath,
             root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+        return serviceTierControlsChanged;
     }
 
     private static void SanitizeCuratedPluginManifests(string codexHome)
@@ -4707,6 +5472,10 @@ catch {
             Path.Combine(projection.DefaultCodexHome, DesktopSelectionFileName),
             projection.DesktopSelectionBackupPath,
             projection.DesktopSelectionExisted);
+        RestoreFile(
+            Path.Combine(projection.DefaultCodexHome, ActiveAccountStateFileName),
+            projection.ActiveAccountStateBackupPath,
+            projection.ActiveAccountStateExisted);
     }
 
     private static void NormalizeDesktopSidebarState(WindowsClientAccountProjection projection)
@@ -4778,9 +5547,9 @@ catch {
         AccountRecord account,
         WindowsClientAccountProjection projection)
     {
-        // Preserve every historical model and reasoning level. All managed accounts share one
-        // stable provider id whose endpoint/auth fields are replaced during account projection.
-        // This prevents cold resume from restoring OpenAI WebSockets or an obsolete API provider.
+        // Preserve every historical model and reasoning level while moving each thread onto the
+        // provider selected for the active account. Official OAuth uses a dedicated HTTPS-only
+        // alias because the built-in OpenAI provider cannot be overridden to disable WebSockets.
         var stateDatabasePath = Path.Combine(projection.DefaultCodexHome, "state_5.sqlite");
         projection.StateDatabaseExisted = File.Exists(stateDatabasePath);
         projection.ThreadRowsUpdated = 0;
@@ -4792,7 +5561,7 @@ catch {
                 ? AccountStore.ManagedProviderId
                 : "openai";
             var targetProvider = account.IsOfficialOAuth
-                ? "openai"
+                ? AccountStore.OfficialOAuthProviderId
                 : AccountStore.ManagedProviderId;
             using (var inspect = new SqliteConnection("Data Source=" + stateDatabasePath))
             {
@@ -4800,10 +5569,15 @@ catch {
                 using var count = inspect.CreateCommand();
                 count.CommandText =
                     "SELECT COUNT(*) FROM threads " +
-                    "WHERE lower(model_provider) IN ($primarySource, $legacyToken, $legacyApi);";
+                    "WHERE lower(model_provider) IN " +
+                    "($primarySource, $builtInOpenAi, $officialHttps, $legacyToken, $legacyApi) " +
+                    "AND lower(model_provider) <> $target;";
                 count.Parameters.AddWithValue("$primarySource", primarySourceProvider);
+                count.Parameters.AddWithValue("$builtInOpenAi", "openai");
+                count.Parameters.AddWithValue("$officialHttps", AccountStore.OfficialOAuthProviderId);
                 count.Parameters.AddWithValue("$legacyToken", AccountStore.LegacyAccessTokenProviderId);
                 count.Parameters.AddWithValue("$legacyApi", AccountStore.LegacyCompatibleApiProviderId);
+                count.Parameters.AddWithValue("$target", targetProvider);
                 needsProviderMigration = Convert.ToInt64(count.ExecuteScalar()) > 0;
             }
 
@@ -4817,9 +5591,13 @@ catch {
                 using var update = connection.CreateCommand();
                 update.CommandText =
                     "UPDATE threads SET model_provider = $target " +
-                    "WHERE lower(model_provider) IN ($primarySource, $legacyToken, $legacyApi);";
+                    "WHERE lower(model_provider) IN " +
+                    "($primarySource, $builtInOpenAi, $officialHttps, $legacyToken, $legacyApi) " +
+                    "AND lower(model_provider) <> $target;";
                 update.Parameters.AddWithValue("$target", targetProvider);
                 update.Parameters.AddWithValue("$primarySource", primarySourceProvider);
+                update.Parameters.AddWithValue("$builtInOpenAi", "openai");
+                update.Parameters.AddWithValue("$officialHttps", AccountStore.OfficialOAuthProviderId);
                 update.Parameters.AddWithValue("$legacyToken", AccountStore.LegacyAccessTokenProviderId);
                 update.Parameters.AddWithValue("$legacyApi", AccountStore.LegacyCompatibleApiProviderId);
                 projection.ThreadRowsUpdated = update.ExecuteNonQuery();
@@ -5051,6 +5829,60 @@ catch {
                 if (Convert.ToInt32(verifyRestore.ExecuteScalar()) != 2)
                 {
                     throw new InvalidOperationException("Desktop provider migration backup was not restored.");
+                }
+            }
+
+            var oauthBackupDirectory = Path.Combine(root, "oauth-backups");
+            Directory.CreateDirectory(oauthBackupDirectory);
+            File.WriteAllText(Path.Combine(root, "models_cache.json"), "{\"oauth\":true}");
+            var oauthProjection = new WindowsClientAccountProjection
+            {
+                DefaultCodexHome = root,
+                BackupDirectory = oauthBackupDirectory
+            };
+            AlignDesktopProfileModelState(
+                new AccountRecord { AuthKind = AccountAuthKind.OfficialOAuth },
+                oauthProjection);
+            using (var connection = new SqliteConnection("Data Source=" + databasePath))
+            {
+                connection.Open();
+                using var verifyOfficial = connection.CreateCommand();
+                verifyOfficial.CommandText =
+                    "SELECT COUNT(*) FROM threads WHERE model_provider = $provider;";
+                verifyOfficial.Parameters.AddWithValue(
+                    "$provider",
+                    AccountStore.OfficialOAuthProviderId);
+                if (Convert.ToInt32(verifyOfficial.ExecuteScalar()) != 2 ||
+                    oauthProjection.ThreadRowsUpdated != 2)
+                {
+                    throw new InvalidOperationException(
+                        "Official OAuth threads did not migrate to the HTTPS-only provider.");
+                }
+            }
+
+            var roundTripBackupDirectory = Path.Combine(root, "round-trip-backups");
+            Directory.CreateDirectory(roundTripBackupDirectory);
+            File.WriteAllText(Path.Combine(root, "models_cache.json"), "{\"roundTrip\":true}");
+            var roundTripProjection = new WindowsClientAccountProjection
+            {
+                DefaultCodexHome = root,
+                BackupDirectory = roundTripBackupDirectory
+            };
+            AlignDesktopProfileModelState(new AccountRecord(), roundTripProjection);
+            using (var connection = new SqliteConnection("Data Source=" + databasePath))
+            {
+                connection.Open();
+                using var verifyRoundTrip = connection.CreateCommand();
+                verifyRoundTrip.CommandText =
+                    "SELECT COUNT(*) FROM threads WHERE model_provider = $provider;";
+                verifyRoundTrip.Parameters.AddWithValue(
+                    "$provider",
+                    AccountStore.AccessTokenProviderId);
+                if (Convert.ToInt32(verifyRoundTrip.ExecuteScalar()) != 2 ||
+                    roundTripProjection.ThreadRowsUpdated != 2)
+                {
+                    throw new InvalidOperationException(
+                        "HTTPS-only official threads did not migrate back to the managed provider.");
                 }
             }
 
@@ -5780,6 +6612,334 @@ catch {
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(rawFingerprint)));
     }
 
+    private static string ReadAccountServiceTier(string accountHome)
+    {
+        try
+        {
+            var configPath = Path.Combine(Path.GetFullPath(accountHome), ConfigFileName);
+            return File.Exists(configPath)
+                ? ReadDesktopServiceTier(File.ReadAllText(configPath))
+                : DesktopServiceTier;
+        }
+        catch (Exception ex) when (
+            ex is IOException or UnauthorizedAccessException or ArgumentException or
+            NotSupportedException)
+        {
+            return DesktopServiceTier;
+        }
+    }
+
+    private static string GetActiveAccountStatePath(string profileHome) =>
+        Path.Combine(profileHome, ActiveAccountStateFileName);
+
+    private static string GetActiveAccountMode(
+        AccountRecord account,
+        AccessTokenSharedProfileMode mode)
+    {
+        if (account.IsOfficialOAuth)
+        {
+            return DesktopSelectionModeOfficialOAuth;
+        }
+
+        if (mode == AccessTokenSharedProfileMode.ChatGptDesktop)
+        {
+            return account.IsCompatibleApi
+                ? DesktopSelectionModeChatGptCompatibleApi
+                : DesktopSelectionModeChatGptAccessToken;
+        }
+
+        return account.IsCompatibleApi
+            ? DesktopSelectionModeDirectCompatibleApi
+            : DesktopSelectionModeDirectAccessToken;
+    }
+
+    private static bool IsActiveAccountMode(string mode)
+    {
+        return mode is DesktopSelectionModeOfficialOAuth or
+            DesktopSelectionModeChatGptAccessToken or
+            DesktopSelectionModeChatGptCompatibleApi or
+            DesktopSelectionModeDirectAccessToken or
+            DesktopSelectionModeDirectCompatibleApi;
+    }
+
+    private static void WriteActiveAccountState(
+        string profileHome,
+        AccountRecord account,
+        AccessTokenSharedProfileMode mode)
+    {
+        ArgumentNullException.ThrowIfNull(account);
+        var normalizedProfileHome = Path.GetFullPath(profileHome);
+        var accountHome = Path.GetFullPath(account.CodexHome);
+        if (PathsEqual(normalizedProfileHome, accountHome))
+        {
+            throw new InvalidOperationException(
+                "The active desktop account cannot use the shared CODEX_HOME.");
+        }
+
+        var contents = JsonSerializer.Serialize(
+            new
+            {
+                schemaVersion = 1,
+                accountKey = GetDesktopAccountKey(account),
+                accountHome,
+                mode = GetActiveAccountMode(account, mode)
+            },
+            new JsonSerializerOptions { WriteIndented = true });
+        WriteTextAtomically(GetActiveAccountStatePath(normalizedProfileHome), contents);
+    }
+
+    private static bool TryReadActiveAccountState(
+        string profileHome,
+        out string accountKey,
+        out string accountHome,
+        out string mode)
+    {
+        accountKey = "";
+        accountHome = "";
+        mode = "";
+        var path = GetActiveAccountStatePath(Path.GetFullPath(profileHome));
+        if (!File.Exists(path))
+        {
+            return false;
+        }
+
+        try
+        {
+            _ = BuildCanonicalJsonSha256(path);
+            using var input = new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            using var document = JsonDocument.Parse(input);
+            var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object ||
+                !root.TryGetProperty("schemaVersion", out var schemaVersion) ||
+                !schemaVersion.TryGetInt32(out var version) ||
+                version != 1 ||
+                !TryReadJsonString(root, "accountKey", out var key) ||
+                !IsDesktopAccountKey(key) ||
+                !TryReadJsonString(root, "accountHome", out var home) ||
+                !TryReadJsonString(root, "mode", out var selectedMode) ||
+                !IsActiveAccountMode(selectedMode))
+            {
+                return false;
+            }
+
+            var normalizedHome = Path.GetFullPath(home);
+            var normalizedProfileHome = Path.GetFullPath(profileHome);
+            if (PathsEqual(normalizedHome, normalizedProfileHome) ||
+                !GetDesktopAccountKeyForHome(normalizedHome).Equals(
+                    key,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            accountKey = key;
+            accountHome = normalizedHome;
+            mode = selectedMode;
+            return true;
+        }
+        catch (Exception ex) when (
+            ex is IOException or UnauthorizedAccessException or JsonException or
+            ArgumentException or NotSupportedException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsActiveAccountCredentialCurrent(
+        string profileHome,
+        string accountKey,
+        string accountHome,
+        string mode)
+    {
+        var sharedAuthPath = Path.Combine(profileHome, AuthFileName);
+        var accountAuthPath = Path.Combine(accountHome, AuthFileName);
+        if (mode is DesktopSelectionModeOfficialOAuth or
+            DesktopSelectionModeChatGptAccessToken or
+            DesktopSelectionModeChatGptCompatibleApi)
+        {
+            return TryReadDesktopSelectionKey(profileHome, out var selectedKey) &&
+                   selectedKey.Equals(accountKey, StringComparison.OrdinalIgnoreCase) &&
+                   IsChatGptDesktopAuthJson(sharedAuthPath);
+        }
+
+        if (mode is not DesktopSelectionModeDirectAccessToken and
+            not DesktopSelectionModeDirectCompatibleApi)
+        {
+            return false;
+        }
+
+        return IsAccessTokenDesktopAuthSelected(accountAuthPath, sharedAuthPath);
+    }
+
+    // The native picker writes the selected tier to the shared CODEX_HOME.  Capture that value
+    // before projecting another account, using the independent active-account marker to avoid
+    // attributing it to an arbitrary account when the marker is missing or stale.
+    private static void PersistSharedServiceTierToSelectedAccount()
+    {
+        try
+        {
+            var profileHome = Path.GetFullPath(GetDefaultCodexHome());
+            var sharedConfigPath = Path.Combine(profileHome, ConfigFileName);
+            if (!File.Exists(sharedConfigPath) ||
+                !TryReadDesktopServiceTier(File.ReadAllText(sharedConfigPath), out var serviceTier) ||
+                !TryReadActiveAccountState(
+                    profileHome,
+                    out var accountKey,
+                    out var accountHome,
+                    out var mode) ||
+                !IsActiveAccountCredentialCurrent(profileHome, accountKey, accountHome, mode))
+            {
+                return;
+            }
+
+            var accountConfigPath = Path.Combine(accountHome, ConfigFileName);
+            if (!File.Exists(accountConfigPath))
+            {
+                return;
+            }
+
+            var current = File.ReadAllText(accountConfigPath);
+            var projected = UpsertDesktopServiceTier(current, serviceTier);
+            if (!string.Equals(current, projected, StringComparison.Ordinal))
+            {
+                WriteTextAtomically(accountConfigPath, projected);
+            }
+        }
+        catch (Exception ex) when (
+            ex is IOException or UnauthorizedAccessException or JsonException or
+            ArgumentException or NotSupportedException)
+        {
+            // A stale/corrupt marker must never prevent an account switch.  The next successful
+            // projection replaces it with a fresh marker and the target account's own tier.
+        }
+    }
+
+    internal static string NormalizeDesktopServiceTier(string? value)
+    {
+        var candidate = value?.Trim();
+        if (candidate?.Equals("default", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            return "default";
+        }
+        if (candidate?.Equals("priority", StringComparison.OrdinalIgnoreCase) == true ||
+            candidate?.Equals("fast", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            // Older manager builds could persist the UI label "fast". Codex's native row and
+            // request contract use the canonical service-tier value "priority".
+            return "priority";
+        }
+
+        return DesktopServiceTier;
+    }
+
+    internal static string ReadDesktopServiceTier(string? config)
+    {
+        return TryReadDesktopServiceTier(config, out var serviceTier)
+            ? serviceTier
+            : DesktopServiceTier;
+    }
+
+    private static bool TryReadDesktopServiceTier(string? config, out string serviceTier)
+    {
+        serviceTier = DesktopServiceTier;
+        if (string.IsNullOrWhiteSpace(config))
+        {
+            return false;
+        }
+
+        foreach (var line in config.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n'))
+        {
+            var trimmed = line.Trim();
+            if (trimmed.StartsWith("[", StringComparison.Ordinal) &&
+                trimmed.EndsWith("]", StringComparison.Ordinal))
+            {
+                break;
+            }
+            if (!IsTopLevelServiceTierLine(trimmed))
+            {
+                continue;
+            }
+
+            var equalsIndex = trimmed.IndexOf('=');
+            if (equalsIndex <= 0)
+            {
+                continue;
+            }
+            var rawValue = trimmed[(equalsIndex + 1)..].Trim();
+            var match = Regex.Match(
+                rawValue,
+                "^(?:\\\"(?<quoted>default|priority|fast)\\\"|(?<bare>default|priority|fast))(?:\\s*#.*)?$",
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            if (!match.Success)
+            {
+                continue;
+            }
+
+            serviceTier = NormalizeDesktopServiceTier(
+                match.Groups["quoted"].Success
+                    ? match.Groups["quoted"].Value
+                    : match.Groups["bare"].Value);
+            return true;
+        }
+
+        return false;
+    }
+
+    private static string UpsertDesktopServiceTier(string currentConfig, string? serviceTier)
+    {
+        var normalizedServiceTier = NormalizeDesktopServiceTier(serviceTier);
+        var lines = currentConfig
+            .Replace("\r\n", "\n")
+            .Replace('\r', '\n')
+            .Split('\n')
+            .ToList();
+        while (lines.Count > 0 && string.IsNullOrWhiteSpace(lines[^1]))
+        {
+            lines.RemoveAt(lines.Count - 1);
+        }
+
+        var output = new List<string>();
+        var inTopLevel = true;
+        foreach (var line in lines)
+        {
+            var trimmed = line.Trim();
+            if (trimmed.StartsWith("[", StringComparison.Ordinal) &&
+                trimmed.EndsWith("]", StringComparison.Ordinal))
+            {
+                inTopLevel = false;
+            }
+            if (inTopLevel && IsTopLevelServiceTierLine(trimmed))
+            {
+                continue;
+            }
+
+            output.Add(line);
+        }
+
+        var insertIndex = output.FindIndex(line =>
+        {
+            var trimmed = line.Trim();
+            return trimmed.StartsWith("[", StringComparison.Ordinal) &&
+                   trimmed.EndsWith("]", StringComparison.Ordinal);
+        });
+        if (insertIndex < 0)
+        {
+            insertIndex = output.Count;
+        }
+        while (insertIndex > 0 && string.IsNullOrWhiteSpace(output[insertIndex - 1]))
+        {
+            insertIndex--;
+        }
+        output.Insert(
+            insertIndex,
+            "service_tier = " + TomlString(normalizedServiceTier));
+        return string.Join(Environment.NewLine, output).TrimEnd() + Environment.NewLine;
+    }
+
     private static void ProjectAccessTokenSourceConfig(string targetConfigPath)
     {
         var currentConfig = File.Exists(targetConfigPath)
@@ -5806,6 +6966,18 @@ catch {
 
     internal static void ValidateConfigProjectionDefaults()
     {
+        var migratedFastAlias = UpsertDesktopServiceTier(
+            "model = \"test\"\n\n[features]\njs_repl = false\n",
+            "fast");
+        if (!NormalizeDesktopServiceTier("fast").Equals("priority", StringComparison.Ordinal) ||
+            !ReadDesktopServiceTier("service_tier = \"fast\"\n").Equals("priority", StringComparison.Ordinal) ||
+            !migratedFastAlias.Contains("service_tier = \"priority\"", StringComparison.Ordinal) ||
+            migratedFastAlias.Contains("service_tier = \"fast\"", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "The legacy Fast service-tier alias was not migrated to Codex's canonical priority value.");
+        }
+
         const string existingConfig =
             "model_provider = \"stale\"\n" +
             "model = \"stale-model\"\n" +
@@ -5837,7 +7009,8 @@ catch {
             AccessTokenModel,
             AccessTokenReasoningEffort,
             false,
-            pluginsEnabled: false);
+            pluginsEnabled: false,
+            expectedServiceTier: "priority");
         AssertManagedProviderSection(tokenConfig, requiresOpenAiAuth: false);
         AssertAccessTokenHttpProvider(tokenConfig, requiresOpenAiAuth: false);
 
@@ -5863,7 +7036,8 @@ catch {
             AccessTokenModel,
             AccessTokenReasoningEffort,
             false,
-            pluginsEnabled: false);
+            pluginsEnabled: false,
+            expectedServiceTier: "priority");
         AssertManagedProviderSection(dualLoginDesktopConfig, requiresOpenAiAuth: true);
         AssertAccessTokenHttpProvider(dualLoginDesktopConfig, requiresOpenAiAuth: true);
         var dualLoginTopLevelLines = dualLoginDesktopConfig
@@ -5936,7 +7110,8 @@ catch {
             AccountStore.CompatibleApiProviderId,
             CompatibleApiDefaultModel,
             CompatibleApiReasoningEffort,
-            false);
+            false,
+            expectedServiceTier: "priority");
         if (!apiConfig.Contains("base_url = \"https://example.invalid\"", StringComparison.Ordinal))
         {
             throw new InvalidOperationException("Compatible API projection did not preserve the selected endpoint.");
@@ -5948,6 +7123,17 @@ catch {
             !apiConfig.Contains("request_max_retries = 1", StringComparison.Ordinal))
         {
             throw new InvalidOperationException("Compatible API projection did not preserve its display name, unrelated providers, or fail-fast retry policy.");
+        }
+
+        var officialPriorityConfig = ProjectOfficialOAuthConfigText(apiConfig);
+        var tokenPriorityRoundTrip = ProjectWindowsClientConfigText(officialPriorityConfig);
+        var apiPriorityRoundTrip = ProjectCompatibleApiConfigText(tokenPriorityRoundTrip, apiAccount);
+        if (!ReadDesktopServiceTier(officialPriorityConfig).Equals("priority", StringComparison.Ordinal) ||
+            !ReadDesktopServiceTier(tokenPriorityRoundTrip).Equals("priority", StringComparison.Ordinal) ||
+            !ReadDesktopServiceTier(apiPriorityRoundTrip).Equals("priority", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "The selected Fast service tier was not preserved across API, official OAuth, PAT, and API projections.");
         }
 
         var providerNameCollisionConfig = ProjectCompatibleApiConfigText(existingConfig, new AccountRecord
@@ -6211,7 +7397,7 @@ catch {
                 "model = \"stale\"\n\n[features]\njs_repl = false\n");
             File.WriteAllText(
                 Path.Combine(differentHome, ConfigFileName),
-                "service_tier = \"priority\"\n\n[features]\njs_repl = false\n");
+                "service_tier = \"default\"\n\n[features]\njs_repl = false\n");
 
             var tokenAccount = new AccountRecord
             {
@@ -6364,7 +7550,8 @@ catch {
                 AccountStore.CompatibleApiProviderId,
                 CompatibleApiDefaultModel,
                 CompatibleApiReasoningEffort,
-                false);
+                false,
+                expectedServiceTier: "default");
             if (!IsChatGptDesktopAuthJson(sharedAuthPath) ||
                 File.ReadAllText(sharedAuthPath) != desktopOAuth)
             {
@@ -6476,6 +7663,9 @@ catch {
                 !differentConfig.Contains(
                     "experimental_bearer_token = \"virtual-b\"",
                     StringComparison.Ordinal) ||
+                !ReadDesktopServiceTier(differentConfig).Equals(
+                    "default",
+                    StringComparison.Ordinal) ||
                 differentConfig.Contains(
                     "experimental_bearer_token = \"virtual-a\"",
                     StringComparison.Ordinal) ||
@@ -6492,6 +7682,9 @@ catch {
                 File.ReadAllText(sharedAuthPath) != desktopOAuth ||
                 !rolledBackTokenConfig.Contains(
                     "experimental_bearer_token = \"virtual-a\"",
+                    StringComparison.Ordinal) ||
+                !ReadDesktopServiceTier(rolledBackTokenConfig).Equals(
+                    "priority",
                     StringComparison.Ordinal) ||
                 rolledBackTokenConfig.Contains(
                     "experimental_bearer_token = \"virtual-b\"",
@@ -6612,6 +7805,143 @@ catch {
             if (Directory.Exists(root))
             {
                 Directory.Delete(root, true);
+            }
+        }
+    }
+
+    internal static void ValidateServiceTierAccountIsolation()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            "codex-service-tier-isolation-" + Guid.NewGuid().ToString("N"));
+        var accountAHome = Path.Combine(root, "account-a");
+        var accountBHome = Path.Combine(root, "account-b");
+        var sharedHome = Path.Combine(root, "shared");
+        var oldSharedHome = Environment.GetEnvironmentVariable(SharedCodexHomeOverrideVariable);
+
+        try
+        {
+            Environment.SetEnvironmentVariable(SharedCodexHomeOverrideVariable, sharedHome);
+            Directory.CreateDirectory(accountAHome);
+            Directory.CreateDirectory(accountBHome);
+            Directory.CreateDirectory(sharedHome);
+
+            var accountA = new AccountRecord
+            {
+                Name = "tier-a",
+                CodexHome = accountAHome,
+                AuthKind = AccountAuthKind.AccessToken
+            };
+            var accountB = new AccountRecord
+            {
+                Name = "tier-b",
+                CodexHome = accountBHome,
+                AuthKind = AccountAuthKind.AccessToken
+            };
+            File.WriteAllText(
+                Path.Combine(accountAHome, AuthFileName),
+                "{\"personal_access_token\":\"tier-a-token\"}");
+            File.WriteAllText(
+                Path.Combine(accountBHome, AuthFileName),
+                "{\"personal_access_token\":\"tier-b-token\"}");
+            File.WriteAllText(
+                Path.Combine(accountAHome, ConfigFileName),
+                "service_tier = \"priority\"\n\n[features]\njs_repl = false\n");
+            File.WriteAllText(
+                Path.Combine(accountBHome, ConfigFileName),
+                "service_tier = \"default\"\n\n[features]\njs_repl = false\n");
+
+            _ = ProjectAccessTokenAccount(
+                accountA,
+                new LoginStatus(),
+                AccessTokenSharedProfileMode.ApiCompatible);
+            var sharedConfigPath = Path.Combine(sharedHome, ConfigFileName);
+            if (!ReadDesktopServiceTier(File.ReadAllText(sharedConfigPath)).Equals(
+                    "priority",
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "The first account's Fast selection was not projected to the shared Codex profile.");
+            }
+
+            // Simulate the native Codex picker changing A back to Standard, then capture it
+            // before the next account is projected.
+            File.WriteAllText(
+                sharedConfigPath,
+                UpsertDesktopServiceTier(File.ReadAllText(sharedConfigPath), "default"));
+            PersistSharedServiceTierToSelectedAccount();
+            if (!ReadAccountServiceTier(accountAHome).Equals("default", StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "The shared Standard selection was not written back to account A.");
+            }
+
+            _ = ProjectAccessTokenAccount(
+                accountB,
+                new LoginStatus(),
+                AccessTokenSharedProfileMode.ApiCompatible);
+            if (!ReadDesktopServiceTier(File.ReadAllText(sharedConfigPath)).Equals(
+                    "default",
+                    StringComparison.Ordinal) ||
+                !ReadAccountServiceTier(accountAHome).Equals("default", StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "Account B inherited account A's service tier or changed account A's stored choice.");
+            }
+
+            // A later Fast choice belongs to B only. Returning to A must project A's own
+            // Standard value instead of carrying B's shared value across the switch.
+            File.WriteAllText(
+                sharedConfigPath,
+                UpsertDesktopServiceTier(File.ReadAllText(sharedConfigPath), "priority"));
+            PersistSharedServiceTierToSelectedAccount();
+            if (!ReadAccountServiceTier(accountBHome).Equals("priority", StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "The shared Fast selection was not written back to account B.");
+            }
+
+            _ = ProjectAccessTokenAccount(
+                accountA,
+                new LoginStatus(),
+                AccessTokenSharedProfileMode.ApiCompatible);
+            if (!ReadDesktopServiceTier(File.ReadAllText(sharedConfigPath)).Equals(
+                    "default",
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "Returning to account A incorrectly inherited account B's Fast selection.");
+            }
+
+            // Credential equality is not account identity. If two account directories happen
+            // to contain the same token, deleting the inactive one must leave A's shared
+            // projection and active marker untouched.
+            File.Copy(
+                Path.Combine(accountAHome, AuthFileName),
+                Path.Combine(accountBHome, AuthFileName),
+                overwrite: true);
+            var service = new CodexCliService();
+            if (service.DeleteSharedCredentialIfSelected(accountB) ||
+                !File.Exists(Path.Combine(sharedHome, AuthFileName)) ||
+                !File.Exists(GetActiveAccountStatePath(sharedHome)))
+            {
+                throw new InvalidOperationException(
+                    "Deleting an inactive account with the same credential cleared A's shared projection.");
+            }
+            if (!service.DeleteSharedCredentialIfSelected(accountA) ||
+                File.Exists(Path.Combine(sharedHome, AuthFileName)) ||
+                File.Exists(GetActiveAccountStatePath(sharedHome)))
+            {
+                throw new InvalidOperationException(
+                    "Deleting the active account did not clear its shared projection and marker.");
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(SharedCodexHomeOverrideVariable, oldSharedHome);
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
             }
         }
     }
@@ -6823,20 +8153,74 @@ catch {
             File.Delete(restoreBackupPath);
 
             var projectedConfig = File.ReadAllText(sharedConfigPath);
+            const string staleOfficialPreferences = """
+                localeOverride = "en-US"
+
+                [features]
+                responses_websockets = true
+                responses_websockets = true
+                responses_websockets_v2 = true
+
+                [desktop]
+                localeOverride = "en-US"
+                localeOverride = "en-GB"
+                """;
+            var repairedPreferences = ProjectOfficialOAuthConfigText(staleOfficialPreferences);
+            var emptyProjectedConfig = ProjectOfficialOAuthConfigText("");
+            var officialProviderHeader =
+                "[model_providers." + AccountStore.OfficialOAuthProviderId + "]";
             var forbidden = new[]
             {
                 LocalPatGateway.ChatGptBaseUrl,
                 AccountStore.AccessTokenBaseUrl,
-                "model_provider",
-                "[model_providers.",
-                "experimental_bearer_token"
+                "experimental_bearer_token",
+                "responses_websockets"
             };
             if (!projectedConfig.Contains("cli_auth_credentials_store = \"file\"", StringComparison.Ordinal) ||
                 !projectedConfig.Contains("forced_login_method = \"chatgpt\"", StringComparison.Ordinal) ||
+                !projectedConfig.Contains(
+                    "model_provider = " + TomlString(AccountStore.OfficialOAuthProviderId),
+                    StringComparison.Ordinal) ||
+                !projectedConfig.Contains(
+                    officialProviderHeader,
+                    StringComparison.Ordinal) ||
+                projectedConfig.IndexOf(officialProviderHeader, StringComparison.Ordinal) !=
+                    projectedConfig.LastIndexOf(officialProviderHeader, StringComparison.Ordinal) ||
+                !projectedConfig.Contains(
+                    "base_url = " + TomlString(AccountStore.OfficialOAuthBaseUrl),
+                    StringComparison.Ordinal) ||
+                !projectedConfig.Contains("wire_api = \"responses\"", StringComparison.Ordinal) ||
+                !projectedConfig.Contains("requires_openai_auth = true", StringComparison.Ordinal) ||
+                !projectedConfig.Contains("supports_websockets = false", StringComparison.Ordinal) ||
+                !TomlSectionStringValueMatches(
+                    projectedConfig,
+                    "desktop",
+                    "localeOverride",
+                    AccountStore.OfficialOAuthDesktopLocale) ||
+                !repairedPreferences.Contains(
+                    "model_provider = " + TomlString(AccountStore.OfficialOAuthProviderId),
+                    StringComparison.Ordinal) ||
+                !repairedPreferences.Contains(
+                    officialProviderHeader,
+                    StringComparison.Ordinal) ||
+                repairedPreferences.IndexOf(officialProviderHeader, StringComparison.Ordinal) !=
+                    repairedPreferences.LastIndexOf(officialProviderHeader, StringComparison.Ordinal) ||
+                !repairedPreferences.Contains("wire_api = \"responses\"", StringComparison.Ordinal) ||
+                !repairedPreferences.Contains("supports_websockets = false", StringComparison.Ordinal) ||
+                !TomlSectionStringValueMatches(
+                    repairedPreferences,
+                    "desktop",
+                    "localeOverride",
+                    AccountStore.OfficialOAuthDesktopLocale) ||
                 forbidden.Any(value => projectedConfig.Contains(value, StringComparison.OrdinalIgnoreCase)) ||
+                forbidden.Any(value => repairedPreferences.Contains(value, StringComparison.OrdinalIgnoreCase)) ||
                 !string.Equals(
                     projectedConfig,
                     ProjectOfficialOAuthConfigText(projectedConfig),
+                    StringComparison.Ordinal) ||
+                !string.Equals(
+                    emptyProjectedConfig,
+                    ProjectOfficialOAuthConfigText(emptyProjectedConfig),
                     StringComparison.Ordinal))
             {
                 throw new InvalidOperationException(
@@ -6876,7 +8260,8 @@ catch {
         string model,
         string reasoningEffort,
         bool remoteCompactionEnabled,
-        bool? pluginsEnabled = null)
+        bool? pluginsEnabled = null,
+        string? expectedServiceTier = null)
     {
         var normalized = config.Replace("\r\n", "\n").Replace('\r', '\n');
         var topLevelLines = normalized.Split('\n')
@@ -6889,7 +8274,8 @@ catch {
             ["model"] = model,
             ["review_model"] = model,
             ["model_reasoning_effort"] = reasoningEffort,
-            ["service_tier"] = DesktopServiceTier
+            ["service_tier"] = NormalizeDesktopServiceTier(
+                expectedServiceTier ?? DesktopServiceTier)
         };
 
         foreach (var pair in expected)
@@ -6950,14 +8336,21 @@ catch {
         return matches == 1;
     }
 
-    internal static string ProjectOfficialOAuthConfigText(string currentConfig)
+    internal static string ProjectOfficialOAuthConfigText(
+        string currentConfig,
+        string? serviceTier = null)
     {
+        var desktopServiceTier = serviceTier == null
+            ? ReadDesktopServiceTier(currentConfig)
+            : NormalizeDesktopServiceTier(serviceTier);
         var normalized = currentConfig.Replace("\r\n", "\n").Replace('\r', '\n');
         var lines = normalized.Split('\n').ToList();
         var output = new List<string>
         {
+            "model_provider = " + TomlString(AccountStore.OfficialOAuthProviderId),
             "cli_auth_credentials_store = \"file\"",
-            "forced_login_method = \"chatgpt\""
+            "forced_login_method = \"chatgpt\"",
+            "service_tier = " + TomlString(desktopServiceTier)
         };
         string? currentSection = null;
         var skipSection = false;
@@ -6990,14 +8383,29 @@ catch {
                  IsTopLevelModelAutoCompactTokenLimitScopeLine(trimmed) ||
                  IsCliAuthCredentialsStoreLine(trimmed) ||
                  IsForcedLoginMethodLine(trimmed) ||
+                 TomlKeyEquals(trimmed, "localeOverride") ||
                  IsExperimentalBearerTokenLine(trimmed)))
             {
                 continue;
             }
 
             if (currentSection?.Equals("[features]", StringComparison.OrdinalIgnoreCase) == true &&
-                new[] { "js_repl", "remote_compaction_v2", "remote_plugin", "plugins" }
+                new[]
+                {
+                    "js_repl",
+                    "remote_compaction_v2",
+                    "remote_plugin",
+                    "plugins",
+                    "responses_websockets",
+                    "responses_websockets_v2"
+                }
                     .Any(key => TomlKeyEquals(trimmed, key)))
+            {
+                continue;
+            }
+
+            if (currentSection?.Equals("[desktop]", StringComparison.OrdinalIgnoreCase) == true &&
+                TomlKeyEquals(trimmed, "localeOverride"))
             {
                 continue;
             }
@@ -7005,11 +8413,33 @@ catch {
             output.Add(line);
         }
 
-        while (output.Count > 2 && string.IsNullOrWhiteSpace(output[^1]))
+        while (output.Count > 4 && string.IsNullOrWhiteSpace(output[^1]))
         {
             output.RemoveAt(output.Count - 1);
         }
 
+        var baseProjection = UpsertTomlSectionStringValue(
+            string.Join(Environment.NewLine, output) + Environment.NewLine,
+            "desktop",
+            "localeOverride",
+            AccountStore.OfficialOAuthDesktopLocale);
+        output = baseProjection
+            .Replace("\r\n", "\n")
+            .Replace('\r', '\n')
+            .Split('\n')
+            .ToList();
+        while (output.Count > 0 && string.IsNullOrWhiteSpace(output[^1]))
+        {
+            output.RemoveAt(output.Count - 1);
+        }
+
+        output.Add("");
+        output.Add("[model_providers." + AccountStore.OfficialOAuthProviderId + "]");
+        output.Add("name = " + TomlString(AccountStore.OfficialOAuthProviderName));
+        output.Add("base_url = " + TomlString(AccountStore.OfficialOAuthBaseUrl));
+        output.Add("wire_api = \"responses\"");
+        output.Add("requires_openai_auth = true");
+        output.Add("supports_websockets = false");
         return string.Join(Environment.NewLine, output) + Environment.NewLine;
     }
 
@@ -7094,8 +8524,12 @@ catch {
         bool requiresOpenAiAuth = false,
         string? desktopProviderName = null,
         string? providerBearerToken = null,
-        bool forceFileAuthStore = false)
+        bool forceFileAuthStore = false,
+        string? serviceTier = null)
     {
+        var desktopServiceTier = serviceTier == null
+            ? ReadDesktopServiceTier(currentConfig)
+            : NormalizeDesktopServiceTier(serviceTier);
         // Materialize the features section before rebuilding the provider section. Without
         // this stable anchor, a config that started without [features] would alternate the
         // section order on every migration pass.
@@ -7110,13 +8544,15 @@ catch {
             "review_model = " + TomlString(AccessTokenModel),
             "model_reasoning_effort = " + TomlString(AccessTokenReasoningEffort),
             "chatgpt_base_url = " + TomlString(LocalPatGateway.ChatGptBaseUrl),
-            "service_tier = " + TomlString(DesktopServiceTier),
             "model_auto_compact_token_limit = " + DesktopAutoCompactTokenLimit
         };
         if (forceFileAuthStore)
         {
             output.Add("cli_auth_credentials_store = \"file\"");
         }
+        // Keep the tier as the final managed top-level preference. UpsertDesktopServiceTier
+        // uses the same canonical position when carrying the shared Codex choice across accounts.
+        output.Add("service_tier = " + TomlString(desktopServiceTier));
         string? currentSection = null;
         var skipSection = false;
 
@@ -7222,8 +8658,12 @@ catch {
         AccountRecord account,
         bool requiresOpenAiAuth = false,
         string? providerBearerToken = null,
-        bool forceFileAuthStore = false)
+        bool forceFileAuthStore = false,
+        string? serviceTier = null)
     {
+        var desktopServiceTier = serviceTier == null
+            ? ReadDesktopServiceTier(currentConfig)
+            : NormalizeDesktopServiceTier(serviceTier);
         var normalized = currentConfig.Replace("\r\n", "\n").Replace('\r', '\n');
         var lines = normalized.Split('\n').ToList();
         var providerName = string.IsNullOrWhiteSpace(account.ApiProviderName) ? "OpenAI" : account.ApiProviderName.Trim();
@@ -7238,13 +8678,15 @@ catch {
             "model = " + TomlString(model),
             "review_model = " + TomlString(model),
             "model_reasoning_effort = " + TomlString(CompatibleApiReasoningEffort),
-            "service_tier = " + TomlString(DesktopServiceTier),
             "model_auto_compact_token_limit = " + DesktopAutoCompactTokenLimit
         };
         if (forceFileAuthStore)
         {
             output.Add("cli_auth_credentials_store = \"file\"");
         }
+        // Match UpsertDesktopServiceTier's canonical ordering so repeated shared-profile
+        // projections are byte-for-byte idempotent after a Standard/Fast selection is carried.
+        output.Add("service_tier = " + TomlString(desktopServiceTier));
 
         string? currentSection = null;
         var skipSection = false;
@@ -7464,6 +8906,100 @@ catch {
 
         lines.Insert(sectionEnd, valueLine);
         return string.Join(Environment.NewLine, lines).TrimEnd() + Environment.NewLine;
+    }
+
+    private static string UpsertTomlSectionStringValue(
+        string config,
+        string section,
+        string key,
+        string value)
+    {
+        var normalized = config.Replace("\r\n", "\n").Replace('\r', '\n');
+        var lines = normalized.Split('\n').ToList();
+        while (lines.Count > 0 && string.IsNullOrWhiteSpace(lines[^1]))
+        {
+            lines.RemoveAt(lines.Count - 1);
+        }
+
+        var sectionHeader = "[" + section + "]";
+        var sectionHeaderIndex = lines.FindIndex(line =>
+            line.Trim().Equals(sectionHeader, StringComparison.OrdinalIgnoreCase));
+        var valueLine = key + " = " + TomlString(value);
+
+        if (sectionHeaderIndex < 0)
+        {
+            while (lines.Count > 0 && string.IsNullOrWhiteSpace(lines[^1]))
+            {
+                lines.RemoveAt(lines.Count - 1);
+            }
+
+            lines.Add("");
+            lines.Add(sectionHeader);
+            lines.Add(valueLine);
+            return string.Join(Environment.NewLine, lines) + Environment.NewLine;
+        }
+
+        var sectionEnd = lines.FindIndex(
+            sectionHeaderIndex + 1,
+            line => line.TrimStart().StartsWith("[", StringComparison.Ordinal));
+        if (sectionEnd < 0)
+        {
+            sectionEnd = lines.Count;
+        }
+
+        for (var index = sectionHeaderIndex + 1; index < sectionEnd; index++)
+        {
+            if (TomlKeyEquals(lines[index].Trim(), key))
+            {
+                lines[index] = valueLine;
+                return string.Join(Environment.NewLine, lines).TrimEnd() + Environment.NewLine;
+            }
+        }
+
+        var insertIndex = sectionEnd;
+        while (insertIndex > sectionHeaderIndex + 1 &&
+               string.IsNullOrWhiteSpace(lines[insertIndex - 1]))
+        {
+            insertIndex--;
+        }
+
+        lines.Insert(insertIndex, valueLine);
+        return string.Join(Environment.NewLine, lines).TrimEnd() + Environment.NewLine;
+    }
+
+    private static bool TomlSectionStringValueMatches(
+        string config,
+        string section,
+        string key,
+        string expectedValue)
+    {
+        var expectedHeader = "[" + section + "]";
+        var expectedLine = key + " = " + TomlString(expectedValue);
+        var inSection = false;
+        var matches = 0;
+        foreach (var line in config.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n'))
+        {
+            var trimmed = line.Trim();
+            if (trimmed.StartsWith("[", StringComparison.Ordinal) &&
+                trimmed.EndsWith("]", StringComparison.Ordinal))
+            {
+                inSection = trimmed.Equals(expectedHeader, StringComparison.OrdinalIgnoreCase);
+                continue;
+            }
+
+            if (!TomlKeyEquals(trimmed, key))
+            {
+                continue;
+            }
+
+            matches++;
+            if (!inSection || !trimmed.Equals(expectedLine, StringComparison.Ordinal))
+            {
+                return false;
+            }
+        }
+
+        return matches == 1;
     }
 
     private static string ApplyDesktopFeatureDefaults(string config, bool disablePlugins = false)
@@ -7766,15 +9302,28 @@ catch {
 
             if (string.IsNullOrWhiteSpace(packageRoot))
             {
-                return process.ProcessName.Equals("ChatGPT", StringComparison.OrdinalIgnoreCase) ||
-                       process.ProcessName.Equals("Codex", StringComparison.OrdinalIgnoreCase);
+                return false;
             }
 
             var fileName = process.MainModule?.FileName;
-            return !string.IsNullOrWhiteSpace(fileName) &&
-                   Path.GetFullPath(fileName).StartsWith(
-                       Path.GetFullPath(packageRoot),
-                       StringComparison.OrdinalIgnoreCase);
+            if (string.IsNullOrWhiteSpace(fileName))
+            {
+                return false;
+            }
+
+            var fullFileName = Path.GetFullPath(fileName);
+            var root = Path.GetFullPath(packageRoot)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var rootPrefix = root + Path.DirectorySeparatorChar;
+            if (!fullFileName.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var executableName = Path.GetFileName(fullFileName);
+            return executableName.Equals("ChatGPT.exe", StringComparison.OrdinalIgnoreCase) ||
+                   executableName.Equals("Codex.exe", StringComparison.OrdinalIgnoreCase) ||
+                   executableName.Equals("codex.exe", StringComparison.OrdinalIgnoreCase);
         }
         catch
         {
@@ -9280,7 +10829,13 @@ catch {
 
     private static string GetDesktopAccountKey(AccountRecord account)
     {
-        var canonicalHome = Path.GetFullPath(account.CodexHome)
+        ArgumentNullException.ThrowIfNull(account);
+        return GetDesktopAccountKeyForHome(account.CodexHome);
+    }
+
+    private static string GetDesktopAccountKeyForHome(string accountHome)
+    {
+        var canonicalHome = Path.GetFullPath(accountHome)
             .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
             .ToUpperInvariant();
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonicalHome)));
@@ -10058,6 +11613,26 @@ catch {
         public int Bottom;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeTcpRowOwnerPid
+    {
+        public uint State;
+        public uint LocalAddress;
+        public uint LocalPort;
+        public uint RemoteAddress;
+        public uint RemotePort;
+        public uint OwningProcessId;
+    }
+
+    [DllImport("iphlpapi.dll", SetLastError = true)]
+    private static extern uint GetExtendedTcpTable(
+        IntPtr tcpTable,
+        ref int outputBufferLength,
+        [MarshalAs(UnmanagedType.Bool)] bool order,
+        int ipVersion,
+        int tableClass,
+        uint reserved);
+
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetClientRect(IntPtr windowHandle, out NativeRect clientRect);
@@ -10341,10 +11916,12 @@ public sealed class WindowsClientAccountProjection
     public string? CockpitAuthBackupPath { get; init; }
     public string? ConfigBackupPath { get; init; }
     public string? DesktopSelectionBackupPath { get; init; }
+    public string? ActiveAccountStateBackupPath { get; init; }
     public bool AuthExisted { get; init; }
     public bool CockpitAuthExisted { get; init; }
     public bool ConfigExisted { get; init; }
     public bool DesktopSelectionExisted { get; init; }
+    public bool ActiveAccountStateExisted { get; init; }
     public bool SharedCredentialsReused { get; init; }
     public bool ProfileChanged { get; set; }
     public bool DesktopLoginRequired { get; init; }

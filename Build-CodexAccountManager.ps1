@@ -31,6 +31,18 @@ $oldDotnetRoot = $env:DOTNET_ROOT
 $oldDotnetRootX64 = $env:DOTNET_ROOT_X64
 $localDotnetRoot = Split-Path -Parent $dotnet
 
+function Get-CurrentProjectGatewayProcesses {
+    try {
+        return @(Get-CimInstance Win32_Process | Where-Object {
+            $_.CommandLine -match '(?i)(?:^|\s)--local-pat-gateway(?:\s|$)' -and
+            $_.CommandLine -match [regex]::Escape($root)
+        })
+    }
+    catch {
+        return @()
+    }
+}
+
 # Release the optional local PAT gateway before publishing. A running single-file
 # process can keep the previous executable locked on Windows. Ask the existing
 # manager to authenticate the shutdown request; this also works with the previous
@@ -54,32 +66,22 @@ finally {
 
 $gatewayDeadline = [DateTime]::UtcNow.AddSeconds(5)
 while ([DateTime]::UtcNow -lt $gatewayDeadline) {
-    $listeners = @(Get-NetTCPConnection -State Listen -LocalPort 8317 -ErrorAction SilentlyContinue)
-    if ($listeners.Count -eq 0) {
+    if (@(Get-CurrentProjectGatewayProcesses).Count -eq 0) {
         break
     }
     Start-Sleep -Milliseconds 150
 }
-if (@(Get-NetTCPConnection -State Listen -LocalPort 8317 -ErrorAction SilentlyContinue).Count -gt 0) {
+if (@(Get-CurrentProjectGatewayProcesses).Count -gt 0) {
     # A gateway started with a different CODEX_ACCOUNT_MANAGER_HOME has a different
-    # control-secret path. It is still safe to stop only the exact project gateway
-    # process, identified by its command-line switch, before replacing the binary.
-    try {
-        $gatewayProcesses = @(Get-CimInstance Win32_Process | Where-Object {
-            $_.CommandLine -match '(?i)(?:^|\s)--local-pat-gateway(?:\s|$)' -and
-            $_.CommandLine -match [regex]::Escape($root)
-        })
-        foreach ($gatewayProcess in $gatewayProcesses) {
-            Stop-Process -Id ([int]$gatewayProcess.ProcessId) -Force -ErrorAction SilentlyContinue
-        }
-    }
-    catch {
-        # The final listener check below reports a clear actionable error.
+    # control-secret path and does not lock this source tree's output. Stop only the
+    # exact current-project gateway before replacing its executable.
+    foreach ($gatewayProcess in @(Get-CurrentProjectGatewayProcesses)) {
+        Stop-Process -Id ([int]$gatewayProcess.ProcessId) -Force -ErrorAction SilentlyContinue
     }
     Start-Sleep -Milliseconds 250
 }
-if (@(Get-NetTCPConnection -State Listen -LocalPort 8317 -ErrorAction SilentlyContinue).Count -gt 0) {
-    throw 'The local PAT gateway is still listening on 127.0.0.1:8317. Close it before publishing so the executable can be replaced safely.'
+if (@(Get-CurrentProjectGatewayProcesses).Count -gt 0) {
+    throw 'The current project local PAT gateway is still running. Close it before publishing so the executable can be replaced safely.'
 }
 
 if (-not (Test-Path -LiteralPath $dotnet -PathType Leaf)) {
@@ -152,17 +154,25 @@ finally {
     Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-# Point the existing desktop shortcut at the GUI executable itself. Launching
-# through cmd.exe gives Windows the launcher's generic taskbar identity even
-# though the WinForms window has the correct icon.
+# Keep a source-tree development shortcut current without replacing a shortcut
+# owned by an installed copy of the application.
 $desktopPath = [Environment]::GetFolderPath('Desktop')
 $desktopShortcutPath = Join-Path $desktopPath 'Codex Account Manager.lnk'
 if (Test-Path -LiteralPath $desktopShortcutPath -PathType Leaf) {
     $shortcutShell = New-Object -ComObject WScript.Shell
     $desktopShortcut = $shortcutShell.CreateShortcut($desktopShortcutPath)
-    $desktopShortcut.TargetPath = $appExe
-    $desktopShortcut.WorkingDirectory = $root
-    $desktopShortcut.Arguments = ''
-    $desktopShortcut.IconLocation = $appExe + ',0'
-    $desktopShortcut.Save()
+    $sourceRootPrefix = [IO.Path]::GetFullPath($root).TrimEnd('\') + '\'
+    $shortcutTarget = if ([string]::IsNullOrWhiteSpace($desktopShortcut.TargetPath)) {
+        ''
+    }
+    else {
+        [IO.Path]::GetFullPath($desktopShortcut.TargetPath)
+    }
+    if ($shortcutTarget.StartsWith($sourceRootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        $desktopShortcut.TargetPath = $appExe
+        $desktopShortcut.WorkingDirectory = $root
+        $desktopShortcut.Arguments = ''
+        $desktopShortcut.IconLocation = $appExe + ',0'
+        $desktopShortcut.Save()
+    }
 }

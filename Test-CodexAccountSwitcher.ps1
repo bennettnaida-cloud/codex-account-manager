@@ -15,7 +15,13 @@ else {
     [IO.Path]::GetFullPath($env:CODEX_ACCOUNT_MANAGER_APP_EXE)
 }
 $projectPath = Join-Path $root 'src\CodexAccountManager\CodexAccountManager.csproj'
-$dotnetPath = Join-Path $root '.tools\dotnet\dotnet.exe'
+$bundledDotnetPath = Join-Path $root '.tools\dotnet\dotnet.exe'
+$dotnetPath = if ([string]::IsNullOrWhiteSpace($env:CODEX_ACCOUNT_MANAGER_DOTNET_PATH)) {
+    $bundledDotnetPath
+}
+else {
+    [IO.Path]::GetFullPath($env:CODEX_ACCOUNT_MANAGER_DOTNET_PATH)
+}
 $fakeJwt = 'eyJhbGciOiJub25lIn0.eyJleHAiOjE4OTM0NTYwMDB9.signature'
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("codex-switcher-test-" + [guid]::NewGuid().ToString('N'))
 $accountsFile = Join-Path $tempRoot 'accounts.json'
@@ -52,7 +58,7 @@ if (-not (Test-Path -LiteralPath $projectPath -PathType Leaf)) {
     throw "Missing Windows client project: $projectPath"
 }
 if (-not (Test-Path -LiteralPath $dotnetPath -PathType Leaf)) {
-    throw "Missing bundled dotnet host: $dotnetPath"
+    throw "Missing dotnet host: $dotnetPath"
 }
 
 New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
@@ -73,7 +79,13 @@ Copy-Item -LiteralPath $appIcon -Destination (Join-Path $tempRoot 'assets\CodexA
 $env:CODEX_SWITCHER_ACCOUNTS_FILE = $accountsFile
 $env:CODEX_SWITCHER_TOKEN_METADATA_FILE = (Join-Path $tempRoot 'token-metadata.json')
 $env:CODEX_ACCOUNT_MANAGER_HOME = $tempRoot
-$env:CODEX_SWITCHER_CODEX_COMMAND = Join-Path $root '.tools\codex-cli\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe'
+$bundledCodexCommand = Join-Path $root '.tools\codex-cli\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe'
+$env:CODEX_SWITCHER_CODEX_COMMAND = if ([string]::IsNullOrWhiteSpace($oldCodexCommand)) {
+    $bundledCodexCommand
+}
+else {
+    [IO.Path]::GetFullPath($oldCodexCommand)
+}
 $env:CODEX_ACCOUNT_MANAGER_SHARED_CODEX_HOME = $sharedCodexHome
 $env:CODEX_SWITCHER_SKIP_GATEWAY_ENSURE = '1'
 # The source-level script tests do not perform an upstream request. A syntactically valid
@@ -93,11 +105,13 @@ $themeArtworkRendererSource = Get-Content -LiteralPath (Join-Path $root 'src\Cod
 $customCodexThemeDialogSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\CustomCodexThemeDialog.cs') -Raw -Encoding UTF8
 $modernUiControlsSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\ModernUiControls.cs') -Raw -Encoding UTF8
 $cliServiceSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\CodexCliService.cs') -Raw -Encoding UTF8
+$cliServiceModelsSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\CodexCliService.Models.cs') -Raw -Encoding UTF8
 $localPatGatewaySource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\LocalPatGateway.cs') -Raw -Encoding UTF8
 $localProxyDetectorSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\LocalProxyDetector.cs') -Raw -Encoding UTF8
 $quotaSnapshotStoreSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\QuotaSnapshotStore.cs') -Raw -Encoding UTF8
 $dreamSkinServiceSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\CodexDreamSkinService.cs') -Raw -Encoding UTF8
 $programSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\Program.cs') -Raw -Encoding UTF8
+$nativeFastBridgeSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\CodexNativeFastBridge.cs') -Raw -Encoding UTF8
 $resetSessionSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\UsageLimitResetSession.cs') -Raw -Encoding UTF8
 $probeUsageLedgerSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\ProbeUsageLedger.cs') -Raw -Encoding UTF8
 $projectSource = Get-Content -LiteralPath $projectPath -Raw -Encoding UTF8
@@ -384,11 +398,11 @@ if ($formSource -notmatch 'WorkspaceView\.ThemeSettings' -or
     $formSource -notmatch 'RenderThemeSettingsPanel' -or
     $formSource -notmatch 'private readonly ThemePicker _themeModePicker\s*=\s*new\(\)' -or
     $formSource -notmatch 'Name\s*=\s*"SidebarFooter"' -or
-    $formSource -notmatch 'void UpdateManagerAppearanceFooterLayout\(\)' -or
-    $formSource -notmatch 'managerAppearanceFooter\.SetBounds\(' -or
+    $formSource -notmatch 'void UpdateSidebarFooterLayout\(\)' -or
+    $formSource -notmatch 'footer\.SetBounds\(' -or
     $formSource -notmatch 'sidebar\.Resize\s*\+=' -or
-    $formSource -notmatch 'Text\s*=\s*"管理器外观"' -or
-    $formSource -notmatch '_themeModePicker\.SetBounds\(0,\s*34,\s*228,\s*46\)' -or
+    $formSource -notmatch 'Text\s*=\s*"外观设置"' -or
+    $formSource -notmatch '_themeModePicker\.SetBounds\(0,\s*34,\s*228,\s*42\)' -or
     $formSource -notmatch '_themeModePicker\.SetItems\(ThemeOptions\.Select\(option => option\.Label\)\)' -or
     $formSource -notmatch '_themeModePicker\.SelectedIndexChanged\s*\+=' -or
     $formSource -notmatch '_themeModePicker\.ApplyPalette\(_palette\)' -or
@@ -821,7 +835,7 @@ if ($passiveQuotaMonitorLayout.Value -notmatch 'var observedSpan\s*=\s*Math\.Cla
 if ($formSource -notmatch 'QueryUsageLimitResetAsync' -or
     $formSource -notmatch 'ResetUsageLimitAsync' -or
     $formSource -match 'ManageUsageLimitResetAsync' -or
-    $formSource -notmatch 'GetResetButtonText' -or
+    $formSource -notmatch 'GetResetActionText' -or
     $formSource -notmatch 'ResetCreditStatus\.Known' -or
     $formSource -notmatch 'UsageResetAction' -or
     $formSource -notmatch 'rightWidth = compact \? width : horizontalGeometry\.RightWidth' -or
@@ -988,7 +1002,7 @@ if (-not ($usageTrackerSource.Contains('rateLimits?["credits"]')) -or
     $usageTrackerSource -notmatch 'IndividualLimit is not \{ Limit: "20\.00", Used: "4\.00", RemainingPercent: 80 \}') {
     throw 'Local token_count snapshots must retain official Credits and individual spend-control metadata.'
 }
-if ($formSource -notmatch 'QueryQuotaOnceAfterExplicitLoginAsync' -or
+if ($formSource -notmatch 'StartOfficialQuotaRefreshAfterLaunch' -or
     $formSource -notmatch 'AccountQuotaLimitType\.FiveHourAndWeekly' -or
     $formSource -notmatch 'AccountQuotaLimitType\.WeeklyOnly' -or
     $formSource -notmatch 'AccountQuotaWindowKind\.Weekly' -or
@@ -998,6 +1012,28 @@ if ($formSource -notmatch 'QueryQuotaOnceAfterExplicitLoginAsync' -or
     $resetSessionSource -notmatch 'UsageRateLimitWindow' -or
     $accountStoreSource -notmatch 'QuotaPrimaryWindowMinutes') {
     throw 'Quota UI must auto-detect and display monthly versus simultaneous 5h/weekly official windows.'
+}
+$quotaDetailSubtitleHelper = [regex]::Match(
+    $formSource,
+    '(?s)private static string GetQuotaDetailSubtitle\(AccountRecord account\)\s*\{.*?\r?\n\s*\}')
+$quotaDetailInPlaceUpdater = [regex]::Match(
+    $formSource,
+    '(?s)private bool TryUpdateQuotaDetailInPlace\(UsageReport report\)\s*\{.*?(?=\r?\n\s*private static void SetLabelText\()')
+$quotaDetailInitialRenderer = [regex]::Match(
+    $formSource,
+    '(?s)private Control CreateQuotaUsageDetailCard\(AccountRecord account, AccountUsageSummary usage, int cardWidth\)\s*\{.*?(?=\r?\n\s*private static \(Rectangle Subtitle,)')
+if (-not $quotaDetailSubtitleHelper.Success -or
+    -not $quotaDetailInPlaceUpdater.Success -or
+    -not $quotaDetailInitialRenderer.Success -or
+    ([regex]::Matches($quotaDetailInPlaceUpdater.Value, 'GetQuotaDetailSubtitle\(account\)')).Count -ne 1 -or
+    ([regex]::Matches($quotaDetailInitialRenderer.Value, 'GetQuotaDetailSubtitle\(account\)')).Count -ne 1 -or
+    ([regex]::Matches($formSource, 'GetQuotaDetailSubtitle\(account\)')).Count -ne 2 -or
+    $quotaDetailInPlaceUpdater.Value -match 'GetOfficialFinancialSummary|officialSummary|个人限额|个人剩余' -or
+    $quotaDetailInitialRenderer.Value -match 'GetOfficialFinancialSummary|officialSummary|个人限额|个人剩余' -or
+    $quotaDetailSubtitleHelper.Value -notmatch 'account\.IsCompatibleApi\s*\?\s*"按 API 账单计费"\s*:\s*"仅显示官方额度百分比"' -or
+    $quotaDetailSubtitleHelper.Value -notmatch 'return\s+\$"\{account\.AuthKindLabel\}\s*·\s*\{usageSummary\}"\s*;' -or
+    $quotaDetailSubtitleHelper.Value -match 'AccountUsageSummary|GetOfficialFinancialSummary|Credits|个人限额|个人剩余') {
+    throw 'Quota detail initial rendering and in-place refresh must share the same concise authentication-only subtitle helper.'
 }
 if ($accountRecordSource -notmatch 'public const string WeeklyOnly = "weekly_only"' -or
     $accountRecordSource -notmatch 'public const string FiveHourOnly = "five_hour_only"' -or
@@ -1167,6 +1203,410 @@ if ($launchOfficialCodexMethod -notmatch 'BuildOfficialCodexActivationStartInfo\
     $launchOfficialCodexMethod -match 'startInfo\.Environment\[' -or
     $launchOfficialCodexMethod -match 'OpenNewTaskAfterWindowsClientLaunchInBackground') {
     throw 'The official MSIX Codex client must be activated through codex:// and never started directly from the protected WindowsApps executable.'
+}
+$reviewedOfficialCodexPageUrls = @(
+    'app://codex/',
+    'app://-/index.html',
+    'app://-/index.html?initialRoute=%2Favatar-overlay'
+)
+$rejectedOfficialCodexPageUrls = @(
+    '',
+    ' app://-/index.html',
+    'APP://-/index.html',
+    'app://fs/',
+    'app://codex/settings',
+    'app://codex/?changed=1',
+    'app://user@codex/',
+    'app://codex/#fragment',
+    'app://codex/%2e',
+    'app://user@-/index.html',
+    'app://-:19335/index.html',
+    'app://-/index.html/',
+    'app://-/index.html/extra',
+    'app://-/./index.html',
+    'app://-/foo/../index.html',
+    'app://-/%69ndex.html',
+    'app://-/index%2Ehtml',
+    'app://-:0/index.html',
+    'app://-/index.html#fragment',
+    'app://-/index.html?changed=1',
+    'app://-/index.html?initialRoute=/avatar-overlay',
+    'app://-/index.html?initialRoute=%2Fsettings',
+    'app://-/index.html?initialRoute=%2favatar-overlay',
+    'app://-/index.html?initialRoute=%2Favatar-overlay&changed=1',
+    'http://-/index.html',
+    'https://codex/'
+)
+$officialCodexPageUrlContractSources = @(
+    [pscustomobject]@{ Name = 'launcher'; Text = $cliServiceSource },
+    [pscustomobject]@{ Name = 'bridge'; Text = $nativeFastBridgeSource }
+)
+foreach ($contractSource in $officialCodexPageUrlContractSources) {
+    foreach ($pageUrl in $reviewedOfficialCodexPageUrls) {
+        $pattern = '!\s*IsReviewedOfficialCodexPageUrl\(\s*"' +
+            [regex]::Escape($pageUrl) + '"\s*\)'
+        if ($contractSource.Text -notmatch $pattern) {
+            throw "Official Codex $($contractSource.Name) URL contract is missing reviewed page $pageUrl."
+        }
+    }
+    foreach ($pageUrl in $rejectedOfficialCodexPageUrls) {
+        $pattern = '(?<!!)IsReviewedOfficialCodexPageUrl\(\s*"' +
+            [regex]::Escape($pageUrl) + '"\s*\)'
+        if ($contractSource.Text -notmatch $pattern) {
+            throw "Official Codex $($contractSource.Name) URL contract is missing rejected page $pageUrl."
+        }
+    }
+    if ($contractSource.Text -notmatch '(?<!!)IsReviewedOfficialCodexPageUrl\(null\)') {
+        throw "Official Codex $($contractSource.Name) URL contract must reject a missing page URL."
+    }
+}
+$bridgePageUrlValidator = [regex]::Match(
+    $nativeFastBridgeSource,
+    '(?s)internal static bool IsReviewedOfficialCodexPageUrl\(string\? value\)\s*\{.*?\r?\n\s*\}')
+if (-not $bridgePageUrlValidator.Success -or
+    $bridgePageUrlValidator.Value -match 'Uri\.TryCreate|StringComparison\.OrdinalIgnoreCase' -or
+    ([regex]::Matches($bridgePageUrlValidator.Value, 'string\.Equals\(\s*value,').Count -ne 3)) {
+    throw 'Official Codex bridge page validation must remain an exact three-entry literal allow-list.'
+}
+foreach ($pageUrl in $reviewedOfficialCodexPageUrls) {
+    $allowListPattern = 'string\.Equals\(\s*value,\s*"' +
+        [regex]::Escape($pageUrl) + '"\s*,\s*StringComparison\.Ordinal\s*\)'
+    if ($bridgePageUrlValidator.Value -notmatch $allowListPattern) {
+        throw "Official Codex bridge allow-list is missing reviewed page $pageUrl."
+    }
+}
+$launcherPageUrlValidator = [regex]::Match(
+    $cliServiceSource,
+    '(?s)private static bool IsReviewedOfficialCodexPageUrl\(string\? value\)\s*\{.*?\r?\n\s*\}')
+if (-not $launcherPageUrlValidator.Success -or
+    $launcherPageUrlValidator.Value -notmatch 'return\s+CodexNativeFastBridge\.IsReviewedOfficialCodexPageUrl\(value\);') {
+    throw 'Official Codex launcher page validation must delegate to the bridge allow-list.'
+}
+$reviewedRendererProfiles = @(
+    [pscustomobject]@{
+        Name = 'legacy-2026-08-20'
+        BundleConstant = 'LegacyRendererBundleUrl'
+        BundleUrl = 'app://codex/assets/app-initial-DWsVN4CS.js'
+        SourceHashConstant = 'PreviousRendererSourceSha256'
+        SourceHash = '4C22397E9DAF90C13978C011AE08142ADC0D7BA49FA4109D946CB840774274D8'
+        PatchContract = 'PreviousRendererPatchContract'
+        SemanticAnchors = 'PreviousRendererSemanticAnchors'
+    },
+    [pscustomobject]@{
+        Name = 'current-2026-08-20'
+        BundleConstant = 'PreviousRendererBundleUrl'
+        BundleUrl = 'app://-/assets/app-initial-DWsVN4CS.js'
+        SourceHashConstant = 'PreviousRendererSourceSha256'
+        SourceHash = '4C22397E9DAF90C13978C011AE08142ADC0D7BA49FA4109D946CB840774274D8'
+        PatchContract = 'PreviousRendererPatchContract'
+        SemanticAnchors = 'PreviousRendererSemanticAnchors'
+    },
+    [pscustomobject]@{
+        Name = 'current-2026-08-21'
+        BundleConstant = 'CurrentRendererBundleUrl'
+        BundleUrl = 'app://-/assets/app-initial-C_Tkoze_.js'
+        SourceHashConstant = 'CurrentRendererSourceSha256'
+        SourceHash = 'B09A7C92CEE07E25F383A8495DD4C0A9754512E7184E845E13A81BAF7DCAF89A'
+        PatchContract = 'CurrentRendererPatchContract'
+        SemanticAnchors = 'CurrentRendererSemanticAnchors'
+    }
+)
+$rendererPatchProfileRecord = [regex]::Match(
+    $nativeFastBridgeSource,
+    '(?s)private sealed record RendererPatchProfile\(\s*string Name,\s*string BundleUrl,\s*string SourceSha256,\s*\(string Name, string Original, string Patched\)\[\] PatchContract,\s*\(string Name, string Value\)\[\] SemanticAnchors\s*\);')
+$rendererPatchProfilesDeclaration = [regex]::Match(
+    $nativeFastBridgeSource,
+    '(?s)private static readonly RendererPatchProfile\[\] RendererPatchProfiles\s*=\s*\[(?<Body>.*?)\r?\n\s*\];')
+if (-not $rendererPatchProfileRecord.Success -or
+    -not $rendererPatchProfilesDeclaration.Success -or
+    ([regex]::Matches($rendererPatchProfilesDeclaration.Groups['Body'].Value, '\bnew\(')).Count -ne 3) {
+    throw 'Native Fast must declare exactly three URL/SHA/contract-scoped renderer profiles.'
+}
+foreach ($profile in $reviewedRendererProfiles) {
+    $bundleConstantPattern = 'private\s+const\s+string\s+' +
+        [regex]::Escape($profile.BundleConstant) + '\s*=\s*"' +
+        [regex]::Escape($profile.BundleUrl) + '"\s*;'
+    $hashConstantPattern = 'private\s+const\s+string\s+' +
+        [regex]::Escape($profile.SourceHashConstant) + '\s*=\s*"' +
+        [regex]::Escape($profile.SourceHash) + '"\s*;'
+    $profilePattern = 'new\(\s*"' + [regex]::Escape($profile.Name) + '"\s*,\s*' +
+        [regex]::Escape($profile.BundleConstant) + '\s*,\s*' +
+        [regex]::Escape($profile.SourceHashConstant) + '\s*,\s*' +
+        [regex]::Escape($profile.PatchContract) + '\s*,\s*' +
+        [regex]::Escape($profile.SemanticAnchors) + '\s*\)'
+    if ($nativeFastBridgeSource -notmatch $bundleConstantPattern -or
+        $nativeFastBridgeSource -notmatch $hashConstantPattern -or
+        $rendererPatchProfilesDeclaration.Groups['Body'].Value -notmatch $profilePattern) {
+        throw "Native Fast renderer profile $($profile.Name) is not bound to its reviewed URL, SHA, patch contract, and semantic anchors."
+    }
+}
+$rendererContractShapes = @(
+    [pscustomobject]@{
+        Name = 'previous'
+        PatchContract = 'PreviousRendererPatchContract'
+        SemanticAnchors = 'PreviousRendererSemanticAnchors'
+        RequiredAnchors = @('fast-is-priority', 'config-key', 'request-tier')
+        AnchorCount = 3
+    },
+    [pscustomobject]@{
+        Name = 'current'
+        PatchContract = 'CurrentRendererPatchContract'
+        SemanticAnchors = 'CurrentRendererSemanticAnchors'
+        RequiredAnchors = @('fast-is-priority', 'fast-fallback', 'config-key', 'request-tier')
+        AnchorCount = 4
+    }
+)
+foreach ($shape in $rendererContractShapes) {
+    $patchArray = [regex]::Match(
+        $nativeFastBridgeSource,
+        '(?s)private static readonly \(string Name, string Original, string Patched\)\[\]\s+' +
+            [regex]::Escape($shape.PatchContract) + '\s*=\s*\[(?<Body>.*?)\r?\n\s*\];')
+    $anchorArray = [regex]::Match(
+        $nativeFastBridgeSource,
+        '(?s)private static readonly \(string Name, string Value\)\[\]\s+' +
+            [regex]::Escape($shape.SemanticAnchors) + '\s*=\s*\[(?<Body>.*?)\r?\n\s*\];')
+    if (-not $patchArray.Success -or
+        -not $anchorArray.Success -or
+        ([regex]::Matches($patchArray.Groups['Body'].Value, '\(\s*"(?:visibility|config|auth-capture|options|selection)"\s*,')).Count -ne 5 -or
+        ([regex]::Matches($anchorArray.Groups['Body'].Value, '\(\s*"')).Count -ne $shape.AnchorCount) {
+        throw "Native Fast $($shape.Name) renderer source contract is incomplete."
+    }
+    foreach ($patchName in @('visibility', 'config', 'auth-capture', 'options', 'selection')) {
+        if (([regex]::Matches(
+                    $patchArray.Groups['Body'].Value,
+                    '\(\s*"' + [regex]::Escape($patchName) + '"\s*,')).Count -ne 1) {
+            throw "Native Fast $($shape.Name) renderer contract must contain exactly one $patchName replacement."
+        }
+    }
+    foreach ($anchorName in $shape.RequiredAnchors) {
+        if (([regex]::Matches(
+                    $anchorArray.Groups['Body'].Value,
+                    '\(\s*"' + [regex]::Escape($anchorName) + '"\s*,')).Count -ne 1) {
+            throw "Native Fast $($shape.Name) renderer contract is missing the $anchorName semantic anchor."
+        }
+    }
+}
+$currentRendererExactConstants = [ordered]@{
+    CurrentVisibilityGateOriginal = 'function Cas(e){let t=(0,was.c)(6),n=Y(Tk),r=e?.hostId??n,i=vA(r),a=i?.authMethod===`chatgpt`,o=i?.authMethod??null,s;t[0]!==r||t[1]!==o?(s={authMethod:o,hostId:r},t[0]=r,t[1]=o,t[2]=s):s=t[2];let{data:c,isPending:l}=gs(Bb,s),u=!!i?.isLoading||a&&l,d=a&&!u&&c!=null&&c?.requirements?.featureRequirements?.fast_mode!==!1,f;return t[3]!==u||t[4]!==d?(f={isServiceTierAllowed:d,isLoading:u},t[3]=u,t[4]=d,t[5]=f):f=t[5],f}'
+    CurrentVisibilityGatePatched = 'function Cas(e){let t=(0,was.c)(6),n=Y(Tk),r=e?.hostId??n,i=vA(r),a=i?.authMethod===`chatgpt`,o=i?.authMethod??null,s;t[0]!==r||t[1]!==o?(s={authMethod:o,hostId:r},t[0]=r,t[1]=o,t[2]=s):s=t[2];let{data:c,isPending:l}=gs(Bb,s),u=!!i?.isLoading||a&&l,d=!u&&(a?c!=null&&c?.requirements?.featureRequirements?.fast_mode!==!1:o===`personalAccessToken`||o===`apikey`),f;return t[3]!==u||t[4]!==d?(f={isServiceTierAllowed:d,isLoading:u},t[3]=u,t[4]=d,t[5]=f):f=t[5],f}'
+    CurrentConfigReadGateOriginal = 'async function Fri(e,t){let n=await Mri(e,t);if(n!==`chatgpt`)return!1;let r=await O0t(e,t,{priority:`critical`});return e.query.setData(Bb,{authMethod:n,hostId:t},r),r.requirements?.featureRequirements?.fast_mode!==!1}'
+    CurrentConfigReadGatePatched = 'async function Fri(e,t){let n=await Mri(e,t);if(n===`personalAccessToken`||n===`apikey`)return!0;if(n!==`chatgpt`)return!1;let r=await O0t(e,t,{priority:`critical`});return e.query.setData(Bb,{authMethod:n,hostId:t},r),r.requirements?.featureRequirements?.fast_mode!==!1}'
+    CurrentServiceTierAuthCaptureOriginal = 'u=gs(uk,e),d=gs(Fss,e),f=vA(o.hostId)?.authMethod??null,p;'
+    CurrentServiceTierAuthCapturePatched = 'u=gs(uk,e),d=gs(Fss,e),f=vA(o.hostId)?.authMethod??null,p,_camAuth;_camAuth=f;'
+    CurrentServiceTierOptionsOriginal = 'T=p,E=o.hostId,w=sTr(s),'
+    CurrentServiceTierOptionsPatched = 'T=p,E=o.hostId,w=(()=>{let e=sTr(s);return(_camAuth===`personalAccessToken`||_camAuth===`apikey`)&&!e.some(e=>e.value===_Tr)?[...e,...STr.filter(e=>e.value===_Tr)]:e})(),'
+    CurrentServiceTierSelectionOriginal = 'S=e!=null&&(u?.serviceTier!==void 0||d!==void 0)?y?k:null:pTr(s,k,y),x=S==null?null:fTr(s,S);'
+    CurrentServiceTierSelectionPatched = 'S=e!=null&&(u?.serviceTier!==void 0||d!==void 0)?y?k:null:pTr(s,k,y),x=S==null?null:fTr(s,S)??((_camAuth===`personalAccessToken`||_camAuth===`apikey`)&&S===_Tr?_Tr:null);'
+}
+foreach ($constant in $currentRendererExactConstants.GetEnumerator()) {
+    $constantMatch = [regex]::Match(
+        $nativeFastBridgeSource,
+        'private\s+const\s+string\s+' + [regex]::Escape($constant.Key) +
+            '\s*=\s*"(?<Value>[^"]*)"\s*;')
+    if (-not $constantMatch.Success -or
+        $constantMatch.Groups['Value'].Value -cne $constant.Value) {
+        throw "Native Fast current renderer source contract drifted at $($constant.Key)."
+    }
+}
+$rejectedRendererBundleUrls = @(
+    'APP://-/assets/app-initial-DWsVN4CS.js',
+    'APP://-/assets/app-initial-C_Tkoze_.js',
+    'https://example.com/assets/app-initial-DWsVN4CS.js',
+    'app://user@-/assets/app-initial-DWsVN4CS.js',
+    'app://-:19335/assets/app-initial-DWsVN4CS.js',
+    'app://-/assets/app-initial-Other.js',
+    'app://-/assets/./app-initial-DWsVN4CS.js',
+    'app://-/assets/foo/../app-initial-DWsVN4CS.js',
+    'app://-/%61ssets/app-initial-DWsVN4CS.js',
+    'app://-/assets/app-initial-DWsVN4CS%2Ejs',
+    'app://-/assets/app-initial-DWsVN4CS.js#fragment',
+    'app://-/assets/app-initial-DWsVN4CS.js?changed=1',
+    'app://-/assets/app-initial-C_Tkoze_.js?changed=1'
+)
+$rendererBundleValidator = [regex]::Match(
+    $nativeFastBridgeSource,
+    '(?s)private static bool IsRendererBundleUrl\(string\? value\)\s*\{.*?\r?\n\s*\}')
+if (-not $rendererBundleValidator.Success -or
+    $rendererBundleValidator.Value -match 'Uri\.TryCreate|Regex|OrdinalIgnoreCase' -or
+    $rendererBundleValidator.Value -notmatch 'RendererPatchProfiles\.Any' -or
+    $rendererBundleValidator.Value -notmatch 'profile\.BundleUrl' -or
+    $rendererBundleValidator.Value -notmatch 'StringComparison\.Ordinal') {
+    throw 'Native Fast renderer bundle validation must remain an exact profile-backed raw URL allow-list.'
+}
+foreach ($profile in $reviewedRendererProfiles) {
+    $bundleUrl = $profile.BundleUrl
+    $positiveContractPattern = '!\s*IsRendererBundleUrl\(\s*"' +
+        [regex]::Escape($bundleUrl) + '"\s*\)'
+    if ($nativeFastBridgeSource -notmatch $positiveContractPattern) {
+        throw "Native Fast renderer allow-list is missing reviewed bundle $bundleUrl."
+    }
+}
+foreach ($bundleUrl in $rejectedRendererBundleUrls) {
+    $negativeContractPattern = '(?<!!)IsRendererBundleUrl\(\s*"' +
+        [regex]::Escape($bundleUrl) + '"\s*\)'
+    if ($nativeFastBridgeSource -notmatch $negativeContractPattern) {
+        throw "Native Fast renderer URL contract is missing rejected bundle $bundleUrl."
+    }
+}
+if ($nativeFastBridgeSource -notmatch '(?<!!)IsRendererBundleUrl\(null\)') {
+    throw 'Native Fast renderer URL contract must reject a missing bundle URL.'
+}
+$profilePatchMethod = [regex]::Match(
+    $nativeFastBridgeSource,
+    '(?s)private static RendererPatchResult PatchRendererSource\(\s*RendererPatchProfile profile,\s*string source,\s*out string patchedSource\)\s*\{.*?(?=\r?\n\s*private static int CountOccurrences\()')
+$reviewedPatchedRendererMethod = [regex]::Match(
+    $nativeFastBridgeSource,
+    '(?s)private static bool IsReviewedPatchedRendererSource\(\s*RendererPatchProfile profile,\s*string patchedSource\s*\)\s*\{.*?(?=\r?\n\s*private static RendererResponseBody ReadRendererResponseBody\()')
+$reviewedProfilesForPageMethod = [regex]::Match(
+    $nativeFastBridgeSource,
+    '(?s)private static IReadOnlyList<RendererPatchProfile> ReviewedRendererProfilesForPage\(\s*string\? pageUrl\)\s*\{.*?(?=\r?\n\s*private static RendererResponseBody ReadRendererResponseBody\()')
+$rendererPreflightMethod = [regex]::Match(
+    $nativeFastBridgeSource,
+    '(?s)private async Task CompletePreflightAsync\(CancellationToken cancellationToken\)\s*\{.*?(?=\r?\n\s*private void RejectPreflight\()')
+if (-not $profilePatchMethod.Success -or
+    -not $reviewedPatchedRendererMethod.Success -or
+    -not $reviewedProfilesForPageMethod.Success -or
+    -not $rendererPreflightMethod.Success -or
+    $profilePatchMethod.Value -notmatch 'profile\.PatchContract' -or
+    $profilePatchMethod.Value -notmatch 'profile\.SemanticAnchors' -or
+    $profilePatchMethod.Value -match '(?<!profile\.)RendererPatchContract|(?<!profile\.)RendererSemanticAnchors' -or
+    $reviewedPatchedRendererMethod.Value -notmatch 'foreach\s*\(var patch in profile\.PatchContract\)' -or
+    $reviewedPatchedRendererMethod.Value -notmatch '(?s)\.Replace\(\s*patch\.Patched,\s*patch\.Original,\s*StringComparison\.Ordinal\s*\)' -or
+    $reviewedPatchedRendererMethod.Value -notmatch '(?s)SourceFingerprint\(restoredSource\)\.Equals\(\s*profile\.SourceSha256,\s*StringComparison\.Ordinal\s*\)' -or
+    $reviewedProfilesForPageMethod.Value -notmatch 'LegacyRendererBundleUrl' -or
+    $reviewedProfilesForPageMethod.Value -notmatch 'PreviousRendererBundleUrl' -or
+    $reviewedProfilesForPageMethod.Value -notmatch 'CurrentRendererBundleUrl' -or
+    $nativeFastBridgeSource -notmatch '_reviewedProfiles\.TryGetValue\(observed\.Url, out var profile\)' -or
+    $rendererPreflightMethod.Value -notmatch '(?s)alreadyPatched\s*&&\s*IsReviewedPatchedRendererSource\(profile, source\)' -or
+    ([regex]::Matches(
+            $nativeFastBridgeSource,
+            '(?:fingerprint|originalFingerprint)\.Equals\(profile\.SourceSha256, StringComparison\.Ordinal\)')).Count -lt 2 -or
+    $nativeFastBridgeSource -notmatch 'PatchRendererSource\(profile,\s*body\.Source,\s*out var patchedSource\)' -or
+    $nativeFastBridgeSource -match '\bReviewedRendererSourceSha256\b') {
+    throw 'Native Fast patching must select one page-compatible renderer profile and use only that profile''s SHA, source replacements, and anchors.'
+}
+$nativeFastPatchContractValidation = [regex]::Match(
+    $nativeFastBridgeSource,
+    '(?s)internal static void ValidatePatchContract\(\)\s*\{.*?(?=\r?\n\s*private sealed class RendererReadinessState)')
+$nativeFastRendererProfileValidation = [regex]::Match(
+    $nativeFastBridgeSource,
+    '(?s)private static void ValidateRendererPatchProfile\(RendererPatchProfile profile\)\s*\{.*?(?=\r?\n\s*internal static void ValidatePatchContract\()')
+if (-not $nativeFastPatchContractValidation.Success -or
+    -not $nativeFastRendererProfileValidation.Success) {
+    throw 'Native Fast must retain an executable patch and renderer-state contract self-test.'
+}
+if ($nativeFastRendererProfileValidation.Value -notmatch '!IsReviewedPatchedRendererSource\(syntheticProfile, patched\)' -or
+    $nativeFastRendererProfileValidation.Value -notmatch 'IsReviewedPatchedRendererSource\(syntheticProfile, patched \+ ";tampered"\)') {
+    throw 'Native Fast patch self-test must accept only the exact reviewed patched renderer and reject appended bytes.'
+}
+$nativeFastStateSelfTestRequirements = [ordered]@{
+    'initial frame arming' = '\.Arm\('
+    'preflight verification' = '\.MarkPreflightVerified\('
+    'controlled reload transition' = '\.TryBeginControlledReload\('
+    'frame loading reset' = '\.BeginFrameLoading\('
+    'loader replacement' = '\.FrameNavigated\('
+    'load lifecycle completion' = '\.LifecycleEvent\('
+    'response interception start' = '\.TryBeginFetch\('
+    'response fulfillment' = '\.MarkFulfilled\('
+    'response rejection' = '\.MarkResponseFailed\('
+    'fulfilled script verification' = '\.MarkScriptVerified\('
+    'verification rejection' = '\.MarkVerificationFailed\('
+    'stale navigation rejection' = '\.IsCurrent\('
+    'connection fault' = '\.Fault\('
+    'pre-activation publication barrier' = '\.Activate\('
+}
+foreach ($requirement in $nativeFastStateSelfTestRequirements.GetEnumerator()) {
+    if ($nativeFastPatchContractValidation.Value -notmatch $requirement.Value) {
+        throw "Native Fast ValidatePatchContract is missing its $($requirement.Key) state-machine self-test."
+    }
+}
+if (([regex]::Matches($nativeFastPatchContractValidation.Value, '\.Activate\(\)')).Count -lt 2 -or
+    ([regex]::Matches($nativeFastPatchContractValidation.Value, '\.IsReady')).Count -lt 6 -or
+    ([regex]::Matches($nativeFastPatchContractValidation.Value, '\.TryBeginFetch\(')).Count -lt 2 -or
+    ([regex]::Matches($nativeFastPatchContractValidation.Value, '\.MarkFulfilled\(')).Count -lt 2 -or
+    ([regex]::Matches($nativeFastPatchContractValidation.Value, '\.MarkScriptVerified\(')).Count -lt 2 -or
+    ([regex]::Matches($nativeFastPatchContractValidation.Value, '\.LifecycleEvent\(')).Count -lt 2 -or
+    $nativeFastPatchContractValidation.Value -notmatch '"load"' -or
+    $nativeFastPatchContractValidation.Value -notmatch 'buffer' -or
+    $nativeFastPatchContractValidation.Value -notmatch 'new\s+ControlledReloadGate\(\)' -or
+    ([regex]::Matches($nativeFastPatchContractValidation.Value, '\.TryConsume\(\)')).Count -lt 2) {
+    throw 'Native Fast ValidatePatchContract must cover armed/fulfilled/loaded readiness, stale loaders, disconnects, pre-activation buffering, and a one-shot controlled reload gate.'
+}
+if ($programSource -notmatch 'CodexNativeFastBridge\.ProcessArgument' -or
+    $programSource -notmatch 'ValidateServiceTierAccountIsolation' -or
+    $launchOfficialCodexMethod -notmatch 'SelectOfficialNativeFastCdpPort' -or
+    $launchOfficialCodexMethod -notmatch 'AttachNativeFastBridgeWhenOfficialCodexIsReady' -or
+    $launchOfficialCodexMethod -notmatch 'nativeFastReadyTask' -or
+    $launchOfficialCodexMethod -notmatch 'DreamSkinCdpPortCandidates' -or
+    $cliServiceSource -notmatch 'CodexNativeFastBridge\.WaitForRendererPatch' -or
+    $cliServiceSource -match 'ResetRendererPatchReadiness' -or
+    $cliServiceSource -notmatch 'restarting it cannot make an unknown renderer version satisfy the patch contract' -or
+    $cliServiceSource -notmatch 'BuildOfficialNativeFastActivationArguments' -or
+    $nativeFastBridgeSource -notmatch '!IsReviewedOfficialCodexPageUrl\(pageUrl\)' -or
+    $nativeFastBridgeSource -notmatch 'app://-/assets/app-initial-DWsVN4CS\.js' -or
+    $nativeFastBridgeSource -match 'Debugger\.setScriptSource|MaximumLiveEditAttempts|PatchScriptWithRetryAsync|PatchScriptOnceAsync|PatchAttemptOutcome' -or
+    $nativeFastBridgeSource -notmatch 'Fetch\.enable' -or
+    $nativeFastBridgeSource -notmatch 'requestStage\s*=\s*"Response"' -or
+    $nativeFastBridgeSource -notmatch 'Fetch\.getResponseBody' -or
+    $nativeFastBridgeSource -notmatch 'Fetch\.fulfillRequest' -or
+    $nativeFastBridgeSource -notmatch 'Fetch\.continueResponse' -or
+    $nativeFastBridgeSource -notmatch '_pausedFetchRequests\.TryAdd\(requestId,\s*PausedFetchResolutionState\.Pending\)' -or
+    $nativeFastBridgeSource -notmatch '_pausedFetchRequests\.TryUpdate\(\s*requestId,\s*PausedFetchResolutionState\.Fulfilling,\s*PausedFetchResolutionState\.Pending\)' -or
+    $nativeFastBridgeSource -notmatch '_pausedFetchRequests\.TryUpdate\(\s*requestId,\s*PausedFetchResolutionState\.Continuing,\s*PausedFetchResolutionState\.Pending\)' -or
+    ([regex]::Matches($nativeFastBridgeSource, '_pausedFetchRequests\.TryRemove\(requestId, out _\)')).Count -lt 2 -or
+    $nativeFastBridgeSource -notmatch 'finally\s*\{\s*await ContinuePausedResponseAsync\(requestId\);\s*_responsePatchLock\.Release\(\);' -or
+    $nativeFastBridgeSource -notmatch 'FailConnectionForUncertainResponse' -or
+    $nativeFastBridgeSource -notmatch '_connection\.Abort\(\)' -or
+    $nativeFastBridgeSource -notmatch 'Page\.setLifecycleEventsEnabled' -or
+    $nativeFastBridgeSource -notmatch 'Page\.frameStartedLoading' -or
+    $nativeFastBridgeSource -notmatch 'Page\.frameNavigated' -or
+    $nativeFastBridgeSource -notmatch 'Page\.lifecycleEvent' -or
+    $nativeFastBridgeSource -notmatch 'Page\.reload' -or
+    $nativeFastBridgeSource -notmatch '!allowRendererReload\s*\|\|\s*!_preflightAllowed\s*\|\|\s*!reloadGate\.TryConsume\(\)' -or
+    $nativeFastBridgeSource -notmatch 'Dictionary<string, ControlledReloadGate>' -or
+    $nativeFastBridgeSource -notmatch 'StartControlledReloadAsync' -or
+    $nativeFastBridgeSource -notmatch 'BuildFulfilledResponseHeaders' -or
+    $nativeFastBridgeSource -notmatch 'VerifyFulfilledScriptAsync' -or
+    ([regex]::Matches($nativeFastBridgeSource, 'Debugger\.getScriptSource')).Count -lt 2 -or
+    $nativeFastBridgeSource -notmatch 'fulfilled\.PatchedSha256' -or
+    $nativeFastBridgeSource -notmatch 'RendererPatchStatus\.AlreadyPatched' -or
+    $nativeFastBridgeSource -notmatch 'RendererReadinessState' -or
+    $nativeFastBridgeSource -notmatch 'RendererWorkerReadinessState' -or
+    $nativeFastBridgeSource -notmatch 'SynchronizeTargets\(activeTargetIds\)' -or
+    $nativeFastBridgeSource -notmatch 'readiness\.Suspend\(\);\s*endpointFailures\+\+' -or
+    $nativeFastBridgeSource -notmatch 'readiness\.Suspend\(\);\s*readiness\.SynchronizeTargets\(activeTargetIds\)' -or
+    $nativeFastBridgeSource -notmatch 'readiness\.Resume\(\);\s*await Task\.Delay' -or
+    ([regex]::Matches($nativeFastBridgeSource, '_suspended\s*=\s*false')).Count -ne 1 -or
+    $nativeFastBridgeSource -notmatch 'restored readiness before a replacement renderer completed' -or
+    $nativeFastBridgeSource -notmatch 'workers\.Add\(target\.Id, worker\);\s*worker\.ActivateReadiness\(\)' -or
+    $nativeFastBridgeSource -notmatch 'RequiresReconnect' -or
+    $nativeFastBridgeSource -notmatch 'target_reconnect_scheduled' -or
+    $nativeFastBridgeSource -notmatch 'rendererReady\.Reset\(\);\s*return RunWatchAsync' -or
+    $nativeFastBridgeSource -match 'internal static void ResetRendererPatchReadiness' -or
+    $nativeFastBridgeSource -notmatch 'personalAccessToken' -or
+    $nativeFastBridgeSource -notmatch 'apikey' -or
+    $nativeFastBridgeSource -notmatch 'OwnerPidArgument' -or
+    $nativeFastBridgeSource -notmatch 'OwnerStartTicksArgument' -or
+    $nativeFastBridgeSource -notmatch 'GetExtendedTcpTable' -or
+    $nativeFastBridgeSource -notmatch 'IsExpectedCdpOwner' -or
+    $nativeFastBridgeSource -notmatch 'OPENAI_TOKEN' -or
+    $nativeFastBridgeSource -notmatch 'CODEX_ACCESS_TOKEN' -or
+    $nativeFastBridgeSource -notmatch 'AZURE_OPENAI_API_KEY' -or
+    $nativeFastBridgeSource -notmatch 'p,_camAuth;_camAuth=f;' -or
+    $nativeFastBridgeSource -match 'p,_camAuth=f;' -or
+    $nativeFastBridgeSource -notmatch '!e\.some\(e=>e\.value===tTr\)' -or
+    $nativeFastBridgeSource -notmatch 'oTr\.filter\(e=>e\.value===tTr\)' -or
+    $nativeFastBridgeSource -notmatch 'UseShellExecute\s*=\s*false' -or
+    $nativeFastBridgeSource -notmatch 'CreateNoWindow\s*=\s*true' -or
+    $nativeFastBridgeSource -notmatch 'EventResetMode\.ManualReset' -or
+    $nativeFastBridgeSource -match 'Runtime\.evaluate|visibilitychange|new Event\(''focus''\)') {
+    throw 'Official Codex PAT/API Fast controls must use identity-scoped Fetch response interception, exact source verification, lifecycle-gated all-renderer readiness, a one-shot controlled reload, and no LiveEdit mutation or retry path.'
+}
+if ($cliServiceSource -notmatch 'public void CaptureActiveServiceTier\(\)' -or
+    $formSource -notmatch '_codex\.CaptureActiveServiceTier\(\)' -or
+    $cliServiceSource -notmatch 'hasActiveAccountState\s*\?' -or
+    $cliServiceSource -notmatch 'Deleting an inactive account with the same credential') {
+    throw 'Fast/Standard choices must be captured before credential rotation and shared cleanup must use the exact active account marker.'
 }
 if ($settingsSource -notmatch 'bool UseCodexDreamSkin' -or
     $formSource -notmatch '_appSettings\.UseCodexDreamSkin' -or
@@ -1687,7 +2127,7 @@ if ($cliServiceSource -notmatch 'startInfo\.Environment\["CODEX_HOME"\]\s*=\s*co
     $cliServiceSource -notmatch 'model_auto_compact_token_limit' -or
     $cliServiceSource -notmatch 'ApplyProxyEnvironment\(startInfo\)' -or
     $cliServiceSource -notmatch 'supports_websockets = false') {
-    throw 'Windows client launch must use shared CODEX_HOME and CODEX_SQLITE_HOME, preserve proxy settings through direct ChatGPT launches, disable Fast and automatic compaction, and keep compatible APIs on HTTP.'
+    throw 'Windows client launch must use shared CODEX_HOME and CODEX_SQLITE_HOME, preserve proxy settings and the selected service tier, disable automatic compaction, and keep compatible APIs on HTTP.'
 }
 $proxyAliases = @('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy')
 foreach ($proxyAlias in $proxyAliases) {
@@ -1731,6 +2171,16 @@ if ($cliServiceSource -notmatch 'ProjectWindowsClientConfig' -or
     $cliServiceSource -notmatch 'disablePlugins:\s*true' -or
      $accountStoreSource -notmatch 'supports_websockets\s*=\s*false') {
     throw 'Windows client account projection must remove stale local-access settings and use the fail-fast Token HTTP provider.'
+}
+if ($accountStoreSource -notmatch 'OfficialOAuthProviderId\s*=\s*"codex_official_https"' -or
+    $accountStoreSource -notmatch 'OfficialOAuthBaseUrl\s*=\s*"https://chatgpt\.com/backend-api/codex"' -or
+    $accountStoreSource -notmatch '(?s)BuildOfficialOAuthConfig\([^)]*\).{0,1800}?model_provider\s*=\s*\{TomlString\(OfficialOAuthProviderId\)\}.{0,1800}?requires_openai_auth\s*=\s*true.{0,500}?supports_websockets\s*=\s*false.{0,500}?\[desktop\].{0,300}?localeOverride\s*=\s*\{TomlString\(OfficialOAuthDesktopLocale\)\}' -or
+    $cliServiceSource -notmatch '(?s)ProjectOfficialOAuthConfigText\([^)]*string currentConfig,[^)]*\).{0,5000}?AccountStore\.OfficialOAuthProviderId.{0,5000}?supports_websockets = false' -or
+    $cliServiceSource -notmatch '(?s)UpsertTomlSectionStringValue\(.{0,300}?"desktop".{0,200}?"localeOverride"' -or
+    $cliServiceSource -notmatch 'TomlSectionStringValueMatches' -or
+    $cliServiceSource -notmatch 'AccountStore\.OfficialOAuthProviderId\s*:\s*AccountStore\.ManagedProviderId' -or
+    $cliServiceSource -match 'UpsertFeatureFlag\(projected,\s*"responses_websockets') {
+    throw 'Official ChatGPT accounts must use the HTTPS-only official provider instead of removed WebSocket feature flags.'
 }
 if ($cliServiceSource -notmatch 'ApiKeyAuthMode\s*=\s*"apikey"' -or
     $cliServiceSource -notmatch '\["auth_mode"\]\s*=\s*ApiKeyAuthMode' -or
@@ -1805,10 +2255,10 @@ if ($accountStoreSource -notmatch 'LegacyCompatibleApiProviderId\s*=\s*"codex_co
     $cliServiceSource -notmatch 'removed an unrelated provider whose id matched the display name') {
     throw 'Compatible APIs must use the fixed codex_compatible_api provider id, retain only the display name, remove conflicting legacy sections, and fail fast on stream errors.'
 }
-if ($cliServiceSource -notmatch 'AccessTokenModel\s*=\s*"gpt-5\.6-terra"' -or
-    $cliServiceSource -notmatch 'AccessTokenReasoningEffort\s*=\s*"medium"' -or
-    $cliServiceSource -notmatch 'CompatibleApiDefaultModel\s*=\s*"gpt-5\.5"' -or
-    $cliServiceSource -notmatch 'CompatibleApiReasoningEffort\s*=\s*"xhigh"' -or
+if ($cliServiceModelsSource -notmatch 'AccessTokenModel\s*=>\s*ModelCatalogService\.CanonicalDefaultModel' -or
+    $cliServiceModelsSource -notmatch 'AccessTokenReasoningEffort\s*=>\s*ModelCatalogService\.DefaultReasoningEffort' -or
+    $cliServiceModelsSource -notmatch 'CompatibleApiDefaultModel\s*=\s*"gpt-5\.5"' -or
+    $cliServiceModelsSource -notmatch 'CompatibleApiReasoningEffort\s*=\s*"xhigh"' -or
     $cliServiceSource -notmatch 'sites@openai-bundled' -or
     $cliServiceSource -notmatch 'SetBoolean\("enhancementsEnabled", true\)' -or
     $cliServiceSource -notmatch 'SetBoolean\("providerSyncEnabled", false\)' -or
@@ -1816,6 +2266,8 @@ if ($cliServiceSource -notmatch 'AccessTokenModel\s*=\s*"gpt-5\.6-terra"' -or
     $cliServiceSource -notmatch 'SetBoolean\("codexAppSessionDelete", true\)' -or
     $cliServiceSource -notmatch 'SetBoolean\("codexAppMarkdownExport", true\)' -or
     $cliServiceSource -notmatch 'SetBoolean\("codexAppProjectMove", true\)' -or
+    $cliServiceSource -notmatch 'SetBoolean\("codexAppServiceTierControls", true\)' -or
+    $cliServiceSource -notmatch 'serviceTierControlsChanged && IsCodexPlusPlusReady\(\)' -or
     $cliServiceSource -notmatch 'SetBoolean\("codexAppModelWhitelistUnlock", false\)' -or
     $cliServiceSource -notmatch 'SetString\("codexAppPath", Path\.GetFullPath\(resolvedCodexAppDirectory\)\)' -or
     $cliServiceSource -notmatch 'EnsureCodexPlusPlusSafeSettings\(clientAppDir\)' -or
@@ -1911,7 +2363,7 @@ if (-not $openUnifiedThreadLayout.Success -or
     $openUnifiedThreadLayout.Value -match 'IsCodexPlusPlusReady|OpenWindowsClientThreadAsync|LaunchAccountAsync|LoginWith|SwitchWindowsClientAccountAsync' -or
     $formSource -notmatch 'Text\s*=\s*"阅读  ›"' -or
     $formSource -notmatch 'AccessibleName\s*=\s*\$"阅读本地聊天：\{thread\.Title\}"' -or
-    $formSource -notmatch '本地只读对话，不启动或登录 Codex\+\+。') {
+    $formSource -notmatch '本地只读，不启动或登录 Codex\+\+。') {
     throw 'Opening a unified chat must show the local read-only preview directly and must not require, launch, switch, or log in to Codex++.'
 }
 if ($threadTranscriptSource -notmatch 'public sealed class SharedThreadTranscriptService' -or
@@ -1961,7 +2413,7 @@ if ($formSource -notmatch '搜索标题或对话内容' -or
     throw 'The unified chat view must search titles and filtered local conversation content in a background index.'
 }
 if ($formSource -notmatch 'Task\.Run\(\(\) =>[\s\S]*?_usageTracker\.BuildReport\(accountSnapshot\)' -or
-    $formSource -notmatch 'Task\.Run\(\(\) => new UnifiedHistoryLoadResult' -or
+    $formSource -notmatch 'Task\.Run\(\(\) => _sharedHistory\.Load\(sharedHome\)\)' -or
     $formSource -notmatch '_quotaUsageCache' -or
     $formSource -notmatch '_unifiedHistoryCache' -or
     $formSource -notmatch 'CreateWorkspaceLoadingState' -or
@@ -1997,24 +2449,25 @@ if ($formSource -notmatch 'QuotaMinimumRefreshInterval\s*=\s*TimeSpan\.FromMilli
 }
 $automaticQuotaRefresh = [regex]::Match(
     $formSource,
-    '(?s)private void StartOfficialQuotaRefreshAfterLaunch\(AccountRecord account\).*?(?=\r?\n\s*private async Task QueryUsageLimitResetAsync)')
+    '(?s)private void StartOfficialQuotaRefreshAfterLaunch\(AccountRecord account\).*?(?=\r?\n\s*private bool StartOfficialQuotaRefreshAfterMinimalTest)')
 if (-not $automaticQuotaRefresh.Success -or
-    $formSource -notmatch 'OfficialQuotaFocusedRefreshInterval\s*=\s*TimeSpan\.FromSeconds\(15\)' -or
-    $formSource -notmatch 'OfficialQuotaBackgroundRefreshInterval\s*=\s*TimeSpan\.FromMinutes\(1\)' -or
+    $formSource -notmatch 'OfficialQuotaActiveRefreshInterval\s*=\s*TimeSpan\.FromSeconds\(10\)' -or
+    $formSource -match 'OfficialQuotaBackgroundRefreshInterval' -or
     ([regex]::Matches($formSource, 'StartOfficialQuotaRefreshAfterLaunch\(account\)')).Count -lt 2 -or
     $automaticQuotaRefresh.Value -notmatch 'account\.IsCompatibleApi' -or
     $automaticQuotaRefresh.Value -notmatch 'var accountKey\s*=\s*QuotaAccountIdentity\.CreateKey\(account\)' -or
+    $automaticQuotaRefresh.Value -notmatch '_launchedOfficialQuotaAccountKey\s*=\s*account\.IsCompatibleApi' -or
+    $automaticQuotaRefresh.Value -notmatch '_officialQuotaRefreshAttemptedAt\.Remove\(' -or
     $automaticQuotaRefresh.Value -notmatch '_officialQuotaRefreshAttemptedAt\.TryGetValue\(accountKey' -or
-    $automaticQuotaRefresh.Value -notmatch 'var refreshInterval\s*=\s*focused' -or
-    $automaticQuotaRefresh.Value -notmatch 'now - lastAttempt < refreshInterval' -or
+    $automaticQuotaRefresh.Value -notmatch 'now - lastAttempt < OfficialQuotaActiveRefreshInterval' -or
     $automaticQuotaRefresh.Value -notmatch '_officialQuotaRefreshInProgress\.Add\(accountKey\)' -or
     $automaticQuotaRefresh.Value -notmatch 'CancellationTokenSource\(TimeSpan\.FromSeconds\(15\)\)' -or
-    $automaticQuotaRefresh.Value -notmatch 'OpenUsageLimitResetSessionAsync\([\s\S]*?account,[\s\S]*?fastFail:\s*true' -or
-    $automaticQuotaRefresh.Value -notmatch 'session\.ReadAsync\(timeout\.Token\)' -or
+    $automaticQuotaRefresh.Value -notmatch 'ReadUsageLimitResetInfoAsync\([\s\S]*?account,[\s\S]*?fastFail:\s*true' -or
+    $automaticQuotaRefresh.Value -notmatch 'cancellationToken:\s*timeout\.Token' -or
     $automaticQuotaRefresh.Value -notmatch 'CacheUsageLimitResetInfo\(account,\s*info\)' -or
     $automaticQuotaRefresh.Value -notmatch 'catch \(OperationCanceledException\)' -or
     $automaticQuotaRefresh.Value -match '_accounts|foreach\s*\(|ConsumeAsync\(|LoginWith|EnsureAccountCanRunMinimalRequest|thread/start|turn/start') {
-    throw 'Official quota refresh must prioritize the focused account every 15 seconds, retain a background cooldown, and avoid model/reset-credit actions.'
+    throw 'Official quota refresh must poll only the launched account every 10 seconds and avoid model/reset-credit actions.'
 }
 $readOnlyQuotaRequest = [regex]::Match(
     $resetSessionSource,

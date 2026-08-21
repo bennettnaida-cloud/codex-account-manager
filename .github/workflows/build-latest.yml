@@ -12,20 +12,25 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  # The run number is monotonic for this workflow, so every push produces a
-  # strictly newer version without requiring a second manual version edit.
-  # Keep this above the locally validated 2.0.x packages so existing installs
-  # can receive the first automatic update published by this workflow.
-  CAM_VERSION: 2.1.${{ github.run_number }}
-
 jobs:
   build-windows:
     name: Build Windows package
     runs-on: windows-latest
+    outputs:
+      version: ${{ steps.release-version.outputs.version }}
     steps:
       - name: Checkout source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Resolve monotonic release version
+        id: release-version
+        shell: pwsh
+        run: |
+          # Keep the rolling release monotonic with the workflow run number:
+          # run 24 publishes 2.1.24, run 25 publishes 2.1.25, and so on.
+          $version = '2.1.{0}' -f ([int]'${{ github.run_number }}')
+          "CAM_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Set up .NET
         uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
@@ -68,8 +73,8 @@ jobs:
           path: |
             CodexAccountManager-Windows-latest.zip
             CodexAccountManager-Windows-latest.zip.sha256
-            CodexAccountManager-Windows-${{ env.CAM_VERSION }}.zip
-            CodexAccountManager-Windows-${{ env.CAM_VERSION }}.zip.sha256
+            CodexAccountManager-Windows-${{ steps.release-version.outputs.version }}.zip
+            CodexAccountManager-Windows-${{ steps.release-version.outputs.version }}.zip.sha256
           if-no-files-found: error
 
   publish:
@@ -78,6 +83,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      CAM_VERSION: ${{ needs.build-windows.outputs.version }}
     steps:
       - name: Download built packages
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -159,3 +166,15 @@ jobs:
             release-assets/CodexAccountManager-Windows-latest.zip
             release-assets/CodexAccountManager-Windows-latest.zip.sha256
           fail_on_unmatched_files: true
+
+      - name: Move rolling latest tag to the published commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api \
+            --method PATCH \
+            "repos/${{ github.repository }}/git/refs/tags/latest" \
+            -f sha="${{ github.sha }}" \
+            -F force=true

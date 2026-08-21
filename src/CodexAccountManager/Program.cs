@@ -9,6 +9,10 @@ static class Program
         {
             return LocalPatGateway.RunProcess(args);
         }
+        if (args.Contains(CodexNativeFastBridge.ProcessArgument, StringComparer.OrdinalIgnoreCase))
+        {
+            return CodexNativeFastBridge.RunProcess(args);
+        }
         if (args.Contains("--ensure-local-pat-gateway", StringComparer.OrdinalIgnoreCase))
         {
             try
@@ -183,6 +187,7 @@ static class Program
             LocalPatGatewayHost.ValidatePatRejectionMessaging();
             CodexCliService.ValidateDesktopSidebarProjection();
             CodexCliService.ValidateSharedProfileProjection();
+            CodexCliService.ValidateServiceTierAccountIsolation();
             CodexCliService.ValidateOfficialOAuthBrowserFlow();
             CodexCliService.ValidateOfficialOAuthProfileProjection();
             CodexCliService.ValidateDesktopStateRewrite();
@@ -261,6 +266,7 @@ static class Program
             }
             CodexCliService.ValidateOfficialCodexActivation();
             CodexDreamSkinService.ValidateBundledRuntime();
+            CodexNativeFastBridge.ValidatePatchContract();
 
             var iconPath = Path.Combine(store.RootPath, "assets", "CodexAccountManager.ico");
             if (!File.Exists(iconPath))

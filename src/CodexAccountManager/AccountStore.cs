@@ -12,6 +12,10 @@ public sealed class AccountStore
     internal const string LegacyAccessTokenProviderId = "codex_token_http";
     internal const string AccessTokenProviderName = "OpenAI Token HTTP";
     internal const string AccessTokenBaseUrl = LocalPatGateway.ProviderBaseUrl;
+    internal const string OfficialOAuthProviderId = "codex_official_https";
+    internal const string OfficialOAuthProviderName = "OpenAI";
+    internal const string OfficialOAuthBaseUrl = "https://chatgpt.com/backend-api/codex";
+    internal const string OfficialOAuthDesktopLocale = "zh-CN";
 
     private readonly JsonSerializerOptions _jsonOptions = new() { WriteIndented = true };
 
@@ -578,26 +582,43 @@ public sealed class AccountStore
         // This profile deliberately stays on Codex's native ChatGPT authentication path.
         // Rewriting the small managed config also removes stale PAT/API-provider routing if
         // an existing account directory is intentionally converted to official OAuth.
-        File.WriteAllText(Path.Combine(codexHome, "config.toml"), BuildOfficialOAuthConfig());
+        var configPath = Path.Combine(codexHome, "config.toml");
+        var existingConfig = File.Exists(configPath) ? File.ReadAllText(configPath) : "";
+        var serviceTier = CodexCliService.ReadDesktopServiceTier(existingConfig);
+        File.WriteAllText(configPath, BuildOfficialOAuthConfig(serviceTier));
     }
 
-    internal static string BuildOfficialOAuthConfig()
+    internal static string BuildOfficialOAuthConfig(string? serviceTier = null)
     {
-        return """
+        var normalizedServiceTier = CodexCliService.NormalizeDesktopServiceTier(serviceTier);
+        return $"""
+model_provider = {TomlString(OfficialOAuthProviderId)}
 cli_auth_credentials_store = "file"
 forced_login_method = "chatgpt"
+service_tier = {TomlString(normalizedServiceTier)}
 windows_wsl_setup_acknowledged = true
 
 approval_policy = "never"
 sandbox_mode = "danger-full-access"
+
+[model_providers.{OfficialOAuthProviderId}]
+name = {TomlString(OfficialOAuthProviderName)}
+base_url = {TomlString(OfficialOAuthBaseUrl)}
+wire_api = "responses"
+requires_openai_auth = true
+supports_websockets = false
+
+[desktop]
+localeOverride = {TomlString(OfficialOAuthDesktopLocale)}
 
 [windows]
 sandbox = "unelevated"
 """;
     }
 
-    internal static string BuildAccessTokenConfig()
+    internal static string BuildAccessTokenConfig(string? serviceTier = null)
     {
+        var normalizedServiceTier = CodexCliService.NormalizeDesktopServiceTier(serviceTier);
         return $"""
 model = {TomlString(ModelCatalogService.CanonicalDefaultModel)}
 review_model = {TomlString(ModelCatalogService.CanonicalDefaultModel)}
@@ -605,7 +626,7 @@ model_reasoning_effort = {TomlString(ModelCatalogService.DefaultReasoningEffort)
 chatgpt_base_url = {TomlString(LocalPatGateway.ChatGptBaseUrl)}
 disable_response_storage = true
 model_provider = {TomlString(AccessTokenProviderId)}
-service_tier = "default"
+service_tier = {TomlString(normalizedServiceTier)}
 model_auto_compact_token_limit = 1000000000
 windows_wsl_setup_acknowledged = true
 
@@ -638,7 +659,10 @@ sandbox = "unelevated"
     private static void EnsureCompatibleApiHome(AccountRecord account, string? apiKey)
     {
         Directory.CreateDirectory(account.CodexHome);
-        File.WriteAllText(Path.Combine(account.CodexHome, "config.toml"), BuildCompatibleApiConfig(account));
+        var configPath = Path.Combine(account.CodexHome, "config.toml");
+        var existingConfig = File.Exists(configPath) ? File.ReadAllText(configPath) : "";
+        var serviceTier = CodexCliService.ReadDesktopServiceTier(existingConfig);
+        File.WriteAllText(configPath, BuildCompatibleApiConfig(account, serviceTier));
 
         var authPath = Path.Combine(account.CodexHome, "auth.json");
         if (!string.IsNullOrWhiteSpace(apiKey))
@@ -655,7 +679,7 @@ sandbox = "unelevated"
         }
     }
 
-    public static string BuildCompatibleApiConfig(AccountRecord account)
+    public static string BuildCompatibleApiConfig(AccountRecord account, string? serviceTier = null)
     {
         var providerDisplayName = string.IsNullOrWhiteSpace(account.ApiProviderName)
             ? "OpenAI"
@@ -665,6 +689,7 @@ sandbox = "unelevated"
         var baseUrl = TomlString(account.ApiBaseUrl.TrimEnd('/'));
         var model = TomlString(account.ApiModel.Trim());
         var wireApi = TomlString(account.ApiWireApi.Trim());
+        var normalizedServiceTier = CodexCliService.NormalizeDesktopServiceTier(serviceTier);
 
         return $"""
 model_provider = {providerId}
@@ -673,7 +698,7 @@ review_model = {model}
 model_reasoning_effort = "xhigh"
 disable_response_storage = true
 network_access = "enabled"
-service_tier = "default"
+service_tier = {TomlString(normalizedServiceTier)}
 model_auto_compact_token_limit = 1000000000
 windows_wsl_setup_acknowledged = true
 
@@ -736,25 +761,69 @@ sandbox = "unelevated"
             var configPath = Path.Combine(oauthHome, "config.toml");
             var authPath = Path.Combine(oauthHome, "auth.json");
             var config = File.ReadAllText(configPath);
+            var normalizedConfig = config.Replace("\r\n", "\n").Replace('\r', '\n');
+            var officialProviderHeader = "[model_providers." + OfficialOAuthProviderId + "]";
+            var localeLine = "localeOverride = \"" + OfficialOAuthDesktopLocale + "\"";
+            var desktopLocaleBlock = "[desktop]\n" + localeLine;
+            var localeIndex = normalizedConfig.IndexOf(localeLine, StringComparison.Ordinal);
+            var desktopLocaleIndex = normalizedConfig.IndexOf(desktopLocaleBlock, StringComparison.Ordinal);
             var forbiddenFragments = new[]
             {
                 "chatgpt_base_url",
-                "model_provider",
-                "[model_providers.",
                 "experimental_bearer_token",
                 "personal_access_token",
-                "OPENAI_API_KEY"
+                "OPENAI_API_KEY",
+                "responses_websockets"
             };
             var storedOAuth = store.LoadAccounts().Single(account => account.Name == oauth.Name);
             if (!storedOAuth.IsOfficialOAuth ||
                 storedOAuth.AuthKind != AccountAuthKind.OfficialOAuth ||
+                !config.Contains(
+                    "model_provider = " + TomlString(OfficialOAuthProviderId),
+                    StringComparison.Ordinal) ||
                 !config.Contains("cli_auth_credentials_store = \"file\"", StringComparison.Ordinal) ||
                 !config.Contains("forced_login_method = \"chatgpt\"", StringComparison.Ordinal) ||
+                !config.Contains(
+                    officialProviderHeader,
+                    StringComparison.Ordinal) ||
+                config.IndexOf(officialProviderHeader, StringComparison.Ordinal) !=
+                    config.LastIndexOf(officialProviderHeader, StringComparison.Ordinal) ||
+                !config.Contains(
+                    "base_url = " + TomlString(OfficialOAuthBaseUrl),
+                    StringComparison.Ordinal) ||
+                !config.Contains("wire_api = \"responses\"", StringComparison.Ordinal) ||
+                !config.Contains("requires_openai_auth = true", StringComparison.Ordinal) ||
+                !config.Contains("supports_websockets = false", StringComparison.Ordinal) ||
+                localeIndex < 0 ||
+                localeIndex != normalizedConfig.LastIndexOf(localeLine, StringComparison.Ordinal) ||
+                desktopLocaleIndex < 0 ||
+                desktopLocaleIndex != normalizedConfig.LastIndexOf(desktopLocaleBlock, StringComparison.Ordinal) ||
                 forbiddenFragments.Any(fragment => config.Contains(fragment, StringComparison.OrdinalIgnoreCase)) ||
                 File.Exists(authPath))
             {
                 throw new InvalidOperationException(
                     "Official OAuth account storage must use native ChatGPT file authentication without PAT/API routing or fabricated credentials.");
+            }
+
+            // Saving an OAuth account again must not reset the native Fast/Standard choice
+            // already written to that account's own config.toml.
+            File.WriteAllText(configPath, BuildOfficialOAuthConfig("priority"));
+            store.SaveAccount(
+                new AccountRecord
+                {
+                    Name = oauth.Name,
+                    CodexHome = oauthHome,
+                    AuthKind = AccountAuthKind.OfficialOAuth
+                },
+                null,
+                null);
+            var preservedConfig = File.ReadAllText(configPath);
+            if (!preservedConfig.Contains(
+                    "service_tier = \"priority\"",
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "Saving an existing official OAuth account reset its persisted service tier.");
             }
         }
         finally

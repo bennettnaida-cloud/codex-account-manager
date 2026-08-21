@@ -144,6 +144,33 @@ internal static class CodexDreamSkinService
         }
     }
 
+    internal static bool TryGetRecordedCdpPort(out int port)
+    {
+        port = 0;
+        try
+        {
+            if (!File.Exists(DreamSkinStatePath))
+            {
+                return false;
+            }
+            using var document = JsonDocument.Parse(File.ReadAllText(DreamSkinStatePath));
+            if (!document.RootElement.TryGetProperty("port", out var portValue) ||
+                !portValue.TryGetInt32(out var recordedPort) ||
+                recordedPort is < 1024 or > 65535)
+            {
+                return false;
+            }
+            port = recordedPort;
+            return true;
+        }
+        catch (Exception ex) when (
+            ex is IOException or UnauthorizedAccessException or JsonException or
+            InvalidOperationException or FormatException)
+        {
+            return false;
+        }
+    }
+
     /// <summary>
     /// Reports the actual persisted Codex appearance state. The manager's startup-sync
     /// preference is intentionally separate: disabling future synchronization must not make
