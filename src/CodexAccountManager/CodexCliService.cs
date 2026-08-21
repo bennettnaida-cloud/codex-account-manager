@@ -2938,9 +2938,29 @@ public sealed partial class CodexCliService
             out _);
     }
 
+    internal static bool TryRefreshNativeFastBridgeAfterUpdate()
+    {
+        try
+        {
+            return TryAttachNativeFastBridgeToExistingOfficialCodex(
+                       OfficialNativeFastCdpPortCandidates(),
+                       out var rendererReady,
+                       allowRendererReload: true) &&
+                   rendererReady;
+        }
+        catch (Exception ex)
+        {
+            WriteCodexPlusPlusLaunchDiagnostic(
+                "official-native-fast-update-refresh-unavailable",
+                MaskSensitive(ex.Message));
+            return false;
+        }
+    }
+
     private static bool TryAttachNativeFastBridgeToExistingOfficialCodex(
         IEnumerable<int> portCandidates,
-        out bool rendererReady)
+        out bool rendererReady,
+        bool allowRendererReload = false)
     {
         ArgumentNullException.ThrowIfNull(portCandidates);
         rendererReady = false;
@@ -2974,7 +2994,7 @@ public sealed partial class CodexCliService
                     GetCodexWindowsClientAppDirectory() ??
                     throw new InvalidOperationException(
                         "The installed Codex application directory could not be verified."),
-                    allowRendererReload: false);
+                    allowRendererReload: allowRendererReload);
                 rendererReady = CodexNativeFastBridge.WaitForRendererPatch(
                         port,
                         browserId,

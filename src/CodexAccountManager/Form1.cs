@@ -243,6 +243,8 @@ public partial class Form1 : Form
     private readonly PassiveQuotaMonitoringService _passiveQuotaMonitoring;
     private readonly QuotaSnapshotStore _quotaSnapshotStore;
     private readonly AppSettings _appSettings;
+    private readonly bool _preserveExistingPatGatewayOnStartup;
+    private readonly bool _refreshNativeFastBridgeOnStartup;
     private readonly Dictionary<string, ResetCreditViewState> _resetCreditState =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, LiveRateLimitSnapshot> _liveRateLimitCache =
@@ -331,8 +333,12 @@ public partial class Form1 : Form
     private Panel? _sidebarFooter;
     private Label? _managerAppearanceLabel;
 
-    public Form1()
+    public Form1(
+        bool preserveExistingPatGatewayOnStartup = false,
+        bool refreshNativeFastBridgeOnStartup = false)
     {
+        _preserveExistingPatGatewayOnStartup = preserveExistingPatGatewayOnStartup;
+        _refreshNativeFastBridgeOnStartup = refreshNativeFastBridgeOnStartup;
         ModelCatalogService.Initialize(_store.RootPath);
         _themeService = new ThemeService(_store.RootPath);
         _usageTracker = new UsageTracker(_store.RootPath);
@@ -379,6 +385,10 @@ public partial class Form1 : Form
                 _ = RefreshQuotaUsageAsync(force: false, _workspaceLoadGeneration);
             }
             _ = InitializePatGatewayOnStartupAsync();
+            if (_refreshNativeFastBridgeOnStartup)
+            {
+                _ = Task.Run(CodexCliService.TryRefreshNativeFastBridgeAfterUpdate);
+            }
             _ = CleanupDeletedThreadArtifactsAsync();
             _ = CheckForUpdatesAsync(manual: false);
         };
@@ -13862,7 +13872,8 @@ public partial class Form1 : Form
                 await DetectLocalPatGatewayProxyAsync(updateStatus: false);
             }
 
-            await LocalPatGateway.EnsureRunningAsync();
+            await LocalPatGateway.EnsureRunningAsync(
+                restartOnProxyMismatch: !_preserveExistingPatGatewayOnStartup);
             _patGatewayRuntimeRunning = true;
             _patGatewayRuntimeStatus = $"已开启 · 127.0.0.1:{LocalPatGateway.Port}";
         }

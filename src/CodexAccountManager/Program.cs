@@ -92,8 +92,14 @@ static class Program
             return RunCodexPlusPlusTaskRepair();
         }
 
+        var preserveExistingPatGateway = args.Contains(
+            AppUpdateService.PreserveExistingGatewayArgument,
+            StringComparer.OrdinalIgnoreCase);
+        var refreshNativeFastBridge = args.Contains(
+            AppUpdateService.RefreshNativeFastBridgeArgument,
+            StringComparer.OrdinalIgnoreCase);
         ApplicationConfiguration.Initialize();
-        Application.Run(new Form1());
+        Application.Run(new Form1(preserveExistingPatGateway, refreshNativeFastBridge));
         return 0;
     }
 

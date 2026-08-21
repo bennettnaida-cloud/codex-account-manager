@@ -164,6 +164,49 @@ function Unblock-InstallerFiles {
     }
 }
 
+function Test-PathInside {
+    param(
+        [Parameter(Mandatory)][string]$Candidate,
+        [Parameter(Mandatory)][string]$Root
+    )
+
+    $candidateFull = [IO.Path]::GetFullPath($Candidate)
+    $rootFull = [IO.Path]::GetFullPath($Root)
+    if ([string]::Equals($candidateFull, $rootFull, [StringComparison]::OrdinalIgnoreCase)) {
+        return $true
+    }
+    $separator = [string][IO.Path]::DirectorySeparatorChar
+    if (-not $rootFull.EndsWith($separator, [StringComparison]::Ordinal)) {
+        $rootFull += $separator
+    }
+    return $candidateFull.StartsWith($rootFull, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Copy-InstallerFileWithRetry {
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Destination,
+        [ValidateRange(1, 120)][int]$Attempts = 40,
+        [ValidateRange(25, 5000)][int]$DelayMilliseconds = 250
+    )
+
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            Copy-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+            return
+        }
+        catch {
+            $isTransientFileError =
+                $_.Exception -is [IO.IOException] -or
+                $_.Exception -is [UnauthorizedAccessException]
+            if (-not $isTransientFileError -or $attempt -eq $Attempts) {
+                throw
+            }
+            Start-Sleep -Milliseconds $DelayMilliseconds
+        }
+    }
+}
+
 function Stop-InstalledManager {
     param([Parameter(Mandatory)][string]$ExecutablePath)
 
@@ -267,6 +310,10 @@ try {
     }
     $installRoot = [IO.Path]::GetFullPath(
         [Environment]::ExpandEnvironmentVariables($InstallPath))
+    $temporaryUpdateRoot = Join-Path ([IO.Path]::GetTempPath()) 'CAM-update'
+    if (Test-PathInside -Candidate $installRoot -Root $temporaryUpdateRoot) {
+        throw '安装目录不能位于临时 CAM-update 目录中。请改用永久安装目录。'
+    }
     $usesInstallRootAsManagerRoot = [string]::IsNullOrWhiteSpace($ManagerWorkingDirectory)
     $managerRoot = if ($usesInstallRootAsManagerRoot) {
         $installRoot
@@ -326,7 +373,9 @@ try {
     Stop-InstalledManager -ExecutablePath $installedExe
     New-Item -ItemType Directory -Force -Path $installRoot | Out-Null
     Write-InstallerProgress -Status '正在复制主程序。' -Percent 38
-    Copy-Item -LiteralPath (Join-Path $payloadRoot 'CodexAccountManager.exe') -Destination $installedExe -Force
+    Copy-InstallerFileWithRetry `
+        -Source (Join-Path $payloadRoot 'CodexAccountManager.exe') `
+        -Destination $installedExe
     Write-InstallerProgress -Status '正在复制界面资源。' -Percent 46
     Copy-DirectoryContents -Source (Join-Path $payloadRoot 'assets') -Destination (Join-Path $installRoot 'assets')
     Write-InstallerProgress -Status '正在复制本地运行组件，请稍候。' -Percent 58

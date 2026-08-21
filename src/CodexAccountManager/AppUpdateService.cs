@@ -41,6 +41,8 @@ internal sealed record AppUpdateProgress(string Message);
 /// </summary>
 internal sealed class AppUpdateService
 {
+    internal const string PreserveExistingGatewayArgument = "--preserve-existing-pat-gateway";
+    internal const string RefreshNativeFastBridgeArgument = "--refresh-native-fast-bridge-after-update";
     private const string Repository = "bennettnaida-cloud/codex-account-manager";
     private const string ReleaseApiUrl = "https://api.github.com/repos/" + Repository + "/releases/tags/latest";
     private const long MaximumDownloadBytes = 800L * 1024L * 1024L;
@@ -159,6 +161,14 @@ internal sealed class AppUpdateService
         IProgress<AppUpdateProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
+        var currentExecutablePath = Environment.ProcessPath
+            ?? Path.Combine(AppContext.BaseDirectory, "CodexAccountManager.exe");
+        EnsurePathIsOutsideUpdateStaging(
+            Path.GetDirectoryName(currentExecutablePath) ?? AppContext.BaseDirectory,
+            "The running application");
+        var installPath = GetVersionedInstallPath(update.Version);
+        EnsurePathIsOutsideUpdateStaging(installPath, "The update install target");
+
         var updateRoot = Path.Combine(
             Path.GetTempPath(),
             "CAM-update",
@@ -235,14 +245,13 @@ internal sealed class AppUpdateService
             startInfo.ArgumentList.Add("-CleanupRoot");
             startInfo.ArgumentList.Add(updateRoot);
             startInfo.ArgumentList.Add("-InstallPath");
-            startInfo.ArgumentList.Add(GetCurrentInstallPath());
+            startInfo.ArgumentList.Add(installPath);
             startInfo.ArgumentList.Add("-WorkingDirectory");
             startInfo.ArgumentList.Add(managerRoot);
             startInfo.ArgumentList.Add("-ManagerRoot");
             startInfo.ArgumentList.Add(managerRoot);
             startInfo.ArgumentList.Add("-CurrentExecutablePath");
-            startInfo.ArgumentList.Add(Environment.ProcessPath
-                ?? Path.Combine(AppContext.BaseDirectory, "CodexAccountManager.exe"));
+            startInfo.ArgumentList.Add(currentExecutablePath);
             startInfo.ArgumentList.Add("-UpdaterLogPath");
             startInfo.ArgumentList.Add(updaterLogPath);
             startInfo.ArgumentList.Add("-InstallerLogPath");
@@ -295,15 +304,22 @@ internal sealed class AppUpdateService
         if (script.Any(character => character > 0x7f)) failures.Add("non-ascii-content");
         if (!script.Contains("powershell.exe", StringComparison.Ordinal)) failures.Add("child-powershell");
         if (!script.Contains("$InstallerLogPath", StringComparison.Ordinal)) failures.Add("installer-log");
-        if (!script.Contains("--shutdown-local-pat-gateway", StringComparison.Ordinal)) failures.Add("gateway-shutdown");
+        if (script.Contains("--shutdown-local-pat-gateway", StringComparison.Ordinal)) failures.Add("gateway-interruption");
+        if (!script.Contains("--preserve-existing-pat-gateway", StringComparison.Ordinal)) failures.Add("gateway-preservation");
+        if (!script.Contains("--refresh-native-fast-bridge-after-update", StringComparison.Ordinal)) failures.Add("native-fast-refresh");
+        if (!script.Contains("$nativeFastArgument", StringComparison.Ordinal) ||
+            !script.Contains("$gatewayArgument", StringComparison.Ordinal) ||
+            !script.Contains("$_.CommandLine.IndexOf($gatewayArgument, [StringComparison]::OrdinalIgnoreCase) -lt 0", StringComparison.Ordinal) ||
+            !script.Contains("Stop-Process -Id $bridge.ProcessId", StringComparison.Ordinal)) failures.Add("bridge-only-stop");
         if (!script.Contains("Start-Process -FilePath $installedExe", StringComparison.Ordinal)) failures.Add("restart");
         if (!script.Contains("$env:CODEX_ACCOUNT_MANAGER_HOME = $managerRoot", StringComparison.Ordinal)) failures.Add("manager-root-environment");
-        if (!script.Contains("Copy-Item -LiteralPath $rollbackExecutablePath", StringComparison.Ordinal)) failures.Add("rollback-restore");
-        if (!GetCurrentInstallPath().Equals(
-                Path.TrimEndingDirectorySeparator(Path.GetFullPath(AppContext.BaseDirectory)),
-                StringComparison.OrdinalIgnoreCase))
+        if (script.Contains("rollbackExecutablePath", StringComparison.Ordinal)) failures.Add("temporary-rollback");
+        var versionedProbePath = GetVersionedInstallPath("999.999.999");
+        var expectedVersionRoot = GetVersionedInstallRoot();
+        if (!IsSamePathOrDescendant(versionedProbePath, expectedVersionRoot) ||
+            IsSamePathOrDescendant(versionedProbePath, GetUpdateStagingRoot()))
         {
-            failures.Add("install-path");
+            failures.Add("versioned-install-path");
         }
         if (failures.Count > 0)
         {
@@ -462,8 +478,46 @@ exit 0
         }
     }
 
-    private static string GetCurrentInstallPath() =>
-        Path.TrimEndingDirectorySeparator(Path.GetFullPath(AppContext.BaseDirectory));
+    private static string GetVersionedInstallPath(string version)
+    {
+        var normalized = NormalizeVersion(version)
+            ?? throw new InvalidOperationException("The update version is invalid.");
+        return Path.Combine(GetVersionedInstallRoot(), normalized);
+    }
+
+    private static string GetVersionedInstallRoot() => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "Programs",
+        "CodexAccountManager",
+        "versions");
+
+    private static string GetUpdateStagingRoot() => Path.Combine(
+        Path.GetTempPath(),
+        "CAM-update");
+
+    private static void EnsurePathIsOutsideUpdateStaging(string path, string description)
+    {
+        if (IsSamePathOrDescendant(path, GetUpdateStagingRoot()))
+        {
+            throw new InvalidOperationException(
+                $"{description} is inside the temporary CAM-update directory. " +
+                "Reinstall the application to a permanent directory before updating.");
+        }
+    }
+
+    private static bool IsSamePathOrDescendant(string candidate, string root)
+    {
+        var candidatePath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(candidate));
+        var rootPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root));
+        if (candidatePath.Equals(rootPath, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return candidatePath.StartsWith(
+            rootPath + Path.DirectorySeparatorChar,
+            StringComparison.OrdinalIgnoreCase);
+    }
 
     private static HttpClient CreateHttpClient()
     {
@@ -623,7 +677,24 @@ $ErrorActionPreference = 'Stop'
 $exitCode = 0
 $managerRoot = [IO.Path]::GetFullPath($ManagerRoot)
 $env:CODEX_ACCOUNT_MANAGER_HOME = $managerRoot
-$rollbackExecutablePath = Join-Path $CleanupRoot 'rollback-CodexAccountManager.exe'
+$pathsValidated = $false
+
+function Test-PathInside {
+    param(
+        [Parameter(Mandatory = $true)][string]$Candidate,
+        [Parameter(Mandatory = $true)][string]$Root
+    )
+    $candidateFull = [IO.Path]::GetFullPath($Candidate)
+    $rootFull = [IO.Path]::GetFullPath($Root)
+    if ([string]::Equals($candidateFull, $rootFull, [StringComparison]::OrdinalIgnoreCase)) {
+        return $true
+    }
+    $separator = [string][IO.Path]::DirectorySeparatorChar
+    if (-not $rootFull.EndsWith($separator, [StringComparison]::Ordinal)) {
+        $rootFull += $separator
+    }
+    return $candidateFull.StartsWith($rootFull, [StringComparison]::OrdinalIgnoreCase)
+}
 
 function Write-UpdaterLog {
     param([Parameter(Mandatory = $true)][string]$Message)
@@ -635,62 +706,99 @@ try {
     $logRoot = Split-Path -Parent $UpdaterLogPath
     New-Item -ItemType Directory -Force -Path $logRoot | Out-Null
     Write-UpdaterLog 'Updater started.'
-    $deadline = [DateTime]::UtcNow.AddSeconds(45)
-    while ([DateTime]::UtcNow -lt $deadline) {
-        if ($null -eq (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) { break }
-        Start-Sleep -Milliseconds 250
+
+    $cleanupFull = [IO.Path]::GetFullPath($CleanupRoot)
+    $installFull = [IO.Path]::GetFullPath($InstallPath)
+    $currentExecutableFull = [IO.Path]::GetFullPath($CurrentExecutablePath)
+    $currentDirectory = Split-Path -Parent $currentExecutableFull
+    $temporaryUpdateRoot = Join-Path ([IO.Path]::GetTempPath()) 'CAM-update'
+    if (Test-PathInside -Candidate $installFull -Root $temporaryUpdateRoot) {
+        throw 'The install target is inside the temporary CAM-update directory.'
+    }
+    if (Test-PathInside -Candidate $installFull -Root $cleanupFull) {
+        throw 'The install target is inside the update cleanup directory.'
+    }
+    if (Test-PathInside -Candidate $currentDirectory -Root $temporaryUpdateRoot) {
+        throw 'The running application is inside the temporary CAM-update directory.'
+    }
+    $pathsValidated = $true
+
+    $previousProcess = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if ($null -ne $previousProcess) {
+        try {
+            Wait-Process -Id $ProcessId -Timeout 45 -ErrorAction Stop
+        }
+        catch {
+            if ($null -ne (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
+                throw 'Codex Account Manager did not exit within 45 seconds.'
+            }
+        }
     }
     if ($null -ne (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
         throw 'Codex Account Manager did not exit within 45 seconds.'
     }
 
     Write-UpdaterLog 'Previous process exited. Starting package installer.'
-    if (Test-Path -LiteralPath $CurrentExecutablePath -PathType Leaf) {
-        Copy-Item -LiteralPath $CurrentExecutablePath -Destination $rollbackExecutablePath -Force
-        Write-UpdaterLog 'Saved the previous executable for rollback.'
-        try {
-            $shutdownProcess = Start-Process -FilePath $CurrentExecutablePath `
-                -ArgumentList '--shutdown-local-pat-gateway' -WorkingDirectory $WorkingDirectory `
-                -Wait -PassThru
-            Write-UpdaterLog ('Gateway shutdown command exited with code {0}.' -f $shutdownProcess.ExitCode)
-        }
-        catch {
-            Write-UpdaterLog ('Gateway shutdown command failed: ' + $_.Exception.Message)
-        }
-    }
-
-    $processPath = [IO.Path]::GetFullPath($CurrentExecutablePath)
-    $remaining = @(
-        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.ExecutablePath -and
-                [string]::Equals(
-                    [IO.Path]::GetFullPath($_.ExecutablePath),
-                    $processPath,
-                    [StringComparison]::OrdinalIgnoreCase)
-            }
-    )
-    foreach ($item in $remaining) {
-        Write-UpdaterLog ('Stopping remaining process {0} before installation.' -f $item.ProcessId)
-        Stop-Process -Id $item.ProcessId -Force -ErrorAction Stop
-    }
-
     $childPowerShell = Join-Path $PSHOME 'powershell.exe'
     & $childPowerShell -NoLogo -NoProfile -ExecutionPolicy Bypass -File $InstallerPath `
-        -Quiet -NoLaunch -InstallPath $InstallPath `
+        -Quiet -NoLaunch -InstallPath $installFull `
         -ManagerWorkingDirectory $managerRoot -LogPath $InstallerLogPath
     $installerExitCode = $LASTEXITCODE
     if ($installerExitCode -ne 0) {
         throw ('Package installer exited with code {0}.' -f $installerExitCode)
     }
 
-    $installedExe = Join-Path $InstallPath 'CodexAccountManager.exe'
+    $installedExe = Join-Path $installFull 'CodexAccountManager.exe'
     if (-not (Test-Path -LiteralPath $installedExe -PathType Leaf)) {
         throw 'The updated executable was not found after installation.'
     }
+
+    $oldProcessPath = [IO.Path]::GetFullPath($CurrentExecutablePath)
+    $nativeFastArgument = '--codex-native-fast-bridge'
+    $gatewayArgument = '--local-pat-gateway'
+    $bridges = @(
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.ExecutablePath -and
+                $_.CommandLine -and
+                [string]::Equals(
+                    [IO.Path]::GetFullPath($_.ExecutablePath),
+                    $oldProcessPath,
+                    [StringComparison]::OrdinalIgnoreCase) -and
+                $_.CommandLine.IndexOf($nativeFastArgument, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+                $_.CommandLine.IndexOf($gatewayArgument, [StringComparison]::OrdinalIgnoreCase) -lt 0
+            }
+    )
+    foreach ($bridge in $bridges) {
+        if ($null -ne (Get-Process -Id $bridge.ProcessId -ErrorAction SilentlyContinue)) {
+            Write-UpdaterLog ('Stopping native Fast bridge {0} for version handoff.' -f $bridge.ProcessId)
+            try {
+                Stop-Process -Id $bridge.ProcessId -Force -ErrorAction Stop
+            }
+            catch {
+                if ($null -ne (Get-Process -Id $bridge.ProcessId -ErrorAction SilentlyContinue)) {
+                    throw
+                }
+            }
+        }
+    }
+    foreach ($bridge in $bridges) {
+        if ($null -ne (Get-Process -Id $bridge.ProcessId -ErrorAction SilentlyContinue)) {
+            try {
+                Wait-Process -Id $bridge.ProcessId -Timeout 15 -ErrorAction Stop
+            }
+            catch {
+                if ($null -ne (Get-Process -Id $bridge.ProcessId -ErrorAction SilentlyContinue)) {
+                    throw
+                }
+            }
+        }
+    }
+
     Remove-Item -LiteralPath $FailureMarkerPath -Force -ErrorAction SilentlyContinue
     Write-UpdaterLog 'Installation completed. Restarting the updated application.'
-    Start-Process -FilePath $installedExe -WorkingDirectory $WorkingDirectory | Out-Null
+    Start-Process -FilePath $installedExe -WorkingDirectory $WorkingDirectory `
+        -ArgumentList @('--preserve-existing-pat-gateway', '--refresh-native-fast-bridge-after-update') | Out-Null
     Start-Sleep -Seconds 2
 }
 catch {
@@ -698,24 +806,10 @@ catch {
     $failure = $_.Exception.Message
     try { Set-Content -LiteralPath $FailureMarkerPath -Value $failure -Encoding UTF8 } catch { }
     try { Write-UpdaterLog ('Update failed: ' + $failure) } catch { }
-    $fallbackExecutablePath = $null
-    if (Test-Path -LiteralPath $rollbackExecutablePath -PathType Leaf) {
+    if ($pathsValidated -and (Test-Path -LiteralPath $CurrentExecutablePath -PathType Leaf)) {
         try {
-            Copy-Item -LiteralPath $rollbackExecutablePath -Destination $CurrentExecutablePath -Force
-            $fallbackExecutablePath = $CurrentExecutablePath
-            Write-UpdaterLog 'Restored the previous executable after the update failure.'
-        }
-        catch {
-            $fallbackExecutablePath = $rollbackExecutablePath
-            try { Write-UpdaterLog ('Could not restore the previous executable in place: ' + $_.Exception.Message) } catch { }
-        }
-    }
-    elseif (Test-Path -LiteralPath $CurrentExecutablePath -PathType Leaf) {
-        $fallbackExecutablePath = $CurrentExecutablePath
-    }
-    if ($fallbackExecutablePath) {
-        try {
-            Start-Process -FilePath $fallbackExecutablePath -WorkingDirectory $WorkingDirectory | Out-Null
+            Start-Process -FilePath $CurrentExecutablePath -WorkingDirectory $WorkingDirectory `
+                -ArgumentList @('--preserve-existing-pat-gateway', '--refresh-native-fast-bridge-after-update') | Out-Null
             Write-UpdaterLog 'Restarted the previous application after the update failure.'
         }
         catch {

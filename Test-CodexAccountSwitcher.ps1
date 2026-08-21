@@ -129,12 +129,28 @@ $threadPreviewDialogSource = Get-Content -LiteralPath (Join-Path $root 'src\Code
 $buildScriptSource = Get-Content -LiteralPath (Join-Path $root 'Build-CodexAccountManager.ps1') -Raw -Encoding UTF8
 $selfContainedLauncherSource = Get-Content -LiteralPath $selfContainedLauncher -Raw -Encoding UTF8
 $installerDefaultsSource = Get-Content -LiteralPath (Join-Path $root 'packaging\defaults\appsettings.json') -Raw -Encoding UTF8
+$appUpdateServiceSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\AppUpdateService.cs') -Raw -Encoding UTF8
+$windowsInstallerSource = Get-Content -LiteralPath (Join-Path $root 'packaging\installer\Install-CodexAccountManager.ps1') -Raw -Encoding UTF8
 
 try {
     [xml]$projectXml = $projectSource
 }
 catch {
     throw "Windows client project is not valid XML: $($_.Exception.Message)"
+}
+if ($appUpdateServiceSource -notmatch 'CodexAccountManager["'']\s*,\s*["'']versions' -or
+    $appUpdateServiceSource -notmatch [regex]::Escape('--preserve-existing-pat-gateway') -or
+    $appUpdateServiceSource -notmatch [regex]::Escape('--refresh-native-fast-bridge-after-update') -or
+    $appUpdateServiceSource -notmatch '\$_\.CommandLine\.IndexOf\(\$gatewayArgument,[^\r\n]+\)\s+-lt\s+0' -or
+    $programSource -notmatch 'PreserveExistingGatewayArgument' -or
+    $formSource -notmatch 'restartOnProxyMismatch:\s*!_preserveExistingPatGatewayOnStartup' -or
+    $formSource -notmatch 'TryRefreshNativeFastBridgeAfterUpdate') {
+    throw 'Automatic updates must use versioned side-by-side installs and preserve the running PAT gateway on the first updated launch.'
+}
+if ($windowsInstallerSource -notmatch 'function\s+Copy-InstallerFileWithRetry' -or
+    $windowsInstallerSource -notmatch "temporaryUpdateRoot\s*=\s*Join-Path\s+\(\[IO\.Path\]::GetTempPath\(\)\)\s+'CAM-update'" -or
+    $windowsInstallerSource -notmatch 'Copy-InstallerFileWithRetry[\s\S]+CodexAccountManager\.exe') {
+    throw 'The Windows installer must reject CAM-update targets and retry transient executable copy locks.'
 }
 $normalBuildUseAppHostNodes = @(
     $projectXml.SelectNodes('/Project/PropertyGroup/UseAppHost') |
@@ -1309,6 +1325,15 @@ $reviewedRendererProfiles = @(
         SourceHash = 'B09A7C92CEE07E25F383A8495DD4C0A9754512E7184E845E13A81BAF7DCAF89A'
         PatchContract = 'CurrentRendererPatchContract'
         SemanticAnchors = 'CurrentRendererSemanticAnchors'
+    },
+    [pscustomobject]@{
+        Name = 'current-2026-08-21-3698'
+        BundleConstant = 'LatestRendererBundleUrl'
+        BundleUrl = 'app://-/assets/app-initial-izy3qYQi.js'
+        SourceHashConstant = 'LatestRendererSourceSha256'
+        SourceHash = 'F09FC19171315B858E31481FCE919366387D67CB04CE0BD7322FDD2D68983B26'
+        PatchContract = 'LatestRendererPatchContract'
+        SemanticAnchors = 'LatestRendererSemanticAnchors'
     }
 )
 $rendererPatchProfileRecord = [regex]::Match(
@@ -1319,8 +1344,8 @@ $rendererPatchProfilesDeclaration = [regex]::Match(
     '(?s)private static readonly RendererPatchProfile\[\] RendererPatchProfiles\s*=\s*\[(?<Body>.*?)\r?\n\s*\];')
 if (-not $rendererPatchProfileRecord.Success -or
     -not $rendererPatchProfilesDeclaration.Success -or
-    ([regex]::Matches($rendererPatchProfilesDeclaration.Groups['Body'].Value, '\bnew\(')).Count -ne 3) {
-    throw 'Native Fast must declare exactly three URL/SHA/contract-scoped renderer profiles.'
+    ([regex]::Matches($rendererPatchProfilesDeclaration.Groups['Body'].Value, '\bnew\(')).Count -ne 4) {
+    throw 'Native Fast must declare exactly four URL/SHA/contract-scoped renderer profiles.'
 }
 foreach ($profile in $reviewedRendererProfiles) {
     $bundleConstantPattern = 'private\s+const\s+string\s+' +
@@ -1352,6 +1377,13 @@ $rendererContractShapes = @(
         Name = 'current'
         PatchContract = 'CurrentRendererPatchContract'
         SemanticAnchors = 'CurrentRendererSemanticAnchors'
+        RequiredAnchors = @('fast-is-priority', 'fast-fallback', 'config-key', 'request-tier')
+        AnchorCount = 4
+    },
+    [pscustomobject]@{
+        Name = 'latest'
+        PatchContract = 'LatestRendererPatchContract'
+        SemanticAnchors = 'LatestRendererSemanticAnchors'
         RequiredAnchors = @('fast-is-priority', 'fast-fallback', 'config-key', 'request-tier')
         AnchorCount = 4
     }
@@ -1397,6 +1429,16 @@ $currentRendererExactConstants = [ordered]@{
     CurrentServiceTierOptionsPatched = 'T=p,E=o.hostId,w=(()=>{let e=sTr(s);return(_camAuth===`personalAccessToken`||_camAuth===`apikey`)&&!e.some(e=>e.value===_Tr)?[...e,...STr.filter(e=>e.value===_Tr)]:e})(),'
     CurrentServiceTierSelectionOriginal = 'S=e!=null&&(u?.serviceTier!==void 0||d!==void 0)?y?k:null:pTr(s,k,y),x=S==null?null:fTr(s,S);'
     CurrentServiceTierSelectionPatched = 'S=e!=null&&(u?.serviceTier!==void 0||d!==void 0)?y?k:null:pTr(s,k,y),x=S==null?null:fTr(s,S)??((_camAuth===`personalAccessToken`||_camAuth===`apikey`)&&S===_Tr?_Tr:null);'
+    LatestVisibilityGateOriginal = 'function jas(e){let t=(0,Mas.c)(6),n=Y(Mk),r=e?.hostId??n,i=TA(r),a=i?.authMethod===`chatgpt`,o=i?.authMethod??null,s;t[0]!==r||t[1]!==o?(s={authMethod:o,hostId:r},t[0]=r,t[1]=o,t[2]=s):s=t[2];let{data:c,isPending:l}=hs(Ub,s),u=!!i?.isLoading||a&&l,d=a&&!u&&c!=null&&c?.requirements?.featureRequirements?.fast_mode!==!1,f;return t[3]!==u||t[4]!==d?(f={isServiceTierAllowed:d,isLoading:u},t[3]=u,t[4]=d,t[5]=f):f=t[5],f}'
+    LatestVisibilityGatePatched = 'function jas(e){let t=(0,Mas.c)(6),n=Y(Mk),r=e?.hostId??n,i=TA(r),a=i?.authMethod===`chatgpt`,o=i?.authMethod??null,s;t[0]!==r||t[1]!==o?(s={authMethod:o,hostId:r},t[0]=r,t[1]=o,t[2]=s):s=t[2];let{data:c,isPending:l}=hs(Ub,s),u=!!i?.isLoading||a&&l,d=!u&&(a?c!=null&&c?.requirements?.featureRequirements?.fast_mode!==!1:o===`personalAccessToken`||o===`apikey`),f;return t[3]!==u||t[4]!==d?(f={isServiceTierAllowed:d,isLoading:u},t[3]=u,t[4]=d,t[5]=f):f=t[5],f}'
+    LatestConfigReadGateOriginal = 'async function Mri(e,t){let n=await kri(e,t);if(n!==`chatgpt`)return!1;let r=await T0t(e,t,{priority:`critical`});return e.query.setData(Ub,{authMethod:n,hostId:t},r),r.requirements?.featureRequirements?.fast_mode!==!1}'
+    LatestConfigReadGatePatched = 'async function Mri(e,t){let n=await kri(e,t);if(n===`personalAccessToken`||n===`apikey`)return!0;if(n!==`chatgpt`)return!1;let r=await T0t(e,t,{priority:`critical`});return e.query.setData(Ub,{authMethod:n,hostId:t},r),r.requirements?.featureRequirements?.fast_mode!==!1}'
+    LatestServiceTierAuthCaptureOriginal = 'u=hs(_k,e),d=hs(Uss,e),f=TA(o.hostId)?.authMethod??null,p;'
+    LatestServiceTierAuthCapturePatched = 'u=hs(_k,e),d=hs(Uss,e),f=TA(o.hostId)?.authMethod??null,p,_camAuth;_camAuth=f;'
+    LatestServiceTierOptionsOriginal = 'T=p,E=o.hostId,w=eTr(s),'
+    LatestServiceTierOptionsPatched = 'T=p,E=o.hostId,w=(()=>{let e=eTr(s);return(_camAuth===`personalAccessToken`||_camAuth===`apikey`)&&!e.some(e=>e.value===uTr)?[...e,...hTr.filter(e=>e.value===uTr)]:e})(),'
+    LatestServiceTierSelectionOriginal = 'S=e!=null&&(u?.serviceTier!==void 0||d!==void 0)?y?k:null:oTr(s,k,y),x=S==null?null:aTr(s,S);'
+    LatestServiceTierSelectionPatched = 'S=e!=null&&(u?.serviceTier!==void 0||d!==void 0)?y?k:null:oTr(s,k,y),x=S==null?null:aTr(s,S)??((_camAuth===`personalAccessToken`||_camAuth===`apikey`)&&S===uTr?uTr:null);'
 }
 foreach ($constant in $currentRendererExactConstants.GetEnumerator()) {
     $constantMatch = [regex]::Match(
@@ -1411,6 +1453,7 @@ foreach ($constant in $currentRendererExactConstants.GetEnumerator()) {
 $rejectedRendererBundleUrls = @(
     'APP://-/assets/app-initial-DWsVN4CS.js',
     'APP://-/assets/app-initial-C_Tkoze_.js',
+    'APP://-/assets/app-initial-izy3qYQi.js',
     'https://example.com/assets/app-initial-DWsVN4CS.js',
     'app://user@-/assets/app-initial-DWsVN4CS.js',
     'app://-:19335/assets/app-initial-DWsVN4CS.js',
@@ -1421,7 +1464,8 @@ $rejectedRendererBundleUrls = @(
     'app://-/assets/app-initial-DWsVN4CS%2Ejs',
     'app://-/assets/app-initial-DWsVN4CS.js#fragment',
     'app://-/assets/app-initial-DWsVN4CS.js?changed=1',
-    'app://-/assets/app-initial-C_Tkoze_.js?changed=1'
+    'app://-/assets/app-initial-C_Tkoze_.js?changed=1',
+    'app://-/assets/app-initial-izy3qYQi.js?changed=1'
 )
 $rendererBundleValidator = [regex]::Match(
     $nativeFastBridgeSource,
@@ -1476,6 +1520,7 @@ if (-not $profilePatchMethod.Success -or
     $reviewedProfilesForPageMethod.Value -notmatch 'LegacyRendererBundleUrl' -or
     $reviewedProfilesForPageMethod.Value -notmatch 'PreviousRendererBundleUrl' -or
     $reviewedProfilesForPageMethod.Value -notmatch 'CurrentRendererBundleUrl' -or
+    $reviewedProfilesForPageMethod.Value -notmatch 'LatestRendererBundleUrl' -or
     $nativeFastBridgeSource -notmatch '_reviewedProfiles\.TryGetValue\(observed\.Url, out var profile\)' -or
     $rendererPreflightMethod.Value -notmatch '(?s)alreadyPatched\s*&&\s*IsReviewedPatchedRendererSource\(profile, source\)' -or
     ([regex]::Matches(

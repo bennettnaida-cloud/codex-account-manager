@@ -42,10 +42,14 @@ internal static class CodexNativeFastBridge
         "app://-/assets/app-initial-DWsVN4CS.js";
     private const string CurrentRendererBundleUrl =
         "app://-/assets/app-initial-C_Tkoze_.js";
+    private const string LatestRendererBundleUrl =
+        "app://-/assets/app-initial-izy3qYQi.js";
     private const string PreviousRendererSourceSha256 =
         "4C22397E9DAF90C13978C011AE08142ADC0D7BA49FA4109D946CB840774274D8";
     private const string CurrentRendererSourceSha256 =
         "B09A7C92CEE07E25F383A8495DD4C0A9754512E7184E845E13A81BAF7DCAF89A";
+    private const string LatestRendererSourceSha256 =
+        "F09FC19171315B858E31481FCE919366387D67CB04CE0BD7322FDD2D68983B26";
     private const string FetchNavigationReadinessKey = "fetch-navigation";
     private static readonly TimeSpan StartupTimeout = TimeSpan.FromSeconds(45);
     private static readonly TimeSpan RendererPreflightTimeout = TimeSpan.FromSeconds(30);
@@ -193,6 +197,56 @@ internal static class CodexNativeFastBridge
         ("request-tier", "serviceTierForRequest:S")
     ];
 
+    // OpenAI.Codex 26.818.3698.0 uses another reviewed renderer bundle. Keep its minified
+    // bodies and semantic anchors isolated from every prior version so a renderer update can
+    // never satisfy a contract by mixing symbols from different builds.
+    private const string LatestVisibilityGateOriginal =
+        "function jas(e){let t=(0,Mas.c)(6),n=Y(Mk),r=e?.hostId??n,i=TA(r),a=i?.authMethod===`chatgpt`,o=i?.authMethod??null,s;t[0]!==r||t[1]!==o?(s={authMethod:o,hostId:r},t[0]=r,t[1]=o,t[2]=s):s=t[2];let{data:c,isPending:l}=hs(Ub,s),u=!!i?.isLoading||a&&l,d=a&&!u&&c!=null&&c?.requirements?.featureRequirements?.fast_mode!==!1,f;return t[3]!==u||t[4]!==d?(f={isServiceTierAllowed:d,isLoading:u},t[3]=u,t[4]=d,t[5]=f):f=t[5],f}";
+
+    private const string LatestVisibilityGatePatched =
+        "function jas(e){let t=(0,Mas.c)(6),n=Y(Mk),r=e?.hostId??n,i=TA(r),a=i?.authMethod===`chatgpt`,o=i?.authMethod??null,s;t[0]!==r||t[1]!==o?(s={authMethod:o,hostId:r},t[0]=r,t[1]=o,t[2]=s):s=t[2];let{data:c,isPending:l}=hs(Ub,s),u=!!i?.isLoading||a&&l,d=!u&&(a?c!=null&&c?.requirements?.featureRequirements?.fast_mode!==!1:o===`personalAccessToken`||o===`apikey`),f;return t[3]!==u||t[4]!==d?(f={isServiceTierAllowed:d,isLoading:u},t[3]=u,t[4]=d,t[5]=f):f=t[5],f}";
+
+    private const string LatestConfigReadGateOriginal =
+        "async function Mri(e,t){let n=await kri(e,t);if(n!==`chatgpt`)return!1;let r=await T0t(e,t,{priority:`critical`});return e.query.setData(Ub,{authMethod:n,hostId:t},r),r.requirements?.featureRequirements?.fast_mode!==!1}";
+
+    private const string LatestConfigReadGatePatched =
+        "async function Mri(e,t){let n=await kri(e,t);if(n===`personalAccessToken`||n===`apikey`)return!0;if(n!==`chatgpt`)return!1;let r=await T0t(e,t,{priority:`critical`});return e.query.setData(Ub,{authMethod:n,hostId:t},r),r.requirements?.featureRequirements?.fast_mode!==!1}";
+
+    private const string LatestServiceTierAuthCaptureOriginal =
+        "u=hs(_k,e),d=hs(Uss,e),f=TA(o.hostId)?.authMethod??null,p;";
+
+    private const string LatestServiceTierAuthCapturePatched =
+        "u=hs(_k,e),d=hs(Uss,e),f=TA(o.hostId)?.authMethod??null,p,_camAuth;_camAuth=f;";
+
+    private const string LatestServiceTierOptionsOriginal =
+        "T=p,E=o.hostId,w=eTr(s),";
+
+    private const string LatestServiceTierOptionsPatched =
+        "T=p,E=o.hostId,w=(()=>{let e=eTr(s);return(_camAuth===`personalAccessToken`||_camAuth===`apikey`)&&!e.some(e=>e.value===uTr)?[...e,...hTr.filter(e=>e.value===uTr)]:e})(),";
+
+    private const string LatestServiceTierSelectionOriginal =
+        "S=e!=null&&(u?.serviceTier!==void 0||d!==void 0)?y?k:null:oTr(s,k,y),x=S==null?null:aTr(s,S);";
+
+    private const string LatestServiceTierSelectionPatched =
+        "S=e!=null&&(u?.serviceTier!==void 0||d!==void 0)?y?k:null:oTr(s,k,y),x=S==null?null:aTr(s,S)??((_camAuth===`personalAccessToken`||_camAuth===`apikey`)&&S===uTr?uTr:null);";
+
+    private static readonly (string Name, string Original, string Patched)[] LatestRendererPatchContract =
+    [
+        ("visibility", LatestVisibilityGateOriginal, LatestVisibilityGatePatched),
+        ("config", LatestConfigReadGateOriginal, LatestConfigReadGatePatched),
+        ("auth-capture", LatestServiceTierAuthCaptureOriginal, LatestServiceTierAuthCapturePatched),
+        ("options", LatestServiceTierOptionsOriginal, LatestServiceTierOptionsPatched),
+        ("selection", LatestServiceTierSelectionOriginal, LatestServiceTierSelectionPatched)
+    ];
+
+    private static readonly (string Name, string Value)[] LatestRendererSemanticAnchors =
+    [
+        ("fast-is-priority", "uTr=`priority`,dTr=`fast`,fTr=`ultrafast`,pTr=`default`"),
+        ("fast-fallback", "hTr=[mTr,{description:XO.fastDescription,iconKind:`fast`,label:XO.fastLabel,tier:null,value:uTr}]"),
+        ("config-key", "function Rss(e){return e==null?`service_tier`:`profiles.${e}.service_tier`}"),
+        ("request-tier", "serviceTierForRequest:S")
+    ];
+
     private sealed record RendererPatchProfile(
         string Name,
         string BundleUrl,
@@ -219,7 +273,13 @@ internal static class CodexNativeFastBridge
             CurrentRendererBundleUrl,
             CurrentRendererSourceSha256,
             CurrentRendererPatchContract,
-            CurrentRendererSemanticAnchors)
+            CurrentRendererSemanticAnchors),
+        new(
+            "current-2026-08-21-3698",
+            LatestRendererBundleUrl,
+            LatestRendererSourceSha256,
+            LatestRendererPatchContract,
+            LatestRendererSemanticAnchors)
     ];
 
     private static string LogPath => Path.Combine(
@@ -956,6 +1016,10 @@ internal static class CodexNativeFastBridge
                     string.Equals(
                         profile.BundleUrl,
                         CurrentRendererBundleUrl,
+                        StringComparison.Ordinal) ||
+                    string.Equals(
+                        profile.BundleUrl,
+                        LatestRendererBundleUrl,
                         StringComparison.Ordinal))
                 .ToArray();
         }
@@ -1395,7 +1459,7 @@ internal static class CodexNativeFastBridge
 
     internal static void ValidatePatchContract()
     {
-        if (RendererPatchProfiles.Length != 3 ||
+        if (RendererPatchProfiles.Length != 4 ||
             RendererPatchProfiles.Select(profile => profile.BundleUrl).Distinct(StringComparer.Ordinal).Count() !=
             RendererPatchProfiles.Length)
         {
@@ -1429,11 +1493,13 @@ internal static class CodexNativeFastBridge
         if (!IsRendererBundleUrl("app://codex/assets/app-initial-DWsVN4CS.js") ||
             !IsRendererBundleUrl("app://-/assets/app-initial-DWsVN4CS.js") ||
             !IsRendererBundleUrl("app://-/assets/app-initial-C_Tkoze_.js") ||
+            !IsRendererBundleUrl("app://-/assets/app-initial-izy3qYQi.js") ||
             IsRendererBundleUrl(null) ||
             IsRendererBundleUrl("") ||
             IsRendererBundleUrl(" app://-/assets/app-initial-DWsVN4CS.js") ||
             IsRendererBundleUrl("APP://-/assets/app-initial-DWsVN4CS.js") ||
             IsRendererBundleUrl("APP://-/assets/app-initial-C_Tkoze_.js") ||
+            IsRendererBundleUrl("APP://-/assets/app-initial-izy3qYQi.js") ||
             IsRendererBundleUrl("https://example.com/assets/app-initial-DWsVN4CS.js") ||
             IsRendererBundleUrl("file://-/assets/app-initial-DWsVN4CS.js") ||
             IsRendererBundleUrl("app://other/assets/app-initial-DWsVN4CS.js") ||
@@ -1452,6 +1518,7 @@ internal static class CodexNativeFastBridge
             IsRendererBundleUrl("app://codex/assets/app-initial-DWsVN4CS.js?changed=1") ||
             IsRendererBundleUrl("app://-/assets/app-initial-DWsVN4CS.js?changed=1") ||
             IsRendererBundleUrl("app://-/assets/app-initial-C_Tkoze_.js?changed=1") ||
+            IsRendererBundleUrl("app://-/assets/app-initial-izy3qYQi.js?changed=1") ||
             IsRendererBundleUrl("app://-/assets/app-initial-DWsVN4CS.js\n"))
         {
             throw new InvalidOperationException("Native Fast bridge renderer URL validation failed.");
@@ -1466,7 +1533,7 @@ internal static class CodexNativeFastBridge
                 legacyProfiles[0].BundleUrl,
                 LegacyRendererBundleUrl,
                 StringComparison.Ordinal) ||
-            currentProfiles.Count != 2 ||
+            currentProfiles.Count != 3 ||
             !currentProfiles.Any(profile => string.Equals(
                 profile.BundleUrl,
                 PreviousRendererBundleUrl,
@@ -1474,6 +1541,10 @@ internal static class CodexNativeFastBridge
             !currentProfiles.Any(profile => string.Equals(
                 profile.BundleUrl,
                 CurrentRendererBundleUrl,
+                StringComparison.Ordinal)) ||
+            !currentProfiles.Any(profile => string.Equals(
+                profile.BundleUrl,
+                LatestRendererBundleUrl,
                 StringComparison.Ordinal)) ||
             overlayProfiles.Count != currentProfiles.Count ||
             ReviewedRendererProfilesForPage("app://-/unreviewed.html").Count != 0)
