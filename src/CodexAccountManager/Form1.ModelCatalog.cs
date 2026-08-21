@@ -4,6 +4,21 @@ namespace CodexAccountManager;
 
 public partial class Form1
 {
+    // Keep every pricing column visible in the clean 1038px first-run window. The
+    // workspace leaves roughly 670px for this grid after the sidebar, card padding,
+    // borders, and the vertical scrollbar are accounted for.
+    private const int ModelPricingGridNarrowViewportWidth = 670;
+    private const int ModelPricingGridChromeReserve = 24;
+    private const int ModelColumnMinimumWidth = 122;
+    private const int InputColumnMinimumWidth = 50;
+    private const int CachedInputColumnMinimumWidth = 62;
+    private const int OutputColumnMinimumWidth = 50;
+    private const int CacheWriteColumnMinimumWidth = 66;
+    private const int LongContextColumnMinimumWidth = 64;
+    private const int ThresholdColumnMinimumWidth = 78;
+    private const int LongInputColumnMinimumWidth = 70;
+    private const int LongOutputColumnMinimumWidth = 70;
+
     private Control CreateModelCatalogPanel(int width)
     {
         var catalog = ModelCatalogService.CreateEditableCopy();
@@ -167,8 +182,8 @@ public partial class Form1
             BorderStyle = BorderStyle.FixedSingle,
             CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal,
             ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.None,
-            ColumnHeadersHeight = 46,
-            ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing,
+            ColumnHeadersHeight = 56,
+            ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize,
             EnableHeadersVisualStyles = false,
             GridColor = _palette.DividerColor,
             RowHeadersVisible = false,
@@ -185,7 +200,7 @@ public partial class Form1
             SelectionBackColor = UiDesign.Blend(_palette.InputBackColor, _palette.PrimaryColor, 0.24F),
             SelectionForeColor = _palette.TextColor,
             Font = new Font(Font.FontFamily, 8.5F),
-            Padding = new Padding(7, 0, 7, 0),
+            Padding = new Padding(5, 0, 5, 0),
             NullValue = ""
         };
         grid.ColumnHeadersDefaultCellStyle = new DataGridViewCellStyle
@@ -195,30 +210,68 @@ public partial class Form1
             SelectionBackColor = _palette.SurfaceAltColor,
             SelectionForeColor = _palette.TextColor,
             Font = new Font(Font.FontFamily, 8.1F, FontStyle.Bold),
-            Padding = new Padding(6, 0, 6, 0),
+            Padding = new Padding(4, 2, 4, 2),
             Alignment = DataGridViewContentAlignment.MiddleLeft,
-            WrapMode = DataGridViewTriState.False
+            WrapMode = DataGridViewTriState.True
         };
 
-        AddModelPricingColumn(grid, "model", "模型", typeof(string), 165F, 170, readOnly: true);
-        AddModelPricingColumn(grid, "input", "输入", typeof(double), 84F, 82);
-        AddModelPricingColumn(grid, "cached", "缓存输入", typeof(double), 92F, 92);
-        AddModelPricingColumn(grid, "output", "输出", typeof(double), 84F, 82);
-        AddModelPricingColumn(grid, "cacheWrite", "写入倍数", typeof(double), 112F, 105);
+        AddModelPricingColumn(
+            grid,
+            "model",
+            "模型",
+            typeof(string),
+            165F,
+            ModelColumnMinimumWidth,
+            readOnly: true);
+        AddModelPricingColumn(grid, "input", "输入", typeof(double), 84F, InputColumnMinimumWidth);
+        AddModelPricingColumn(
+            grid,
+            "cached",
+            "缓存输入",
+            typeof(double),
+            92F,
+            CachedInputColumnMinimumWidth);
+        AddModelPricingColumn(grid, "output", "输出", typeof(double), 84F, OutputColumnMinimumWidth);
+        AddModelPricingColumn(
+            grid,
+            "cacheWrite",
+            "写入倍数",
+            typeof(double),
+            112F,
+            CacheWriteColumnMinimumWidth);
         grid.Columns.Add(new DataGridViewCheckBoxColumn
         {
             Name = "usesLongContext",
             HeaderText = "长上下文",
+            ToolTipText = "长上下文",
             ValueType = typeof(bool),
             AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
             FillWeight = 104F,
-            MinimumWidth = 100,
+            MinimumWidth = LongContextColumnMinimumWidth,
             SortMode = DataGridViewColumnSortMode.NotSortable,
             FlatStyle = FlatStyle.Standard
         });
-        AddModelPricingColumn(grid, "threshold", "阈值 (token)", typeof(int), 122F, 116);
-        AddModelPricingColumn(grid, "longInput", "长输入倍数", typeof(double), 104F, 98);
-        AddModelPricingColumn(grid, "longOutput", "长输出倍数", typeof(double), 104F, 98);
+        AddModelPricingColumn(
+            grid,
+            "threshold",
+            "阈值 (token)",
+            typeof(int),
+            122F,
+            ThresholdColumnMinimumWidth);
+        AddModelPricingColumn(
+            grid,
+            "longInput",
+            "长输入倍数",
+            typeof(double),
+            104F,
+            LongInputColumnMinimumWidth);
+        AddModelPricingColumn(
+            grid,
+            "longOutput",
+            "长输出倍数",
+            typeof(double),
+            104F,
+            LongOutputColumnMinimumWidth);
 
         foreach (var model in catalog.Models)
         {
@@ -250,6 +303,7 @@ public partial class Form1
         {
             Name = name,
             HeaderText = header,
+            ToolTipText = header,
             ValueType = valueType,
             ReadOnly = readOnly,
             AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
@@ -264,6 +318,25 @@ public partial class Form1
                     : DataGridViewContentAlignment.MiddleRight
             }
         });
+    }
+
+    internal static void ValidateModelPricingGridLayout()
+    {
+        var minimumColumnsWidth =
+            ModelColumnMinimumWidth +
+            InputColumnMinimumWidth +
+            CachedInputColumnMinimumWidth +
+            OutputColumnMinimumWidth +
+            CacheWriteColumnMinimumWidth +
+            LongContextColumnMinimumWidth +
+            ThresholdColumnMinimumWidth +
+            LongInputColumnMinimumWidth +
+            LongOutputColumnMinimumWidth;
+        if (minimumColumnsWidth + ModelPricingGridChromeReserve > ModelPricingGridNarrowViewportWidth)
+        {
+            throw new InvalidOperationException(
+                "Model-pricing columns no longer fit the default narrow viewport.");
+        }
     }
 
     private void SaveManualModelCatalog(DataGridView grid, ComboBox defaultModel)

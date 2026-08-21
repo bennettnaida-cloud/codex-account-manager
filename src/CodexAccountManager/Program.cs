@@ -222,6 +222,7 @@ static class Program
             Form1.ValidateStableWorkspaceGutter();
             Form1.ValidateResponsiveAccountCardLayouts();
             Form1.ValidateCodexAppearanceLayouts();
+            Form1.ValidateModelPricingGridLayout();
             AppUpdateService.ValidateUpdateHelperScript();
             ModelCatalogService.ValidatePersistenceAndProxy();
             var officialCatalogProxy = Environment.GetEnvironmentVariable(
@@ -463,6 +464,7 @@ static class Program
         {
             BufferedFlowLayoutPanel.ValidateNestedViewportRedraw();
             Form1.ValidateCodexAppearanceLayouts();
+            Form1.ValidateModelPricingGridLayout();
             ModelUsageDistributionControl.ValidateResponsiveLayout();
             ModelUsageDistributionControl.ValidateOffscreenRendering();
             Console.WriteLine("Model usage distribution rendering self test passed.");

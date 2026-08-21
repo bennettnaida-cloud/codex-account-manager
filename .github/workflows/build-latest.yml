@@ -26,9 +26,10 @@ jobs:
         id: release-version
         shell: pwsh
         run: |
-          # Keep the rolling release monotonic with the workflow run number:
-          # run 24 publishes 2.1.24, run 25 publishes 2.1.25, and so on.
-          $version = '2.1.{0}' -f ([int]'${{ github.run_number }}')
+          # Runs 1-24 used the workflow run number directly. Reserve 2.1.25-2.1.28
+          # because those versions already existed in local development builds; run 25
+          # therefore publishes 2.1.29 and later runs remain monotonic.
+          $version = '2.1.{0}' -f (([int]'${{ github.run_number }}') + 4)
           "CAM_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
