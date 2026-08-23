@@ -111,6 +111,8 @@ $localProxyDetectorSource = Get-Content -LiteralPath (Join-Path $root 'src\Codex
 $quotaSnapshotStoreSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\QuotaSnapshotStore.cs') -Raw -Encoding UTF8
 $dreamSkinServiceSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\CodexDreamSkinService.cs') -Raw -Encoding UTF8
 $programSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\Program.cs') -Raw -Encoding UTF8
+$appServerClientSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\CodexAppServerClient.cs') -Raw -Encoding UTF8
+$threadSectionDialogSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\ThreadSectionNameDialog.cs') -Raw -Encoding UTF8
 $nativeFastBridgeSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\CodexNativeFastBridge.cs') -Raw -Encoding UTF8
 $resetSessionSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\UsageLimitResetSession.cs') -Raw -Encoding UTF8
 $probeUsageLedgerSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\ProbeUsageLedger.cs') -Raw -Encoding UTF8
@@ -127,6 +129,7 @@ $historyMergerSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccou
 $threadTranscriptSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\SharedThreadTranscriptService.cs') -Raw -Encoding UTF8
 $threadPreviewDialogSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\ThreadPreviewDialog.cs') -Raw -Encoding UTF8
 $buildScriptSource = Get-Content -LiteralPath (Join-Path $root 'Build-CodexAccountManager.ps1') -Raw -Encoding UTF8
+$buildLatestWorkflowSource = Get-Content -LiteralPath (Join-Path $root '.github\workflows\build-latest.yml') -Raw -Encoding UTF8
 $selfContainedLauncherSource = Get-Content -LiteralPath $selfContainedLauncher -Raw -Encoding UTF8
 $installerDefaultsSource = Get-Content -LiteralPath (Join-Path $root 'packaging\defaults\appsettings.json') -Raw -Encoding UTF8
 $appUpdateServiceSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\AppUpdateService.cs') -Raw -Encoding UTF8
@@ -923,6 +926,37 @@ if ($formSource -notmatch 'QueryUsageLimitResetAsync' -or
     $programSource -notmatch 'OpenUsageLimitResetSessionAsync\(\s*account,\s*preserveRunningGateway:\s*true\)') {
     throw 'Quota view must expose the official usage-limit reset-credit flow and size its detail card to real content.'
 }
+$consumeWhenConfirmed = [regex]::Match(
+    $resetSessionSource,
+    '(?s)internal static async Task<UsageLimitResetConsumeAttempt> ConsumeWhenConfirmedAsync\(.*?(?=\r?\n\s*internal static JsonObject BuildConsumeParameters)')
+$formatResetActionText = [regex]::Match(
+    $formSource,
+    '(?s)private static string FormatResetActionText\(.*?(?=\r?\n\s*private string GetResetCreditToolTip)')
+$canResetUsage = [regex]::Match(
+    $formSource,
+    '(?s)private bool CanResetUsage\(.*?(?=\r?\n\s*private void SetResetCreditState)')
+if ($resetSessionSource -notmatch 'public long\? ApplicableAvailableCount \{ get; init; \}' -or
+    -not ($resetSessionSource.Contains('"applicableAvailableCount"')) -or
+    -not ($resetSessionSource.Contains('"applicable_available_count"')) -or
+    $resetSessionSource -notmatch 'public bool CanConsumeResetCredit\s*=>\s*EffectiveApplicableAvailableCount is > 0' -or
+    $resetSessionSource -notmatch 'AvailableCreditExpiresAtUtc\s*=>\s*AvailableCount is > 0[\s\S]*?credit\.ExpiresAtUtc' -or
+    $resetSessionSource -notmatch '"credits": null' -or
+    $resetSessionSource -notmatch 'unavailableExpiryAndNotApplicable\.AvailableCreditExpiresAtUtc\.HasValue' -or
+    $resetSessionSource -notmatch 'unavailableExpiryAndNotApplicable\.EffectiveApplicableAvailableCount != 0' -or
+    $resetSessionSource -notmatch 'notApplicableAttempt\.WasSent' -or
+    $resetSessionSource -notmatch 'mockConsumeCalls != 1' -or
+    $quotaSnapshotStoreSource -notmatch 'ApplicableAvailableCount' -or
+    -not $consumeWhenConfirmed.Success -or
+    $consumeWhenConfirmed.Value -notmatch '!confirmed\s*\|\|\s*!info\.CanConsumeResetCredit[\s\S]*?return new UsageLimitResetConsumeAttempt\(false, null, null\)' -or
+    -not $formatResetActionText.Success -or
+    $formatResetActionText.Value -notmatch '到期时间：官方未提供' -or
+    $formSource -notmatch '到期时间：官方未提供' -or
+    -not $canResetUsage.Success -or
+    $canResetUsage.Value -notmatch 'state\.ApplicableCount is > 0' -or
+    $resetPreConsume -notmatch 'if \(!info\.CanConsumeResetCredit\)[\s\S]*?return;' -or
+    $programSource -notmatch 'UsageLimitResetSession\.ValidateProtocolParsing\(\)') {
+    throw 'Reset-card expiry and applicability must survive credits=null, show an explicit unknown-expiry state, and never send consume for a non-applicable card.'
+}
 $modelTonalArcMethod = [regex]::Match(
     $modelUsageDistributionSource,
     'private static void DrawTonalArc\([\s\S]*?(?=\r?\n    private static void DrawOrbitalDepthAccents\()').Value
@@ -1184,7 +1218,9 @@ if ($passiveQuotaMonitoringSource -notmatch 'StartingWindowMinutes' -or
     throw 'Passive quota monitoring must invalidate stale window estimates and classify weekly-only capacity with the natural-usage $90 threshold.'
 }
 if ($formSource -notmatch 'MeasureActionButtonWidth\("查询重置次数", 184\)' -or
-    $formSource -notmatch 'var controlHeight\s*=\s*compact \? 42 : 54' -or
+    $formSource -notmatch 'var baseControlHeight\s*=\s*compact \? 42 : 54' -or
+    $formSource -notmatch 'CalculateQuotaResetActionButtonHeight\(' -or
+    $formSource -notmatch '\(controlHeight - baseControlHeight\) \* 2' -or
     $formSource -notmatch 'queryResetCount\.Height\s*=\s*controlHeight' -or
     $formSource -notmatch 'queryResetCount\.UseMnemonic\s*=\s*false') {
     throw 'Usage reset controls must size from the rendered text so high-DPI Chinese labels are not clipped.'
@@ -2538,6 +2574,205 @@ if ($formSource -notmatch 'WorkspaceView\.UnifiedHistory' -or
     $accountStoreSource -notmatch 'PathsEqual\(account\.CodexHome, CodexCliService\.GetDefaultCodexHome\(\)\)') {
     throw 'Account Manager must expose one unified .codex history view, safely upsert existing thread metadata, and persist the selected project path.'
 }
+$listThreadsMethod = [regex]::Match(
+    $appServerClientSource,
+    '(?s)public async Task<IReadOnlyList<CodexThreadSummary>> ListThreadsAsync\(.*?(?=\r?\n\s*public async Task<IReadOnlyList<CodexThreadSection>> ListThreadSectionsAsync)')
+$listThreadSectionsMethod = [regex]::Match(
+    $appServerClientSource,
+    '(?s)public async Task<IReadOnlyList<CodexThreadSection>> ListThreadSectionsAsync\(.*?(?=\r?\n\s*public async Task<CodexThreadSection> CreateThreadSectionAsync)')
+$createThreadSectionMethod = [regex]::Match(
+    $appServerClientSource,
+    '(?s)public async Task<CodexThreadSection> CreateThreadSectionAsync\(.*?(?=\r?\n\s*public async Task<CodexThreadSection> RenameThreadSectionAsync)')
+$renameThreadSectionMethod = [regex]::Match(
+    $appServerClientSource,
+    '(?s)public async Task<CodexThreadSection> RenameThreadSectionAsync\(.*?(?=\r?\n\s*public async Task DeleteThreadSectionAsync)')
+$deleteThreadSectionMethod = [regex]::Match(
+    $appServerClientSource,
+    '(?s)public async Task DeleteThreadSectionAsync\(.*?(?=\r?\n\s*public async Task MoveThreadToSectionAsync)')
+$moveThreadToSectionMethod = [regex]::Match(
+    $appServerClientSource,
+    '(?s)public async Task MoveThreadToSectionAsync\(.*?(?=\r?\n\s*internal static void ValidateThreadSectionProtocol)')
+$validateMutableSectionMethod = [regex]::Match(
+    $appServerClientSource,
+    '(?s)private static void ValidateMutableSectionId\(.*?(?=\r?\n\s*private static long\? ReadInt64)')
+$cliDeleteThreadSectionMethod = [regex]::Match(
+    $cliServiceSource,
+    '(?s)internal async Task DeleteThreadSectionAsync\(.*?(?=\r?\n\s*internal async Task MoveThreadToSectionAsync)')
+$threadSectionMutationWrapper = [regex]::Match(
+    $cliServiceSource,
+    '(?s)private async Task<T> ExecuteThreadSectionMutationAsync<T>\(.*?(?=\r?\n\s*private async Task<T> ExecuteThreadSectionMutationCoreAsync<T>)')
+$threadSectionMutationCore = [regex]::Match(
+    $cliServiceSource,
+    '(?s)private async Task<T> ExecuteThreadSectionMutationCoreAsync<T>\(.*?(?=\r?\n\s*internal static void ValidateThreadSectionMutationSafety\(\))')
+$threadSectionCliResolverMethod = [regex]::Match(
+    $cliServiceSource,
+    '(?s)internal static IReadOnlyList<string> ResolveThreadSectionCodexCliCandidates\(\).*?(?=\r?\n\s*private static IReadOnlyList<string> GetThreadSectionPackagedManagerRoots)')
+$threadSectionPackagedRootsMethod = [regex]::Match(
+    $cliServiceSource,
+    '(?s)private static IReadOnlyList<string> GetThreadSectionPackagedManagerRoots\(\).*?(?=\r?\n\s*private static IReadOnlyList<string> MergeThreadSectionCodexCliCandidates)')
+$globalCliResolverMethod = [regex]::Match(
+    $cliServiceSource,
+    '(?s)public static string\? ResolveCodexCliCommand\(\).*?(?=\r?\n\s*internal static IReadOnlyList<string> ResolveThreadSectionCodexCliCandidates)')
+$threadSectionSessionStartMethod = [regex]::Match(
+    $appServerClientSource,
+    '(?s)public static async Task<AppServerSession> StartThreadSectionAsync\(.*?(?=\r?\n\s*private static async Task<AppServerSession> StartCommandAsync)')
+$threadSectionBackupMethod = [regex]::Match(
+    $historyServiceSource,
+    '(?s)public string CreateThreadSectionSafetyBackup\(.*?(?=\r?\n\s*public void EnsureThreadSectionEmpty)')
+$threadSectionEmptyGuardMethod = [regex]::Match(
+    $historyServiceSource,
+    '(?s)public void EnsureThreadSectionEmpty\(.*?(?=\r?\n\s*public void VerifyThreadSectionDatabaseIntegrity)')
+$threadSectionIntegrityMethod = [regex]::Match(
+    $historyServiceSource,
+    '(?s)public void VerifyThreadSectionDatabaseIntegrity\(.*?(?=\r?\n\s*internal IReadOnlyList<UnifiedThreadRecord> ReconcileWithCodex)')
+$threadSectionBackupCallIndex = if ($threadSectionMutationCore.Success) {
+    $threadSectionMutationCore.Value.IndexOf('createSafetyBackup();', [StringComparison]::Ordinal)
+}
+else { -1 }
+$threadSectionMutationCallIndex = if ($threadSectionMutationCore.Success) {
+    $threadSectionMutationCore.Value.IndexOf('result = await mutation()', [StringComparison]::Ordinal)
+}
+else { -1 }
+$threadSectionPackagedCandidateIndex = if ($threadSectionCliResolverMethod.Success) {
+    $threadSectionCliResolverMethod.Value.IndexOf('packagedCandidates', [StringComparison]::Ordinal)
+}
+else { -1 }
+$threadSectionDesktopCandidateIndex = if ($threadSectionCliResolverMethod.Success) {
+    $threadSectionCliResolverMethod.Value.IndexOf('appCliRoot', [StringComparison]::Ordinal)
+}
+else { -1 }
+$threadSectionCompatibilityCandidateIndex = if ($threadSectionCliResolverMethod.Success) {
+    $threadSectionCliResolverMethod.Value.IndexOf('compatibilityCandidates', [StringComparison]::Ordinal)
+}
+else { -1 }
+$globalDesktopCandidateIndex = if ($globalCliResolverMethod.Success) {
+    $globalCliResolverMethod.Value.IndexOf('appCliRoot', [StringComparison]::Ordinal)
+}
+else { -1 }
+$globalPackagedCandidateIndex = if ($globalCliResolverMethod.Success) {
+    $globalCliResolverMethod.Value.IndexOf('GetCandidateManagerRoots()', [StringComparison]::Ordinal)
+}
+else { -1 }
+if ($buildLatestWorkflowSource -notmatch "@openai/codex@0\.149\.0" -or
+    -not $threadSectionCliResolverMethod.Success -or
+    $threadSectionPackagedCandidateIndex -lt 0 -or
+    $threadSectionDesktopCandidateIndex -le $threadSectionPackagedCandidateIndex -or
+    $threadSectionCompatibilityCandidateIndex -le $threadSectionDesktopCandidateIndex -or
+    $threadSectionCliResolverMethod.Value -notmatch 'GetThreadSectionPackagedManagerRoots\(\)' -or
+    $threadSectionCliResolverMethod.Value -match 'GetCandidateManagerRoots|Directory\.GetCurrentDirectory|CODEX_ACCOUNT_MANAGER_HOME' -or
+    $threadSectionCliResolverMethod.Value -notmatch 'CODEX_SWITCHER_CODEX_COMMAND' -or
+    -not $threadSectionPackagedRootsMethod.Success -or
+    $threadSectionPackagedRootsMethod.Value -notmatch 'BuildThreadSectionPackagedManagerRoots\(AppContext\.BaseDirectory\)' -or
+    $threadSectionPackagedRootsMethod.Value -notmatch 'for \(var depth = 0; depth < 6' -or
+    $threadSectionPackagedRootsMethod.Value -match 'GetCandidateManagerRoots|Directory\.GetCurrentDirectory|CODEX_ACCOUNT_MANAGER_HOME' -or
+    $threadSectionCliResolverMethod.Value -notmatch 'EnumerateFiles\(appCliRoot, "codex\.exe", SearchOption\.AllDirectories\)' -or
+    $threadSectionCliResolverMethod.Value -notmatch 'OrderByDescending\(File\.GetLastWriteTimeUtc\)' -or
+    -not $globalCliResolverMethod.Success -or
+    $globalDesktopCandidateIndex -lt 0 -or
+    $globalPackagedCandidateIndex -le $globalDesktopCandidateIndex -or
+    -not $threadSectionSessionStartMethod.Success -or
+    $threadSectionSessionStartMethod.Value -notmatch 'ResolveThreadSectionCodexCliCandidates\(\)' -or
+    $threadSectionSessionStartMethod.Value -notmatch 'RequestAsync\(\s*"threadSection/list",\s*new JsonObject \{ \["limit"\] = 1 \}' -or
+    $appServerClientSource -notmatch 'catch \(OperationCanceledException\)[\s\S]*?throw;[\s\S]*?failures\.Add') {
+    throw 'Thread-section RPCs must pin Codex 0.149.0, search packaged CLIs only under AppContext, fall back through desktop CLIs, and leave the global resolver order unchanged.'
+}
+if (-not $listThreadSectionsMethod.Success -or
+    -not $listThreadsMethod.Success -or
+    $listThreadsMethod.Value -notmatch 'AppServerSession\.StartAsync\(' -or
+    $listThreadsMethod.Value -match 'StartThreadSectionAsync' -or
+    $listThreadSectionsMethod.Value -notmatch 'AppServerSession\.StartThreadSectionAsync\(' -or
+    $listThreadSectionsMethod.Value -notmatch 'RequestAsync\(\s*"threadSection/list",\s*parameters,' -or
+    $listThreadSectionsMethod.Value -notmatch '\["cursor"\]\s*=\s*cursor' -or
+    -not $createThreadSectionMethod.Success -or
+    $createThreadSectionMethod.Value -notmatch 'AppServerSession\.StartThreadSectionAsync\(' -or
+    $createThreadSectionMethod.Value -notmatch 'RequestAsync\(\s*"threadSection/create"' -or
+    $createThreadSectionMethod.Value -notmatch '\["name"\]\s*=\s*name' -or
+    $createThreadSectionMethod.Value -notmatch '\["appearance"\]\s*=\s*null' -or
+    -not $renameThreadSectionMethod.Success -or
+    $renameThreadSectionMethod.Value -notmatch 'AppServerSession\.StartThreadSectionAsync\(' -or
+    $renameThreadSectionMethod.Value -notmatch 'RequestAsync\(\s*"threadSection/update"' -or
+    $renameThreadSectionMethod.Value -notmatch '\["sectionId"\]\s*=\s*sectionId' -or
+    $renameThreadSectionMethod.Value -notmatch '\["name"\]\s*=\s*name' -or
+    $renameThreadSectionMethod.Value -notmatch 'ValidateMutableSectionId\(sectionId\)' -or
+    -not $deleteThreadSectionMethod.Success -or
+    $deleteThreadSectionMethod.Value -notmatch 'AppServerSession\.StartThreadSectionAsync\(' -or
+    $deleteThreadSectionMethod.Value -notmatch 'RequestAsync\(\s*"threadSection/delete"' -or
+    $deleteThreadSectionMethod.Value -notmatch '\["sectionId"\]\s*=\s*sectionId' -or
+    $deleteThreadSectionMethod.Value -notmatch 'ValidateMutableSectionId\(sectionId\)' -or
+    -not $moveThreadToSectionMethod.Success -or
+    $moveThreadToSectionMethod.Value -notmatch 'AppServerSession\.StartThreadSectionAsync\(' -or
+    $moveThreadToSectionMethod.Value -notmatch 'RequestAsync\(\s*"thread/section/move"' -or
+    $moveThreadToSectionMethod.Value -notmatch '\["threadId"\]\s*=\s*threadId' -or
+    $moveThreadToSectionMethod.Value -notmatch '\["sectionId"\]\s*=\s*string\.IsNullOrWhiteSpace\(sectionId\) \? null : sectionId' -or
+    $moveThreadToSectionMethod.Value -notmatch '\["beforeThreadId"\]\s*=\s*null' -or
+    $moveThreadToSectionMethod.Value -notmatch 'ValidateMutableSectionId\(sectionId\)' -or
+    $appServerClientSource -notmatch 'internal const string PinnedSectionId\s*=\s*"01984de2-8f74-7c91-a3b2-5c5e937cf318"' -or
+    $appServerClientSource -notmatch 'CodexAppServerClient\.PinnedSectionId' -or
+    -not $validateMutableSectionMethod.Success -or
+    $validateMutableSectionMethod.Value -notmatch 'sectionId\.Equals\(PinnedSectionId, StringComparison\.OrdinalIgnoreCase\)' -or
+    $validateMutableSectionMethod.Value -notmatch 'throw new InvalidOperationException\("内置 Pinned 目录不能作为普通目录修改。"\)' -or
+    $appServerClientSource -notmatch 'pinnedRejected\s*=\s*true' -or
+    $formSource -notmatch 'BuildUnifiedHistoryGroups' -or
+    $formSource -notmatch 'CreateUnifiedHistorySectionAsync' -or
+    $formSource -notmatch 'RenameUnifiedHistorySectionAsync' -or
+    $formSource -notmatch 'DeleteUnifiedHistorySectionAsync' -or
+    $formSource -notmatch 'MoveUnifiedThreadToSectionAsync' -or
+    $formSource -notmatch '_codex\.CreateThreadSectionAsync' -or
+    $formSource -notmatch '_codex\.RenameThreadSectionAsync' -or
+    $formSource -notmatch '_codex\.DeleteThreadSectionAsync' -or
+    $formSource -notmatch '_codex\.MoveThreadToSectionAsync') {
+    throw 'Manual chat classification must use the official thread-section RPC names and parameters, while keeping the built-in Pinned section immutable.'
+}
+$threadSectionIntegrityCallIndex = if ($threadSectionMutationCore.Success) {
+    $threadSectionMutationCore.Value.IndexOf('verifyIntegrity();', [StringComparison]::Ordinal)
+}
+else { -1 }
+$deleteEmptyCheckIndex = if ($cliDeleteThreadSectionMethod.Success) {
+    $cliDeleteThreadSectionMethod.Value.IndexOf('EnsureThreadSectionEmpty', [StringComparison]::Ordinal)
+}
+else { -1 }
+$deleteRpcIndex = if ($cliDeleteThreadSectionMethod.Success) {
+    $cliDeleteThreadSectionMethod.Value.IndexOf('_appServer.DeleteThreadSectionAsync', [StringComparison]::Ordinal)
+}
+else { -1 }
+if ($cliServiceSource -notmatch 'internal Task<CodexThreadSection> CreateThreadSectionAsync\([\s\S]*?ExecuteThreadSectionMutationAsync' -or
+    $cliServiceSource -notmatch 'internal Task<CodexThreadSection> RenameThreadSectionAsync\([\s\S]*?ExecuteThreadSectionMutationAsync' -or
+    $cliServiceSource -notmatch 'internal async Task DeleteThreadSectionAsync\([\s\S]*?ExecuteThreadSectionMutationAsync' -or
+    $cliServiceSource -notmatch 'internal async Task MoveThreadToSectionAsync\([\s\S]*?ExecuteThreadSectionMutationAsync' -or
+    -not $cliDeleteThreadSectionMethod.Success -or
+    $deleteEmptyCheckIndex -lt 0 -or
+    $deleteRpcIndex -le $deleteEmptyCheckIndex -or
+    -not $threadSectionMutationWrapper.Success -or
+    $threadSectionMutationWrapper.Value -notmatch 'CreateThreadSectionSafetyBackup\(codexHome\)' -or
+    $threadSectionMutationWrapper.Value -notmatch 'VerifyThreadSectionDatabaseIntegrity\(codexHome\)' -or
+    $threadSectionMutationWrapper.Value -notmatch 'ExecuteThreadSectionMutationCoreAsync' -or
+    -not $threadSectionMutationCore.Success -or
+    $threadSectionBackupCallIndex -lt 0 -or
+    $threadSectionMutationCallIndex -le $threadSectionBackupCallIndex -or
+    $threadSectionIntegrityCallIndex -le $threadSectionMutationCallIndex -or
+    $threadSectionMutationCore.Value -notmatch 'catch \(Exception ex\)[\s\S]*?mutationError = ex;[\s\S]*?verifyIntegrity\(\);' -or
+    $threadSectionMutationCore.Value -notmatch 'mutationError is OperationCanceledException cancellationError' -or
+    $threadSectionMutationCore.Value -notmatch 'ExceptionDispatchInfo\.Capture\(cancellationError\)\.Throw\(\)' -or
+    $threadSectionMutationCore.Value -notmatch 'throw new OperationCanceledException\([\s\S]*?new AggregateException\(cancellationError, integrityError\)' -or
+    -not $threadSectionBackupMethod.Success -or
+    $threadSectionBackupMethod.Value -notmatch 'VerifyThreadSectionDatabaseIntegrity\(databasePath\)[\s\S]*?BackupDatabase\(destination\)[\s\S]*?VerifyThreadSectionDatabaseIntegrity\(backupPath\)' -or
+    -not $threadSectionEmptyGuardMethod.Success -or
+    $threadSectionEmptyGuardMethod.Value -notmatch 'SELECT 1\s+FROM threads\s+WHERE thread_section_id = \$sectionId\s+LIMIT 1;' -or
+    $historyServiceSource -notmatch 'activeMemberRejected' -or
+    $historyServiceSource -notmatch 'archivedMemberRejected' -or
+    -not $threadSectionIntegrityMethod.Success -or
+    $threadSectionIntegrityMethod.Value -notmatch 'PRAGMA integrity_check;' -or
+    $threadSectionIntegrityMethod.Value -notmatch 'string\.Equals\(result, "ok", StringComparison\.OrdinalIgnoreCase\)' -or
+    $historyServiceSource -notmatch 'BackupDatabase' -or
+    $historyServiceSource -notmatch 'recovery-backups' -or
+    $programSource -notmatch 'CodexCliService\.ValidateThreadSectionMutationSafety\(\)' -or
+    $programSource -notmatch 'CodexAppServerClient\.ValidateThreadSectionProtocol\(\)' -or
+    $programSource -notmatch 'ThreadSectionNameDialog\.ValidateValidation\(\)' -or
+    $programSource -notmatch 'ThreadSectionNameDialog\.ValidateLayout\(\)' -or
+    $threadSectionDialogSource -notmatch 'internal static void ValidateValidation\(\)' -or
+    $threadSectionDialogSource -notmatch 'internal static void ValidateLayout\(\)') {
+    throw 'Thread-section mutations must back up first, reject active or archived members before delete RPC, and run integrity checks after success, failure, cancellation, and timeout without changing cancellation semantics.'
+}
 $restoreWorkspaceLayout = [regex]::Match(
     $formSource,
     '(?s)private bool TryRestoreWorkspaceView\(WorkspaceView view\).*?(?=\r?\n\s*private void ClearWorkspaceViewCache)')
@@ -2555,20 +2790,26 @@ if (-not $restoreWorkspaceLayout.Success -or
 }
 $openUnifiedThreadLayout = [regex]::Match(
     $formSource,
-    '(?s)private async Task OpenUnifiedThreadAsync\(UnifiedThreadRecord thread\).*?(?=\r?\n\s*private async Task ToggleUnifiedThreadArchiveAsync)')
+    '(?s)private async Task OpenUnifiedThreadAsync\(UnifiedThreadRecord thread\).*?(?=\r?\n\s*private async Task CreateUnifiedHistorySectionAsync)')
 if (-not $openUnifiedThreadLayout.Success -or
     $openUnifiedThreadLayout.Value -notmatch 'CodexCliService\.GetDefaultCodexHome\(\)' -or
-    $openUnifiedThreadLayout.Value -notmatch 'Task\.Run\(\(\) => _threadTranscript\.Load\(sharedHome, thread\)\)' -or
+    $openUnifiedThreadLayout.Value -notmatch 'Task\.Run\(\(\) => _threadTranscript\.LoadComplete\(sharedHome, thread\)\)' -or
     $openUnifiedThreadLayout.Value -notmatch 'new ThreadPreviewDialog\(thread, transcript, _palette\)' -or
     $openUnifiedThreadLayout.Value -notmatch 'dialog\.ShowDialog\(this\)' -or
     $openUnifiedThreadLayout.Value -match 'IsCodexPlusPlusReady|OpenWindowsClientThreadAsync|LaunchAccountAsync|LoginWith|SwitchWindowsClientAccountAsync' -or
-    $formSource -notmatch 'Text\s*=\s*"阅读  ›"' -or
+    $formSource -notmatch 'row\.Click\s*\+=\s*openThread' -or
+    $formSource -notmatch 'title\.Click\s*\+=\s*openThread' -or
     $formSource -notmatch 'AccessibleName\s*=\s*\$"阅读本地聊天：\{thread\.Title\}"' -or
-    $formSource -notmatch '本地只读，不启动或登录 Codex\+\+。') {
+    $openUnifiedThreadLayout.Value -notmatch '未启动或登录 Codex\+\+') {
     throw 'Opening a unified chat must show the local read-only preview directly and must not require, launch, switch, or log in to Codex++.'
 }
 if ($threadTranscriptSource -notmatch 'public sealed class SharedThreadTranscriptService' -or
     $threadTranscriptSource -notmatch 'public UnifiedThreadTranscript Load\(' -or
+    $threadTranscriptSource -notmatch 'public UnifiedThreadTranscript LoadComplete\(' -or
+    $threadTranscriptSource -notmatch 'LoadComplete\([\s\S]*?int\.MaxValue,[\s\S]*?int\.MaxValue,[\s\S]*?long\.MaxValue' -or
+    $threadTranscriptSource -notmatch 'CompleteMaxProjectedJsonCharacters\s*=\s*16 \* 1024 \* 1024' -or
+    $threadTranscriptSource -notmatch 'projectNonTranscriptStrings:\s*true' -or
+    $threadTranscriptSource -notmatch 'ReadProjectedJsonLines\(reader, maxJsonLineCharacters\)' -or
     $threadTranscriptSource -notmatch 'UnifiedThreadTranscriptStatus' -or
     $threadTranscriptSource -notmatch 'IReadOnlyList<UnifiedThreadMessage> Messages' -or
     $threadTranscriptSource -notmatch 'maxMessages = Math\.Clamp\(maxMessages, 1, 200\)' -or
@@ -2578,6 +2819,14 @@ if ($threadTranscriptSource -notmatch 'public sealed class SharedThreadTranscrip
     $threadTranscriptSource -notmatch 'IsInsideDirectory\(fullRolloutPath, home\)' -or
     $threadTranscriptSource -notmatch 'Path\.GetExtension\(fullRolloutPath\)\.Equals\("\.jsonl"' -or
     $threadTranscriptSource -notmatch 'ReadBoundedLines\(reader, maxJsonLineCharacters\)' -or
+    $threadTranscriptSource -notmatch 'NormalizeComparablePath\(path\)' -or
+    $threadTranscriptSource -notmatch 'extendedPathPrefix' -or
+    $threadTranscriptSource -notmatch 'complete\.Messages\.Count != 205' -or
+    $threadTranscriptSource -notmatch 'complete\.Messages\[0\]\.Text\.Length != 13_000' -or
+    $threadTranscriptSource -notmatch 'new FileInfo\(completePath\)\.Length <= DefaultMaxSourceBytes' -or
+    $threadTranscriptSource -notmatch 'boundedComplete\.Messages\.Count != 160' -or
+    $threadTranscriptSource -notmatch 'partial\.IgnoredMalformedLines != 1' -or
+    $threadTranscriptSource -notmatch 'left\.Priority == right\.Priority' -or
     $threadTranscriptSource -notmatch 'FilterConversationText\(role, text\)' -or
     $threadTranscriptSource -notmatch '# AGENTS\.md instructions' -or
     $threadTranscriptSource -notmatch 'environment_context' -or
@@ -2598,6 +2847,8 @@ if ($threadPreviewDialogSource -notmatch 'public sealed class ThreadPreviewDialo
     $threadPreviewDialogSource -notmatch 'private static int CountMatches\(string text, string query\)' -or
     $threadPreviewDialogSource -notmatch 'Text = "复制全部"' -or
     $threadPreviewDialogSource -notmatch 'private void RenderTranscript\(UnifiedThreadTranscript transcript, ThemePalette palette\)' -or
+    $threadPreviewDialogSource -notmatch 'BuildWindowTitle\(transcript\)' -or
+    $threadPreviewDialogSource -notmatch 'partialTitle\.Contains\("完整", StringComparison\.Ordinal\)' -or
     $threadPreviewDialogSource -notmatch 'internal static void ValidateFormatting\(\)' -or
     $threadPreviewDialogSource -notmatch 'BuildCopyText\(thread, transcript\)' -or
     $programSource -notmatch 'ThreadPreviewDialog\.ValidateFormatting\(\)') {
@@ -2619,12 +2870,13 @@ if ($formSource -notmatch 'Task\.Run\(\(\) =>[\s\S]*?_usageTracker\.BuildReport\
     $formSource -notmatch '_unifiedHistoryCache' -or
     $formSource -notmatch 'CreateWorkspaceLoadingState' -or
     $formSource -notmatch 'UnifiedHistoryPageSize\s*=\s*8' -or
-    $formSource -notmatch 'foreach \(var thread in renderedThreads\)' -or
+    $formSource -notmatch 'foreach \(var thread in group\.Threads\.Take\(groupLimit\)\)' -or
+    $formSource -notmatch '_unifiedHistoryGroupVisibleLimits\[group\.Key\]' -or
+    $formSource -notmatch 'CreateUnifiedHistoryGroupLoadMoreRow\(' -or
     $formSource -notmatch 'TryUpdateQuotaUsageInPlace' -or
-    $formSource -notmatch 'var loadMore = MakeHistoryActionButton\(' -or
     $formSource -notmatch 'var refresh = MakeHistoryActionButton\(' -or
     $formSource -notmatch 'var archive = MakeHistoryActionButton\(' -or
-    $formSource -notmatch 'var delete = MakeHistoryActionButton\("删除",[\s\S]*?danger:\s*true\)' -or
+    $formSource -notmatch 'var delete = MakeHistoryActionButton\(\s*"删除",[\s\S]*?danger:\s*true\)' -or
     $formSource -notmatch 'button\.Tag = danger \? "history-danger" : "history-tonal"' -or
     $formSource -notmatch 'Equals\(button\.Tag, "history-tonal"\)[\s\S]*?ApplyHistoryActionButtonStyle\(button, danger:\s*false\)' -or
     $formSource -notmatch 'Equals\(button\.Tag, "history-danger"\)[\s\S]*?ApplyHistoryActionButtonStyle\(button, danger:\s*true\)' -or
@@ -2633,6 +2885,16 @@ if ($formSource -notmatch 'Task\.Run\(\(\) =>[\s\S]*?_usageTracker\.BuildReport\
     $formSource -notmatch 'modern\.ShadowColor\s*=\s*Color\.Transparent' -or
     $formSource -match 'AppendUnifiedHistoryRowsAsync') {
     throw 'Quota and history views must keep cached in-place updates, the eight-item shortcut page, and white-background tonal/danger history actions.'
+}
+if ($formSource -notmatch 'private static UnifiedHistorySummaryGeometry CalculateUnifiedHistorySummaryGeometry\(' -or
+    $formSource -notmatch 'private static UnifiedHistoryGroupHeaderGeometry CalculateUnifiedHistoryGroupHeaderGeometry\(' -or
+    $formSource -notmatch 'private static UnifiedHistoryRowGeometry CalculateUnifiedHistoryRowGeometry\(' -or
+    $formSource -notmatch 'GraphicsUnit\.Pixel' -or
+    $formSource -notmatch 'pixelEmSize\s*=\s*fontSize \* \(96F / 72F\)' -or
+    $formSource -notmatch 'internal static void ValidateUnifiedHistoryResponsiveLayouts\(\)' -or
+    $formSource -notmatch 'foreach \(var scale in new\[\] \{ 1F, 1\.5F, 2F \}\)' -or
+    $formSource -notmatch 'ValidateUnifiedHistoryResponsiveLayouts\(\);') {
+    throw 'Manual chat classification must use deterministic 100/150/200% text measurement and non-overlapping narrow/wide responsive geometry.'
 }
 if ($programSource -notmatch 'AccountDialog\.ValidateExistingTokenEditLayout\(\)') {
     throw 'The high-DPI account-dialog layout regression test must remain wired into self-test mode.'
@@ -2643,7 +2905,8 @@ if ($formSource -notmatch 'QuotaMinimumRefreshInterval\s*=\s*TimeSpan\.FromMilli
     $usageTrackerSource -notmatch '_usageFileCache' -or
     $usageTrackerSource -notmatch 'TryGetUsageFileIdentity' -or
     $usageTrackerSource -notmatch 'CachedUsageFile' -or
-    $formSource -notmatch 'var openHint = new Label[\s\S]*?Width = 140' -or
+    $formSource -notmatch 'var geometry = CalculateUnifiedHistoryRowGeometry\(' -or
+    $formSource -notmatch 'thread\.Archived \? "先取消归档" : "分类到…"' -or
     $settingsSource -notmatch 'SecondaryAccentColor' -or
     $settingsSource -notmatch 'TertiaryAccentColor') {
     throw 'Quota refresh, chat shortcuts, and theme palettes must keep their responsive high-DPI multi-accent design.'

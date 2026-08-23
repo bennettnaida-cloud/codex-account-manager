@@ -41,6 +41,7 @@ public sealed class SharedThreadTranscriptService
     private const int DefaultMaxMessageCharacters = 4000;
     private const long DefaultMaxSourceBytes = 32L * 1024 * 1024;
     private const int DefaultMaxJsonLineCharacters = 512 * 1024;
+    private const int CompleteMaxProjectedJsonCharacters = 16 * 1024 * 1024;
 
     public UnifiedThreadTranscript Load(
         string codexHome,
@@ -58,6 +59,27 @@ public sealed class SharedThreadTranscriptService
             maxMessageCharacters,
             DefaultMaxSourceBytes,
             DefaultMaxJsonLineCharacters);
+    }
+
+    /// <summary>
+    /// Reads the complete user/assistant conversation for the interactive preview.
+    /// The lightweight Load overload remains bounded for background full-text indexing.
+    /// A bounded JSON projection omits embedded images and unrelated tool strings before
+    /// parsing, so source records may be large while normal chat text is not clipped.
+    /// </summary>
+    public UnifiedThreadTranscript LoadComplete(
+        string codexHome,
+        UnifiedThreadRecord thread)
+    {
+        ArgumentNullException.ThrowIfNull(thread);
+        return LoadCore(
+            codexHome,
+            thread,
+            int.MaxValue,
+            int.MaxValue,
+            long.MaxValue,
+            CompleteMaxProjectedJsonCharacters,
+            projectNonTranscriptStrings: true);
     }
 
     internal static void ValidateReader()
@@ -104,7 +126,7 @@ public sealed class SharedThreadTranscriptService
                     INSERT INTO threads (id, rollout_path) VALUES ($missingId, $missingPath);
                     """;
                 command.Parameters.AddWithValue("$id", threadId);
-                command.Parameters.AddWithValue("$path", rolloutPath);
+                command.Parameters.AddWithValue("$path", @"\\?\" + Path.GetFullPath(rolloutPath));
                 command.Parameters.AddWithValue("$missingId", missingThreadId);
                 command.Parameters.AddWithValue("$missingPath", missingPath);
                 command.ExecuteNonQuery();
@@ -180,6 +202,116 @@ public sealed class SharedThreadTranscriptService
                 throw new InvalidOperationException("Oversized transcript tail-reading validation failed.");
             }
 
+            var completeTail = new SharedThreadTranscriptService().LoadComplete(
+                root,
+                MakeFixtureThread(tailThreadId));
+            if (completeTail.Status != UnifiedThreadTranscriptStatus.Available ||
+                completeTail.Messages.Count != 2 ||
+                completeTail.Messages[0].Text.Length != 500 ||
+                completeTail.Messages[1].Text != "latest reply" ||
+                completeTail.IsTruncated)
+            {
+                throw new InvalidOperationException(
+                    "Complete transcript reading retained the background tail limit.");
+            }
+
+            var completeThreadId = "019f5c10-7f43-7a84-89c6-b94ba0c82454";
+            var completePath = Path.Combine(
+                sessions,
+                $"rollout-fixture-{completeThreadId}.jsonl");
+            WriteCompleteTranscriptFixture(
+                completePath,
+                startedAt.AddSeconds(100),
+                firstMessageText: new string('完', 13_000),
+                imageCharacters: checked((int)DefaultMaxSourceBytes + 1024 * 1024),
+                messageCount: 205);
+            AddFixtureThread(root, completeThreadId, completePath);
+            var complete = new SharedThreadTranscriptService().LoadComplete(
+                root,
+                MakeFixtureThread(completeThreadId));
+            var boundedComplete = new SharedThreadTranscriptService().Load(
+                root,
+                MakeFixtureThread(completeThreadId),
+                maxMessages: 160,
+                maxMessageCharacters: 6000);
+            if (new FileInfo(completePath).Length <= DefaultMaxSourceBytes ||
+                complete.Status != UnifiedThreadTranscriptStatus.Available ||
+                complete.Messages.Count != 205 ||
+                complete.Messages[0].Text.Length != 13_000 ||
+                complete.Messages[^1].Text != "complete message 204" ||
+                complete.IsTruncated ||
+                !complete.Notice.Contains("完整读取", StringComparison.Ordinal) ||
+                boundedComplete.Messages.Count != 160 ||
+                boundedComplete.Messages[0].Text != "complete message 45" ||
+                !boundedComplete.IsTruncated)
+            {
+                throw new InvalidOperationException(
+                    "Complete transcript reading clipped a large-image message, count, text, or history order; " +
+                    "or it removed the background reader bounds.");
+            }
+
+            var partialThreadId = "019f5c10-7f43-7a84-89c6-b94ba0c82456";
+            var partialPath = Path.Combine(sessions, $"rollout-fixture-{partialThreadId}.jsonl");
+            File.WriteAllText(
+                partialPath,
+                MakeResponseMessageFixture(startedAt, "user", "complete before partial") +
+                Environment.NewLine +
+                "{\"timestamp\":\"2026-07-12T12:00:01Z\",\"type\":\"response_item\",\"payload\":",
+                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            AddFixtureThread(root, partialThreadId, partialPath);
+            var partial = new SharedThreadTranscriptService().LoadComplete(
+                root,
+                MakeFixtureThread(partialThreadId));
+            if (partial.Messages is not [{ Text: "complete before partial" }] ||
+                partial.IgnoredMalformedLines != 1 ||
+                !partial.IsTruncated ||
+                partial.Notice.Contains("已完整读取", StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "A partially written active rollout was incorrectly reported as complete.");
+            }
+
+            var repeatedRealMessages = Deduplicate(
+            [
+                new MessageCandidate(
+                    new UnifiedThreadMessage(
+                        UnifiedThreadMessageRole.User,
+                        "repeat exactly",
+                        startedAt),
+                    1,
+                    2),
+                new MessageCandidate(
+                    new UnifiedThreadMessage(
+                        UnifiedThreadMessageRole.User,
+                        "repeat exactly",
+                        startedAt.AddSeconds(1)),
+                    2,
+                    2)
+            ]);
+            var duplicateRepresentations = Deduplicate(
+            [
+                new MessageCandidate(
+                    new UnifiedThreadMessage(
+                        UnifiedThreadMessageRole.User,
+                        "one logical message",
+                        startedAt),
+                    1,
+                    1),
+                new MessageCandidate(
+                    new UnifiedThreadMessage(
+                        UnifiedThreadMessageRole.User,
+                        "one logical message",
+                        startedAt.AddMilliseconds(200)),
+                    2,
+                    2)
+            ]);
+            if (repeatedRealMessages.Count != 2 ||
+                duplicateRepresentations is not [{ Priority: 2 }])
+            {
+                throw new InvalidOperationException(
+                    "Transcript deduplication removed a genuine repeated user message.");
+            }
+
             ValidateConversationFiltering();
         }
         finally
@@ -201,7 +333,8 @@ public sealed class SharedThreadTranscriptService
         int maxMessages,
         int maxMessageCharacters,
         long maxSourceBytes,
-        int maxJsonLineCharacters)
+        int maxJsonLineCharacters,
+        bool projectNonTranscriptStrings = false)
     {
         string home;
         try
@@ -210,12 +343,12 @@ public sealed class SharedThreadTranscriptService
         }
         catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
         {
-            return Unavailable("聊天目录无效，无法读取简版正文。");
+            return Unavailable("聊天目录无效，无法读取聊天正文。");
         }
 
         if (!Guid.TryParse(thread.Id, out _))
         {
-            return Unavailable("聊天记录 ID 无效，无法读取简版正文。");
+            return Unavailable("聊天记录 ID 无效，无法读取聊天正文。");
         }
 
         string? rolloutPath;
@@ -259,7 +392,8 @@ public sealed class SharedThreadTranscriptService
                 maxMessages,
                 maxMessageCharacters,
                 Math.Max(1, maxSourceBytes),
-                Math.Max(128, maxJsonLineCharacters));
+                Math.Max(128, maxJsonLineCharacters),
+                projectNonTranscriptStrings);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or DecoderFallbackException)
         {
@@ -272,7 +406,8 @@ public sealed class SharedThreadTranscriptService
         int maxMessages,
         int maxMessageCharacters,
         long maxSourceBytes,
-        int maxJsonLineCharacters)
+        int maxJsonLineCharacters,
+        bool projectNonTranscriptStrings)
     {
         using var stream = new FileStream(
             path,
@@ -282,7 +417,9 @@ public sealed class SharedThreadTranscriptService
             bufferSize: 64 * 1024,
             FileOptions.SequentialScan);
 
-        var startsAt = Math.Max(0, stream.Length - maxSourceBytes);
+        var startsAt = maxSourceBytes >= stream.Length
+            ? 0
+            : stream.Length - maxSourceBytes;
         var sourceWasTailTruncated = startsAt > 0;
         var discardPartialFirstLine = false;
         if (startsAt > 0)
@@ -305,7 +442,10 @@ public sealed class SharedThreadTranscriptService
             bufferSize: 64 * 1024,
             leaveOpen: false);
         var isFirstLine = true;
-        foreach (var line in ReadBoundedLines(reader, maxJsonLineCharacters))
+        var lines = projectNonTranscriptStrings
+            ? ReadProjectedJsonLines(reader, maxJsonLineCharacters)
+            : ReadBoundedLines(reader, maxJsonLineCharacters);
+        foreach (var line in lines)
         {
             if (isFirstLine && discardPartialFirstLine)
             {
@@ -356,7 +496,11 @@ public sealed class SharedThreadTranscriptService
         }
 
         var messages = deduplicated.Select(candidate => candidate.Message).ToList();
-        var isTruncated = sourceWasTailTruncated || messageLimitReached || textWasTruncated || oversizedLines > 0;
+        var isTruncated = sourceWasTailTruncated ||
+                          messageLimitReached ||
+                          textWasTruncated ||
+                          oversizedLines > 0 ||
+                          malformedLines > 0;
         if (messages.Count == 0)
         {
             return new UnifiedThreadTranscript(
@@ -375,8 +519,8 @@ public sealed class SharedThreadTranscriptService
             malformedLines,
             oversizedLines,
             isTruncated
-                ? $"已显示最近 {messages.Count} 条简版消息，过长或过早内容已安全省略。"
-                : $"已读取 {messages.Count} 条简版消息。");
+                ? $"已读取 {messages.Count} 条消息；部分内容仍在写入、格式异常或受安全限制，未能完整显示。"
+                : $"已完整读取 {messages.Count} 条消息。");
     }
 
     private static string? ResolveRolloutPath(string home, string threadId)
@@ -847,7 +991,8 @@ public sealed class SharedThreadTranscriptService
 
     private static bool AreDuplicate(MessageCandidate left, MessageCandidate right)
     {
-        if (left.Message.Role != right.Message.Role ||
+        if (left.Priority == right.Priority ||
+            left.Message.Role != right.Message.Role ||
             !left.Message.Text.Equals(right.Message.Text, StringComparison.Ordinal))
         {
             return false;
@@ -909,13 +1054,310 @@ public sealed class SharedThreadTranscriptService
         }
     }
 
+    /// <summary>
+    /// Builds a bounded JSON projection instead of bounding the source record itself.
+    /// Codex user messages may embed a multi-megabyte data URL beside a very small text
+    /// request. Keeping only transcript-relevant string values lets the complete preview
+    /// recover that text without retaining the image or an arbitrarily large tool payload.
+    /// </summary>
+    private static IEnumerable<BoundedLine> ReadProjectedJsonLines(
+        TextReader reader,
+        int maxProjectedCharacters)
+    {
+        var buffer = new char[8192];
+        var projection = new ProjectedJsonLineBuilder(maxProjectedCharacters);
+        while (true)
+        {
+            var count = reader.Read(buffer, 0, buffer.Length);
+            if (count == 0)
+            {
+                break;
+            }
+
+            for (var i = 0; i < count; i++)
+            {
+                var character = buffer[i];
+                if (character == '\n')
+                {
+                    yield return projection.Build();
+                    projection = new ProjectedJsonLineBuilder(maxProjectedCharacters);
+                    continue;
+                }
+
+                projection.Append(character);
+            }
+        }
+
+        if (projection.HasInput)
+        {
+            yield return projection.Build();
+        }
+    }
+
+    private sealed class ProjectedJsonLineBuilder
+    {
+        private const int MaxRememberedPropertyNameCharacters = 256;
+        private static readonly HashSet<string> PreservedStringProperties = new(
+            StringComparer.OrdinalIgnoreCase)
+        {
+            "timestamp",
+            "type",
+            "role",
+            "message",
+            "text",
+            "content"
+        };
+
+        private readonly int _maxProjectedCharacters;
+        private readonly StringBuilder _projected;
+        private readonly Stack<JsonProjectionFrame> _frames = new();
+        private StringBuilder? _propertyNameRaw;
+        private bool _propertyNameTooLong;
+        private bool _inString;
+        private bool _escaped;
+        private bool _currentStringIsProperty;
+        private bool _preserveCurrentString;
+        private bool _projectionExceeded;
+
+        internal ProjectedJsonLineBuilder(int maxProjectedCharacters)
+        {
+            _maxProjectedCharacters = Math.Max(128, maxProjectedCharacters);
+            _projected = new StringBuilder(Math.Min(_maxProjectedCharacters, 4096));
+        }
+
+        internal bool HasInput { get; private set; }
+
+        internal void Append(char character)
+        {
+            HasInput = true;
+            if (_inString)
+            {
+                AppendStringCharacter(character);
+                return;
+            }
+
+            switch (character)
+            {
+                case '"':
+                    BeginString();
+                    return;
+                case '{':
+                    AppendProjected(character);
+                    _frames.Push(new JsonProjectionFrame(
+                        isObject: true,
+                        ownerPropertyName: CurrentValuePropertyName()));
+                    return;
+                case '[':
+                    AppendProjected(character);
+                    _frames.Push(new JsonProjectionFrame(
+                        isObject: false,
+                        ownerPropertyName: CurrentValuePropertyName()));
+                    return;
+                case '}':
+                case ']':
+                    AppendProjected(character);
+                    if (_frames.Count > 0)
+                    {
+                        _frames.Pop();
+                    }
+                    return;
+                case ':':
+                    AppendProjected(character);
+                    if (_frames.TryPeek(out var propertyFrame) && propertyFrame.IsObject)
+                    {
+                        propertyFrame.ExpectPropertyName = false;
+                    }
+                    return;
+                case ',':
+                    AppendProjected(character);
+                    if (_frames.TryPeek(out var nextFrame) && nextFrame.IsObject)
+                    {
+                        nextFrame.ExpectPropertyName = true;
+                        nextFrame.CurrentPropertyName = null;
+                    }
+                    return;
+                default:
+                    AppendProjected(character);
+                    return;
+            }
+        }
+
+        internal BoundedLine Build()
+        {
+            if (!_inString && _projected.Length > 0 && _projected[^1] == '\r')
+            {
+                _projected.Length--;
+            }
+
+            return new BoundedLine(
+                _projectionExceeded ? null : _projected.ToString(),
+                _projectionExceeded);
+        }
+
+        private void BeginString()
+        {
+            _inString = true;
+            _escaped = false;
+            var frame = _frames.TryPeek(out var current) ? current : null;
+            _currentStringIsProperty = frame is { IsObject: true, ExpectPropertyName: true };
+            _preserveCurrentString = _currentStringIsProperty || ShouldPreserveStringValue(frame);
+            _propertyNameTooLong = false;
+            _propertyNameRaw = _currentStringIsProperty ? new StringBuilder(32) : null;
+            AppendProjected('"');
+        }
+
+        private void AppendStringCharacter(char character)
+        {
+            if (_escaped)
+            {
+                RememberPropertyNameCharacter(character);
+                if (_preserveCurrentString)
+                {
+                    AppendProjected(character);
+                }
+                _escaped = false;
+                return;
+            }
+
+            if (character == '\\')
+            {
+                RememberPropertyNameCharacter(character);
+                if (_preserveCurrentString)
+                {
+                    AppendProjected(character);
+                }
+                _escaped = true;
+                return;
+            }
+
+            if (character == '"')
+            {
+                AppendProjected(character);
+                _inString = false;
+                if (_currentStringIsProperty &&
+                    _frames.TryPeek(out var frame) &&
+                    frame.IsObject)
+                {
+                    frame.CurrentPropertyName = DecodePropertyName();
+                }
+                _propertyNameRaw = null;
+                return;
+            }
+
+            RememberPropertyNameCharacter(character);
+            if (_preserveCurrentString)
+            {
+                AppendProjected(character);
+            }
+        }
+
+        private string? CurrentValuePropertyName()
+        {
+            if (!_frames.TryPeek(out var frame))
+            {
+                return null;
+            }
+
+            return frame.IsObject ? frame.CurrentPropertyName : frame.OwnerPropertyName;
+        }
+
+        private static bool ShouldPreserveStringValue(JsonProjectionFrame? frame)
+        {
+            if (frame == null)
+            {
+                return false;
+            }
+
+            var propertyName = frame.IsObject
+                ? frame.CurrentPropertyName
+                : frame.OwnerPropertyName;
+            return !string.IsNullOrWhiteSpace(propertyName) &&
+                   PreservedStringProperties.Contains(propertyName);
+        }
+
+        private void RememberPropertyNameCharacter(char character)
+        {
+            if (!_currentStringIsProperty || _propertyNameRaw == null || _propertyNameTooLong)
+            {
+                return;
+            }
+
+            if (_propertyNameRaw.Length >= MaxRememberedPropertyNameCharacters)
+            {
+                _propertyNameTooLong = true;
+                _propertyNameRaw.Clear();
+                return;
+            }
+
+            _propertyNameRaw.Append(character);
+        }
+
+        private string? DecodePropertyName()
+        {
+            if (_propertyNameTooLong || _propertyNameRaw == null)
+            {
+                return null;
+            }
+
+            try
+            {
+                return JsonSerializer.Deserialize<string>("\"" + _propertyNameRaw + "\"");
+            }
+            catch (JsonException)
+            {
+                return null;
+            }
+        }
+
+        private void AppendProjected(char character)
+        {
+            if (_projectionExceeded)
+            {
+                return;
+            }
+
+            if (_projected.Length >= _maxProjectedCharacters)
+            {
+                _projectionExceeded = true;
+                return;
+            }
+
+            _projected.Append(character);
+        }
+    }
+
+    private sealed class JsonProjectionFrame(bool isObject, string? ownerPropertyName)
+    {
+        internal bool IsObject { get; } = isObject;
+
+        internal string? OwnerPropertyName { get; } = ownerPropertyName;
+
+        internal bool ExpectPropertyName { get; set; } = isObject;
+
+        internal string? CurrentPropertyName { get; set; }
+    }
+
     private static bool IsInsideDirectory(string path, string directory)
     {
-        var root = Path.GetFullPath(directory)
+        var root = NormalizeComparablePath(directory)
             .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-        var candidate = Path.GetFullPath(path);
+        var candidate = NormalizeComparablePath(path);
         return candidate.Equals(root, StringComparison.OrdinalIgnoreCase) ||
                candidate.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string NormalizeComparablePath(string path)
+    {
+        var fullPath = Path.GetFullPath(path);
+        const string extendedUncPrefix = @"\\?\UNC\";
+        const string extendedPathPrefix = @"\\?\";
+        if (fullPath.StartsWith(extendedUncPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return @"\\" + fullPath[extendedUncPrefix.Length..];
+        }
+        return fullPath.StartsWith(extendedPathPrefix, StringComparison.OrdinalIgnoreCase)
+            ? fullPath[extendedPathPrefix.Length..]
+            : fullPath;
     }
 
     private static UnifiedThreadTranscript Missing()
@@ -969,6 +1411,54 @@ public sealed class SharedThreadTranscriptService
             type = "event_msg",
             payload = new { type = eventType, message }
         });
+    }
+
+    private static void WriteCompleteTranscriptFixture(
+        string path,
+        DateTimeOffset startedAt,
+        string firstMessageText,
+        int imageCharacters,
+        int messageCount)
+    {
+        using var stream = new FileStream(
+            path,
+            FileMode.Create,
+            FileAccess.Write,
+            FileShare.None,
+            bufferSize: 64 * 1024,
+            FileOptions.SequentialScan);
+        using var writer = new StreamWriter(
+            stream,
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+            bufferSize: 64 * 1024,
+            leaveOpen: false)
+        {
+            NewLine = "\n"
+        };
+
+        writer.Write("{\"timestamp\":");
+        writer.Write(JsonSerializer.Serialize(startedAt.ToString("O")));
+        writer.Write(",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":");
+        writer.Write(JsonSerializer.Serialize(firstMessageText));
+        writer.Write("},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,");
+        var imageChunk = new string('A', 64 * 1024);
+        var remaining = Math.Max(0, imageCharacters);
+        while (remaining > 0)
+        {
+            var count = Math.Min(remaining, imageChunk.Length);
+            writer.Write(imageChunk.AsSpan(0, count));
+            remaining -= count;
+        }
+        writer.Write("\",\"detail\":\"auto\"}]}}");
+        writer.WriteLine();
+
+        for (var index = 1; index < messageCount; index++)
+        {
+            writer.WriteLine(MakeResponseMessageFixture(
+                startedAt.AddSeconds(index),
+                index % 2 == 0 ? "user" : "assistant",
+                $"complete message {index}"));
+        }
     }
 
     private static UnifiedThreadRecord MakeFixtureThread(string id)

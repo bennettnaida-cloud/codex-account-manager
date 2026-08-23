@@ -1,4 +1,5 @@
 using Microsoft.Data.Sqlite;
+using System.Globalization;
 using System.Text.Json;
 
 namespace CodexAccountManager;
@@ -12,7 +13,9 @@ public sealed record UnifiedThreadRecord(
     string Provider,
     DateTimeOffset UpdatedAt,
     bool Archived,
-    bool HasUserEvent);
+    bool HasUserEvent,
+    string SectionId = "",
+    string SectionName = "");
 
 public sealed class SharedHistoryService
 {
@@ -54,6 +57,10 @@ public sealed class SharedHistoryService
 
         var updatedMilliseconds = BuildUpdatedMillisecondsExpression(columns);
         var visibleThreadFilter = BuildVisibleThreadFilter(columns);
+        var sectionNameExpression = columns.Contains("thread_section_id") &&
+                                    TableExists(connection, "thread_sections")
+            ? "COALESCE((SELECT name FROM thread_sections WHERE id = threads.thread_section_id), '')"
+            : "''";
         using var command = connection.CreateCommand();
         command.CommandText = $"""
             SELECT
@@ -68,7 +75,9 @@ public sealed class SharedHistoryService
                 {TextColumn(columns, "agent_path")} AS agent_path,
                 {IntegerColumn(columns, "archived")} AS archived,
                 {IntegerColumn(columns, "has_user_event")} AS has_user_event,
-                {updatedMilliseconds} AS updated_ms
+                {updatedMilliseconds} AS updated_ms,
+                {TextColumn(columns, "thread_section_id")} AS thread_section_id,
+                {sectionNameExpression} AS thread_section_name
             FROM threads
             WHERE {visibleThreadFilter}
             ORDER BY updated_ms DESC, id DESC
@@ -128,10 +137,146 @@ public sealed class SharedHistoryService
                 ReadText(reader, 6),
                 FromUnixMilliseconds(updatedMillisecondsValue),
                 !reader.IsDBNull(9) && reader.GetInt64(9) != 0,
-                hasUserEvent));
+                hasUserEvent,
+                ReadText(reader, 12),
+                ReadText(reader, 13)));
         }
 
         return result;
+    }
+
+    internal IReadOnlyList<CodexThreadSection> LoadThreadSections(string codexHome)
+    {
+        var databasePath = Path.Combine(Path.GetFullPath(codexHome), "state_5.sqlite");
+        if (!File.Exists(databasePath))
+        {
+            return [];
+        }
+
+        CodexCliService.EnsureSqliteProvider();
+        using var connection = OpenDatabase(databasePath, SqliteOpenMode.ReadOnly);
+        if (!TableExists(connection, "thread_sections"))
+        {
+            return [];
+        }
+
+        var columns = ReadColumns(connection, "thread_sections");
+        if (!columns.Contains("id") || !columns.Contains("name"))
+        {
+            return [];
+        }
+
+        using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            SELECT
+                {TextColumn(columns, "id")} AS id,
+                {TextColumn(columns, "name")} AS name,
+                {TextColumn(columns, "appearance")} AS appearance
+            FROM thread_sections
+            ORDER BY rowid ASC;
+            """;
+        var result = new List<CodexThreadSection>();
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var id = ReadText(reader, 0);
+            var name = NormalizeLine(ReadText(reader, 1));
+            if (!Guid.TryParse(id, out _) || string.IsNullOrWhiteSpace(name))
+            {
+                continue;
+            }
+            result.Add(new CodexThreadSection(id, name, ReadText(reader, 2)));
+        }
+        return result;
+    }
+
+    public string CreateThreadSectionSafetyBackup(string codexHome)
+    {
+        var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(codexHome));
+        var databasePath = Path.Combine(root, "state_5.sqlite");
+        if (!File.Exists(databasePath))
+        {
+            throw new FileNotFoundException("找不到 Codex 聊天数据库，无法安全修改目录。", databasePath);
+        }
+
+        VerifyThreadSectionDatabaseIntegrity(databasePath);
+        var backupDirectory = Path.Combine(
+            root,
+            "recovery-backups",
+            "thread-sections-" + DateTime.Now.ToString("yyyyMMdd-HHmmssfff", CultureInfo.InvariantCulture));
+        Directory.CreateDirectory(backupDirectory);
+        var backupPath = Path.Combine(backupDirectory, "state_5.sqlite");
+
+        CodexCliService.EnsureSqliteProvider();
+        using (var source = OpenDatabase(databasePath, SqliteOpenMode.ReadOnly))
+        using (var destination = OpenDatabase(backupPath, SqliteOpenMode.ReadWriteCreate))
+        {
+            source.BackupDatabase(destination);
+        }
+        VerifyThreadSectionDatabaseIntegrity(backupPath);
+        return backupPath;
+    }
+
+    public void EnsureThreadSectionEmpty(string codexHome, string sectionId)
+    {
+        if (!Guid.TryParse(sectionId, out _))
+        {
+            throw new ArgumentException("Codex 聊天目录 ID 无效。", nameof(sectionId));
+        }
+
+        var databasePath = Path.Combine(Path.GetFullPath(codexHome), "state_5.sqlite");
+        if (!File.Exists(databasePath))
+        {
+            throw new FileNotFoundException("找不到 Codex 聊天数据库，无法确认目录是否为空。", databasePath);
+        }
+
+        CodexCliService.EnsureSqliteProvider();
+        using var connection = OpenDatabase(databasePath, SqliteOpenMode.ReadOnly);
+        if (!TableExists(connection, "threads") ||
+            !ReadColumns(connection, "threads").Contains("thread_section_id"))
+        {
+            // Fail closed: deleting without an authoritative membership check could silently
+            // remove the classification from active and archived conversations.
+            throw new InvalidDataException(
+                "Codex 聊天数据库缺少目录成员字段，已拒绝删除目录以保护聊天分类。");
+        }
+
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT 1
+            FROM threads
+            WHERE thread_section_id = $sectionId
+            LIMIT 1;
+            """;
+        command.Parameters.AddWithValue("$sectionId", sectionId);
+        if (command.ExecuteScalar() != null)
+        {
+            throw new InvalidOperationException(
+                "该目录仍包含聊天（包括可能已归档的聊天）。请先移出全部聊天，再删除目录。");
+        }
+    }
+
+    public void VerifyThreadSectionDatabaseIntegrity(string codexHomeOrDatabasePath)
+    {
+        var path = codexHomeOrDatabasePath.EndsWith(
+            ".sqlite",
+            StringComparison.OrdinalIgnoreCase)
+            ? Path.GetFullPath(codexHomeOrDatabasePath)
+            : Path.Combine(Path.GetFullPath(codexHomeOrDatabasePath), "state_5.sqlite");
+        if (!File.Exists(path))
+        {
+            throw new FileNotFoundException("找不到 Codex 聊天数据库。", path);
+        }
+
+        CodexCliService.EnsureSqliteProvider();
+        using var connection = OpenDatabase(path, SqliteOpenMode.ReadOnly);
+        using var command = connection.CreateCommand();
+        command.CommandText = "PRAGMA integrity_check;";
+        var result = Convert.ToString(command.ExecuteScalar(), CultureInfo.InvariantCulture);
+        if (!string.Equals(result, "ok", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException("Codex 聊天数据库完整性检查失败：" + (result ?? "无结果"));
+        }
     }
 
     internal IReadOnlyList<UnifiedThreadRecord> ReconcileWithCodex(
@@ -173,7 +318,9 @@ public sealed class SharedHistoryService
                     ? codexThread.UpdatedAt
                     : indexed?.UpdatedAt ?? DateTimeOffset.MinValue,
                 codexThread.Archived,
-                indexed?.HasUserEvent ?? true));
+                indexed?.HasUserEvent ?? true,
+                FirstNonEmptyOrEmpty(codexThread.SectionId, indexed?.SectionId ?? string.Empty),
+                FirstNonEmptyOrEmpty(codexThread.SectionName, indexed?.SectionName ?? string.Empty)));
         }
 
         // The live Codex list can be temporarily incomplete. Keep normal records
@@ -407,7 +554,18 @@ public sealed class SharedHistoryService
                         agent_path TEXT,
                         archived INTEGER,
                         has_user_event INTEGER,
-                        updated_at_ms INTEGER
+                        updated_at_ms INTEGER,
+                        thread_section_id TEXT
+                    );
+                    CREATE TABLE thread_sections (
+                        id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        appearance TEXT
+                    );
+                    INSERT INTO thread_sections VALUES (
+                        '01a02005-6112-7c52-a91e-3a8d5e3b8339',
+                        'Test section',
+                        NULL
                     );
                     INSERT INTO threads VALUES (
                         '019f4be7-aa6e-72b2-84bf-4e35b9c5f25f',
@@ -421,7 +579,8 @@ public sealed class SharedHistoryService
                         NULL,
                         0,
                         1,
-                        1783684901000
+                        1783684901000,
+                        '01a02005-6112-7c52-a91e-3a8d5e3b8339'
                     );
                     INSERT INTO threads VALUES (
                         '019f4be7-aa6e-72b2-84bf-4e35b9c5f260',
@@ -435,7 +594,8 @@ public sealed class SharedHistoryService
                         '/root/worker',
                         0,
                         0,
-                        1783684902000
+                        1783684902000,
+                        NULL
                     );
                     """;
                 command.ExecuteNonQuery();
@@ -444,10 +604,71 @@ public sealed class SharedHistoryService
             var records = new SharedHistoryService().Load(root);
             if (records.Count != 1 ||
                 records[0].Title != "Visible task" ||
-                records[0].WorkingDirectory != @"C:\work")
+                records[0].WorkingDirectory != @"C:\work" ||
+                records[0].SectionId != "01a02005-6112-7c52-a91e-3a8d5e3b8339" ||
+                records[0].SectionName != "Test section")
             {
                 throw new InvalidOperationException("Unified shared history reader validation failed.");
             }
+
+            var service = new SharedHistoryService();
+            var sections = service.LoadThreadSections(root);
+            if (sections is not [{ Id: "01a02005-6112-7c52-a91e-3a8d5e3b8339", Name: "Test section" }])
+            {
+                throw new InvalidOperationException("Unified shared history section reader validation failed.");
+            }
+
+            var activeMemberRejected = false;
+            try
+            {
+                service.EnsureThreadSectionEmpty(root, sections[0].Id);
+            }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("仍包含聊天", StringComparison.Ordinal))
+            {
+                activeMemberRejected = true;
+            }
+            if (!activeMemberRejected)
+            {
+                throw new InvalidOperationException("Active thread-section membership was not protected.");
+            }
+
+            using (var connection = OpenDatabase(databasePath, SqliteOpenMode.ReadWrite))
+            {
+                using var archive = connection.CreateCommand();
+                archive.CommandText = "UPDATE threads SET archived = 1;";
+                archive.ExecuteNonQuery();
+            }
+            var archivedMemberRejected = false;
+            try
+            {
+                service.EnsureThreadSectionEmpty(root, sections[0].Id);
+            }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("仍包含聊天", StringComparison.Ordinal))
+            {
+                archivedMemberRejected = true;
+            }
+            if (!archivedMemberRejected)
+            {
+                throw new InvalidOperationException("Archived thread-section membership was not protected.");
+            }
+
+            using (var connection = OpenDatabase(databasePath, SqliteOpenMode.ReadWrite))
+            {
+                using var clearSection = connection.CreateCommand();
+                clearSection.CommandText = "UPDATE threads SET thread_section_id = NULL;";
+                clearSection.ExecuteNonQuery();
+            }
+            service.EnsureThreadSectionEmpty(root, sections[0].Id);
+
+            var backupPath = service.CreateThreadSectionSafetyBackup(root);
+            if (!File.Exists(backupPath) ||
+                !service.LoadThreadSections(Path.GetDirectoryName(backupPath)!)
+                    .Any(section => section.Id == sections[0].Id))
+            {
+                throw new InvalidOperationException("Thread section safety backup validation failed.");
+            }
+            service.VerifyThreadSectionDatabaseIntegrity(root);
+            service.VerifyThreadSectionDatabaseIntegrity(backupPath);
 
             var retainedThread = new UnifiedThreadRecord(
                 "019f4be7-aa6e-72b2-84bf-4e35b9c5f261",
@@ -469,7 +690,6 @@ public sealed class SharedHistoryService
                 DateTimeOffset.FromUnixTimeSeconds(1783685101),
                 false,
                 true);
-            var service = new SharedHistoryService();
             service.RecordDeletedThread(root, deletedThread.Id);
             var reconciled = service.ReconcileWithCodex(
                 root,

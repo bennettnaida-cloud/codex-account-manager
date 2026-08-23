@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.ComponentModel;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -40,6 +41,8 @@ internal sealed record MinimalQuotaTestResult(
 public sealed partial class CodexCliService
 {
     private readonly CodexAppServerClient _appServer = new();
+    private readonly SharedHistoryService _threadSectionSafety = new();
+    private readonly SemaphoreSlim _threadSectionMutationGate = new(1, 1);
     private static readonly Regex ApiKeyPattern = new("sk-[A-Za-z0-9_-]{8,}", RegexOptions.Compiled);
     private static readonly Regex PersonalAccessTokenPattern = new("at-[A-Za-z0-9_-]{8,}", RegexOptions.Compiled);
     private static readonly Regex NamedApiKeyPattern = new("(?i)(OPENAI_API_KEY\\s*[\"':=]+\\s*[\"']?)[^\"'\\s,}]+", RegexOptions.Compiled);
@@ -572,6 +575,244 @@ public sealed partial class CodexCliService
         string codexHome,
         CancellationToken cancellationToken = default) =>
         _appServer.ListThreadsAsync(codexHome, cancellationToken);
+
+    internal async Task<IReadOnlyList<CodexThreadSection>> ListThreadSectionsFromCodexAsync(
+        string codexHome,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            return await _appServer.ListThreadSectionsAsync(codexHome, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            throw new InvalidOperationException(
+                "当前 Codex 运行时不支持读取聊天目录；请先更新 Codex 后再使用手动分类。",
+                ex);
+        }
+    }
+
+    internal Task<CodexThreadSection> CreateThreadSectionAsync(
+        string name,
+        string codexHome,
+        CancellationToken cancellationToken = default) =>
+        ExecuteThreadSectionMutationAsync(
+            codexHome,
+            () => _appServer.CreateThreadSectionAsync(name, codexHome, cancellationToken),
+            cancellationToken);
+
+    internal Task<CodexThreadSection> RenameThreadSectionAsync(
+        string sectionId,
+        string name,
+        string codexHome,
+        CancellationToken cancellationToken = default) =>
+        ExecuteThreadSectionMutationAsync(
+            codexHome,
+            () => _appServer.RenameThreadSectionAsync(
+                sectionId,
+                name,
+                codexHome,
+                cancellationToken),
+            cancellationToken);
+
+    internal async Task DeleteThreadSectionAsync(
+        string sectionId,
+        string codexHome,
+        CancellationToken cancellationToken = default)
+    {
+        await ExecuteThreadSectionMutationAsync(
+            codexHome,
+            async () =>
+            {
+                // Re-read the authoritative state database while the mutation gate is held.
+                // The UI cache may be stale and Codex would otherwise unclassify every active
+                // and archived thread in a non-empty section when the section is deleted.
+                _threadSectionSafety.EnsureThreadSectionEmpty(codexHome, sectionId);
+                await _appServer.DeleteThreadSectionAsync(
+                    sectionId,
+                    codexHome,
+                    cancellationToken);
+                return true;
+            },
+            cancellationToken);
+    }
+
+    internal async Task MoveThreadToSectionAsync(
+        string threadId,
+        string? sectionId,
+        string codexHome,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateThreadId(threadId);
+        await ExecuteThreadSectionMutationAsync(
+            codexHome,
+            async () =>
+            {
+                await _appServer.MoveThreadToSectionAsync(
+                    threadId,
+                    sectionId,
+                    codexHome,
+                    cancellationToken);
+                return true;
+            },
+            cancellationToken);
+    }
+
+    private async Task<T> ExecuteThreadSectionMutationAsync<T>(
+        string codexHome,
+        Func<Task<T>> mutation,
+        CancellationToken cancellationToken)
+    {
+        return await ExecuteThreadSectionMutationCoreAsync(
+            () => _ = _threadSectionSafety.CreateThreadSectionSafetyBackup(codexHome),
+            () => _threadSectionSafety.VerifyThreadSectionDatabaseIntegrity(codexHome),
+            mutation,
+            cancellationToken);
+    }
+
+    private async Task<T> ExecuteThreadSectionMutationCoreAsync<T>(
+        Action createSafetyBackup,
+        Action verifyIntegrity,
+        Func<Task<T>> mutation,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(createSafetyBackup);
+        ArgumentNullException.ThrowIfNull(verifyIntegrity);
+        ArgumentNullException.ThrowIfNull(mutation);
+        await _threadSectionMutationGate.WaitAsync(cancellationToken);
+        try
+        {
+            createSafetyBackup();
+            T result = default!;
+            Exception? mutationError = null;
+            try
+            {
+                result = await mutation();
+            }
+            catch (Exception ex)
+            {
+                mutationError = ex;
+            }
+
+            Exception? integrityError = null;
+            try
+            {
+                // This must run after success, ordinary failure, cancellation, and timeout.
+                verifyIntegrity();
+            }
+            catch (Exception ex)
+            {
+                integrityError = ex;
+            }
+
+            if (mutationError is OperationCanceledException cancellationError)
+            {
+                if (integrityError != null)
+                {
+                    throw new OperationCanceledException(
+                        "聊天目录操作已取消或超时，并且操作后的数据库完整性检查失败：" +
+                        integrityError.Message,
+                        new AggregateException(cancellationError, integrityError),
+                        cancellationError.CancellationToken);
+                }
+
+                // Preserve the exact cancellation instance, token, and original stack.
+                ExceptionDispatchInfo.Capture(cancellationError).Throw();
+            }
+
+            if (mutationError != null)
+            {
+                if (integrityError != null)
+                {
+                    throw new InvalidOperationException(
+                        $"聊天目录修改失败，并且操作后的数据库完整性检查也失败：{integrityError.Message}\n\n" +
+                        "操作前备份已保留，请从备份恢复数据库后再继续操作。",
+                        new AggregateException(mutationError, integrityError));
+                }
+
+                throw new InvalidOperationException(
+                    $"聊天目录修改失败：{mutationError.Message}\n\n" +
+                    "操作前备份已保留，原聊天记录没有被删除。" +
+                    "如果提示目录方法不存在，请先更新 Codex 后再试。",
+                    mutationError);
+            }
+
+            if (integrityError != null)
+            {
+                throw new InvalidOperationException(
+                    "聊天目录修改完成，但操作后的数据库完整性检查失败。" +
+                    "操作前备份已保留，请从备份恢复数据库后再继续操作。",
+                    integrityError);
+            }
+
+            return result;
+        }
+        finally
+        {
+            _threadSectionMutationGate.Release();
+        }
+    }
+
+    internal static void ValidateThreadSectionMutationSafety()
+    {
+        var service = new CodexCliService();
+        var backupCount = 0;
+        var integrityCount = 0;
+        using var cancellationSource = new CancellationTokenSource();
+        cancellationSource.Cancel();
+        var expectedCancellation = new OperationCanceledException(
+            "thread-section cancellation self-test",
+            cancellationSource.Token);
+
+        OperationCanceledException? observedCancellation = null;
+        try
+        {
+            _ = service.ExecuteThreadSectionMutationCoreAsync(
+                    () => backupCount++,
+                    () => integrityCount++,
+                    () => Task.FromException<bool>(expectedCancellation),
+                    CancellationToken.None)
+                .GetAwaiter()
+                .GetResult();
+        }
+        catch (OperationCanceledException ex)
+        {
+            observedCancellation = ex;
+        }
+
+        if (!ReferenceEquals(observedCancellation, expectedCancellation) ||
+            backupCount != 1 ||
+            integrityCount != 1)
+        {
+            throw new InvalidOperationException(
+                "聊天目录取消路径没有原样重抛取消异常并执行操作后完整性检查。");
+        }
+
+        var integrityFailure = new InvalidDataException("expected integrity failure");
+        OperationCanceledException? combinedCancellation = null;
+        try
+        {
+            _ = service.ExecuteThreadSectionMutationCoreAsync(
+                    () => backupCount++,
+                    () => throw integrityFailure,
+                    () => Task.FromException<bool>(expectedCancellation),
+                    CancellationToken.None)
+                .GetAwaiter()
+                .GetResult();
+        }
+        catch (OperationCanceledException ex)
+        {
+            combinedCancellation = ex;
+        }
+
+        if (combinedCancellation?.InnerException is not AggregateException aggregate ||
+            !aggregate.InnerExceptions.Contains(expectedCancellation) ||
+            !aggregate.InnerExceptions.Contains(integrityFailure))
+        {
+            throw new InvalidOperationException(
+                "聊天目录取消后的完整性故障没有保留取消语义和两项原始异常。");
+        }
+    }
 
     private async Task<bool?> TryThreadExistsInCodexAsync(string threadId, string codexHome)
     {
@@ -5524,6 +5765,161 @@ catch {
             "npm",
             "codex.cmd");
         return File.Exists(npmShim) ? npmShim : null;
+    }
+
+    internal static IReadOnlyList<string> ResolveThreadSectionCodexCliCandidates()
+    {
+        // Thread-section RPCs are newer than several desktop app-server builds. Always try the
+        // release-pinned runtime shipped with Account Manager before any desktop cache entry.
+        var packagedCandidates = GetThreadSectionPackagedManagerRoots()
+            .Select(root => Path.Combine(root, LocalCodexCliRelativePath));
+
+        var desktopCandidates = new List<string>();
+        var appCliRoot = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "OpenAI",
+            "Codex",
+            "bin");
+        if (Directory.Exists(appCliRoot))
+        {
+            try
+            {
+                desktopCandidates.AddRange(Directory
+                    .EnumerateFiles(appCliRoot, "codex.exe", SearchOption.AllDirectories)
+                    .OrderByDescending(File.GetLastWriteTimeUtc)
+                    .ThenBy(path => path, StringComparer.OrdinalIgnoreCase));
+            }
+            catch
+            {
+                // Keep the packaged and compatibility candidates usable if the cache is busy.
+            }
+        }
+
+        var npmShim = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "npm",
+            "codex.cmd");
+        var compatibilityCandidates = new[]
+        {
+            Environment.GetEnvironmentVariable("CODEX_SWITCHER_CODEX_COMMAND"),
+            npmShim
+        };
+
+        return MergeThreadSectionCodexCliCandidates(
+            File.Exists,
+            packagedCandidates,
+            desktopCandidates,
+            compatibilityCandidates);
+    }
+
+    private static IReadOnlyList<string> GetThreadSectionPackagedManagerRoots() =>
+        BuildThreadSectionPackagedManagerRoots(AppContext.BaseDirectory);
+
+    private static IReadOnlyList<string> BuildThreadSectionPackagedManagerRoots(
+        string appBaseDirectory)
+    {
+        // Never search the current working directory or a configurable manager home here. The
+        // app may be launched while an untrusted repository is the CWD. Six fixed levels cover
+        // both an installed payload and the development bin/<configuration>/<tfm> layout.
+        var roots = new List<string>();
+        string? current;
+        try
+        {
+            current = Path.TrimEndingDirectorySeparator(Path.GetFullPath(appBaseDirectory));
+        }
+        catch
+        {
+            return roots;
+        }
+
+        for (var depth = 0; depth < 6 && !string.IsNullOrWhiteSpace(current); depth++)
+        {
+            roots.Add(current);
+            current = Directory.GetParent(current)?.FullName;
+        }
+        return roots;
+    }
+
+    private static IReadOnlyList<string> MergeThreadSectionCodexCliCandidates(
+        Func<string, bool> candidateExists,
+        params IEnumerable<string?>[] candidateGroups)
+    {
+        ArgumentNullException.ThrowIfNull(candidateExists);
+        var result = new List<string>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var group in candidateGroups)
+        {
+            foreach (var candidate in group)
+            {
+                if (string.IsNullOrWhiteSpace(candidate))
+                {
+                    continue;
+                }
+
+                string fullPath;
+                try
+                {
+                    fullPath = Path.GetFullPath(candidate);
+                }
+                catch
+                {
+                    continue;
+                }
+
+                if (candidateExists(fullPath) && seen.Add(fullPath))
+                {
+                    result.Add(fullPath);
+                }
+            }
+        }
+        return result;
+    }
+
+    internal static void ValidateThreadSectionCliResolution()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "thread-section-cli-resolution");
+        var appBase = Path.Combine(
+            root,
+            "repository",
+            "src",
+            "CodexAccountManager",
+            "bin",
+            "Debug",
+            "net10.0-windows");
+        var packagedRoots = BuildThreadSectionPackagedManagerRoots(appBase);
+        if (packagedRoots.Count != 6 ||
+            !Path.GetFullPath(packagedRoots[0]).Equals(
+                Path.GetFullPath(appBase),
+                StringComparison.OrdinalIgnoreCase) ||
+            !Path.GetFullPath(packagedRoots[^1]).Equals(
+                Path.Combine(root, "repository"),
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                "聊天目录随包 CLI 根目录没有严格限制在应用目录及固定深度父目录。");
+        }
+
+        var packaged = Path.Combine(root, "packaged", "codex.exe");
+        var desktopNewest = Path.Combine(root, "desktop-new", "codex.exe");
+        var desktopOlder = Path.Combine(root, "desktop-old", "codex.exe");
+        var compatibility = Path.Combine(root, "override", "codex.exe");
+        var ordered = MergeThreadSectionCodexCliCandidates(
+            _ => true,
+            new[] { packaged },
+            new[] { desktopNewest, packaged, desktopOlder },
+            new[] { compatibility, desktopNewest });
+        var expected = new[]
+        {
+            packaged,
+            desktopNewest,
+            desktopOlder,
+            compatibility
+        }.Select(Path.GetFullPath);
+        if (!ordered.SequenceEqual(expected, StringComparer.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                "聊天目录 CLI 候选没有保持随包优先、桌面逐项回退和路径去重顺序。");
+        }
     }
 
     private static IEnumerable<string> GetCandidateManagerRoots()

@@ -21,6 +21,13 @@ public sealed record UsageLimitResetInfo(
     public bool IsAvailable => AvailableCount.HasValue;
     public int? UsedPercent => Primary?.UsedPercent;
     public DateTimeOffset? ResetsAtUtc => Primary?.ResetsAtUtc;
+    public long? ApplicableAvailableCount { get; init; }
+    public long? EffectiveApplicableAvailableCount => ResolveApplicableAvailableCount(
+        AvailableCount,
+        ApplicableAvailableCount,
+        Primary,
+        Secondary);
+    public bool CanConsumeResetCredit => EffectiveApplicableAvailableCount is > 0;
     public DateTimeOffset? AvailableCreditExpiresAtUtc => AvailableCount is > 0
         ? Credits
             .Where(credit =>
@@ -30,6 +37,43 @@ public sealed record UsageLimitResetInfo(
             .OrderBy(expiresAt => expiresAt)
             .FirstOrDefault()
         : null;
+
+    internal static long? ResolveApplicableAvailableCount(
+        long? availableCount,
+        long? applicableAvailableCount,
+        UsageRateLimitWindow? primary,
+        UsageRateLimitWindow? secondary)
+    {
+        if (!availableCount.HasValue)
+        {
+            return null;
+        }
+
+        var normalizedAvailable = Math.Max(0, availableCount.Value);
+        if (normalizedAvailable == 0)
+        {
+            return 0;
+        }
+        if (applicableAvailableCount.HasValue)
+        {
+            return Math.Min(
+                normalizedAvailable,
+                Math.Max(0, applicableAvailableCount.Value));
+        }
+
+        // Older app-server builds omit applicableAvailableCount. In that compatibility
+        // shape, a fully consumed official window is the only safe evidence that a reset
+        // card can be used now. A known non-exhausted window must not enable consume.
+        var knownPercentages = new[] { primary?.UsedPercent, secondary?.UsedPercent }
+            .Where(value => value.HasValue)
+            .Select(value => value!.Value)
+            .ToArray();
+        if (knownPercentages.Any(value => value >= 100))
+        {
+            return normalizedAvailable;
+        }
+        return knownPercentages.Length > 0 ? 0 : null;
+    }
 }
 
 public sealed record UsageCreditsSnapshot(
@@ -151,7 +195,7 @@ public sealed class UsageLimitResetSession : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(info);
         ArgumentNullException.ThrowIfNull(consume);
-        if (!confirmed || info.AvailableCount is not > 0)
+        if (!confirmed || !info.CanConsumeResetCredit)
         {
             return new UsageLimitResetConsumeAttempt(false, null, null);
         }
@@ -201,6 +245,7 @@ public sealed class UsageLimitResetSession : IAsyncDisposable
     internal static UsageLimitResetInfo ParseRateLimits(JsonObject result)
     {
         long? availableCount = null;
+        long? applicableAvailableCount = null;
         var credits = new List<UsageLimitResetCredit>();
         if (ReadProperty(
                 result,
@@ -211,6 +256,10 @@ public sealed class UsageLimitResetSession : IAsyncDisposable
                 resetSummary,
                 "availableCount",
                 "available_count"));
+            applicableAvailableCount = ReadLong(ReadProperty(
+                resetSummary,
+                "applicableAvailableCount",
+                "applicable_available_count"));
             if (ReadProperty(resetSummary, "credits") is JsonArray creditRows)
             {
                 foreach (var node in creditRows.OfType<JsonObject>())
@@ -240,7 +289,10 @@ public sealed class UsageLimitResetSession : IAsyncDisposable
             secondary,
             creditBalance,
             individualLimit,
-            string.IsNullOrWhiteSpace(planType) ? null : planType);
+            string.IsNullOrWhiteSpace(planType) ? null : planType)
+        {
+            ApplicableAvailableCount = applicableAvailableCount
+        };
     }
 
     private static JsonObject? SelectCodexRateLimitSnapshot(JsonObject result)
@@ -365,6 +417,7 @@ public sealed class UsageLimitResetSession : IAsyncDisposable
               },
               "rateLimitResetCredits": {
                 "availableCount": 2,
+                "applicableAvailableCount": 1,
                 "credits": [
                   {
                     "id": "credit-1",
@@ -399,6 +452,9 @@ public sealed class UsageLimitResetSession : IAsyncDisposable
             """)!.AsObject();
         var parsed = ParseRateLimits(sample);
         if (parsed.AvailableCount != 2 ||
+            parsed.ApplicableAvailableCount != 1 ||
+            parsed.EffectiveApplicableAvailableCount != 1 ||
+            !parsed.CanConsumeResetCredit ||
             parsed.Credits.Count != 3 ||
             parsed.AvailableCreditExpiresAtUtc !=
                 new DateTimeOffset(2026, 8, 11, 0, 0, 0, TimeSpan.Zero) ||
@@ -435,6 +491,7 @@ public sealed class UsageLimitResetSession : IAsyncDisposable
             {
               "rate_limit_reset_credits": {
                 "available_count": 1,
+                "applicable_available_count": 1,
                 "credits": [{
                   "id": "credit-snake",
                   "reset_type": "codexRateLimits",
@@ -446,12 +503,63 @@ public sealed class UsageLimitResetSession : IAsyncDisposable
             }
             """)!.AsObject());
         if (snakeCase.AvailableCount != 1 ||
+            snakeCase.ApplicableAvailableCount != 1 ||
+            snakeCase.EffectiveApplicableAvailableCount != 1 ||
             snakeCase.Credits is not [{ Id: "credit-snake", ResetType: "codexRateLimits" }] ||
             snakeCase.AvailableCreditExpiresAtUtc !=
                 DateTimeOffset.FromUnixTimeSeconds(1_784_246_400))
         {
             throw new InvalidOperationException(
                 "Usage-limit reset parser did not accept the safe snake_case compatibility shape.");
+        }
+
+        var unavailableExpiryAndNotApplicable = ParseRateLimits(JsonNode.Parse(
+            """
+            {
+              "rateLimits": {
+                "primary": { "usedPercent": 64, "windowDurationMins": 10080 }
+              },
+              "rateLimitResetCredits": {
+                "availableCount": 1,
+                "applicableAvailableCount": 0,
+                "credits": null
+              }
+            }
+            """)!.AsObject());
+        var legacyNotApplicable = ParseRateLimits(JsonNode.Parse(
+            """
+            {
+              "rateLimits": {
+                "primary": { "usedPercent": 64, "windowDurationMins": 10080 }
+              },
+              "rateLimitResetCredits": {
+                "availableCount": 1,
+                "credits": null
+              }
+            }
+            """)!.AsObject());
+        var legacyExhausted = ParseRateLimits(JsonNode.Parse(
+            """
+            {
+              "rateLimits": {
+                "primary": { "usedPercent": 100, "windowDurationMins": 10080 }
+              },
+              "rateLimitResetCredits": {
+                "availableCount": 1,
+                "credits": null
+              }
+            }
+            """)!.AsObject());
+        if (unavailableExpiryAndNotApplicable.AvailableCreditExpiresAtUtc.HasValue ||
+            unavailableExpiryAndNotApplicable.EffectiveApplicableAvailableCount != 0 ||
+            unavailableExpiryAndNotApplicable.CanConsumeResetCredit ||
+            legacyNotApplicable.EffectiveApplicableAvailableCount != 0 ||
+            legacyNotApplicable.CanConsumeResetCredit ||
+            legacyExhausted.EffectiveApplicableAvailableCount != 1 ||
+            !legacyExhausted.CanConsumeResetCredit)
+        {
+            throw new InvalidOperationException(
+                "Reset-credit applicability fallback did not handle credits=null safely.");
         }
 
         var readRequest = BuildRequest(2, "account/rateLimits/read", null);
@@ -519,6 +627,14 @@ public sealed class UsageLimitResetSession : IAsyncDisposable
                 () => throw new InvalidOperationException("An unavailable reset generated an idempotency key."))
             .GetAwaiter()
             .GetResult();
+        var notApplicableAttempt = ConsumeWhenConfirmedAsync(
+                unavailableExpiryAndNotApplicable,
+                confirmed: true,
+                MockConsume,
+                () => throw new InvalidOperationException(
+                    "A non-applicable reset generated an idempotency key."))
+            .GetAwaiter()
+            .GetResult();
         if (!confirmedAttempt.WasSent ||
             confirmedAttempt.Outcome != UsageLimitResetOutcome.Reset ||
             confirmedAttempt.IdempotencyKey != mockIdempotencyKey ||
@@ -526,7 +642,8 @@ public sealed class UsageLimitResetSession : IAsyncDisposable
             mockConsumeCalls != 1 ||
             cancelledAttempt.WasSent ||
             zeroCreditAttempt.WasSent ||
-            unavailableAttempt.WasSent)
+            unavailableAttempt.WasSent ||
+            notApplicableAttempt.WasSent)
         {
             throw new InvalidOperationException(
                 "Usage-limit reset confirmation/credit guards did not isolate the consume request.");

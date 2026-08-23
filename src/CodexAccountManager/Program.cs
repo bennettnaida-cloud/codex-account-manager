@@ -253,6 +253,10 @@ static class Program
                     $"Default={officialCatalog.DefaultModel}");
             }
             SharedHistoryService.ValidateReader();
+            CodexCliService.ValidateThreadSectionMutationSafety();
+            CodexAppServerClient.ValidateThreadSectionProtocol();
+            ThreadSectionNameDialog.ValidateValidation();
+            ThreadSectionNameDialog.ValidateLayout();
             SharedThreadTranscriptService.ValidateReader();
             ThreadPreviewDialog.ValidateFormatting();
             BufferedFlowLayoutPanel.ValidateNestedViewportRedraw();

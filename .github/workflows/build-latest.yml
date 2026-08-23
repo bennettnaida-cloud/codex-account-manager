@@ -27,8 +27,8 @@ jobs:
         shell: pwsh
         run: |
           # Runs 1-24 used the workflow run number directly. Reserve 2.1.25-2.1.28
-          # because those versions already existed in local development builds; run 25
-          # therefore publishes 2.1.29 and later runs remain monotonic.
+          # because those versions already existed in local development builds; run 28
+          # therefore publishes 2.1.32 and later runs remain monotonic.
           $version = '2.1.{0}' -f (([int]'${{ github.run_number }}') + 4)
           "CAM_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
@@ -47,7 +47,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path '.tools/codex-cli' | Out-Null
-          npm install --prefix '.tools/codex-cli' --no-package-lock --ignore-scripts '@openai/codex@0.144.1'
+          npm install --prefix '.tools/codex-cli' --no-package-lock --ignore-scripts '@openai/codex@0.149.0'
 
       - name: Build and package Windows
         shell: pwsh

@@ -65,6 +65,7 @@ internal sealed class QuotaSnapshotStore
             QuotaAccountIdentity.CreateKey(account),
             observedAtUtc.ToUniversalTime(),
             info.AvailableCount,
+            info.ApplicableAvailableCount,
             info.AvailableCreditExpiresAtUtc,
             info.Primary,
             info.Secondary,
@@ -274,7 +275,10 @@ internal sealed class QuotaSnapshotStore
                     new UsageRateLimitWindow(17, 300, durableSecondaryReset),
                     new UsageCreditsSnapshot(true, false, "12.34"),
                     new UsageSpendControl("100", "25", 75D, durableSpendReset),
-                    "durable-team"),
+                    "durable-team")
+                {
+                    ApplicableAvailableCount = 2
+                },
                 durableObservedAt);
 
             void AssertDurableSnapshot(QuotaSnapshotStore restartedStore, string restartLabel)
@@ -283,6 +287,7 @@ internal sealed class QuotaSnapshotStore
                 if (!restartedLoad.TryGetValue(firstKey, out var restartedSnapshot) ||
                     restartedSnapshot.ObservedAtUtc != durableObservedAt.ToUniversalTime() ||
                     restartedSnapshot.AvailableCount != 5 ||
+                    restartedSnapshot.ApplicableAvailableCount != 2 ||
                     restartedSnapshot.ResetCreditExpiresAtUtc != durableResetCreditExpiry ||
                     restartedSnapshot.Primary?.UsedPercent != 13 ||
                     restartedSnapshot.Primary?.WindowMinutes != 10_080 ||
@@ -351,6 +356,7 @@ internal sealed record PersistedQuotaSnapshot(
     string AccountKey,
     DateTimeOffset ObservedAtUtc,
     long? AvailableCount,
+    long? ApplicableAvailableCount,
     DateTimeOffset? ResetCreditExpiresAtUtc,
     UsageRateLimitWindow? Primary,
     UsageRateLimitWindow? Secondary,

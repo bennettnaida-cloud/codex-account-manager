@@ -33,8 +33,25 @@ public partial class Form1 : Form
 
     private sealed record UnifiedHistoryLoadResult(
         IReadOnlyList<UnifiedThreadRecord> Threads,
+        IReadOnlyList<CodexThreadSection> Sections,
         int InvalidationVersion,
         bool SyncedWithCodex);
+
+    private sealed record UnifiedHistorySourceSnapshot(
+        IReadOnlyList<UnifiedThreadRecord> Threads,
+        IReadOnlyList<CodexThreadSection> Sections);
+
+    private sealed record UnifiedHistoryCodexSnapshot(
+        IReadOnlyList<CodexThreadSummary> Threads,
+        IReadOnlyList<CodexThreadSection> Sections);
+
+    private sealed record UnifiedHistoryGroup(
+        string Key,
+        string Title,
+        CodexThreadSection? Section,
+        IReadOnlyList<UnifiedThreadRecord> Threads,
+        Color AccentColor,
+        bool IsArchived = false);
 
     private sealed record UnifiedHistoryContentIndexResult(
         IReadOnlyDictionary<string, string> SearchTextByThreadId,
@@ -85,6 +102,34 @@ public partial class Form1 : Form
         int MiddleLeft,
         int MiddleWidth,
         int MetricWidth);
+
+    private readonly record struct UnifiedHistorySummaryGeometry(
+        int Height,
+        Rectangle Title,
+        Rectangle Detail,
+        Rectangle Create,
+        Rectangle Refresh,
+        bool Stacked);
+
+    private readonly record struct UnifiedHistoryGroupHeaderGeometry(
+        int Height,
+        Rectangle Title,
+        Rectangle Count,
+        Rectangle Rename,
+        Rectangle Delete,
+        Rectangle Toggle,
+        bool Stacked);
+
+    private readonly record struct UnifiedHistoryRowGeometry(
+        int Height,
+        Rectangle Title,
+        Rectangle Meta,
+        Rectangle Status,
+        Rectangle Classify,
+        Rectangle Archive,
+        Rectangle Delete,
+        bool Stacked,
+        bool ActionsWrapped);
 
     private sealed class UsageMetricBinding
     {
@@ -163,6 +208,11 @@ public partial class Form1 : Form
     private const int CardGap = 22;
     private const int UnifiedHistoryPageSize = 8;
     private const int UnifiedHistorySearchMaxCharactersPerThread = 384 * 1024;
+    private const string UnifiedHistoryPinnedGroupKey = "special:pinned";
+    private const string UnifiedHistoryUnclassifiedGroupKey = "special:unclassified";
+    private const string UnifiedHistoryArchivedGroupKey = "special:archived";
+    private static readonly string[] UnifiedHistoryReservedSectionNames =
+        ["未分类", "已归档", "已置顶"];
     private static readonly (string Label, ThemeMode Mode)[] ThemeOptions =
     [
         ("跟随系统", ThemeMode.System),
@@ -266,6 +316,9 @@ public partial class Form1 : Form
     private readonly Dictionary<string, long> _quotaRuntimeStateGenerations =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _collapsedAccountGroups = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _collapsedUnifiedHistoryGroups = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> _unifiedHistoryGroupVisibleLimits =
+        new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<WorkspaceView, WorkspaceViewCacheEntry> _workspaceViewCache = [];
     private ThemePalette _palette;
     private List<AccountRecord> _accounts = [];
@@ -288,13 +341,14 @@ public partial class Form1 : Form
     private DateTime _quotaUsageLoadedAtUtc;
     private UsageReport? _quotaUsageCache;
     private IReadOnlyList<UnifiedThreadRecord>? _unifiedHistoryCache;
+    private IReadOnlyList<CodexThreadSection> _unifiedHistorySections = [];
     private bool _unifiedHistorySyncedWithCodex;
     private IReadOnlyDictionary<string, string> _unifiedHistoryContentIndex =
         new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _unifiedThreadDeleteGate = new(1, 1);
     private Task<QuotaUsageLoadResult>? _quotaUsageLoadTask;
     private Task<UnifiedHistoryLoadResult>? _unifiedHistoryLoadTask;
-    private Task<IReadOnlyList<CodexThreadSummary>>? _unifiedHistoryCodexSyncTask;
+    private Task<UnifiedHistoryCodexSnapshot>? _unifiedHistoryCodexSyncTask;
     private Task<UnifiedHistoryContentIndexResult>? _unifiedHistoryContentIndexTask;
     private CancellationTokenSource? _unifiedHistoryContentIndexCancellation;
     private Exception? _quotaUsageLoadError;
@@ -308,7 +362,6 @@ public partial class Form1 : Form
     private int _unifiedHistoryContentIndexRequestedVersion = -1;
     private int _workspaceLoadGeneration;
     private int _quotaUsageRequestedGeneration;
-    private int _unifiedHistoryVisibleLimit = UnifiedHistoryPageSize;
     private TimeSpan _quotaTrendRange = TimeSpan.FromHours(24);
     private QuotaTrendMetric _quotaTrendMetric = QuotaTrendMetric.Tokens;
     private readonly Dictionary<string, QuotaTrendScope> _quotaTrendScopes =
@@ -777,7 +830,7 @@ public partial class Form1 : Form
             _showAccountDetail = false;
             if (_activeView == WorkspaceView.UnifiedHistory)
             {
-                _unifiedHistoryVisibleLimit = UnifiedHistoryPageSize;
+                ResetUnifiedHistoryGroupPagination();
             }
             RenderCards();
         };
@@ -1379,7 +1432,7 @@ public partial class Form1 : Form
             _showCodexAppearanceDetail = false;
             if (_activeView == WorkspaceView.UnifiedHistory)
             {
-                _unifiedHistoryVisibleLimit = UnifiedHistoryPageSize;
+                ResetUnifiedHistoryGroupPagination();
             }
 
             _suppressSearchRender = true;
@@ -2336,6 +2389,7 @@ public partial class Form1 : Form
             if (resultIsCurrent)
             {
                 _unifiedHistoryCache = result.Threads;
+                _unifiedHistorySections = result.Sections;
                 _unifiedHistoryCacheVersion = result.InvalidationVersion;
                 _unifiedHistorySyncedWithCodex = result.SyncedWithCodex;
                 _unifiedHistoryLoadError = null;
@@ -2385,7 +2439,7 @@ public partial class Form1 : Form
         string sharedHome,
         int invalidationVersion)
     {
-        var indexedTask = Task.Run(() => _sharedHistory.Load(sharedHome));
+        var indexedTask = LoadUnifiedHistoryLocalSnapshotAsync(sharedHome);
         var codexTask = GetOrStartUnifiedHistoryCodexSync(sharedHome);
         var timeoutTask = Task.Delay(TimeSpan.FromSeconds(2));
 
@@ -2394,13 +2448,17 @@ public partial class Form1 : Form
         {
             try
             {
-                var codexThreads = await codexTask;
-                var indexedThreads = indexedTask.IsCompletedSuccessfully
+                var codexSnapshot = await codexTask;
+                var indexedSnapshot = indexedTask.IsCompletedSuccessfully
                     ? await indexedTask
-                    : [];
+                    : new UnifiedHistorySourceSnapshot([], []);
                 _ = ObserveTaskAsync(indexedTask);
                 return new UnifiedHistoryLoadResult(
-                    _sharedHistory.ReconcileWithCodex(sharedHome, indexedThreads, codexThreads),
+                    _sharedHistory.ReconcileWithCodex(
+                        sharedHome,
+                        indexedSnapshot.Threads,
+                        codexSnapshot.Threads),
+                    codexSnapshot.Sections,
                     invalidationVersion,
                     SyncedWithCodex: true);
             }
@@ -2408,9 +2466,10 @@ public partial class Form1 : Form
             {
                 try
                 {
-                    var indexedThreads = await indexedTask.WaitAsync(TimeSpan.FromSeconds(2));
+                    var indexedSnapshot = await indexedTask.WaitAsync(TimeSpan.FromSeconds(2));
                     return new UnifiedHistoryLoadResult(
-                        indexedThreads,
+                        indexedSnapshot.Threads,
+                        indexedSnapshot.Sections,
                         invalidationVersion,
                         SyncedWithCodex: false);
                 }
@@ -2428,14 +2487,15 @@ public partial class Form1 : Form
         {
             try
             {
-                var indexedThreads = await indexedTask;
+                var indexedSnapshot = await indexedTask;
                 _ = CompleteUnifiedHistoryCodexSyncAsync(
                     sharedHome,
-                    indexedThreads,
+                    indexedSnapshot,
                     codexTask,
                     invalidationVersion);
                 return new UnifiedHistoryLoadResult(
-                    indexedThreads,
+                    indexedSnapshot.Threads,
+                    indexedSnapshot.Sections,
                     invalidationVersion,
                     SyncedWithCodex: false);
             }
@@ -2443,9 +2503,10 @@ public partial class Form1 : Form
             {
                 try
                 {
-                    var codexThreads = await codexTask.WaitAsync(TimeSpan.FromSeconds(2));
+                    var codexSnapshot = await codexTask.WaitAsync(TimeSpan.FromSeconds(2));
                     return new UnifiedHistoryLoadResult(
-                        _sharedHistory.ReconcileWithCodex(sharedHome, [], codexThreads),
+                        _sharedHistory.ReconcileWithCodex(sharedHome, [], codexSnapshot.Threads),
+                        codexSnapshot.Sections,
                         invalidationVersion,
                         SyncedWithCodex: true);
                 }
@@ -2462,32 +2523,50 @@ public partial class Form1 : Form
         _ = ObserveTaskAsync(indexedTask);
         _ = CompleteUnifiedHistoryCodexSyncAsync(
             sharedHome,
-            [],
+            new UnifiedHistorySourceSnapshot([], []),
             codexTask,
             invalidationVersion);
         throw new TimeoutException("聊天目录读取超过 2 秒；请稍后点击刷新重试。");
     }
 
-    private Task<IReadOnlyList<CodexThreadSummary>> GetOrStartUnifiedHistoryCodexSync(
+    private async Task<UnifiedHistorySourceSnapshot> LoadUnifiedHistoryLocalSnapshotAsync(
+        string sharedHome)
+    {
+        var threadsTask = Task.Run(() => _sharedHistory.Load(sharedHome));
+        var sectionsTask = Task.Run(() => _sharedHistory.LoadThreadSections(sharedHome));
+        await Task.WhenAll(threadsTask, sectionsTask);
+        return new UnifiedHistorySourceSnapshot(await threadsTask, await sectionsTask);
+    }
+
+    private Task<UnifiedHistoryCodexSnapshot> GetOrStartUnifiedHistoryCodexSync(
         string sharedHome)
     {
         if (_unifiedHistoryCodexSyncTask == null || _unifiedHistoryCodexSyncTask.IsCompleted)
         {
-            _unifiedHistoryCodexSyncTask = _codex.ListThreadsFromCodexAsync(sharedHome);
+            _unifiedHistoryCodexSyncTask = LoadUnifiedHistoryCodexSnapshotAsync(sharedHome);
         }
 
         return _unifiedHistoryCodexSyncTask;
     }
 
+    private async Task<UnifiedHistoryCodexSnapshot> LoadUnifiedHistoryCodexSnapshotAsync(
+        string sharedHome)
+    {
+        var threadsTask = _codex.ListThreadsFromCodexAsync(sharedHome);
+        var sectionsTask = _codex.ListThreadSectionsFromCodexAsync(sharedHome);
+        await Task.WhenAll(threadsTask, sectionsTask);
+        return new UnifiedHistoryCodexSnapshot(await threadsTask, await sectionsTask);
+    }
+
     private async Task CompleteUnifiedHistoryCodexSyncAsync(
         string sharedHome,
-        IReadOnlyList<UnifiedThreadRecord> indexedThreads,
-        Task<IReadOnlyList<CodexThreadSummary>> codexTask,
+        UnifiedHistorySourceSnapshot indexedSnapshot,
+        Task<UnifiedHistoryCodexSnapshot> codexTask,
         int invalidationVersion)
     {
         try
         {
-            var codexThreads = await codexTask;
+            var codexSnapshot = await codexTask;
             if (_formClosed || IsDisposed ||
                 invalidationVersion != _unifiedHistoryInvalidationVersion)
             {
@@ -2496,8 +2575,9 @@ public partial class Form1 : Form
 
             _unifiedHistoryCache = _sharedHistory.ReconcileWithCodex(
                 sharedHome,
-                indexedThreads,
-                codexThreads);
+                indexedSnapshot.Threads,
+                codexSnapshot.Threads);
+            _unifiedHistorySections = codexSnapshot.Sections;
             _unifiedHistoryCacheVersion = invalidationVersion;
             _unifiedHistorySyncedWithCodex = true;
             _unifiedHistoryLoadError = null;
@@ -2782,13 +2862,22 @@ public partial class Form1 : Form
         _unifiedHistoryContentIndexVersion = -1;
         _unifiedHistoryContentIndexRequestedVersion = -1;
         _unifiedHistoryContentIndexError = null;
+        // A mutation may finish while an older app-server snapshot is still running. Never reuse
+        // that pre-mutation snapshot for the next classification refresh.
+        _unifiedHistoryCodexSyncTask = null;
         if (!clearCachedData)
         {
             return;
         }
 
         _unifiedHistoryCache = null;
+        _unifiedHistorySections = [];
         _unifiedHistoryCacheVersion = -1;
+    }
+
+    private void ResetUnifiedHistoryGroupPagination()
+    {
+        _unifiedHistoryGroupVisibleLimits.Clear();
     }
 
     private void UpdateWorkspaceChrome()
@@ -2807,7 +2896,8 @@ public partial class Form1 : Form
         var subtitleDetail = _activeView switch
         {
             WorkspaceView.AccountSwitch => "账号配置和登录状态相互隔离；聊天记录集中保存在默认 .codex。",
-            WorkspaceView.UnifiedHistory => "按标题和对话正文搜索；本地只读，不启动或登录 Codex++。",
+            WorkspaceView.UnifiedHistory =>
+                "阅读本地聊天；分类经 Codex 官方目录接口并自动备份，不启动或登录 Codex++。",
             WorkspaceView.StatusCheck => "状态检查按账号单独执行；ChatGPT 登录、Access Token 与 API Key 均按账号目录隔离。",
             WorkspaceView.QuotaUsage => "按官方返回显示 5h、周或月额度窗口；不会在后台轮流登录账号。",
             WorkspaceView.ThemeSettings => "Codex 主题可以独立启用、应用或恢复，不影响账号与聊天记录。",
@@ -3479,7 +3569,12 @@ public partial class Form1 : Form
                     account,
                     ResetCreditStatus.Known,
                     snapshot.AvailableCount.Value,
-                    snapshot.ResetCreditExpiresAtUtc);
+                    snapshot.ResetCreditExpiresAtUtc,
+                    UsageLimitResetInfo.ResolveApplicableAvailableCount(
+                        snapshot.AvailableCount,
+                        snapshot.ApplicableAvailableCount,
+                        snapshot.Primary,
+                        snapshot.Secondary));
             }
             else
             {
@@ -3934,6 +4029,482 @@ public partial class Form1 : Form
         return panel;
     }
 
+    private static int ScaleUnifiedHistoryPixel(int logicalPixels, float dpiScale) =>
+        (int)Math.Ceiling(Math.Max(0, logicalPixels) * Math.Max(1F, dpiScale));
+
+    private float GetUnifiedHistoryDpiScale() => Math.Max(1F, DeviceDpi / 96F);
+
+    private static Size MeasureUnifiedHistoryText(
+        string text,
+        FontFamily fontFamily,
+        float fontSize,
+        FontStyle fontStyle,
+        float dpiScale)
+    {
+        // Point fonts are converted through the current monitor DPI. Multiplying a Point font
+        // by dpiScale here would therefore scale twice on a real 150%/200% monitor. Measure with
+        // a deterministic physical-pixel em size so runtime layout and the 96-DPI offline tests
+        // describe the same rendered glyph box.
+        var pixelEmSize = fontSize * (96F / 72F) * Math.Max(1F, dpiScale);
+        using var measuredFont = new Font(
+            fontFamily,
+            pixelEmSize,
+            fontStyle,
+            GraphicsUnit.Pixel);
+        return TextRenderer.MeasureText(
+            string.IsNullOrEmpty(text) ? "国Ag" : text,
+            measuredFont,
+            Size.Empty,
+            TextFormatFlags.SingleLine |
+            TextFormatFlags.NoPadding |
+            TextFormatFlags.NoPrefix);
+    }
+
+    private static Size MeasureUnifiedHistoryButton(
+        string text,
+        FontFamily fontFamily,
+        float fontSize,
+        FontStyle fontStyle,
+        float dpiScale,
+        int logicalMinimumWidth,
+        int logicalMinimumHeight,
+        int logicalHorizontalPadding,
+        bool hasIcon = false)
+    {
+        var scale = Math.Max(1F, dpiScale);
+        var measured = MeasureUnifiedHistoryText(text, fontFamily, fontSize, fontStyle, scale);
+        var horizontalPadding = ScaleUnifiedHistoryPixel(logicalHorizontalPadding, scale) * 2;
+        var iconSlot = hasIcon
+            ? ScaleUnifiedHistoryPixel(20 + 8, scale)
+            : 0;
+        var safetyInset = ScaleUnifiedHistoryPixel(4, scale);
+        var verticalPadding = ScaleUnifiedHistoryPixel(12, scale);
+        return new Size(
+            Math.Max(
+                ScaleUnifiedHistoryPixel(logicalMinimumWidth, scale),
+                measured.Width + horizontalPadding + iconSlot + safetyInset),
+            Math.Max(
+                ScaleUnifiedHistoryPixel(logicalMinimumHeight, scale),
+                measured.Height + verticalPadding));
+    }
+
+    private static UnifiedHistorySummaryGeometry CalculateUnifiedHistorySummaryGeometry(
+        int width,
+        string titleText,
+        string detailText,
+        FontFamily fontFamily,
+        float dpiScale)
+    {
+        var scale = Math.Max(1F, dpiScale);
+        var left = ScaleUnifiedHistoryPixel(20, scale);
+        var right = ScaleUnifiedHistoryPixel(34, scale);
+        var gap = ScaleUnifiedHistoryPixel(12, scale);
+        var createSize = MeasureUnifiedHistoryButton(
+            "新建目录",
+            fontFamily,
+            8.9F,
+            FontStyle.Regular,
+            scale,
+            160,
+            42,
+            10,
+            hasIcon: true);
+        var refreshSize = MeasureUnifiedHistoryButton(
+            "刷新",
+            fontFamily,
+            8.9F,
+            FontStyle.Regular,
+            scale,
+            116,
+            42,
+            10,
+            hasIcon: true);
+        var actionHeight = Math.Max(createSize.Height, refreshSize.Height);
+        var actionsWidth = createSize.Width + gap + refreshSize.Width;
+        var availableHorizontalTextWidth = width - left - gap - actionsWidth - right;
+        var stacked = availableHorizontalTextWidth < ScaleUnifiedHistoryPixel(260, scale);
+        var titleHeight = Math.Max(
+            ScaleUnifiedHistoryPixel(32, scale),
+            MeasureUnifiedHistoryText(titleText, fontFamily, 10F, FontStyle.Bold, scale).Height +
+            ScaleUnifiedHistoryPixel(8, scale));
+        var detailHeight = Math.Max(
+            ScaleUnifiedHistoryPixel(26, scale),
+            MeasureUnifiedHistoryText(detailText, fontFamily, 8.5F, FontStyle.Regular, scale).Height +
+            ScaleUnifiedHistoryPixel(6, scale));
+
+        if (!stacked)
+        {
+            var createLeft = width - right - refreshSize.Width - gap - createSize.Width;
+            var actionTop = ScaleUnifiedHistoryPixel(21, scale);
+            return new UnifiedHistorySummaryGeometry(
+                Math.Max(
+                    ScaleUnifiedHistoryPixel(82, scale),
+                    actionTop + actionHeight + ScaleUnifiedHistoryPixel(19, scale)),
+                new Rectangle(left, ScaleUnifiedHistoryPixel(6, scale), availableHorizontalTextWidth, titleHeight),
+                new Rectangle(left, ScaleUnifiedHistoryPixel(40, scale), availableHorizontalTextWidth, detailHeight),
+                new Rectangle(createLeft, actionTop, createSize.Width, actionHeight),
+                new Rectangle(createLeft + createSize.Width + gap, actionTop, refreshSize.Width, actionHeight),
+                Stacked: false);
+        }
+
+        var innerWidth = Math.Max(1, width - left - ScaleUnifiedHistoryPixel(20, scale));
+        var stackedTitle = new Rectangle(left, ScaleUnifiedHistoryPixel(6, scale), innerWidth, titleHeight);
+        var stackedDetail = new Rectangle(
+            left,
+            stackedTitle.Bottom + ScaleUnifiedHistoryPixel(2, scale),
+            innerWidth,
+            detailHeight);
+        var stackedActionTop = stackedDetail.Bottom + ScaleUnifiedHistoryPixel(10, scale);
+        var stackedCreateLeft = Math.Max(left, width - right - actionsWidth);
+        var stackedCreate = new Rectangle(
+            stackedCreateLeft,
+            stackedActionTop,
+            createSize.Width,
+            actionHeight);
+        var stackedRefresh = new Rectangle(
+            stackedCreate.Right + gap,
+            stackedActionTop,
+            refreshSize.Width,
+            actionHeight);
+        return new UnifiedHistorySummaryGeometry(
+            stackedActionTop + actionHeight + ScaleUnifiedHistoryPixel(14, scale),
+            stackedTitle,
+            stackedDetail,
+            stackedCreate,
+            stackedRefresh,
+            Stacked: true);
+    }
+
+    private static UnifiedHistoryGroupHeaderGeometry CalculateUnifiedHistoryGroupHeaderGeometry(
+        int width,
+        string titleText,
+        string countText,
+        string toggleText,
+        bool hasManagement,
+        FontFamily fontFamily,
+        float dpiScale)
+    {
+        var scale = Math.Max(1F, dpiScale);
+        var left = ScaleUnifiedHistoryPixel(20, scale);
+        var right = ScaleUnifiedHistoryPixel(12, scale);
+        var gap = ScaleUnifiedHistoryPixel(8, scale);
+        var titleMinimumWidth = ScaleUnifiedHistoryPixel(120, scale);
+        var toggleSize = MeasureUnifiedHistoryButton(
+            toggleText,
+            fontFamily,
+            8.5F,
+            FontStyle.Bold,
+            scale,
+            86,
+            36,
+            12);
+        var renameSize = MeasureUnifiedHistoryButton(
+            "重命名",
+            fontFamily,
+            8.9F,
+            FontStyle.Regular,
+            scale,
+            92,
+            36,
+            10);
+        var deleteSize = MeasureUnifiedHistoryButton(
+            "删除目录",
+            fontFamily,
+            8.9F,
+            FontStyle.Regular,
+            scale,
+            92,
+            36,
+            10);
+        var countMeasured = MeasureUnifiedHistoryText(
+            countText,
+            fontFamily,
+            8.5F,
+            FontStyle.Bold,
+            scale);
+        var countWidth = Math.Max(
+            ScaleUnifiedHistoryPixel(72, scale),
+            countMeasured.Width + ScaleUnifiedHistoryPixel(20, scale));
+        var managementWidth = hasManagement
+            ? renameSize.Width + gap + deleteSize.Width + gap
+            : 0;
+        var requiredHorizontalWidth =
+            left + titleMinimumWidth + gap + countWidth + gap + managementWidth +
+            toggleSize.Width + right;
+        var stacked = hasManagement && width < requiredHorizontalWidth;
+        var firstRowTop = ScaleUnifiedHistoryPixel(10, scale);
+        var firstRowHeight = Math.Max(
+            toggleSize.Height,
+            Math.Max(
+                ScaleUnifiedHistoryPixel(36, scale),
+                countMeasured.Height + ScaleUnifiedHistoryPixel(10, scale)));
+        var toggle = new Rectangle(
+            width - right - toggleSize.Width,
+            firstRowTop,
+            toggleSize.Width,
+            firstRowHeight);
+
+        Rectangle rename;
+        Rectangle delete;
+        int countLeft;
+        int height;
+        if (!stacked)
+        {
+            delete = hasManagement
+                ? new Rectangle(
+                    toggle.Left - gap - deleteSize.Width,
+                    firstRowTop,
+                    deleteSize.Width,
+                    firstRowHeight)
+                : Rectangle.Empty;
+            rename = hasManagement
+                ? new Rectangle(
+                    delete.Left - gap - renameSize.Width,
+                    firstRowTop,
+                    renameSize.Width,
+                    firstRowHeight)
+                : Rectangle.Empty;
+            countLeft = (hasManagement ? rename.Left : toggle.Left) - gap - countWidth;
+            height = Math.Max(
+                ScaleUnifiedHistoryPixel(56, scale),
+                firstRowTop + firstRowHeight + ScaleUnifiedHistoryPixel(10, scale));
+        }
+        else
+        {
+            countLeft = toggle.Left - gap - countWidth;
+            var secondRowTop = firstRowTop + firstRowHeight + ScaleUnifiedHistoryPixel(8, scale);
+            var secondRowHeight = Math.Max(renameSize.Height, deleteSize.Height);
+            delete = new Rectangle(
+                width - right - deleteSize.Width,
+                secondRowTop,
+                deleteSize.Width,
+                secondRowHeight);
+            rename = new Rectangle(
+                delete.Left - gap - renameSize.Width,
+                secondRowTop,
+                renameSize.Width,
+                secondRowHeight);
+            height = delete.Bottom + ScaleUnifiedHistoryPixel(10, scale);
+        }
+
+        var titleTop = ScaleUnifiedHistoryPixel(5, scale);
+        var titleHeight = Math.Max(
+            firstRowTop + firstRowHeight - titleTop,
+            MeasureUnifiedHistoryText(titleText, fontFamily, 9.6F, FontStyle.Bold, scale).Height +
+            ScaleUnifiedHistoryPixel(8, scale));
+        return new UnifiedHistoryGroupHeaderGeometry(
+            height,
+            new Rectangle(left, titleTop, Math.Max(1, countLeft - gap - left), titleHeight),
+            new Rectangle(countLeft, firstRowTop, countWidth, firstRowHeight),
+            rename,
+            delete,
+            toggle,
+            stacked);
+    }
+
+    private static UnifiedHistoryRowGeometry CalculateUnifiedHistoryRowGeometry(
+        int width,
+        string titleText,
+        string metaText,
+        bool archived,
+        FontFamily fontFamily,
+        float dpiScale)
+    {
+        var scale = Math.Max(1F, dpiScale);
+        var left = ScaleUnifiedHistoryPixel(20, scale);
+        var right = ScaleUnifiedHistoryPixel(32, scale);
+        var gap = ScaleUnifiedHistoryPixel(12, scale);
+        var contentGap = ScaleUnifiedHistoryPixel(24, scale);
+        var classifyText = archived ? "先取消归档" : "分类到…";
+        var archiveText = archived ? "取消归档" : "归档";
+        var statusText = archived ? "已归档" : "活动";
+        var classifySize = MeasureUnifiedHistoryButton(
+            classifyText,
+            fontFamily,
+            8.9F,
+            FontStyle.Regular,
+            scale,
+            140,
+            34,
+            10,
+            hasIcon: true);
+        var archiveSize = MeasureUnifiedHistoryButton(
+            archiveText,
+            fontFamily,
+            8.9F,
+            FontStyle.Regular,
+            scale,
+            112,
+            42,
+            10);
+        var deleteSize = MeasureUnifiedHistoryButton(
+            "删除",
+            fontFamily,
+            8.9F,
+            FontStyle.Regular,
+            scale,
+            104,
+            42,
+            10);
+        var statusMeasured = MeasureUnifiedHistoryText(
+            statusText,
+            fontFamily,
+            8.5F,
+            FontStyle.Bold,
+            scale);
+        var statusSize = new Size(
+            Math.Max(
+                ScaleUnifiedHistoryPixel(132, scale),
+                statusMeasured.Width + ScaleUnifiedHistoryPixel(20, scale)),
+            Math.Max(
+                ScaleUnifiedHistoryPixel(34, scale),
+                statusMeasured.Height + ScaleUnifiedHistoryPixel(10, scale)));
+        var actionHeight = Math.Max(classifySize.Height, Math.Max(archiveSize.Height, deleteSize.Height));
+        var firstColumnWidth = Math.Max(statusSize.Width, classifySize.Width);
+        var wideActionsWidth = firstColumnWidth + gap + archiveSize.Width + gap + deleteSize.Width;
+        var requiredWideWidth =
+            left + ScaleUnifiedHistoryPixel(320, scale) + contentGap + wideActionsWidth + right;
+        var stacked = width < requiredWideWidth;
+        var titleHeight = Math.Max(
+            ScaleUnifiedHistoryPixel(34, scale),
+            MeasureUnifiedHistoryText(titleText, fontFamily, 9.8F, FontStyle.Bold, scale).Height +
+            ScaleUnifiedHistoryPixel(10, scale));
+        var metaHeight = Math.Max(
+            ScaleUnifiedHistoryPixel(28, scale),
+            MeasureUnifiedHistoryText(metaText, fontFamily, 8.3F, FontStyle.Regular, scale).Height +
+            ScaleUnifiedHistoryPixel(8, scale));
+
+        if (!stacked)
+        {
+            var deleteLeft = width - right - deleteSize.Width;
+            var archiveLeft = deleteLeft - gap - archiveSize.Width;
+            var firstColumnLeft = archiveLeft - gap - firstColumnWidth;
+            var title = new Rectangle(
+                left,
+                ScaleUnifiedHistoryPixel(14, scale),
+                Math.Max(1, firstColumnLeft - contentGap - left),
+                titleHeight);
+            var meta = new Rectangle(
+                left,
+                title.Bottom + ScaleUnifiedHistoryPixel(10, scale),
+                title.Width,
+                metaHeight);
+            var status = new Rectangle(
+                firstColumnLeft,
+                ScaleUnifiedHistoryPixel(14, scale),
+                firstColumnWidth,
+                statusSize.Height);
+            var classify = new Rectangle(
+                firstColumnLeft,
+                status.Bottom + ScaleUnifiedHistoryPixel(7, scale),
+                firstColumnWidth,
+                classifySize.Height);
+            var actionsTop = Math.Max(
+                ScaleUnifiedHistoryPixel(14, scale),
+                (Math.Max(meta.Bottom, classify.Bottom) - actionHeight) / 2);
+            var archive = new Rectangle(
+                archiveLeft,
+                actionsTop,
+                archiveSize.Width,
+                actionHeight);
+            var delete = new Rectangle(
+                deleteLeft,
+                actionsTop,
+                deleteSize.Width,
+                actionHeight);
+            var height = Math.Max(
+                ScaleUnifiedHistoryPixel(104, scale),
+                Math.Max(meta.Bottom, Math.Max(classify.Bottom, delete.Bottom)) +
+                ScaleUnifiedHistoryPixel(14, scale));
+            return new UnifiedHistoryRowGeometry(
+                height,
+                title,
+                meta,
+                status,
+                classify,
+                archive,
+                delete,
+                Stacked: false,
+                ActionsWrapped: false);
+        }
+
+        var statusLeft = width - right - statusSize.Width;
+        var stackedTitle = new Rectangle(
+            left,
+            ScaleUnifiedHistoryPixel(14, scale),
+            Math.Max(1, statusLeft - gap - left),
+            titleHeight);
+        var stackedStatus = new Rectangle(
+            statusLeft,
+            ScaleUnifiedHistoryPixel(14, scale),
+            statusSize.Width,
+            statusSize.Height);
+        var stackedMeta = new Rectangle(
+            left,
+            Math.Max(stackedTitle.Bottom, stackedStatus.Bottom) + ScaleUnifiedHistoryPixel(8, scale),
+            Math.Max(1, width - left - right),
+            metaHeight);
+        var actionTop = stackedMeta.Bottom + ScaleUnifiedHistoryPixel(12, scale);
+        var narrowActionsWidth = classifySize.Width + gap + archiveSize.Width + gap + deleteSize.Width;
+        var availableActionWidth = Math.Max(1, width - left - right);
+        if (narrowActionsWidth <= availableActionWidth)
+        {
+            var classifyLeft = width - right - narrowActionsWidth;
+            var classify = new Rectangle(
+                classifyLeft,
+                actionTop,
+                classifySize.Width,
+                actionHeight);
+            var archive = new Rectangle(
+                classify.Right + gap,
+                actionTop,
+                archiveSize.Width,
+                actionHeight);
+            var delete = new Rectangle(
+                archive.Right + gap,
+                actionTop,
+                deleteSize.Width,
+                actionHeight);
+            return new UnifiedHistoryRowGeometry(
+                delete.Bottom + ScaleUnifiedHistoryPixel(14, scale),
+                stackedTitle,
+                stackedMeta,
+                stackedStatus,
+                classify,
+                archive,
+                delete,
+                Stacked: true,
+                ActionsWrapped: false);
+        }
+
+        var wrappedClassify = new Rectangle(
+            left,
+            actionTop,
+            Math.Min(classifySize.Width, availableActionWidth),
+            actionHeight);
+        var wrappedSecondTop = wrappedClassify.Bottom + ScaleUnifiedHistoryPixel(8, scale);
+        var wrappedDelete = new Rectangle(
+            width - right - deleteSize.Width,
+            wrappedSecondTop,
+            deleteSize.Width,
+            actionHeight);
+        var wrappedArchive = new Rectangle(
+            wrappedDelete.Left - gap - archiveSize.Width,
+            wrappedSecondTop,
+            archiveSize.Width,
+            actionHeight);
+        return new UnifiedHistoryRowGeometry(
+            wrappedDelete.Bottom + ScaleUnifiedHistoryPixel(14, scale),
+            stackedTitle,
+            stackedMeta,
+            stackedStatus,
+            wrappedClassify,
+            wrappedArchive,
+            wrappedDelete,
+            Stacked: true,
+            ActionsWrapped: true);
+    }
+
     private void RenderUnifiedHistory(
         string query,
         int width,
@@ -3971,9 +4542,10 @@ public partial class Form1 : Form
                  _unifiedHistoryContentIndex.TryGetValue(thread.Id, out var searchText) &&
                  searchText.Contains(query, StringComparison.CurrentCultureIgnoreCase)))
             .ToList();
-        var renderedThreads = visibleThreads
-            .Take(Math.Max(UnifiedHistoryPageSize, _unifiedHistoryVisibleLimit))
-            .ToList();
+        var groups = BuildUnifiedHistoryGroups(visibleThreads, !string.IsNullOrWhiteSpace(query));
+        var renderedCount = groups.Sum(group => Math.Min(
+            group.Threads.Count,
+            GetUnifiedHistoryGroupVisibleLimit(group.Key)));
 
         _cardsPanel.Controls.Add(CreateUnifiedHistorySummary(
             width,
@@ -3981,11 +4553,12 @@ public partial class Form1 : Form
             allThreads.Count,
             allThreads.Count(thread => thread.Archived),
             visibleThreads.Count,
-            renderedThreads.Count,
+            renderedCount,
             contentSearchStatus));
         PumpHeaderAnimationFrame();
 
-        if (visibleThreads.Count == 0)
+        if (visibleThreads.Count == 0 &&
+            (!string.IsNullOrWhiteSpace(query) || groups.Count == 0))
         {
             _cardsPanel.Controls.Add(contentIndexLoading
                 ? CreateUnifiedHistoryMessagePanel(
@@ -3997,32 +4570,350 @@ public partial class Form1 : Form
         }
         else
         {
-            foreach (var thread in renderedThreads)
+            var searching = !string.IsNullOrWhiteSpace(query);
+            foreach (var group in groups)
             {
-                string? matchSnippet = null;
-                if (!string.IsNullOrWhiteSpace(query) &&
-                    contentIndexReady &&
-                    _unifiedHistoryContentIndex.TryGetValue(thread.Id, out var searchText) &&
-                    searchText.Contains(query, StringComparison.CurrentCultureIgnoreCase))
+                var groupRows = new List<Control>();
+                var groupLimit = GetUnifiedHistoryGroupVisibleLimit(group.Key);
+                foreach (var thread in group.Threads.Take(groupLimit))
                 {
-                    matchSnippet = CreateUnifiedHistorySearchSnippet(searchText, query);
+                    string? matchSnippet = null;
+                    if (searching &&
+                        contentIndexReady &&
+                        _unifiedHistoryContentIndex.TryGetValue(thread.Id, out var searchText) &&
+                        searchText.Contains(query, StringComparison.CurrentCultureIgnoreCase))
+                    {
+                        matchSnippet = CreateUnifiedHistorySearchSnippet(searchText, query);
+                    }
+                    groupRows.Add(CreateUnifiedHistoryRow(thread, width, matchSnippet));
                 }
-                _cardsPanel.Controls.Add(CreateUnifiedHistoryRow(thread, width, matchSnippet));
+
+                if (group.Threads.Count > groupLimit)
+                {
+                    groupRows.Add(CreateUnifiedHistoryGroupLoadMoreRow(
+                        group,
+                        width,
+                        groupLimit));
+                }
+
+                var collapsed = !searching &&
+                                _collapsedUnifiedHistoryGroups.Contains(group.Key);
+                foreach (var row in groupRows)
+                {
+                    row.Visible = !collapsed;
+                }
+
+                _cardsPanel.Controls.Add(CreateUnifiedHistoryGroupHeader(
+                    group,
+                    width,
+                    groupRows,
+                    searching));
+                foreach (var row in groupRows)
+                {
+                    _cardsPanel.Controls.Add(row);
+                }
                 PumpHeaderAnimationFrame();
             }
         }
 
         _statusBox.Text =
             contentIndexLoading
-                ? $"已显示 {renderedThreads.Count}/{visibleThreads.Count} 条标题结果；正在索引对话正文…"
+                ? $"已显示 {renderedCount}/{visibleThreads.Count} 条标题结果；正在索引对话正文…"
                 : _unifiedHistorySyncedWithCodex
-                    ? $"已显示 {renderedThreads.Count}/{visibleThreads.Count} 条聊天；目录已与 Codex 同步。"
-                    : $"已显示 {renderedThreads.Count}/{visibleThreads.Count} 条聊天；Codex 同步暂不可用，当前为本地缓存。";
+                    ? $"已显示 {renderedCount}/{visibleThreads.Count} 条聊天；分类目录已与 Codex 同步。"
+                    : $"已显示 {renderedCount}/{visibleThreads.Count} 条聊天；Codex 同步暂不可用，当前为本地缓存。";
         _toolTip.SetToolTip(
             _statusBox,
             $"聊天目录：{sharedHome}；总计 {allThreads.Count} 条；" +
             (_unifiedHistorySyncedWithCodex ? "已与 Codex 同步。" : "当前为本地缓存。") +
             "可搜索标题与对话正文；系统信息和工具日志已过滤。");
+    }
+
+    private IReadOnlyList<UnifiedHistoryGroup> BuildUnifiedHistoryGroups(
+        IReadOnlyList<UnifiedThreadRecord> visibleThreads,
+        bool searching)
+    {
+        var customSections = new Dictionary<string, CodexThreadSection>(StringComparer.OrdinalIgnoreCase);
+        foreach (var section in _unifiedHistorySections.Where(section => !section.IsPinned))
+        {
+            customSections[section.Id] = section;
+        }
+
+        // A local cache can contain a section before threadSection/list completes. Preserve that
+        // real membership instead of temporarily folding the task back into “未分类”.
+        foreach (var thread in visibleThreads.Where(thread => !thread.Archived))
+        {
+            if (string.IsNullOrWhiteSpace(thread.SectionId) ||
+                thread.SectionId.Equals(CodexAppServerClient.PinnedSectionId, StringComparison.OrdinalIgnoreCase) ||
+                customSections.ContainsKey(thread.SectionId))
+            {
+                continue;
+            }
+
+            customSections[thread.SectionId] = new CodexThreadSection(
+                thread.SectionId,
+                string.IsNullOrWhiteSpace(thread.SectionName) ? "未知目录" : thread.SectionName,
+                string.Empty);
+        }
+
+        var pinnedThreads = visibleThreads
+            .Where(thread => !thread.Archived &&
+                             thread.SectionId.Equals(
+                                 CodexAppServerClient.PinnedSectionId,
+                                 StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        var unclassifiedThreads = visibleThreads
+            .Where(thread => !thread.Archived && string.IsNullOrWhiteSpace(thread.SectionId))
+            .ToList();
+        var archivedThreads = visibleThreads.Where(thread => thread.Archived).ToList();
+
+        var groups = new List<UnifiedHistoryGroup>();
+        if (pinnedThreads.Count > 0)
+        {
+            groups.Add(new UnifiedHistoryGroup(
+                UnifiedHistoryPinnedGroupKey,
+                "已置顶",
+                null,
+                pinnedThreads,
+                _palette.SecondaryAccentColor));
+        }
+
+        foreach (var section in customSections.Values
+                     .OrderBy(section => section.Name, StringComparer.CurrentCultureIgnoreCase))
+        {
+            var sectionThreads = visibleThreads
+                .Where(thread => !thread.Archived &&
+                                 thread.SectionId.Equals(section.Id, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            if (searching && sectionThreads.Count == 0)
+            {
+                continue;
+            }
+            groups.Add(new UnifiedHistoryGroup(
+                "section:" + section.Id,
+                section.Name,
+                section,
+                sectionThreads,
+                _palette.PrimaryColor));
+        }
+
+        if (!searching || unclassifiedThreads.Count > 0)
+        {
+            groups.Add(new UnifiedHistoryGroup(
+                UnifiedHistoryUnclassifiedGroupKey,
+                "未分类",
+                null,
+                unclassifiedThreads,
+                _palette.TertiaryAccentColor));
+        }
+        if (!searching || archivedThreads.Count > 0)
+        {
+            groups.Add(new UnifiedHistoryGroup(
+                UnifiedHistoryArchivedGroupKey,
+                "已归档",
+                null,
+                archivedThreads,
+                _palette.WarningColor,
+                IsArchived: true));
+        }
+        return groups;
+    }
+
+    private int GetUnifiedHistoryGroupVisibleLimit(string groupKey)
+    {
+        return _unifiedHistoryGroupVisibleLimits.TryGetValue(groupKey, out var value)
+            ? Math.Max(UnifiedHistoryPageSize, value)
+            : UnifiedHistoryPageSize;
+    }
+
+    private Control CreateUnifiedHistoryGroupLoadMoreRow(
+        UnifiedHistoryGroup group,
+        int width,
+        int rendered)
+    {
+        var scale = GetUnifiedHistoryDpiScale();
+        var buttonText = $"加载更多（{rendered}/{group.Threads.Count}）";
+        var buttonSize = MeasureUnifiedHistoryButton(
+            buttonText,
+            Font.FontFamily,
+            8.9F,
+            FontStyle.Regular,
+            scale,
+            210,
+            40,
+            10,
+            hasIcon: true);
+        var right = ScaleUnifiedHistoryPixel(20, scale);
+        var top = ScaleUnifiedHistoryPixel(8, scale);
+        var panel = new RoundedPanel
+        {
+            Width = width,
+            Height = top + buttonSize.Height + ScaleUnifiedHistoryPixel(10, scale),
+            Radius = 12,
+            BorderColor = Color.FromArgb(50, group.AccentColor),
+            BackColor = _palette.SurfaceColor,
+            Margin = new Padding(0, 0, 0, 10)
+        };
+        var button = MakeHistoryActionButton(
+            buttonText,
+            Math.Max(ScaleUnifiedHistoryPixel(18, scale), width - right - buttonSize.Width),
+            top,
+            buttonSize.Width,
+            iconText: "＋");
+        button.Height = buttonSize.Height;
+        button.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        button.Click += (_, _) =>
+        {
+            _unifiedHistoryGroupVisibleLimits[group.Key] =
+                GetUnifiedHistoryGroupVisibleLimit(group.Key) + UnifiedHistoryPageSize;
+            RenderCards();
+        };
+        panel.Controls.Add(button);
+        return panel;
+    }
+
+    private Control CreateUnifiedHistoryGroupHeader(
+        UnifiedHistoryGroup group,
+        int width,
+        IReadOnlyList<Control> groupRows,
+        bool searching)
+    {
+        var collapsed = !searching && _collapsedUnifiedHistoryGroups.Contains(group.Key);
+        var hasManagement = group.Section is { IsPinned: false };
+        var toggleText = searching ? "匹配" : collapsed ? "展开" : "收起";
+        var geometry = CalculateUnifiedHistoryGroupHeaderGeometry(
+            width,
+            group.Title,
+            $"{group.Threads.Count} 条",
+            toggleText,
+            hasManagement,
+            Font.FontFamily,
+            GetUnifiedHistoryDpiScale());
+        var panel = new RoundedPanel
+        {
+            Width = width,
+            Height = geometry.Height,
+            Radius = 12,
+            BorderColor = Color.FromArgb(58, group.AccentColor),
+            BackColor = _palette.CardColor,
+            UseGradient = true,
+            GradientColor = UiDesign.Blend(_palette.SurfaceColor, group.AccentColor, 0.03F),
+            AccentColor = group.AccentColor,
+            AccentWidth = 3,
+            Margin = new Padding(0, 2, 0, 8),
+            Cursor = searching ? Cursors.Default : Cursors.Hand,
+            AccessibleName = $"{group.Title}，{group.Threads.Count} 条聊天"
+        };
+
+        var title = new Label
+        {
+            Text = group.Title,
+            Bounds = geometry.Title,
+            Font = new Font(Font.FontFamily, 9.6F, FontStyle.Bold),
+            AutoEllipsis = true,
+            TextAlign = ContentAlignment.MiddleLeft,
+            UseMnemonic = false,
+            Cursor = searching ? Cursors.Default : Cursors.Hand
+        };
+        ThemeStyler.ApplyLabel(title, _palette);
+        panel.Controls.Add(title);
+
+        var count = MakeBadge(
+            $"{group.Threads.Count} 条",
+            geometry.Count.Left,
+            geometry.Count.Top,
+            Color.FromArgb(28, group.AccentColor),
+            group.AccentColor);
+        count.Size = geometry.Count.Size;
+        count.Cursor = searching ? Cursors.Default : Cursors.Hand;
+        panel.Controls.Add(count);
+
+        if (group.Section is { IsPinned: false } section)
+        {
+            var rename = MakeHistoryActionButton(
+                "重命名",
+                geometry.Rename.Left,
+                geometry.Rename.Top,
+                geometry.Rename.Width);
+            rename.Height = geometry.Rename.Height;
+            rename.Click += async (_, _) => await RenameUnifiedHistorySectionAsync(section);
+            panel.Controls.Add(rename);
+
+            var allSectionThreadCount = _unifiedHistoryCache?.Count(thread =>
+                thread.SectionId.Equals(section.Id, StringComparison.OrdinalIgnoreCase)) ?? 0;
+            var delete = MakeHistoryActionButton(
+                "删除目录",
+                geometry.Delete.Left,
+                geometry.Delete.Top,
+                geometry.Delete.Width,
+                danger: true);
+            delete.Height = geometry.Delete.Height;
+            delete.Enabled = allSectionThreadCount == 0;
+            if (!delete.Enabled)
+            {
+                delete.Name = "DisabledUnifiedHistoryAction";
+            }
+            _toolTip.SetToolTip(
+                delete,
+                delete.Enabled
+                    ? "删除这个空目录；不会删除任何聊天记录。"
+                    : $"目录中仍有 {allSectionThreadCount} 条聊天，请先移出后再删除。");
+            delete.Click += async (_, _) => await DeleteUnifiedHistorySectionAsync(section);
+            panel.Controls.Add(delete);
+        }
+
+        var toggle = MakeAccountGroupToggleButton(
+            collapsed,
+            geometry.Toggle.Left,
+            geometry.Toggle.Top);
+        toggle.Size = geometry.Toggle.Size;
+        toggle.Enabled = !searching;
+        if (searching)
+        {
+            toggle.Name = "DisabledUnifiedHistoryAction";
+        }
+        toggle.Text = toggleText;
+        toggle.AccessibleName = searching ? "搜索结果已展开" : collapsed ? "展开目录" : "收起目录";
+        _toolTip.SetToolTip(toggle, searching ? "搜索时自动展开匹配目录" : toggle.AccessibleName);
+        panel.Controls.Add(toggle);
+
+        EventHandler toggleGroup = (_, _) =>
+        {
+            if (searching)
+            {
+                return;
+            }
+
+            var collapseRows = _collapsedUnifiedHistoryGroups.Add(group.Key);
+            if (!collapseRows)
+            {
+                _collapsedUnifiedHistoryGroups.Remove(group.Key);
+            }
+            using (NativeWindowTheme.SuspendRedraw(_cardsPanel))
+            {
+                _cardsPanel.SuspendLayout();
+                try
+                {
+                    foreach (var row in groupRows)
+                    {
+                        row.Visible = !collapseRows;
+                    }
+                    toggle.Text = collapseRows ? "展开" : "收起";
+                    toggle.AccessibleName = collapseRows ? "展开目录" : "收起目录";
+                    _toolTip.SetToolTip(toggle, toggle.AccessibleName);
+                }
+                finally
+                {
+                    _cardsPanel.ResumeLayout(performLayout: false);
+                }
+                _cardsPanel.PerformLayout();
+            }
+        };
+        panel.Click += toggleGroup;
+        title.Click += toggleGroup;
+        count.Click += toggleGroup;
+        toggle.Click += toggleGroup;
+        return panel;
     }
 
     private Control CreateUnifiedHistorySummary(
@@ -4034,10 +4925,22 @@ public partial class Form1 : Form
         int rendered,
         string? contentSearchStatus)
     {
+        var titleText =
+            $"聊天库 · {total} 条 · {_unifiedHistorySections.Count(section => !section.IsPinned)} 个目录";
+        var detailText =
+            $"活动 {total - archived} · 归档 {archived} · 显示 {rendered}/{visible} · " +
+            (_unifiedHistorySyncedWithCodex ? "已与 Codex 同步" : "本地缓存") +
+            (string.IsNullOrWhiteSpace(contentSearchStatus) ? "" : $" · {contentSearchStatus}");
+        var geometry = CalculateUnifiedHistorySummaryGeometry(
+            width,
+            titleText,
+            detailText,
+            Font.FontFamily,
+            GetUnifiedHistoryDpiScale());
         var panel = new RoundedPanel
         {
             Width = width,
-            Height = 82,
+            Height = geometry.Height,
             Radius = 12,
             BorderColor = UiDesign.Blend(_palette.BorderColor, _palette.PrimaryColor, 0.24F),
             BackColor = _palette.SurfaceColor,
@@ -4050,11 +4953,8 @@ public partial class Form1 : Form
 
         var title = new Label
         {
-            Text = $"聊天库 · {total} 条",
-            Left = 20,
-            Top = 6,
-            Width = Math.Max(320, width - (visible > rendered ? 390 : 250)),
-            Height = 32,
+            Text = titleText,
+            Bounds = geometry.Title,
             Font = new Font(Font.FontFamily, 10F, FontStyle.Bold),
             AutoEllipsis = true,
             TextAlign = ContentAlignment.MiddleLeft,
@@ -4065,13 +4965,8 @@ public partial class Form1 : Form
 
         var path = new Label
         {
-            Text = $"活动 {total - archived} · 归档 {archived} · 显示 {rendered}/{visible} · " +
-                   (_unifiedHistorySyncedWithCodex ? "已与 Codex 同步" : "本地缓存") +
-                   (string.IsNullOrWhiteSpace(contentSearchStatus) ? "" : $" · {contentSearchStatus}"),
-            Left = 20,
-            Top = 40,
-            Width = Math.Max(320, width - (visible > rendered ? 390 : 250)),
-            Height = 26,
+            Text = detailText,
+            Bounds = geometry.Detail,
             Font = new Font(Font.FontFamily, 8.5F),
             AutoEllipsis = true,
             TextAlign = ContentAlignment.MiddleLeft,
@@ -4084,18 +4979,23 @@ public partial class Form1 : Form
             "全文索引只读取本地对话，不启动或登录 Codex++。");
         panel.Controls.Add(path);
 
-        if (visible > rendered)
-        {
-            var loadMore = MakeHistoryActionButton("加载更多", width - 314, 21, 160, iconText: "＋");
-            loadMore.Click += (_, _) =>
-            {
-                _unifiedHistoryVisibleLimit += UnifiedHistoryPageSize;
-                RenderCards();
-            };
-            panel.Controls.Add(loadMore);
-        }
+        var create = MakeHistoryActionButton(
+            "新建目录",
+            geometry.Create.Left,
+            geometry.Create.Top,
+            geometry.Create.Width,
+            iconText: "＋");
+        create.Height = geometry.Create.Height;
+        create.Click += async (_, _) => await CreateUnifiedHistorySectionAsync();
+        panel.Controls.Add(create);
 
-        var refresh = MakeHistoryActionButton("刷新", width - 142, 21, 108, iconText: "↻");
+        var refresh = MakeHistoryActionButton(
+            "刷新",
+            geometry.Refresh.Left,
+            geometry.Refresh.Top,
+            geometry.Refresh.Width,
+            iconText: "↻");
+        refresh.Height = geometry.Refresh.Height;
         refresh.Click += async (_, _) =>
         {
             InvalidateUnifiedHistoryCache(clearCachedData: false);
@@ -4110,13 +5010,28 @@ public partial class Form1 : Form
         int width,
         string? matchSnippet = null)
     {
-        const int rowHeight = 104;
-        const int actionsWidth = 450;
-        var contentWidth = Math.Max(320, width - actionsWidth - 44);
+        var updated = thread.UpdatedAt == DateTimeOffset.MinValue
+            ? "时间未知"
+            : thread.UpdatedAt.ToString("yyyy-MM-dd HH:mm", CultureInfo.CurrentCulture);
+        var project = string.IsNullOrWhiteSpace(thread.WorkingDirectory)
+            ? "项目未知"
+            : thread.WorkingDirectory;
+        var model = string.Join(" / ", new[] { thread.Provider, thread.Model }
+            .Where(value => !string.IsNullOrWhiteSpace(value)));
+        var metaText = string.IsNullOrWhiteSpace(matchSnippet)
+            ? $"{updated}    {project}{(string.IsNullOrWhiteSpace(model) ? "" : "    " + model)}"
+            : $"正文匹配：{matchSnippet}";
+        var geometry = CalculateUnifiedHistoryRowGeometry(
+            width,
+            thread.Title,
+            metaText,
+            thread.Archived,
+            Font.FontFamily,
+            GetUnifiedHistoryDpiScale());
         var row = new RoundedPanel
         {
             Width = width,
-            Height = rowHeight,
+            Height = geometry.Height,
             Radius = 14,
             BorderColor = thread.Archived ? _palette.WarningColor : _palette.BorderColor,
             BackColor = _palette.CardColor,
@@ -4140,10 +5055,7 @@ public partial class Form1 : Form
         var title = new Label
         {
             Text = thread.Title,
-            Left = 20,
-            Top = 14,
-            Width = contentWidth,
-            Height = 34,
+            Bounds = geometry.Title,
             Font = new Font(Font.FontFamily, 9.8F, FontStyle.Bold),
             AutoEllipsis = true,
             UseMnemonic = false,
@@ -4154,23 +5066,10 @@ public partial class Form1 : Form
         _toolTip.SetToolTip(title, thread.Title);
         row.Controls.Add(title);
 
-        var updated = thread.UpdatedAt == DateTimeOffset.MinValue
-            ? "时间未知"
-            : thread.UpdatedAt.ToString("yyyy-MM-dd HH:mm", CultureInfo.CurrentCulture);
-        var project = string.IsNullOrWhiteSpace(thread.WorkingDirectory)
-            ? "项目未知"
-            : thread.WorkingDirectory;
-        var model = string.Join(" / ", new[] { thread.Provider, thread.Model }
-            .Where(value => !string.IsNullOrWhiteSpace(value)));
         var meta = new Label
         {
-            Text = string.IsNullOrWhiteSpace(matchSnippet)
-                ? $"{updated}    {project}{(string.IsNullOrWhiteSpace(model) ? "" : "    " + model)}"
-                : $"正文匹配：{matchSnippet}",
-            Left = 20,
-            Top = 58,
-            Width = contentWidth,
-            Height = 28,
+            Text = metaText,
+            Bounds = geometry.Meta,
             Font = new Font(Font.FontFamily, 8.3F),
             AutoEllipsis = true,
             UseMnemonic = false,
@@ -4187,40 +5086,59 @@ public partial class Form1 : Form
 
         var badge = MakeBadge(
             thread.Archived ? "已归档" : "活动",
-            width - 420,
-            14,
+            geometry.Status.Left,
+            geometry.Status.Top,
             thread.Archived ? Color.FromArgb(40, _palette.WarningColor) : Color.FromArgb(44, _palette.SuccessColor),
             thread.Archived ? _palette.WarningColor : _palette.SuccessColor);
-        badge.Width = 132;
-        badge.Height = 34;
+        badge.Size = geometry.Status.Size;
         badge.Cursor = Cursors.Hand;
         row.Controls.Add(badge);
 
-        var openHint = new Label
+        var classify = MakeHistoryActionButton(
+            thread.Archived ? "先取消归档" : "分类到…",
+            geometry.Classify.Left,
+            geometry.Classify.Top,
+            geometry.Classify.Width,
+            iconText: "▾");
+        classify.Height = geometry.Classify.Height;
+        classify.Enabled = !thread.Archived;
+        if (thread.Archived)
         {
-            Text = "阅读  ›",
-            Left = width - 420,
-            Top = 58,
-            Width = 140,
-            Height = 28,
-            Font = new Font(Font.FontFamily, 8F, FontStyle.Bold),
-            TextAlign = ContentAlignment.MiddleCenter,
-            Cursor = Cursors.Hand,
-            UseMnemonic = false
-        };
-        ThemeStyler.ApplyLabel(openHint, _palette);
-        openHint.ForeColor = _palette.PrimaryColor;
-        row.Controls.Add(openHint);
+            classify.Name = "DisabledUnifiedHistoryAction";
+            _toolTip.SetToolTip(classify, "已归档聊天不能分类；请先点击“取消归档”。");
+            _toolTip.SetToolTip(badge, "已归档聊天不能分类；请先点击“取消归档”。");
+        }
+        else
+        {
+            var classificationMenu = CreateUnifiedHistoryClassificationMenu(thread);
+            classify.Click += (_, _) => classificationMenu.Show(
+                classify,
+                new Point(0, classify.Height + 2));
+            classify.Disposed += (_, _) => classificationMenu.Dispose();
+            _toolTip.SetToolTip(
+                classify,
+                thread.SectionId.Equals(CodexAppServerClient.PinnedSectionId, StringComparison.OrdinalIgnoreCase)
+                    ? "移动到自定义目录会同时取消置顶。"
+                    : "把这条聊天移动到自定义目录或未分类。");
+        }
+        row.Controls.Add(classify);
 
         var archive = MakeHistoryActionButton(
             thread.Archived ? "取消归档" : "归档",
-            width - 260,
-            31,
-            112);
+            geometry.Archive.Left,
+            geometry.Archive.Top,
+            geometry.Archive.Width);
+        archive.Height = geometry.Archive.Height;
         archive.Click += async (_, _) => await ToggleUnifiedThreadArchiveAsync(thread);
         row.Controls.Add(archive);
 
-        var delete = MakeHistoryActionButton("删除", width - 136, 31, 104, danger: true);
+        var delete = MakeHistoryActionButton(
+            "删除",
+            geometry.Delete.Left,
+            geometry.Delete.Top,
+            geometry.Delete.Width,
+            danger: true);
+        delete.Height = geometry.Delete.Height;
         delete.Click += async (_, _) => await DeleteUnifiedThreadAsync(thread);
         row.Controls.Add(delete);
 
@@ -4229,8 +5147,72 @@ public partial class Form1 : Form
         title.Click += openThread;
         meta.Click += openThread;
         badge.Click += openThread;
-        openHint.Click += openThread;
         return row;
+    }
+
+    private ContextMenuStrip CreateUnifiedHistoryClassificationMenu(UnifiedThreadRecord thread)
+    {
+        var menuBack = _palette.SurfaceColor;
+        var menu = new ContextMenuStrip
+        {
+            AutoSize = true,
+            ShowImageMargin = false,
+            ShowCheckMargin = false,
+            BackColor = menuBack,
+            ForeColor = _palette.TextColor,
+            Font = new Font(Font.FontFamily, 9F),
+            Renderer = new ThemePickerMenuRenderer(
+                menuBack,
+                UiDesign.Blend(menuBack, _palette.PrimaryColor, 0.035F),
+                _palette.TextColor,
+                UiDesign.Blend(menuBack, _palette.PrimaryColor, 0.16F),
+                _palette.BorderColor,
+                _palette.AccentColor)
+        };
+
+        AddTarget("未分类", null);
+        menu.Items.Add(new ToolStripSeparator());
+        var sections = _unifiedHistorySections
+            .Where(section => !section.IsPinned)
+            .OrderBy(section => section.Name, StringComparer.CurrentCultureIgnoreCase)
+            .ToList();
+        if (sections.Count == 0)
+        {
+            menu.Items.Add(new ToolStripMenuItem("尚未创建自定义目录") { Enabled = false });
+        }
+        else
+        {
+            foreach (var section in sections)
+            {
+                AddTarget(section.Name, section.Id);
+            }
+        }
+
+        foreach (ToolStripItem item in menu.Items)
+        {
+            item.BackColor = menuBack;
+            item.ForeColor = _palette.TextColor;
+            item.Padding = new Padding(10, 2, 10, 2);
+        }
+        return menu;
+
+        void AddTarget(string label, string? sectionId)
+        {
+            var isCurrent = string.IsNullOrWhiteSpace(sectionId)
+                ? string.IsNullOrWhiteSpace(thread.SectionId)
+                : thread.SectionId.Equals(sectionId, StringComparison.OrdinalIgnoreCase);
+            var item = new ToolStripMenuItem((isCurrent ? "✓  " : "    ") + label)
+            {
+                Enabled = !isCurrent,
+                AccessibleName = label + (isCurrent ? "，当前目录" : string.Empty),
+                Tag = sectionId ?? string.Empty
+            };
+            item.Click += async (_, _) => await MoveUnifiedThreadToSectionAsync(
+                thread,
+                sectionId,
+                label);
+            menu.Items.Add(item);
+        }
     }
 
     private Control CreateUnifiedHistoryEmptyState(int width, string query)
@@ -4343,27 +5325,171 @@ public partial class Form1 : Form
         try
         {
             _openingUnifiedThread = true;
-            _statusBox.Text = $"正在读取本地聊天简版：{thread.Title}";
+            _statusBox.Text = $"正在读取完整本地聊天：{thread.Title}";
             var sharedHome = CodexCliService.GetDefaultCodexHome();
-            var transcript = await Task.Run(() => _threadTranscript.Load(sharedHome, thread));
+            var transcript = await Task.Run(() => _threadTranscript.LoadComplete(sharedHome, thread));
             if (_formClosed || IsDisposed)
             {
                 return;
             }
 
             using var dialog = new ThreadPreviewDialog(thread, transcript, _palette);
-            _statusBox.Text = $"正在阅读本地聊天简版：{thread.Title}";
+            _statusBox.Text = $"正在阅读完整本地聊天：{thread.Title}";
             dialog.ShowDialog(this);
-            _statusBox.Text = $"已关闭本地聊天简版：{thread.Title}；未启动或登录 Codex++。";
+            _statusBox.Text = $"已关闭完整本地聊天：{thread.Title}；未启动或登录 Codex++。";
         }
         catch (Exception ex)
         {
-            ShowError($"无法读取本地聊天简版：{ex.Message}");
+            ShowError($"无法读取完整本地聊天：{ex.Message}");
         }
         finally
         {
             _openingUnifiedThread = false;
         }
+    }
+
+    private async Task CreateUnifiedHistorySectionAsync()
+    {
+        using var dialog = new ThreadSectionNameDialog(
+            "新建聊天目录",
+            "创建目录",
+            initialName: string.Empty,
+            _unifiedHistorySections.Select(section => section.Name)
+                .Concat(UnifiedHistoryReservedSectionNames),
+            _palette);
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        var sharedHome = CodexCliService.GetDefaultCodexHome();
+        await RunBusyAsync(async () =>
+        {
+            var section = await _codex.CreateThreadSectionAsync(dialog.SectionName, sharedHome);
+            _collapsedUnifiedHistoryGroups.Remove("section:" + section.Id);
+            ResetUnifiedHistoryGroupPagination();
+            InvalidateUnifiedHistoryCache(clearCachedData: false);
+            await RefreshUnifiedHistoryAsync(force: true, _workspaceLoadGeneration);
+            _statusBox.Text =
+                $"已创建聊天目录：{section.Name}。Account Manager 已刷新；" +
+                "Codex 左侧栏若未立即变化，切换页面或重新打开 Codex 即可。";
+        });
+    }
+
+    private async Task RenameUnifiedHistorySectionAsync(CodexThreadSection section)
+    {
+        if (section.IsPinned)
+        {
+            return;
+        }
+
+        using var dialog = new ThreadSectionNameDialog(
+            "重命名聊天目录",
+            "保存名称",
+            section.Name,
+            _unifiedHistorySections.Select(candidate => candidate.Name)
+                .Concat(UnifiedHistoryReservedSectionNames),
+            _palette);
+        if (dialog.ShowDialog(this) != DialogResult.OK ||
+            dialog.SectionName.Equals(section.Name, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        var sharedHome = CodexCliService.GetDefaultCodexHome();
+        await RunBusyAsync(async () =>
+        {
+            var renamed = await _codex.RenameThreadSectionAsync(
+                section.Id,
+                dialog.SectionName,
+                sharedHome);
+            InvalidateUnifiedHistoryCache(clearCachedData: false);
+            await RefreshUnifiedHistoryAsync(force: true, _workspaceLoadGeneration);
+            _statusBox.Text =
+                $"已将目录“{section.Name}”重命名为“{renamed.Name}”。Account Manager 已刷新；" +
+                "Codex 左侧栏若未立即变化，切换页面或重新打开 Codex 即可。";
+        });
+    }
+
+    private async Task DeleteUnifiedHistorySectionAsync(CodexThreadSection section)
+    {
+        if (section.IsPinned)
+        {
+            return;
+        }
+
+        var threadCount = _unifiedHistoryCache?.Count(thread =>
+            thread.SectionId.Equals(section.Id, StringComparison.OrdinalIgnoreCase)) ?? 0;
+        if (threadCount > 0)
+        {
+            MessageBox.Show(
+                this,
+                $"目录“{section.Name}”中仍有 {threadCount} 条聊天。请先把这些聊天移到其它目录或未分类，再删除目录。",
+                "目录不是空的",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        var confirm = MessageBox.Show(
+            this,
+            $"确定删除空目录“{section.Name}”吗？\n\n不会删除任何聊天记录。",
+            "删除聊天目录",
+            MessageBoxButtons.OKCancel,
+            MessageBoxIcon.Warning,
+            MessageBoxDefaultButton.Button2);
+        if (confirm != DialogResult.OK)
+        {
+            return;
+        }
+
+        var sharedHome = CodexCliService.GetDefaultCodexHome();
+        await RunBusyAsync(async () =>
+        {
+            await _codex.DeleteThreadSectionAsync(section.Id, sharedHome);
+            _collapsedUnifiedHistoryGroups.Remove("section:" + section.Id);
+            _unifiedHistoryGroupVisibleLimits.Remove("section:" + section.Id);
+            InvalidateUnifiedHistoryCache(clearCachedData: false);
+            await RefreshUnifiedHistoryAsync(force: true, _workspaceLoadGeneration);
+            _statusBox.Text =
+                $"已删除空目录：{section.Name}。Account Manager 已刷新；" +
+                "Codex 左侧栏若未立即变化，切换页面或重新打开 Codex 即可。";
+        });
+    }
+
+    private async Task MoveUnifiedThreadToSectionAsync(
+        UnifiedThreadRecord thread,
+        string? sectionId,
+        string targetName)
+    {
+        if (thread.Archived)
+        {
+            MessageBox.Show(
+                this,
+                "已归档聊天不能分类，请先点击“取消归档”。",
+                "无法分类",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+        if ((string.IsNullOrWhiteSpace(sectionId) && string.IsNullOrWhiteSpace(thread.SectionId)) ||
+            (!string.IsNullOrWhiteSpace(sectionId) &&
+             thread.SectionId.Equals(sectionId, StringComparison.OrdinalIgnoreCase)))
+        {
+            return;
+        }
+
+        var sharedHome = CodexCliService.GetDefaultCodexHome();
+        await RunBusyAsync(async () =>
+        {
+            await _codex.MoveThreadToSectionAsync(thread.Id, sectionId, sharedHome);
+            ResetUnifiedHistoryGroupPagination();
+            InvalidateUnifiedHistoryCache(clearCachedData: false);
+            await RefreshUnifiedHistoryAsync(force: true, _workspaceLoadGeneration);
+            _statusBox.Text =
+                $"已将“{thread.Title}”移动到“{targetName}”。Account Manager 已刷新；" +
+                "Codex 左侧栏若未立即变化，切换页面或重新打开 Codex 即可。";
+        });
     }
 
     private async Task ToggleUnifiedThreadArchiveAsync(UnifiedThreadRecord thread)
@@ -4706,6 +5832,209 @@ public partial class Form1 : Form
                 {
                     throw new InvalidOperationException(
                         $"Quota detail header clips at {width}px/{scale:P0} DPI: {header}.");
+                }
+            }
+        }
+
+        ValidateUnifiedHistoryResponsiveLayouts();
+    }
+
+    internal static void ValidateUnifiedHistoryResponsiveLayouts()
+    {
+        var fontFamily = SystemFonts.DefaultFont.FontFamily;
+        const string summaryTitle = "聊天库 · 10000 条 · 36 个目录";
+        const string summaryDetail =
+            "活动 9990 · 归档 10 · 显示 288/10000 · 已与 Codex 同步 · 标题与正文搜索已就绪";
+        const string threadTitle = "一个用于验证窄窗口和高 DPI 分类按钮布局的聊天标题";
+        const string threadMeta =
+            "2026-08-24 12:34    C:\\very-long-workspace\\project    gpt-5.6-sol";
+        foreach (var scale in new[] { 1F, 1.5F, 2F })
+        {
+            foreach (var logicalWidth in new[] { AccountRowMinWidth, 720, 920, 1_280 })
+            {
+                var width = ScaleUnifiedHistoryPixel(logicalWidth, scale);
+                var summary = CalculateUnifiedHistorySummaryGeometry(
+                    width,
+                    summaryTitle,
+                    summaryDetail,
+                    fontFamily,
+                    scale);
+                AssertContained(summary.Height, summary.Title, "summary-title");
+                AssertContained(summary.Height, summary.Detail, "summary-detail");
+                AssertContained(summary.Height, summary.Create, "summary-create");
+                AssertContained(summary.Height, summary.Refresh, "summary-refresh");
+                AssertNoOverlap(summary.Create, summary.Refresh, "summary-actions");
+                AssertNoOverlap(summary.Title, summary.Create, "summary-title-create");
+                AssertNoOverlap(summary.Title, summary.Refresh, "summary-title-refresh");
+                AssertNoOverlap(summary.Detail, summary.Create, "summary-detail-create");
+                AssertNoOverlap(summary.Detail, summary.Refresh, "summary-detail-refresh");
+                AssertButtonFits(summary.Create, "新建目录", 8.9F, FontStyle.Regular, 10, true, "summary-create");
+                AssertButtonFits(summary.Refresh, "刷新", 8.9F, FontStyle.Regular, 10, true, "summary-refresh");
+
+                var customHeader = CalculateUnifiedHistoryGroupHeaderGeometry(
+                    width,
+                    "兼容性与界面修复",
+                    "100000 条",
+                    "收起",
+                    hasManagement: true,
+                    fontFamily,
+                    scale);
+                AssertContained(customHeader.Height, customHeader.Title, "header-title");
+                AssertContained(customHeader.Height, customHeader.Count, "header-count");
+                AssertContained(customHeader.Height, customHeader.Rename, "header-rename");
+                AssertContained(customHeader.Height, customHeader.Delete, "header-delete");
+                AssertContained(customHeader.Height, customHeader.Toggle, "header-toggle");
+                AssertNoOverlap(customHeader.Title, customHeader.Count, "header-title-count");
+                AssertNoOverlap(customHeader.Count, customHeader.Rename, "header-count-rename");
+                AssertNoOverlap(customHeader.Count, customHeader.Delete, "header-count-delete");
+                AssertNoOverlap(customHeader.Rename, customHeader.Delete, "header-actions");
+                AssertNoOverlap(customHeader.Delete, customHeader.Toggle, "header-delete-toggle");
+                AssertButtonFits(customHeader.Rename, "重命名", 8.9F, FontStyle.Regular, 10, false, "header-rename");
+                AssertButtonFits(customHeader.Delete, "删除目录", 8.9F, FontStyle.Regular, 10, false, "header-delete");
+                AssertButtonFits(customHeader.Toggle, "收起", 8.5F, FontStyle.Bold, 12, false, "header-toggle");
+
+                foreach (var archived in new[] { false, true })
+                {
+                    var row = CalculateUnifiedHistoryRowGeometry(
+                        width,
+                        threadTitle,
+                        threadMeta,
+                        archived,
+                        fontFamily,
+                        scale);
+                    AssertContained(row.Height, row.Title, "row-title");
+                    AssertContained(row.Height, row.Meta, "row-meta");
+                    AssertContained(row.Height, row.Status, "row-status");
+                    AssertContained(row.Height, row.Classify, "row-classify");
+                    AssertContained(row.Height, row.Archive, "row-archive");
+                    AssertContained(row.Height, row.Delete, "row-delete");
+                    AssertNoOverlap(row.Title, row.Status, "row-title-status");
+                    AssertNoOverlap(row.Meta, row.Classify, "row-meta-classify");
+                    AssertNoOverlap(row.Meta, row.Archive, "row-meta-archive");
+                    AssertNoOverlap(row.Meta, row.Delete, "row-meta-delete");
+                    AssertNoOverlap(row.Classify, row.Archive, "row-classify-archive");
+                    AssertNoOverlap(row.Classify, row.Delete, "row-classify-delete");
+                    AssertNoOverlap(row.Archive, row.Delete, "row-archive-delete");
+                    AssertButtonFits(
+                        row.Classify,
+                        archived ? "先取消归档" : "分类到…",
+                        8.9F,
+                        FontStyle.Regular,
+                        10,
+                        true,
+                        "row-classify");
+                    AssertButtonFits(
+                        row.Archive,
+                        archived ? "取消归档" : "归档",
+                        8.9F,
+                        FontStyle.Regular,
+                        10,
+                        false,
+                        "row-archive");
+                    AssertButtonFits(row.Delete, "删除", 8.9F, FontStyle.Regular, 10, false, "row-delete");
+                }
+
+                var loadMoreText = "加载更多（9992/10000）";
+                var loadMoreSize = MeasureUnifiedHistoryButton(
+                    loadMoreText,
+                    fontFamily,
+                    8.9F,
+                    FontStyle.Regular,
+                    scale,
+                    210,
+                    40,
+                    10,
+                    hasIcon: true);
+                var loadMoreBounds = new Rectangle(
+                    ScaleUnifiedHistoryPixel(18, scale),
+                    ScaleUnifiedHistoryPixel(8, scale),
+                    loadMoreSize.Width,
+                    loadMoreSize.Height);
+                if (loadMoreBounds.Right > width - ScaleUnifiedHistoryPixel(18, scale))
+                {
+                    throw new InvalidOperationException(
+                        $"Unified-history load-more button exceeds {logicalWidth}px/{scale:P0} DPI.");
+                }
+                AssertButtonFits(
+                    loadMoreBounds,
+                    loadMoreText,
+                    8.9F,
+                    FontStyle.Regular,
+                    10,
+                    true,
+                    "load-more");
+
+                if (logicalWidth == AccountRowMinWidth && (!summary.Stacked ||
+                                                           !CalculateUnifiedHistoryRowGeometry(
+                                                               width,
+                                                               threadTitle,
+                                                               threadMeta,
+                                                               archived: false,
+                                                               fontFamily,
+                                                               scale).Stacked))
+                {
+                    throw new InvalidOperationException(
+                        $"Unified-history narrow layout must stack at {logicalWidth}px/{scale:P0} DPI.");
+                }
+                if (logicalWidth == 1_280 && (summary.Stacked ||
+                                              CalculateUnifiedHistoryRowGeometry(
+                                                  width,
+                                                  threadTitle,
+                                                  threadMeta,
+                                                  archived: false,
+                                                  fontFamily,
+                                                  scale).Stacked))
+                {
+                    throw new InvalidOperationException(
+                        $"Unified-history wide layout must stay horizontal at {logicalWidth}px/{scale:P0} DPI.");
+                }
+
+                void AssertButtonFits(
+                    Rectangle bounds,
+                    string text,
+                    float fontSize,
+                    FontStyle style,
+                    int logicalPadding,
+                    bool hasIcon,
+                    string name)
+                {
+                    var measured = MeasureUnifiedHistoryText(
+                        text,
+                        fontFamily,
+                        fontSize,
+                        style,
+                        scale);
+                    var iconSlot = hasIcon ? ScaleUnifiedHistoryPixel(20 + 8, scale) : 0;
+                    var availableWidth = bounds.Width -
+                                         (ScaleUnifiedHistoryPixel(logicalPadding, scale) * 2) -
+                                         iconSlot;
+                    var availableHeight = bounds.Height - ScaleUnifiedHistoryPixel(4, scale);
+                    if (measured.Width > availableWidth || measured.Height > availableHeight)
+                    {
+                        throw new InvalidOperationException(
+                            $"Unified-history {name} text clips at {logicalWidth}px/{scale:P0} DPI: " +
+                            $"text={measured}, available={availableWidth}x{availableHeight}.");
+                    }
+                }
+
+                void AssertContained(int height, Rectangle bounds, string name)
+                {
+                    if (bounds.IsEmpty ||
+                        !new Rectangle(0, 0, width, height).Contains(bounds))
+                    {
+                        throw new InvalidOperationException(
+                            $"Unified-history {name} escapes {logicalWidth}px/{scale:P0} DPI: {bounds}.");
+                    }
+                }
+
+                void AssertNoOverlap(Rectangle left, Rectangle right, string name)
+                {
+                    if (!left.IsEmpty && !right.IsEmpty && left.IntersectsWith(right))
+                    {
+                        throw new InvalidOperationException(
+                            $"Unified-history {name} overlaps at {logicalWidth}px/{scale:P0} DPI: " +
+                            $"{left} / {right}.");
+                    }
                 }
             }
         }
@@ -7357,9 +8686,39 @@ public partial class Form1 : Form
     {
         var normalizedCount = Math.Max(0, count);
         var actionText = $"立即重置（{normalizedCount} 次）";
-        return normalizedCount > 0 && expiresAtUtc.HasValue
-            ? $"{actionText}{Environment.NewLine}到期 {expiresAtUtc.Value.ToLocalTime():MM-dd HH:mm}"
-            : actionText;
+        if (normalizedCount == 0)
+        {
+            return actionText;
+        }
+
+        var expiryText = expiresAtUtc.HasValue
+            ? $"到期时间：{expiresAtUtc.Value.ToLocalTime():MM-dd HH:mm}"
+            : "到期时间：官方未提供";
+        return $"{actionText}{Environment.NewLine}{expiryText}";
+    }
+
+    private static int CalculateQuotaResetActionButtonHeight(
+        bool compact,
+        FontFamily fontFamily,
+        float dpiScale)
+    {
+        var scale = Math.Max(1F, dpiScale);
+        var fontSize = compact ? 8.9F : 9.4F;
+        var lineOne = MeasureUnifiedHistoryText(
+            "立即重置（99 次）",
+            fontFamily,
+            fontSize,
+            FontStyle.Bold,
+            scale);
+        var lineTwo = MeasureUnifiedHistoryText(
+            "到期时间：官方未提供",
+            fontFamily,
+            fontSize,
+            FontStyle.Bold,
+            scale);
+        return Math.Max(
+            compact ? 42 : 54,
+            lineOne.Height + lineTwo.Height + ScaleUnifiedHistoryPixel(8, scale));
     }
 
     private string GetResetCreditToolTip(AccountRecord account)
@@ -7371,10 +8730,22 @@ public partial class Form1 : Form
 
         return state.Status switch
         {
+            ResetCreditStatus.Known when state.Count > 0 && state.ApplicableCount == 0 =>
+                $"当前有 {state.Count} 次重置卡，但官方额度窗口尚未达到可重置条件；按钮已禁用。" +
+                Environment.NewLine +
+                (state.ExpiresAtUtc is { } unavailableExpiry
+                    ? $"最近一张将于 {unavailableExpiry.ToLocalTime():yyyy-MM-dd HH:mm} 到期。"
+                    : "到期时间：官方未提供。"),
+            ResetCreditStatus.Known when state.Count > 0 && !state.ApplicableCount.HasValue =>
+                $"当前有 {state.Count} 次重置卡，但官方未提供当前适用次数；为避免误触发，按钮已禁用。" +
+                Environment.NewLine +
+                (state.ExpiresAtUtc is { } unknownExpiry
+                    ? $"最近一张将于 {unknownExpiry.ToLocalTime():yyyy-MM-dd HH:mm} 到期。"
+                    : "到期时间：官方未提供。"),
             ResetCreditStatus.Known when state.Count > 0 =>
                 state.ExpiresAtUtc is { } expiresAt
                     ? $"点击后确认并使用一次官方 Codex 用量重置；最近一张可用重置卡将于 {expiresAt.ToLocalTime():yyyy-MM-dd HH:mm} 到期。"
-                    : "点击后确认并使用一次官方 Codex 用量重置；官方未提供可用重置卡的到期时间。",
+                    : "点击后确认并使用一次官方 Codex 用量重置；到期时间：官方未提供。",
             ResetCreditStatus.Known => "官方明确返回可重置 0 次，不能执行重置。",
             ResetCreditStatus.Unavailable =>
                 "官方本次没有提供 rateLimitResetCredits；这不等同于可重置 0 次。",
@@ -7389,7 +8760,8 @@ public partial class Form1 : Form
     {
         return _resetCreditState.TryGetValue(QuotaAccountIdentity.CreateKey(account), out var state) &&
                state.Status == ResetCreditStatus.Known &&
-               state.Count > 0;
+               state.Count > 0 &&
+               state.ApplicableCount is > 0;
     }
 
     private void SetResetCreditState(
@@ -7397,6 +8769,7 @@ public partial class Form1 : Form
         ResetCreditStatus status,
         long count = 0,
         DateTimeOffset? expiresAtUtc = null,
+        long? applicableCount = null,
         string? error = null)
     {
         _resetCreditState[QuotaAccountIdentity.CreateKey(account)] = new ResetCreditViewState(
@@ -7404,6 +8777,7 @@ public partial class Form1 : Form
             Math.Max(0, count),
             DateTimeOffset.UtcNow,
             expiresAtUtc?.ToUniversalTime(),
+            applicableCount.HasValue ? Math.Max(0, applicableCount.Value) : null,
             error);
     }
 
@@ -7456,7 +8830,8 @@ public partial class Form1 : Form
             account,
             info.IsAvailable ? ResetCreditStatus.Known : ResetCreditStatus.Unavailable,
             info.AvailableCount ?? 0,
-            info.AvailableCreditExpiresAtUtc);
+            info.AvailableCreditExpiresAtUtc,
+            info.EffectiveApplicableAvailableCount);
         try
         {
             // Keep the latest official response per credential directory so a restart does
@@ -8865,9 +10240,17 @@ public partial class Form1 : Form
         var infoWidth = compact ? width - 36 : Math.Max(360, width - infoLeft - 18);
         // The quota controls use balanced rows so long Chinese labels stay readable.
         var stackedActions = !account.IsCompatibleApi;
-        var infoBlockHeight = account.IsCompatibleApi
+        var baseControlHeight = compact ? 42 : 54;
+        var controlHeight = account.IsCompatibleApi
+            ? baseControlHeight
+            : CalculateQuotaResetActionButtonHeight(
+                compact,
+                Font.FontFamily,
+                Math.Max(1F, DeviceDpi / 96F));
+        var infoBlockHeight = (account.IsCompatibleApi
             ? compact ? 224 : 278
-            : compact ? 318 : Math.Clamp(gaugeSize + 20, 410, 440);
+            : compact ? 318 : Math.Clamp(gaugeSize + 20, 410, 440)) +
+            (account.IsCompatibleApi ? 0 : (controlHeight - baseControlHeight) * 2);
         var infoTop = compact
             ? externalStatus.Bottom + 12
             : gauge.Top + Math.Max(0, (gauge.Height - infoBlockHeight) / 2);
@@ -8984,7 +10367,6 @@ public partial class Form1 : Form
             var actionGap = compact ? 8 : 12;
             var horizontalInset = compact ? 14 : 22;
             var rowTop = usageMetricTop + usageMetricHeight + (compact ? 12 : 16);
-            var controlHeight = compact ? 42 : 54;
             var usableRowWidth = infoWidth - (horizontalInset * 2) - actionGap;
             var quotaWidth = stackedActions
                 ? usableRowWidth / 2
@@ -10700,7 +12082,11 @@ public partial class Form1 : Form
         static int ScalePixels(int value, float factor) =>
             (int)Math.Ceiling(value * factor);
 
-        using var font = new Font(SystemFonts.DefaultFont.FontFamily, 8F * scale);
+        using var font = new Font(
+            SystemFonts.DefaultFont.FontFamily,
+            8F * (96F / 72F) * scale,
+            FontStyle.Regular,
+            GraphicsUnit.Pixel);
         var textSize = MeasureQuotaResetText(font);
         var lineHeight = Math.Max(
             ScalePixels(34, scale),
@@ -10717,41 +12103,53 @@ public partial class Form1 : Form
         var wideLabelWidth = ScalePixels(280, scale);
         var stackedLabelWidth = ScalePixels(AccountRowMinWidth - 36, scale);
         var horizontalInset = ScalePixels(8, scale);
-        using var resetActionFont = new Font(
-            SystemFonts.DefaultFont.FontFamily,
-            9.4F * scale,
-            FontStyle.Bold);
-        var resetActionLines = new[] { "立即重置（99 次）", "到期 12-31 23:59" };
-        var resetActionLineSizes = resetActionLines
-            .Select(line => TextRenderer.MeasureText(
+        var resetActionLines = new[] { "立即重置（99 次）", "到期时间：官方未提供" };
+        var compactResetActionLineSizes = resetActionLines
+            .Select(line => MeasureUnifiedHistoryText(
                 line,
-                resetActionFont,
-                Size.Empty,
-                TextFormatFlags.SingleLine |
-                TextFormatFlags.NoPadding |
-                TextFormatFlags.NoPrefix))
+                SystemFonts.DefaultFont.FontFamily,
+                8.9F,
+                FontStyle.Bold,
+                scale))
             .ToArray();
-        var resetActionTextWidth = resetActionLineSizes.Max(size => size.Width);
-        var resetActionTextHeight = resetActionLineSizes.Sum(size => size.Height);
-        // At the narrowest supported detail geometry the second-row reset button owns
-        // half of a 304px action row. WinForms DPI autoscaling grows that 152x42 box.
+        var wideResetActionLineSizes = resetActionLines
+            .Select(line => MeasureUnifiedHistoryText(
+                line,
+                SystemFonts.DefaultFont.FontFamily,
+                9.4F,
+                FontStyle.Bold,
+                scale))
+            .ToArray();
+        var compactResetActionTextWidth = compactResetActionLineSizes.Max(size => size.Width);
+        var compactResetActionTextHeight = compactResetActionLineSizes.Sum(size => size.Height);
+        var wideResetActionTextHeight = wideResetActionLineSizes.Sum(size => size.Height);
+        // The detail card is created after form-level autoscaling, so its physical button
+        // height must be assigned explicitly from the rendered two-line text measurement.
         var resetActionWidth = ScalePixels(152, scale);
-        var resetActionHeight = ScalePixels(42, scale);
+        var compactResetActionHeight = CalculateQuotaResetActionButtonHeight(
+            compact: true,
+            SystemFonts.DefaultFont.FontFamily,
+            scale);
+        var wideResetActionHeight = CalculateQuotaResetActionButtonHeight(
+            compact: false,
+            SystemFonts.DefaultFont.FontFamily,
+            scale);
 
         if (textSize.Width + horizontalInset > Math.Min(wideLabelWidth, stackedLabelWidth) ||
             lineHeight < textSize.Height + ScalePixels(12, scale) ||
             secondLineTop < resetAreaTop + lineHeight ||
             secondLineBottom + actionGap > actionTop ||
             actionTop + actionHeight + bottomPadding > rowHeight ||
-            resetActionTextWidth + ScalePixels(8, scale) > resetActionWidth ||
-            resetActionTextHeight + ScalePixels(4, scale) > resetActionHeight)
+            compactResetActionTextWidth + ScalePixels(8, scale) > resetActionWidth ||
+            compactResetActionTextHeight + ScalePixels(4, scale) > compactResetActionHeight ||
+            wideResetActionTextHeight + ScalePixels(4, scale) > wideResetActionHeight)
         {
             throw new InvalidOperationException(
                 $"Quota reset layout clips at {scale * 100F:0}% DPI: " +
                 $"text={textSize}, line={lineHeight}, wide={wideLabelWidth}, " +
                 $"stacked={stackedLabelWidth}, row={rowHeight}, " +
-                $"resetText={resetActionTextWidth}x{resetActionTextHeight}, " +
-                $"resetButton={resetActionWidth}x{resetActionHeight}.");
+                $"resetText={compactResetActionTextWidth}x{compactResetActionTextHeight}, " +
+                $"resetButton={resetActionWidth}x{compactResetActionHeight}/{wideResetActionHeight}.");
         }
     }
 
@@ -11535,10 +12933,16 @@ public partial class Form1 : Form
         var now = new DateTimeOffset(2026, 7, 19, 5, 32, 0, TimeSpan.Zero);
         var resetCreditExpiry = now.AddDays(14);
         var expectedResetAction =
-            $"立即重置（2 次）{Environment.NewLine}到期 {resetCreditExpiry.ToLocalTime():MM-dd HH:mm}";
+            $"立即重置（2 次）{Environment.NewLine}到期时间：{resetCreditExpiry.ToLocalTime():MM-dd HH:mm}";
+        var expectedUnknownExpiryAction =
+            $"立即重置（1 次）{Environment.NewLine}到期时间：官方未提供";
         if (!string.Equals(
                 FormatResetActionText(2, resetCreditExpiry),
                 expectedResetAction,
+                StringComparison.Ordinal) ||
+            !string.Equals(
+                FormatResetActionText(1, expiresAtUtc: null),
+                expectedUnknownExpiryAction,
                 StringComparison.Ordinal) ||
             FormatResetActionText(0, resetCreditExpiry).Contains(
                 "到期",
@@ -12440,11 +13844,15 @@ public partial class Form1 : Form
         string iconText = "")
     {
         var button = (ModernButton)MakeActionButton(text, left, top, width, primary: false);
+        var scale = GetUnifiedHistoryDpiScale();
         button.Tag = danger ? "history-danger" : "history-tonal";
-        button.Radius = 11;
-        button.Padding = new Padding(10, 0, 10, 0);
+        button.Radius = ScaleUnifiedHistoryPixel(11, scale);
+        var horizontalPadding = ScaleUnifiedHistoryPixel(10, scale);
+        button.Padding = new Padding(horizontalPadding, 0, horizontalPadding, 0);
         button.IconText = iconText;
-        button.IconWidth = string.IsNullOrEmpty(iconText) ? 0 : 20;
+        button.IconWidth = string.IsNullOrEmpty(iconText)
+            ? 0
+            : ScaleUnifiedHistoryPixel(20, scale);
         button.AutoShrinkText = false;
         ApplyHistoryActionButtonStyle(button, danger);
         return button;
@@ -13163,17 +14571,26 @@ public partial class Form1 : Form
                 { HasCredits: true, Balance: { Length: > 0 } balance } => $"\n官方 Credits：{balance}（协议未提供币种）",
                 _ => ""
             };
-            var expiryText = availableCount > 0 && info.AvailableCreditExpiresAtUtc is { } expiresAt
-                ? $"\n最近到期：{expiresAt.ToLocalTime():yyyy-MM-dd HH:mm}"
+            var expiryText = availableCount > 0
+                ? info.AvailableCreditExpiresAtUtc is { } expiresAt
+                    ? $"\n最近到期：{expiresAt.ToLocalTime():yyyy-MM-dd HH:mm}"
+                    : "\n到期时间：官方未提供"
                 : "";
             var availabilityText =
                 $"账号 {account.Name}\n{primaryText}{secondaryText}\n可重置 {availableCount} 次。{expiryText}{creditsText}\n\n" +
                 "本次仅调用只读额度接口，没有发送提示、调用模型或消耗 Token。";
-            _statusBox.Text = availabilityText +
-                              (availableCount == 0 ? " 立即重置按钮已禁用。" : " 可以点击“立即重置”使用一次。");
+            var actionAvailabilityText = availableCount == 0
+                ? " 立即重置按钮已禁用。"
+                : info.CanConsumeResetCredit
+                    ? " 可以点击“立即重置”使用一次。"
+                    : info.EffectiveApplicableAvailableCount == 0
+                        ? " 当前没有达到可重置条件的额度窗口，立即重置按钮已禁用。"
+                        : " 官方未提供当前适用次数，为避免误触发，立即重置按钮已禁用。";
+            var completeAvailabilityText = availabilityText + actionAvailabilityText;
+            _statusBox.Text = completeAvailabilityText;
             MessageBox.Show(
                 this,
-                availabilityText,
+                completeAvailabilityText,
                 $"查询完成：可重置 {availableCount} 次",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
@@ -13367,9 +14784,24 @@ public partial class Form1 : Form
                     return;
                 }
 
+                if (!info.CanConsumeResetCredit)
+                {
+                    var notApplicableText = info.EffectiveApplicableAvailableCount == 0
+                        ? $"账号 {account.Name} 有 {availableCount} 次重置卡，但当前没有达到可重置条件的额度窗口，未发送重置请求。"
+                        : $"账号 {account.Name} 有 {availableCount} 次重置卡，但官方未提供当前适用次数，为避免误触发，未发送重置请求。";
+                    _statusBox.Text = notApplicableText;
+                    MessageBox.Show(
+                        this,
+                        notApplicableText,
+                        "当前不能执行重置",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+                    return;
+                }
+
                 var expiryText = info.AvailableCreditExpiresAtUtc is { } expiresAt
                     ? $"\n该次数到期时间：{expiresAt.ToLocalTime():yyyy-MM-dd HH:mm}"
-                    : "";
+                    : "\n到期时间：官方未提供";
                 var confirmation = MessageBox.Show(
                     this,
                     $"账号：{account.Name}\n当前可重置：{availableCount} 次{expiryText}\n\n" +
@@ -13720,6 +15152,10 @@ public partial class Form1 : Form
             {
                 button.Enabled = !_minimalQuotaTestsInProgress.Contains(
                     button.AccessibleDescription ?? string.Empty);
+            }
+            else if (button.Name.Equals("DisabledUnifiedHistoryAction", StringComparison.Ordinal))
+            {
+                button.Enabled = false;
             }
             else
             {
@@ -14399,6 +15835,7 @@ public partial class Form1 : Form
         long Count,
         DateTimeOffset CheckedAtUtc,
         DateTimeOffset? ExpiresAtUtc,
+        long? ApplicableCount,
         string? Error);
 
     private sealed record LiveRateLimitSnapshot(

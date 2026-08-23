@@ -20,7 +20,7 @@ public sealed class ThreadPreviewDialog : Form
         ArgumentNullException.ThrowIfNull(thread);
         ArgumentNullException.ThrowIfNull(transcript);
 
-        Text = "阅读本地聊天";
+        Text = BuildWindowTitle(transcript);
         StartPosition = FormStartPosition.CenterParent;
         FormBorderStyle = FormBorderStyle.Sizable;
         MaximizeBox = true;
@@ -212,7 +212,7 @@ public sealed class ThreadPreviewDialog : Form
         _transcriptBox.ShortcutsEnabled = true;
         _transcriptBox.HideSelection = false;
         _transcriptBox.DetectUrls = false;
-        _transcriptBox.AccessibleName = "本地聊天简版正文";
+        _transcriptBox.AccessibleName = "本地聊天正文";
         _transcriptBox.AccessibleDescription = "只读内容，可选择后按 Ctrl+C 复制。";
         transcriptSurface.Controls.Add(_transcriptBox);
         RenderTranscript(transcript, palette);
@@ -317,12 +317,14 @@ public sealed class ThreadPreviewDialog : Form
             IgnoredOversizedLines: 0,
             Notice: "fixture notice");
         var text = BuildCopyText(thread, transcript);
+        var partialTitle = BuildWindowTitle(transcript with { IsTruncated = true });
         var user = text.IndexOf("你 ·", StringComparison.Ordinal);
         var assistant = text.IndexOf("Codex ·", StringComparison.Ordinal);
         if (user < 0 || assistant <= user ||
             !text.Contains("question fixture", StringComparison.Ordinal) ||
             !text.Contains("answer fixture", StringComparison.Ordinal) ||
             text.Contains("fixture notice", StringComparison.Ordinal) ||
+            partialTitle.Contains("完整", StringComparison.Ordinal) ||
             CountMatches("alpha beta ALPHA", "alpha") != 2)
         {
             throw new InvalidOperationException("Thread preview dialog formatting validation failed.");
@@ -386,7 +388,7 @@ public sealed class ThreadPreviewDialog : Form
         try
         {
             Clipboard.SetText(_copyText, TextDataFormat.UnicodeText);
-            _noticeLabel.Text = "已复制全部简版聊天正文。";
+            _noticeLabel.Text = "已复制全部聊天正文。";
         }
         catch (ExternalException)
         {
@@ -499,4 +501,7 @@ public sealed class ThreadPreviewDialog : Form
 
         return builder.ToString().TrimEnd();
     }
+
+    private static string BuildWindowTitle(UnifiedThreadTranscript transcript) =>
+        transcript.IsTruncated ? "阅读本地聊天" : "阅读完整本地聊天";
 }
