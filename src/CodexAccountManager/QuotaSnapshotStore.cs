@@ -65,6 +65,7 @@ internal sealed class QuotaSnapshotStore
             QuotaAccountIdentity.CreateKey(account),
             observedAtUtc.ToUniversalTime(),
             info.AvailableCount,
+            info.AvailableCreditExpiresAtUtc,
             info.Primary,
             info.Secondary,
             info.CreditBalance,
@@ -254,11 +255,21 @@ internal sealed class QuotaSnapshotStore
             var durablePrimaryReset = durableObservedAt.AddDays(7);
             var durableSecondaryReset = durableObservedAt.AddHours(5);
             var durableSpendReset = durableObservedAt.AddDays(30);
+            var durableResetCreditExpiry = durableObservedAt.AddDays(14);
             store.Save(
                 first,
                 new UsageLimitResetInfo(
                     5,
-                    [],
+                    [
+                        new UsageLimitResetCredit(
+                            "durable-reset-credit",
+                            "codexRateLimits",
+                            "available",
+                            durableObservedAt,
+                            durableResetCreditExpiry,
+                            "Reset",
+                            "Reset current limits")
+                    ],
                     new UsageRateLimitWindow(13, 10_080, durablePrimaryReset),
                     new UsageRateLimitWindow(17, 300, durableSecondaryReset),
                     new UsageCreditsSnapshot(true, false, "12.34"),
@@ -272,6 +283,7 @@ internal sealed class QuotaSnapshotStore
                 if (!restartedLoad.TryGetValue(firstKey, out var restartedSnapshot) ||
                     restartedSnapshot.ObservedAtUtc != durableObservedAt.ToUniversalTime() ||
                     restartedSnapshot.AvailableCount != 5 ||
+                    restartedSnapshot.ResetCreditExpiresAtUtc != durableResetCreditExpiry ||
                     restartedSnapshot.Primary?.UsedPercent != 13 ||
                     restartedSnapshot.Primary?.WindowMinutes != 10_080 ||
                     restartedSnapshot.Primary?.ResetsAtUtc != durablePrimaryReset ||
@@ -339,6 +351,7 @@ internal sealed record PersistedQuotaSnapshot(
     string AccountKey,
     DateTimeOffset ObservedAtUtc,
     long? AvailableCount,
+    DateTimeOffset? ResetCreditExpiresAtUtc,
     UsageRateLimitWindow? Primary,
     UsageRateLimitWindow? Secondary,
     UsageCreditsSnapshot? CreditBalance,

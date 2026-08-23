@@ -33,6 +33,7 @@ internal static class CodexNativeFastBridge
     private const int MaximumFetchResponseHeaders = 128;
     private const int MaximumFetchResponseHeaderNameLength = 128;
     private const int MaximumFetchResponseHeaderValueLength = 16 * 1024;
+    private const int CompatibilityAuthCaptureOccurrences = 6;
     private const uint ErrorInsufficientBuffer = 122;
     private const int AddressFamilyInterNetwork = 2;
     private const int TcpTableOwnerPidListener = 3;
@@ -44,12 +45,18 @@ internal static class CodexNativeFastBridge
         "app://-/assets/app-initial-C_Tkoze_.js";
     private const string LatestRendererBundleUrl =
         "app://-/assets/app-initial-izy3qYQi.js";
+    private const string Current5229RendererBundleUrl =
+        "app://-/assets/app-initial-BhpTek7p.js";
     private const string PreviousRendererSourceSha256 =
         "4C22397E9DAF90C13978C011AE08142ADC0D7BA49FA4109D946CB840774274D8";
     private const string CurrentRendererSourceSha256 =
         "B09A7C92CEE07E25F383A8495DD4C0A9754512E7184E845E13A81BAF7DCAF89A";
     private const string LatestRendererSourceSha256 =
         "F09FC19171315B858E31481FCE919366387D67CB04CE0BD7322FDD2D68983B26";
+    private const string Current5229RendererSourceSha256 =
+        "7359EEFF35A798A68C0E610CA65F3B12946E08FDAC68CD988A903F061CFCE7A0";
+    private const string Current5229RendererPatchedSha256 =
+        "479E9B7F2419B7DC90874D863016A2AE513E4F2BE2E1E70B0FE5B8C3166F8ADB";
     private const string FetchNavigationReadinessKey = "fetch-navigation";
     private static readonly TimeSpan StartupTimeout = TimeSpan.FromSeconds(45);
     private static readonly TimeSpan RendererPreflightTimeout = TimeSpan.FromSeconds(30);
@@ -59,6 +66,12 @@ internal static class CodexNativeFastBridge
     private static readonly Regex BrowserIdentityPattern = new(
         "^[A-Za-z0-9._-]{1,200}$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex ModernRendererBundlePattern = new(
+        "\\Aapp://-/assets/app-initial-[A-Za-z0-9_-]{6,80}\\.js\\z",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant,
+        TimeSpan.FromSeconds(2));
+    private static readonly ConcurrentDictionary<string, RendererPatchProfile>
+        CompatibleRendererProfilesByFingerprint = new(StringComparer.Ordinal);
     private static readonly UTF8Encoding StrictUtf8 = new(
         encoderShouldEmitUTF8Identifier: false,
         throwOnInvalidBytes: true);
@@ -247,12 +260,63 @@ internal static class CodexNativeFastBridge
         ("request-tier", "serviceTierForRequest:S")
     ];
 
+    // OpenAI.Codex 26.818.5229.0 keeps the same reviewed behavior but renames its minified
+    // symbols again. Bind all five edits and all four downstream semantics to this exact build.
+    private const string Current5229VisibilityGateOriginal =
+        "function $os(e){let t=(0,ess.c)(6),n=Y(Hk),r=e?.hostId??n,i=FA(r),a=i?.authMethod===`chatgpt`,o=i?.authMethod??null,s;t[0]!==r||t[1]!==o?(s={authMethod:o,hostId:r},t[0]=r,t[1]=o,t[2]=s):s=t[2];let{data:c,isPending:l}=hs(Lb,s),u=!!i?.isLoading||a&&l,d=a&&!u&&c!=null&&c?.requirements?.featureRequirements?.fast_mode!==!1,f;return t[3]!==u||t[4]!==d?(f={isServiceTierAllowed:d,isLoading:u},t[3]=u,t[4]=d,t[5]=f):f=t[5],f}";
+
+    private const string Current5229VisibilityGatePatched =
+        "function $os(e){let t=(0,ess.c)(6),n=Y(Hk),r=e?.hostId??n,i=FA(r),a=i?.authMethod===`chatgpt`,o=i?.authMethod??null,s;t[0]!==r||t[1]!==o?(s={authMethod:o,hostId:r},t[0]=r,t[1]=o,t[2]=s):s=t[2];let{data:c,isPending:l}=hs(Lb,s),u=!!i?.isLoading||a&&l,d=!u&&(a?c!=null&&c?.requirements?.featureRequirements?.fast_mode!==!1:o===`personalAccessToken`||o===`apikey`),f;return t[3]!==u||t[4]!==d?(f={isServiceTierAllowed:d,isLoading:u},t[3]=u,t[4]=d,t[5]=f):f=t[5],f}";
+
+    private const string Current5229ConfigReadGateOriginal =
+        "async function Yii(e,t){let n=await Kii(e,t);if(n!==`chatgpt`)return!1;let r=await F0t(e,t,{priority:`critical`});return e.query.setData(Lb,{authMethod:n,hostId:t},r),r.requirements?.featureRequirements?.fast_mode!==!1}";
+
+    private const string Current5229ConfigReadGatePatched =
+        "async function Yii(e,t){let n=await Kii(e,t);if(n===`personalAccessToken`||n===`apikey`)return!0;if(n!==`chatgpt`)return!1;let r=await F0t(e,t,{priority:`critical`});return e.query.setData(Lb,{authMethod:n,hostId:t},r),r.requirements?.featureRequirements?.fast_mode!==!1}";
+
+    private const string Current5229ServiceTierAuthCaptureOriginal =
+        "u=hs(Dk,e),d=hs(dls,e),f=FA(o.hostId)?.authMethod??null,p;";
+
+    private const string Current5229ServiceTierAuthCapturePatched =
+        "u=hs(Dk,e),d=hs(dls,e),f=FA(o.hostId)?.authMethod??null,p,_camAuth;_camAuth=f;";
+
+    private const string Current5229ServiceTierOptionsOriginal =
+        "T=p,E=o.hostId,w=gEr(s),";
+
+    private const string Current5229ServiceTierOptionsPatched =
+        "T=p,E=o.hostId,w=(()=>{let e=gEr(s);return(_camAuth===`personalAccessToken`||_camAuth===`apikey`)&&!e.some(e=>e.value===EEr)?[...e,...jEr.filter(e=>e.value===EEr)]:e})(),";
+
+    private const string Current5229ServiceTierSelectionOriginal =
+        "S=e!=null&&(u?.serviceTier!==void 0||d!==void 0)?y?k:null:SEr(s,k,y),x=S==null?null:xEr(s,S);";
+
+    private const string Current5229ServiceTierSelectionPatched =
+        "S=e!=null&&(u?.serviceTier!==void 0||d!==void 0)?y?k:null:SEr(s,k,y),x=S==null?null:xEr(s,S)??((_camAuth===`personalAccessToken`||_camAuth===`apikey`)&&S===EEr?EEr:null);";
+
+    private static readonly (string Name, string Original, string Patched)[] Current5229RendererPatchContract =
+    [
+        ("visibility", Current5229VisibilityGateOriginal, Current5229VisibilityGatePatched),
+        ("config", Current5229ConfigReadGateOriginal, Current5229ConfigReadGatePatched),
+        ("auth-capture", Current5229ServiceTierAuthCaptureOriginal, Current5229ServiceTierAuthCapturePatched),
+        ("options", Current5229ServiceTierOptionsOriginal, Current5229ServiceTierOptionsPatched),
+        ("selection", Current5229ServiceTierSelectionOriginal, Current5229ServiceTierSelectionPatched)
+    ];
+
+    private static readonly (string Name, string Value)[] Current5229RendererSemanticAnchors =
+    [
+        ("fast-is-priority", "EEr=`priority`,DEr=`fast`,OEr=`ultrafast`,kEr=`default`"),
+        ("fast-fallback", "jEr=[AEr,{description:ok.fastDescription,iconKind:`fast`,label:ok.fastLabel,tier:null,value:EEr}]"),
+        ("config-key", "function ols(e){return e==null?`service_tier`:`profiles.${e}.service_tier`}"),
+        ("request-tier", "serviceTierForRequest:S")
+    ];
+
     private sealed record RendererPatchProfile(
         string Name,
         string BundleUrl,
         string SourceSha256,
         (string Name, string Original, string Patched)[] PatchContract,
-        (string Name, string Value)[] SemanticAnchors);
+        (string Name, string Value)[] SemanticAnchors,
+        string? PatchedSha256 = null,
+        bool IsCompatibilityProfile = false);
 
     private static readonly RendererPatchProfile[] RendererPatchProfiles =
     [
@@ -279,7 +343,14 @@ internal static class CodexNativeFastBridge
             LatestRendererBundleUrl,
             LatestRendererSourceSha256,
             LatestRendererPatchContract,
-            LatestRendererSemanticAnchors)
+            LatestRendererSemanticAnchors),
+        new(
+            "current-2026-08-23-5229",
+            Current5229RendererBundleUrl,
+            Current5229RendererSourceSha256,
+            Current5229RendererPatchContract,
+            Current5229RendererSemanticAnchors,
+            Current5229RendererPatchedSha256)
     ];
 
     private static string LogPath => Path.Combine(
@@ -818,6 +889,15 @@ internal static class CodexNativeFastBridge
                    StringComparison.Ordinal);
     }
 
+    private static bool IsReviewedModernCodexPageUrl(string? value)
+    {
+        return string.Equals(value, "app://-/index.html", StringComparison.Ordinal) ||
+               string.Equals(
+                   value,
+                   "app://-/index.html?initialRoute=%2Favatar-overlay",
+                   StringComparison.Ordinal);
+    }
+
     private static async Task<JsonDocument> ReadJsonAsync(
         HttpClient client,
         int port,
@@ -921,6 +1001,14 @@ internal static class CodexNativeFastBridge
 
         if (counts.All(count => count.Original == 0 && count.Patched == 1))
         {
+            if (profile.PatchedSha256 != null &&
+                !SourceFingerprint(source).Equals(
+                    profile.PatchedSha256,
+                    StringComparison.Ordinal))
+            {
+                return RendererPatchResult.Rejected(
+                    "patched renderer fingerprint did not match the reviewed contract");
+            }
             return RendererPatchResult.AlreadyPatched();
         }
         if (counts.Any(count => count.Original != 1 || count.Patched != 0))
@@ -948,6 +1036,15 @@ internal static class CodexNativeFastBridge
             patchedSource = source;
             return RendererPatchResult.Rejected("post-patch contract verification failed");
         }
+        if (profile.PatchedSha256 != null &&
+            !SourceFingerprint(verifiedPatchedSource).Equals(
+                profile.PatchedSha256,
+                StringComparison.Ordinal))
+        {
+            patchedSource = source;
+            return RendererPatchResult.Rejected(
+                "post-patch renderer fingerprint did not match the reviewed contract");
+        }
         return RendererPatchResult.Patched();
     }
 
@@ -963,10 +1060,1266 @@ internal static class CodexNativeFastBridge
         return count;
     }
 
+    private static bool TryCreateCompatibleRendererProfile(
+        string bundleUrl,
+        string source,
+        out RendererPatchProfile profile,
+        out string detail)
+    {
+        var authCaptureCount = CountOccurrences(source, "_camAuth");
+        if (authCaptureCount == 0)
+        {
+            return TryCreateCompatibleRendererProfileFromOriginal(
+                bundleUrl,
+                source,
+                out profile,
+                out detail);
+        }
+        if (authCaptureCount == CompatibilityAuthCaptureOccurrences)
+        {
+            return TryCreateCompatibleRendererProfileFromPatched(
+                bundleUrl,
+                source,
+                out profile,
+                out detail);
+        }
+        profile = null!;
+        detail =
+            "renderer contained a partial or ambiguous bridge-local auth capture contract";
+        return false;
+    }
+
+    private static bool TryCreateCompatibleRendererProfileFromOriginal(
+        string bundleUrl,
+        string source,
+        out RendererPatchProfile profile,
+        out string detail)
+    {
+        profile = null!;
+        detail = string.Empty;
+        if (!ModernRendererBundlePattern.IsMatch(bundleUrl))
+        {
+            detail = "renderer URL was not an exact modern app-initial bundle candidate";
+            return false;
+        }
+        if (StrictUtf8.GetByteCount(source) > MaximumRendererSourceBytes)
+        {
+            detail = "renderer bundle exceeds the 32 MB safety limit";
+            return false;
+        }
+        if (CountOccurrences(source, "_camAuth") != 0)
+        {
+            detail = "renderer already contains the bridge-local auth capture identifier";
+            return false;
+        }
+
+        const string identifier = "[A-Za-z_$][A-Za-z0-9_$]*";
+        var priorityPattern =
+            "(?<priority>" + identifier + ")=`priority`," +
+            "(?<fast>" + identifier + ")=`fast`," +
+            "(?<ultrafast>" + identifier + ")=`ultrafast`," +
+            "(?<standard>" + identifier + ")=`default`";
+        if (!TryGetUniqueStructuralMatch(
+                source,
+                "fast-is-priority",
+                priorityPattern,
+                out var priorityMatch,
+                out detail))
+        {
+            return false;
+        }
+        var priority = priorityMatch.Groups["priority"].Value;
+        var tierNames = new[]
+        {
+            priority,
+            priorityMatch.Groups["fast"].Value,
+            priorityMatch.Groups["ultrafast"].Value,
+            priorityMatch.Groups["standard"].Value
+        };
+        if (tierNames.Distinct(StringComparer.Ordinal).Count() != tierNames.Length)
+        {
+            detail = "renderer service-tier identifiers were not distinct";
+            return false;
+        }
+
+        var fallbackPattern =
+            "(?<fallback>" + identifier + ")=\\[(?<standardOption>" + identifier +
+            "),\\{description:(?<labels>" + identifier +
+            ")\\.fastDescription,iconKind:`fast`,label:(?<labelsAgain>" + identifier +
+            ")\\.fastLabel,tier:null,value:" + Regex.Escape(priority) + "\\}\\]";
+        if (!TryGetUniqueStructuralMatch(
+                source,
+                "fast-fallback",
+                fallbackPattern,
+                out var fallbackMatch,
+                out detail))
+        {
+            return false;
+        }
+        if (!string.Equals(
+                fallbackMatch.Groups["labels"].Value,
+                fallbackMatch.Groups["labelsAgain"].Value,
+                StringComparison.Ordinal))
+        {
+            detail = "renderer Fast fallback did not use one label source";
+            return false;
+        }
+        var fallback = fallbackMatch.Groups["fallback"].Value;
+        var declarationPattern =
+            "var " + priority + "," + priorityMatch.Groups["fast"].Value + "," +
+            priorityMatch.Groups["ultrafast"].Value + "," +
+            priorityMatch.Groups["standard"].Value + "," +
+            fallbackMatch.Groups["labels"].Value + "," +
+            fallbackMatch.Groups["standardOption"].Value + "," + fallback + ",";
+        if (!TryGetUniqueStructuralMatch(
+                source,
+                "service-tier-declarations",
+                Regex.Escape(declarationPattern),
+                out var declarationMatch,
+                out detail))
+        {
+            return false;
+        }
+
+        var visibilityPattern =
+            "function (?<visibilityFunction>" + identifier +
+            @")\(e\)\{let t=\(0,(?<memo>" + identifier +
+            @")\.c\)\(6\),n=Y\((?<hostAtom>" + identifier +
+            @")\),r=e\?\.hostId\?\?n,i=(?<authLookup>" + identifier +
+            @")\(r\),a=i\?\.authMethod===`chatgpt`,o=i\?\.authMethod\?\?null,s;t\[0\]!==r\|\|t\[1\]!==o\?\(s=\{authMethod:o,hostId:r\},t\[0\]=r,t\[1\]=o,t\[2\]=s\):s=t\[2\];let\{data:c,isPending:l\}=(?<stateHook>" + identifier +
+            @")\((?<queryKey>" + identifier +
+            @"),s\),u=!!i\?\.isLoading\|\|a&&l,d=a&&!u&&c!=null&&c\?\.requirements\?\.featureRequirements\?\.fast_mode!==!1,f;return t\[3\]!==u\|\|t\[4\]!==d\?\(f=\{isServiceTierAllowed:d,isLoading:u\},t\[3\]=u,t\[4\]=d,t\[5\]=f\):f=t\[5\],f\}";
+        if (!TryGetUniqueStructuralMatch(
+                source,
+                "visibility",
+                visibilityPattern,
+                out var visibilityMatch,
+                out detail))
+        {
+            return false;
+        }
+        var authLookup = visibilityMatch.Groups["authLookup"].Value;
+        var stateHook = visibilityMatch.Groups["stateHook"].Value;
+        var queryKey = visibilityMatch.Groups["queryKey"].Value;
+
+        var configPattern =
+            "async function (?<configFunction>" + identifier +
+            @")\(e,t\)\{let n=await (?<authReader>" + identifier +
+            @")\(e,t\);if\(n!==`chatgpt`\)return!1;let r=await (?<requirementsReader>" +
+            identifier + @")\(e,t,\{priority:`critical`\}\);return e\.query\.setData\(" +
+            Regex.Escape(queryKey) +
+            @",\{authMethod:n,hostId:t\},r\),r\.requirements\?\.featureRequirements\?\.fast_mode!==!1\}";
+        if (!TryGetUniqueStructuralMatch(
+                source,
+                "config",
+                configPattern,
+                out var configMatch,
+                out detail))
+        {
+            return false;
+        }
+
+        var authCapturePattern =
+            @"let\{data:(?<modelsData>" + identifier +
+            @"),isLoading:(?<modelsLoading>" + identifier +
+            @")\}=(?<modelsHook>" + identifier + @")\(s\),u=" +
+            Regex.Escape(stateHook) + "\\((?<threadAtom>" + identifier +
+            "),e\\),d=" + Regex.Escape(stateHook) + "\\((?<profileAtom>" + identifier +
+            "),e\\),f=" + Regex.Escape(authLookup) +
+            @"\(o\.hostId\)\?\.authMethod\?\?null,p;";
+        if (!TryGetUniqueStructuralMatch(
+                source,
+                "auth-capture",
+                authCapturePattern,
+                out var authCaptureMatch,
+                out detail))
+        {
+            return false;
+        }
+
+        var optionsPattern =
+            @"T=p,E=o\.hostId,w=(?<optionsFunction>" + identifier + @")\(s\),";
+        if (!TryGetUniqueStructuralMatch(
+                source,
+                "options",
+                optionsPattern,
+                out var optionsMatch,
+                out detail))
+        {
+            return false;
+        }
+        var optionsFunction = optionsMatch.Groups["optionsFunction"].Value;
+
+        var selectionPattern =
+            @"S=e!=null&&\(u\?\.serviceTier!==void 0\|\|d!==void 0\)\?y\?k:null:(?<normalizeTier>" +
+            identifier + @")\(s,k,y\),x=S==null\?null:(?<resolveTier>" + identifier +
+            @")\(s,S\);";
+        if (!TryGetUniqueStructuralMatch(
+                source,
+                "selection",
+                selectionPattern,
+                out var selectionMatch,
+                out detail))
+        {
+            return false;
+        }
+        var configKeyPattern =
+            "function (?<configKeyFunction>" + identifier +
+            @")\(e\)\{return e==null\?`service_tier`:`profiles\.\$\{e\}\.service_tier`\}";
+        if (!TryGetUniqueStructuralMatch(
+                source,
+                "config-key",
+                configKeyPattern,
+                out var configKeyMatch,
+                out detail) ||
+            !TryGetUniqueStructuralMatch(
+                source,
+                "request-tier",
+                "serviceTierForRequest:S",
+                out var requestTierMatch,
+                out detail))
+        {
+            return false;
+        }
+
+        var settingsFunctionPattern =
+            "function (?<settingsFunction>" + identifier +
+            @")\(e,t,n,r\)\{(?=let i=\(0,(?<settingsMemo>" + identifier +
+            @")\.c\)\((?<cacheSlots>[1-9][0-9]{0,2})\),)";
+        if (!TryFindUniqueServiceTierFunction(
+                source,
+                settingsFunctionPattern,
+                configKeyMatch,
+                authCaptureMatch,
+                selectionMatch,
+                optionsMatch,
+                requestTierMatch,
+                out var settingsFunctionMatch,
+                out var settingsFunctionEnd,
+                out detail))
+        {
+            return false;
+        }
+        if (MatchesOverlap(visibilityMatch, configMatch) ||
+            MatchesOverlap(authCaptureMatch, selectionMatch) ||
+            MatchesOverlap(authCaptureMatch, optionsMatch) ||
+            MatchesOverlap(selectionMatch, optionsMatch))
+        {
+            detail =
+                "renderer service-tier structures were not ordered inside one complete bounded function";
+            return false;
+        }
+        if (CountOccurrences(
+                source[settingsFunctionMatch.Index..(settingsFunctionEnd + 1)],
+                fallback) != 0)
+        {
+            detail =
+                "renderer service-tier function shadowed the reviewed Fast fallback identifier";
+            return false;
+        }
+        var codeMatches = new[]
+        {
+            declarationMatch,
+            priorityMatch,
+            fallbackMatch,
+            visibilityMatch,
+            configMatch,
+            configKeyMatch,
+            settingsFunctionMatch,
+            authCaptureMatch,
+            selectionMatch,
+            optionsMatch,
+            requestTierMatch
+        };
+        var settingsOpeningBrace =
+            settingsFunctionMatch.Index + settingsFunctionMatch.Length - 1;
+        if (!TryGetJavaScriptBracePaths(
+                source,
+                codeMatches.Select(match => match.Index),
+                out var bracePaths) ||
+            !bracePaths[declarationMatch.Index].SequenceEqual(
+                bracePaths[settingsFunctionMatch.Index]) ||
+            !bracePaths[priorityMatch.Index].SequenceEqual(
+                bracePaths[fallbackMatch.Index]) ||
+            !IsBracePathPrefix(
+                bracePaths[declarationMatch.Index],
+                bracePaths[priorityMatch.Index],
+                requireChild: true) ||
+            !IsBracePathPrefix(
+                bracePaths[authCaptureMatch.Index],
+                bracePaths[selectionMatch.Index],
+                requireChild: false) ||
+            !IsBracePathPrefix(
+                bracePaths[authCaptureMatch.Index],
+                bracePaths[optionsMatch.Index],
+                requireChild: false) ||
+            !bracePaths[selectionMatch.Index].SequenceEqual(
+                bracePaths[optionsMatch.Index]) ||
+            !IsBracePathPrefix(
+                bracePaths[authCaptureMatch.Index],
+                bracePaths[requestTierMatch.Index],
+                requireChild: false) ||
+            !codeMatches
+                .Where(match =>
+                    match == authCaptureMatch ||
+                    match == selectionMatch ||
+                    match == optionsMatch ||
+                    match == requestTierMatch)
+                .All(match => bracePaths[match.Index].Contains(settingsOpeningBrace)))
+        {
+            detail =
+                "renderer structural matches were not executable code in one verified lexical scope";
+            return false;
+        }
+
+        const string visibilityGateOriginal =
+            "d=a&&!u&&c!=null&&c?.requirements?.featureRequirements?.fast_mode!==!1";
+        const string visibilityGatePatched =
+            "d=!u&&(a?c!=null&&c?.requirements?.featureRequirements?.fast_mode!==!1:o===`personalAccessToken`||o===`apikey`)";
+        const string configGateOriginal = "if(n!==`chatgpt`)return!1;";
+        const string configGatePatched =
+            "if(n===`personalAccessToken`||n===`apikey`)return!0;if(n!==`chatgpt`)return!1;";
+        if (!TryReplaceExactlyOnce(
+                visibilityMatch.Value,
+                visibilityGateOriginal,
+                visibilityGatePatched,
+                out var visibilityPatched) ||
+            !TryReplaceExactlyOnce(
+                configMatch.Value,
+                configGateOriginal,
+                configGatePatched,
+                out var configPatched) ||
+            !TryReplaceExactlyOnce(
+                authCaptureMatch.Value,
+                "p;",
+                "p,_camAuth;_camAuth=f;",
+                out var authCapturePatched))
+        {
+            detail = "renderer structural match could not produce exact gate replacements";
+            return false;
+        }
+
+        var optionsPatched =
+            "T=p,E=o.hostId,w=(()=>{let e=" + optionsFunction +
+            "(s);return(_camAuth===`personalAccessToken`||_camAuth===`apikey`)&&!e.some(e=>e.value===" +
+            "`priority`)?[...e,..." + fallback +
+            ".filter(e=>e.value===`priority`)]:e})(),";
+        var selectionPatched =
+            selectionMatch.Value[..^1] +
+            "??((_camAuth===`personalAccessToken`||_camAuth===`apikey`)&&S===" +
+            "`priority`?`priority`:null);";
+        var patchContract = new (string Name, string Original, string Patched)[]
+        {
+            ("visibility", visibilityMatch.Value, visibilityPatched),
+            ("config", configMatch.Value, configPatched),
+            ("auth-capture", authCaptureMatch.Value, authCapturePatched),
+            ("options", optionsMatch.Value, optionsPatched),
+            ("selection", selectionMatch.Value, selectionPatched)
+        };
+        var semanticAnchors = new (string Name, string Value)[]
+        {
+            ("fast-is-priority", priorityMatch.Value),
+            ("fast-fallback", fallbackMatch.Value),
+            ("config-key", configKeyMatch.Value),
+            ("request-tier", requestTierMatch.Value)
+        };
+        var originalSha256 = SourceFingerprint(source);
+        var provisional = new RendererPatchProfile(
+            "compatible-" + originalSha256[..12].ToLowerInvariant(),
+            bundleUrl,
+            originalSha256,
+            patchContract,
+            semanticAnchors,
+            PatchedSha256: null,
+            IsCompatibilityProfile: true);
+        var patchResult = PatchRendererSource(provisional, source, out var patchedSource);
+        if (patchResult.Status != RendererPatchStatus.Patched ||
+            CountOccurrences(patchedSource, "_camAuth") !=
+            CompatibilityAuthCaptureOccurrences)
+        {
+            detail = "renderer compatibility profile failed full patch verification: " +
+                     patchResult.Detail +
+                     $"; auth_capture_count={CountOccurrences(patchedSource, "_camAuth")}";
+            return false;
+        }
+        var patchedSha256 = SourceFingerprint(patchedSource);
+        profile = provisional with { PatchedSha256 = patchedSha256 };
+        var verified = PatchRendererSource(profile, source, out var verifiedSource);
+        if (verified.Status != RendererPatchStatus.Patched ||
+            !string.Equals(verifiedSource, patchedSource, StringComparison.Ordinal) ||
+            !IsReviewedPatchedRendererSource(profile, patchedSource))
+        {
+            profile = null!;
+            detail = "renderer compatibility profile failed fingerprint-bound verification";
+            return false;
+        }
+
+        detail = "strict structural compatibility profile verified";
+        return true;
+    }
+
+    private static bool TryCreateCompatibleRendererProfileFromPatched(
+        string bundleUrl,
+        string source,
+        out RendererPatchProfile profile,
+        out string detail)
+    {
+        profile = null!;
+        detail = string.Empty;
+        if (!ModernRendererBundlePattern.IsMatch(bundleUrl) ||
+            StrictUtf8.GetByteCount(source) > MaximumRendererSourceBytes ||
+            CountOccurrences(source, "_camAuth") != CompatibilityAuthCaptureOccurrences)
+        {
+            detail = "patched renderer did not satisfy the bounded compatibility preconditions";
+            return false;
+        }
+
+        const string identifier = "[A-Za-z_$][A-Za-z0-9_$]*";
+        var priorityPattern =
+            "(?<priority>" + identifier + ")=`priority`," +
+            "(?<fast>" + identifier + ")=`fast`," +
+            "(?<ultrafast>" + identifier + ")=`ultrafast`," +
+            "(?<standard>" + identifier + ")=`default`";
+        if (!TryGetUniqueStructuralMatch(
+                source,
+                "patched-fast-is-priority",
+                priorityPattern,
+                out var priorityMatch,
+                out detail))
+        {
+            return false;
+        }
+        var priority = priorityMatch.Groups["priority"].Value;
+        var tierNames = new[]
+        {
+            priority,
+            priorityMatch.Groups["fast"].Value,
+            priorityMatch.Groups["ultrafast"].Value,
+            priorityMatch.Groups["standard"].Value
+        };
+        if (tierNames.Distinct(StringComparer.Ordinal).Count() != tierNames.Length)
+        {
+            detail = "patched renderer service-tier identifiers were not distinct";
+            return false;
+        }
+
+        var fallbackPattern =
+            "(?<fallback>" + identifier + ")=\\[(?<standardOption>" + identifier +
+            "),\\{description:(?<labels>" + identifier +
+            ")\\.fastDescription,iconKind:`fast`,label:(?<labelsAgain>" + identifier +
+            ")\\.fastLabel,tier:null,value:" + Regex.Escape(priority) + "\\}\\]";
+        if (!TryGetUniqueStructuralMatch(
+                source,
+                "patched-fast-fallback",
+                fallbackPattern,
+                out var fallbackMatch,
+                out detail) ||
+            !string.Equals(
+                fallbackMatch.Groups["labels"].Value,
+                fallbackMatch.Groups["labelsAgain"].Value,
+                StringComparison.Ordinal))
+        {
+            detail = string.IsNullOrEmpty(detail)
+                ? "patched renderer Fast fallback did not use one label source"
+                : detail;
+            return false;
+        }
+        var fallback = fallbackMatch.Groups["fallback"].Value;
+
+        var visibilityPattern =
+            "function (?<visibilityFunction>" + identifier +
+            @")\(e\)\{let t=\(0,(?<memo>" + identifier +
+            @")\.c\)\(6\),n=Y\((?<hostAtom>" + identifier +
+            @")\),r=e\?\.hostId\?\?n,i=(?<authLookup>" + identifier +
+            @")\(r\),a=i\?\.authMethod===`chatgpt`,o=i\?\.authMethod\?\?null,s;t\[0\]!==r\|\|t\[1\]!==o\?\(s=\{authMethod:o,hostId:r\},t\[0\]=r,t\[1\]=o,t\[2\]=s\):s=t\[2\];let\{data:c,isPending:l\}=(?<stateHook>" + identifier +
+            @")\((?<queryKey>" + identifier +
+            @"),s\),u=!!i\?\.isLoading\|\|a&&l,d=!u&&\(a\?c!=null&&c\?\.requirements\?\.featureRequirements\?\.fast_mode!==!1:o===`personalAccessToken`\|\|o===`apikey`\),f;return t\[3\]!==u\|\|t\[4\]!==d\?\(f=\{isServiceTierAllowed:d,isLoading:u\},t\[3\]=u,t\[4\]=d,t\[5\]=f\):f=t\[5\],f\}";
+        if (!TryGetUniqueStructuralMatch(
+                source,
+                "patched-visibility",
+                visibilityPattern,
+                out var visibilityMatch,
+                out detail))
+        {
+            return false;
+        }
+        var authLookup = visibilityMatch.Groups["authLookup"].Value;
+        var stateHook = visibilityMatch.Groups["stateHook"].Value;
+        var queryKey = visibilityMatch.Groups["queryKey"].Value;
+
+        var configPattern =
+            "async function (?<configFunction>" + identifier +
+            @")\(e,t\)\{let n=await (?<authReader>" + identifier +
+            @")\(e,t\);if\(n===`personalAccessToken`\|\|n===`apikey`\)return!0;if\(n!==`chatgpt`\)return!1;let r=await (?<requirementsReader>" +
+            identifier + @")\(e,t,\{priority:`critical`\}\);return e\.query\.setData\(" +
+            Regex.Escape(queryKey) +
+            @",\{authMethod:n,hostId:t\},r\),r\.requirements\?\.featureRequirements\?\.fast_mode!==!1\}";
+        if (!TryGetUniqueStructuralMatch(
+                source,
+                "patched-config",
+                configPattern,
+                out var configMatch,
+                out detail))
+        {
+            return false;
+        }
+
+        var authCapturePattern =
+            @"let\{data:(?<modelsData>" + identifier +
+            @"),isLoading:(?<modelsLoading>" + identifier +
+            @")\}=(?<modelsHook>" + identifier + @")\(s\),u=" +
+            Regex.Escape(stateHook) + "\\((?<threadAtom>" + identifier +
+            "),e\\),d=" + Regex.Escape(stateHook) + "\\((?<profileAtom>" + identifier +
+            "),e\\),f=" + Regex.Escape(authLookup) +
+            @"\(o\.hostId\)\?\.authMethod\?\?null,p,_camAuth;_camAuth=f;";
+        if (!TryGetUniqueStructuralMatch(
+                source,
+                "patched-auth-capture",
+                authCapturePattern,
+                out var authCaptureMatch,
+                out detail))
+        {
+            return false;
+        }
+
+        var optionsPattern =
+            @"T=p,E=o\.hostId,w=\(\(\)=>\{let e=(?<optionsFunction>" + identifier +
+            @")\(s\);return\(_camAuth===`personalAccessToken`\|\|_camAuth===`apikey`\)&&!e\.some\(e=>e\.value===" +
+            @"`priority`\)\?\[\.\.\.e,\.\.\." + Regex.Escape(fallback) +
+            @"\.filter\(e=>e\.value===`priority`\)\]:e\}\)\(\),";
+        if (!TryGetUniqueStructuralMatch(
+                source,
+                "patched-options",
+                optionsPattern,
+                out var optionsMatch,
+                out detail))
+        {
+            return false;
+        }
+
+        var selectionPattern =
+            @"S=e!=null&&\(u\?\.serviceTier!==void 0\|\|d!==void 0\)\?y\?k:null:(?<normalizeTier>" +
+            identifier + @")\(s,k,y\),x=S==null\?null:(?<resolveTier>" + identifier +
+            @")\(s,S\)\?\?\(\(_camAuth===`personalAccessToken`\|\|_camAuth===`apikey`\)&&S===" +
+            @"`priority`\?`priority`:null\);";
+        if (!TryGetUniqueStructuralMatch(
+                source,
+                "patched-selection",
+                selectionPattern,
+                out var selectionMatch,
+                out detail))
+        {
+            return false;
+        }
+
+        const string visibilityGatePatched =
+            "d=!u&&(a?c!=null&&c?.requirements?.featureRequirements?.fast_mode!==!1:o===`personalAccessToken`||o===`apikey`)";
+        const string visibilityGateOriginal =
+            "d=a&&!u&&c!=null&&c?.requirements?.featureRequirements?.fast_mode!==!1";
+        const string configGatePatched =
+            "if(n===`personalAccessToken`||n===`apikey`)return!0;if(n!==`chatgpt`)return!1;";
+        const string configGateOriginal = "if(n!==`chatgpt`)return!1;";
+        if (!TryReplaceExactlyOnce(
+                visibilityMatch.Value,
+                visibilityGatePatched,
+                visibilityGateOriginal,
+                out var visibilityOriginal) ||
+            !TryReplaceExactlyOnce(
+                configMatch.Value,
+                configGatePatched,
+                configGateOriginal,
+                out var configOriginal) ||
+            !TryReplaceExactlyOnce(
+                authCaptureMatch.Value,
+                "p,_camAuth;_camAuth=f;",
+                "p;",
+                out var authCaptureOriginal))
+        {
+            detail = "patched renderer could not be deterministically restored";
+            return false;
+        }
+        var optionsOriginal =
+            "T=p,E=o.hostId,w=" + optionsMatch.Groups["optionsFunction"].Value + "(s),";
+        var selectionOriginal =
+            "S=e!=null&&(u?.serviceTier!==void 0||d!==void 0)?y?k:null:" +
+            selectionMatch.Groups["normalizeTier"].Value +
+            "(s,k,y),x=S==null?null:" + selectionMatch.Groups["resolveTier"].Value + "(s,S);";
+
+        var restoredSource = source;
+        var reverseContracts = new[]
+        {
+            (Patched: visibilityMatch.Value, Original: visibilityOriginal),
+            (Patched: configMatch.Value, Original: configOriginal),
+            (Patched: authCaptureMatch.Value, Original: authCaptureOriginal),
+            (Patched: optionsMatch.Value, Original: optionsOriginal),
+            (Patched: selectionMatch.Value, Original: selectionOriginal)
+        };
+        foreach (var contract in reverseContracts)
+        {
+            if (!TryReplaceExactlyOnce(
+                    restoredSource,
+                    contract.Patched,
+                    contract.Original,
+                    out restoredSource))
+            {
+                detail = "patched renderer reverse contract was incomplete or ambiguous";
+                return false;
+            }
+        }
+        if (CountOccurrences(restoredSource, "_camAuth") != 0 ||
+            !TryCreateCompatibleRendererProfileFromOriginal(
+                bundleUrl,
+                restoredSource,
+                out profile,
+                out detail) ||
+            profile.PatchedSha256 == null ||
+            !profile.PatchedSha256.Equals(SourceFingerprint(source), StringComparison.Ordinal))
+        {
+            profile = null!;
+            detail = string.IsNullOrEmpty(detail)
+                ? "restored renderer did not regenerate the same patched fingerprint"
+                : detail;
+            return false;
+        }
+        var verification = PatchRendererSource(profile, source, out var verifiedSource);
+        if (verification.Status != RendererPatchStatus.AlreadyPatched ||
+            !string.Equals(verifiedSource, source, StringComparison.Ordinal) ||
+            !IsReviewedPatchedRendererSource(profile, source))
+        {
+            profile = null!;
+            detail = "patched renderer failed the regenerated compatibility contract";
+            return false;
+        }
+
+        detail = "strict already-patched structural compatibility profile verified";
+        return true;
+    }
+
+    private static bool TryGetUniqueStructuralMatch(
+        string source,
+        string name,
+        string pattern,
+        out Match match,
+        out string detail)
+    {
+        try
+        {
+            var expression = new Regex(
+                pattern,
+                RegexOptions.CultureInvariant,
+                TimeSpan.FromSeconds(5));
+            match = expression.Match(source);
+            if (!match.Success || match.NextMatch().Success)
+            {
+                detail = $"renderer structural contract {name} did not match exactly once";
+                return false;
+            }
+            detail = string.Empty;
+            return true;
+        }
+        catch (RegexMatchTimeoutException)
+        {
+            match = Match.Empty;
+            detail = $"renderer structural contract {name} exceeded its matching deadline";
+            return false;
+        }
+    }
+
+    private static bool TryFindUniqueServiceTierFunction(
+        string source,
+        string pattern,
+        Match configKeyMatch,
+        Match authCaptureMatch,
+        Match selectionMatch,
+        Match optionsMatch,
+        Match requestTierMatch,
+        out Match settingsFunctionMatch,
+        out int settingsFunctionEnd,
+        out string detail)
+    {
+        settingsFunctionMatch = Match.Empty;
+        settingsFunctionEnd = -1;
+        try
+        {
+            var expression = new Regex(
+                pattern,
+                RegexOptions.CultureInvariant,
+                TimeSpan.FromSeconds(5));
+            var candidateCount = 0;
+            foreach (Match candidate in expression.Matches(source))
+            {
+                if (!int.TryParse(candidate.Groups["cacheSlots"].Value, out var cacheSlots) ||
+                    cacheSlots is < 20 or > 200)
+                {
+                    continue;
+                }
+                var openingBrace = candidate.Index + candidate.Length - 1;
+                if (!TryFindJavaScriptBlockEnd(source, openingBrace, out var candidateEnd) ||
+                    configKeyMatch.Index >= candidate.Index ||
+                    candidate.Index - (configKeyMatch.Index + configKeyMatch.Length) > 4 * 1024 ||
+                    authCaptureMatch.Index <= openingBrace ||
+                    selectionMatch.Index <= authCaptureMatch.Index + authCaptureMatch.Length ||
+                    optionsMatch.Index <= selectionMatch.Index + selectionMatch.Length ||
+                    requestTierMatch.Index <= optionsMatch.Index + optionsMatch.Length ||
+                    requestTierMatch.Index + requestTierMatch.Length >= candidateEnd ||
+                    candidateEnd - candidate.Index > 32 * 1024)
+                {
+                    continue;
+                }
+                candidateCount++;
+                settingsFunctionMatch = candidate;
+                settingsFunctionEnd = candidateEnd;
+                if (candidateCount > 1)
+                {
+                    break;
+                }
+            }
+            if (candidateCount == 1)
+            {
+                detail = string.Empty;
+                return true;
+            }
+            settingsFunctionMatch = Match.Empty;
+            settingsFunctionEnd = -1;
+            detail =
+                "renderer service-tier structures did not resolve to exactly one complete function";
+            return false;
+        }
+        catch (RegexMatchTimeoutException)
+        {
+            detail = "renderer service-tier function matching exceeded its deadline";
+            return false;
+        }
+    }
+
+    private static bool TryGetJavaScriptBracePaths(
+        string source,
+        IEnumerable<int> offsets,
+        out Dictionary<int, int[]> bracePaths)
+    {
+        bracePaths = new Dictionary<int, int[]>();
+        var targets = offsets.Distinct().Order().ToArray();
+        if (targets.Length == 0 || targets[0] < 0 || targets[^1] >= source.Length)
+        {
+            return false;
+        }
+        var targetSet = targets.ToHashSet();
+        var braces = new Stack<int>();
+        var templateExpressionDepths = new Stack<int>();
+        var inSingleQuotedString = false;
+        var inDoubleQuotedString = false;
+        var inTemplateText = false;
+        var inLineComment = false;
+        var inBlockComment = false;
+        var canStartRegularExpression = true;
+        var limit = targets[^1] + 1;
+
+        for (var index = 0; index < limit; index++)
+        {
+            if (targetSet.Contains(index))
+            {
+                if (inSingleQuotedString ||
+                    inDoubleQuotedString ||
+                    inTemplateText ||
+                    inLineComment ||
+                    inBlockComment)
+                {
+                    bracePaths.Clear();
+                    return false;
+                }
+                bracePaths[index] = braces.Reverse().ToArray();
+                if (bracePaths.Count == targetSet.Count)
+                {
+                    return true;
+                }
+            }
+
+            var current = source[index];
+            if (inSingleQuotedString || inDoubleQuotedString)
+            {
+                if (current == '\\')
+                {
+                    index++;
+                    continue;
+                }
+                if (inSingleQuotedString && current == '\'' ||
+                    inDoubleQuotedString && current == '"')
+                {
+                    inSingleQuotedString = false;
+                    inDoubleQuotedString = false;
+                    canStartRegularExpression = false;
+                }
+                continue;
+            }
+            if (inTemplateText)
+            {
+                if (current == '\\')
+                {
+                    index++;
+                    continue;
+                }
+                if (current == '`')
+                {
+                    inTemplateText = false;
+                    canStartRegularExpression = false;
+                    continue;
+                }
+                if (current == '$' &&
+                    index + 1 < limit &&
+                    source[index + 1] == '{')
+                {
+                    braces.Push(index + 1);
+                    templateExpressionDepths.Push(braces.Count);
+                    inTemplateText = false;
+                    canStartRegularExpression = true;
+                    index++;
+                }
+                continue;
+            }
+            if (inLineComment)
+            {
+                if (current is '\r' or '\n')
+                {
+                    inLineComment = false;
+                }
+                continue;
+            }
+            if (inBlockComment)
+            {
+                if (current == '*' && index + 1 < limit && source[index + 1] == '/')
+                {
+                    inBlockComment = false;
+                    index++;
+                }
+                continue;
+            }
+
+            if (current == '\'')
+            {
+                inSingleQuotedString = true;
+            }
+            else if (current == '"')
+            {
+                inDoubleQuotedString = true;
+            }
+            else if (current == '`')
+            {
+                inTemplateText = true;
+            }
+            else if (current == '/' && index + 1 < limit && source[index + 1] == '/')
+            {
+                inLineComment = true;
+                index++;
+            }
+            else if (current == '/' && index + 1 < limit && source[index + 1] == '*')
+            {
+                inBlockComment = true;
+                index++;
+            }
+            else if (current == '/')
+            {
+                if (!canStartRegularExpression)
+                {
+                    canStartRegularExpression = true;
+                    if (index + 1 < limit && source[index + 1] == '=')
+                    {
+                        index++;
+                    }
+                    continue;
+                }
+                if (!TrySkipJavaScriptRegularExpression(source, ref index, limit))
+                {
+                    bracePaths.Clear();
+                    return false;
+                }
+                canStartRegularExpression = false;
+            }
+            else if (current == '{')
+            {
+                braces.Push(index);
+                canStartRegularExpression = true;
+            }
+            else if (current == '}')
+            {
+                if (braces.Count == 0)
+                {
+                    bracePaths.Clear();
+                    return false;
+                }
+                var closingTemplateExpression =
+                    templateExpressionDepths.Count > 0 &&
+                    templateExpressionDepths.Peek() == braces.Count;
+                braces.Pop();
+                if (closingTemplateExpression)
+                {
+                    templateExpressionDepths.Pop();
+                    inTemplateText = true;
+                }
+                else
+                {
+                    canStartRegularExpression = false;
+                }
+            }
+            else if (IsJavaScriptIdentifierStart(current))
+            {
+                var tokenStart = index;
+                while (index + 1 < limit &&
+                       IsJavaScriptIdentifierPart(source[index + 1]))
+                {
+                    index++;
+                }
+                canStartRegularExpression = IsRegularExpressionPrefixKeyword(
+                    source.AsSpan(tokenStart, index - tokenStart + 1));
+            }
+            else if (char.IsDigit(current) ||
+                     current == '.' && index + 1 < limit && char.IsDigit(source[index + 1]))
+            {
+                while (index + 1 < limit &&
+                       (char.IsLetterOrDigit(source[index + 1]) ||
+                        source[index + 1] is '_' or '.'))
+                {
+                    index++;
+                }
+                canStartRegularExpression = false;
+            }
+            else if (!char.IsWhiteSpace(current))
+            {
+                canStartRegularExpression = current switch
+                {
+                    ')' or ']' => false,
+                    '.' => false,
+                    '+' or '-' when index + 1 < limit && source[index + 1] == current => false,
+                    _ => true
+                };
+                if ((current is '+' or '-' or '&' or '|' or '=' or '!' or '<' or '>') &&
+                    index + 1 < limit &&
+                    source[index + 1] == current)
+                {
+                    index++;
+                }
+            }
+        }
+
+        bracePaths.Clear();
+        return false;
+    }
+
+    private static bool IsBracePathPrefix(
+        IReadOnlyList<int> parent,
+        IReadOnlyList<int> child,
+        bool requireChild)
+    {
+        if (parent.Count > child.Count || requireChild && parent.Count == child.Count)
+        {
+            return false;
+        }
+        for (var index = 0; index < parent.Count; index++)
+        {
+            if (parent[index] != child[index])
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static bool TryReplaceExactlyOnce(
+        string source,
+        string original,
+        string replacement,
+        out string result)
+    {
+        result = source;
+        if (CountOccurrences(source, original) != 1)
+        {
+            return false;
+        }
+        var offset = source.IndexOf(original, StringComparison.Ordinal);
+        result = string.Concat(
+            source.AsSpan(0, offset),
+            replacement,
+            source.AsSpan(offset + original.Length));
+        return result.Length == source.Length - original.Length + replacement.Length &&
+               result.AsSpan(offset, replacement.Length).SequenceEqual(replacement);
+    }
+
+    private static bool MatchesOverlap(Match left, Match right)
+    {
+        return left.Index < right.Index + right.Length &&
+               right.Index < left.Index + left.Length;
+    }
+
+    private static bool TryFindJavaScriptBlockEnd(
+        string source,
+        int openingBrace,
+        out int closingBrace)
+    {
+        closingBrace = -1;
+        if (openingBrace < 0 ||
+            openingBrace >= source.Length ||
+            source[openingBrace] != '{')
+        {
+            return false;
+        }
+
+        var depth = 0;
+        var templateExpressionDepths = new Stack<int>();
+        var inSingleQuotedString = false;
+        var inDoubleQuotedString = false;
+        var inTemplateText = false;
+        var inLineComment = false;
+        var inBlockComment = false;
+        var canStartRegularExpression = true;
+        var limit = Math.Min(source.Length, openingBrace + 32 * 1024 + 1);
+        for (var index = openingBrace; index < limit; index++)
+        {
+            var current = source[index];
+            if (inSingleQuotedString || inDoubleQuotedString)
+            {
+                if (current == '\\')
+                {
+                    index++;
+                    continue;
+                }
+                if (inSingleQuotedString && current == '\'' ||
+                    inDoubleQuotedString && current == '"')
+                {
+                    inSingleQuotedString = false;
+                    inDoubleQuotedString = false;
+                    canStartRegularExpression = false;
+                }
+                continue;
+            }
+            if (inTemplateText)
+            {
+                if (current == '\\')
+                {
+                    index++;
+                    continue;
+                }
+                if (current == '`')
+                {
+                    inTemplateText = false;
+                    canStartRegularExpression = false;
+                    continue;
+                }
+                if (current == '$' &&
+                    index + 1 < limit &&
+                    source[index + 1] == '{')
+                {
+                    depth++;
+                    templateExpressionDepths.Push(depth);
+                    inTemplateText = false;
+                    canStartRegularExpression = true;
+                    index++;
+                }
+                continue;
+            }
+            if (inLineComment)
+            {
+                if (current is '\r' or '\n')
+                {
+                    inLineComment = false;
+                }
+                continue;
+            }
+            if (inBlockComment)
+            {
+                if (current == '*' && index + 1 < limit && source[index + 1] == '/')
+                {
+                    inBlockComment = false;
+                    index++;
+                }
+                continue;
+            }
+
+            if (current == '\'')
+            {
+                inSingleQuotedString = true;
+            }
+            else if (current == '"')
+            {
+                inDoubleQuotedString = true;
+            }
+            else if (current == '`')
+            {
+                inTemplateText = true;
+            }
+            else if (current == '/' && index + 1 < limit && source[index + 1] == '/')
+            {
+                inLineComment = true;
+                index++;
+            }
+            else if (current == '/' && index + 1 < limit && source[index + 1] == '*')
+            {
+                inBlockComment = true;
+                index++;
+            }
+            else if (current == '/')
+            {
+                if (!canStartRegularExpression)
+                {
+                    canStartRegularExpression = true;
+                    if (index + 1 < limit && source[index + 1] == '=')
+                    {
+                        index++;
+                    }
+                    continue;
+                }
+                if (!TrySkipJavaScriptRegularExpression(source, ref index, limit))
+                {
+                    return false;
+                }
+                canStartRegularExpression = false;
+            }
+            else if (current == '{')
+            {
+                depth++;
+                canStartRegularExpression = true;
+            }
+            else if (current == '}')
+            {
+                if (depth <= 0)
+                {
+                    return false;
+                }
+                var closingTemplateExpression =
+                    templateExpressionDepths.Count > 0 &&
+                    templateExpressionDepths.Peek() == depth;
+                depth--;
+                if (closingTemplateExpression)
+                {
+                    templateExpressionDepths.Pop();
+                    inTemplateText = true;
+                    continue;
+                }
+                if (depth == 0)
+                {
+                    closingBrace = index;
+                    return templateExpressionDepths.Count == 0;
+                }
+                canStartRegularExpression = false;
+            }
+            else if (IsJavaScriptIdentifierStart(current))
+            {
+                var tokenStart = index;
+                while (index + 1 < limit &&
+                       IsJavaScriptIdentifierPart(source[index + 1]))
+                {
+                    index++;
+                }
+                var token = source.AsSpan(tokenStart, index - tokenStart + 1);
+                canStartRegularExpression = IsRegularExpressionPrefixKeyword(token);
+            }
+            else if (char.IsDigit(current) ||
+                     current == '.' && index + 1 < limit && char.IsDigit(source[index + 1]))
+            {
+                while (index + 1 < limit &&
+                       (char.IsLetterOrDigit(source[index + 1]) ||
+                        source[index + 1] is '_' or '.'))
+                {
+                    index++;
+                }
+                canStartRegularExpression = false;
+            }
+            else if (!char.IsWhiteSpace(current))
+            {
+                canStartRegularExpression = current switch
+                {
+                    ')' or ']' => false,
+                    '.' => false,
+                    '+' or '-' when index + 1 < limit && source[index + 1] == current => false,
+                    _ => true
+                };
+                if ((current is '+' or '-' or '&' or '|' or '=' or '!' or '<' or '>') &&
+                    index + 1 < limit &&
+                    source[index + 1] == current)
+                {
+                    index++;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static bool TrySkipJavaScriptRegularExpression(
+        string source,
+        ref int slashIndex,
+        int limit)
+    {
+        var inCharacterClass = false;
+        for (var index = slashIndex + 1; index < limit; index++)
+        {
+            var current = source[index];
+            if (current == '\\')
+            {
+                index++;
+                continue;
+            }
+            if (current is '\r' or '\n')
+            {
+                return false;
+            }
+            if (current == '[')
+            {
+                inCharacterClass = true;
+            }
+            else if (current == ']' && inCharacterClass)
+            {
+                inCharacterClass = false;
+            }
+            else if (current == '/' && !inCharacterClass)
+            {
+                while (index + 1 < limit && IsJavaScriptIdentifierPart(source[index + 1]))
+                {
+                    index++;
+                }
+                slashIndex = index;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static bool IsJavaScriptIdentifierStart(char value)
+    {
+        return value is '_' or '$' || char.IsLetter(value) || value >= 0x80;
+    }
+
+    private static bool IsJavaScriptIdentifierPart(char value)
+    {
+        return IsJavaScriptIdentifierStart(value) || char.IsDigit(value);
+    }
+
+    private static bool IsRegularExpressionPrefixKeyword(ReadOnlySpan<char> token)
+    {
+        return token.SequenceEqual("return") ||
+               token.SequenceEqual("throw") ||
+               token.SequenceEqual("case") ||
+               token.SequenceEqual("delete") ||
+               token.SequenceEqual("void") ||
+               token.SequenceEqual("typeof") ||
+               token.SequenceEqual("new") ||
+               token.SequenceEqual("in") ||
+               token.SequenceEqual("of") ||
+               token.SequenceEqual("yield") ||
+               token.SequenceEqual("await") ||
+               token.SequenceEqual("else") ||
+               token.SequenceEqual("do") ||
+               token.SequenceEqual("instanceof");
+    }
+
     private static bool IsReviewedPatchedRendererSource(
         RendererPatchProfile profile,
         string patchedSource)
     {
+        if (profile.PatchedSha256 != null &&
+            !SourceFingerprint(patchedSource).Equals(
+                profile.PatchedSha256,
+                StringComparison.Ordinal))
+        {
+            return false;
+        }
         var restoredSource = patchedSource;
         foreach (var patch in profile.PatchContract)
         {
@@ -980,13 +2333,70 @@ internal static class CodexNativeFastBridge
             StringComparison.Ordinal);
     }
 
+    private static bool RendererSourceMatchesProfile(
+        RendererPatchProfile profile,
+        string source,
+        string fingerprint,
+        out RendererPatchResult patch,
+        out bool alreadyPatched)
+    {
+        patch = PatchRendererSource(profile, source, out _);
+        alreadyPatched = patch.Status == RendererPatchStatus.AlreadyPatched;
+        return (patch.Status == RendererPatchStatus.Patched &&
+                fingerprint.Equals(profile.SourceSha256, StringComparison.Ordinal)) ||
+               (alreadyPatched && IsReviewedPatchedRendererSource(profile, source));
+    }
+
+    private static string CompatibilityProfileCacheKey(string bundleUrl, string fingerprint)
+    {
+        return bundleUrl + "\n" + fingerprint;
+    }
+
+    private static void CacheCompatibleRendererProfile(RendererPatchProfile profile)
+    {
+        if (!profile.IsCompatibilityProfile || profile.PatchedSha256 == null)
+        {
+            throw new InvalidOperationException(
+                "Only a fingerprint-bound compatibility profile can enter the runtime cache.");
+        }
+        CompatibleRendererProfilesByFingerprint[
+            CompatibilityProfileCacheKey(profile.BundleUrl, profile.SourceSha256)] = profile;
+        CompatibleRendererProfilesByFingerprint[
+            CompatibilityProfileCacheKey(profile.BundleUrl, profile.PatchedSha256)] = profile;
+    }
+
+    private static bool TryGetCachedCompatibleRendererProfile(
+        string bundleUrl,
+        string fingerprint,
+        out RendererPatchProfile profile)
+    {
+        return CompatibleRendererProfilesByFingerprint.TryGetValue(
+                   CompatibilityProfileCacheKey(bundleUrl, fingerprint),
+                   out profile!) &&
+               profile.IsCompatibilityProfile &&
+               string.Equals(profile.BundleUrl, bundleUrl, StringComparison.Ordinal);
+    }
+
     private static bool IsRendererBundleUrl(string? value)
     {
-        // These are the only raw script URLs whose complete, version-specific patch profiles
-        // are declared above. Never normalize the value through Uri:
-        // escaped and dot-segment paths could otherwise impersonate a reviewed script.
-        return RendererPatchProfiles.Any(profile =>
-            string.Equals(value, profile.BundleUrl, StringComparison.Ordinal));
+        // Never normalize through Uri: escaped or dot-segment paths could otherwise impersonate
+        // a renderer. Modern hash-named candidates are observed only on an exact reviewed page;
+        // their source must still satisfy the strict structural contract before interception.
+        return value != null &&
+               (RendererPatchProfiles.Any(profile =>
+                    string.Equals(value, profile.BundleUrl, StringComparison.Ordinal)) ||
+                ModernRendererBundlePattern.IsMatch(value));
+    }
+
+    private static bool IsRendererBundleUrlForPage(string? pageUrl, string? bundleUrl)
+    {
+        if (string.Equals(pageUrl, "app://codex/", StringComparison.Ordinal))
+        {
+            return string.Equals(bundleUrl, LegacyRendererBundleUrl, StringComparison.Ordinal);
+        }
+        return IsReviewedModernCodexPageUrl(pageUrl) &&
+               bundleUrl != null &&
+               ModernRendererBundlePattern.IsMatch(bundleUrl);
     }
 
     private static IReadOnlyList<RendererPatchProfile> ReviewedRendererProfilesForPage(
@@ -1020,6 +2430,10 @@ internal static class CodexNativeFastBridge
                     string.Equals(
                         profile.BundleUrl,
                         LatestRendererBundleUrl,
+                        StringComparison.Ordinal) ||
+                    string.Equals(
+                        profile.BundleUrl,
+                        Current5229RendererBundleUrl,
                         StringComparison.Ordinal))
                 .ToArray();
         }
@@ -1403,12 +2817,65 @@ internal static class CodexNativeFastBridge
                ";suffix";
     }
 
+    private static string BuildCompatibleRendererSource(RendererPatchProfile profile)
+    {
+        var patches = profile.PatchContract.ToDictionary(
+            patch => patch.Name,
+            patch => patch.Original,
+            StringComparer.Ordinal);
+        var anchors = profile.SemanticAnchors.ToDictionary(
+            anchor => anchor.Name,
+            anchor => anchor.Value,
+            StringComparer.Ordinal);
+        var tiers = Regex.Matches(
+                anchors["fast-is-priority"],
+                "([A-Za-z_$][A-Za-z0-9_$]*)=`(?:priority|fast|ultrafast|default)`",
+                RegexOptions.CultureInvariant)
+            .Select(match => match.Groups[1].Value)
+            .ToArray();
+        var fallbackShape = Regex.Match(
+            anchors["fast-fallback"],
+            "(?<fallback>[A-Za-z_$][A-Za-z0-9_$]*)=\\[(?<standardOption>[A-Za-z_$][A-Za-z0-9_$]*)," +
+            "\\{description:(?<labels>[A-Za-z_$][A-Za-z0-9_$]*)\\.fastDescription",
+            RegexOptions.CultureInvariant);
+        if (tiers.Length != 4 || !fallbackShape.Success)
+        {
+            throw new InvalidOperationException(
+                "Compatibility renderer fixture requires the four modern semantic anchors.");
+        }
+        var declaration =
+            "var " + string.Join(",", tiers) + "," +
+            fallbackShape.Groups["labels"].Value + "," +
+            fallbackShape.Groups["standardOption"].Value + "," +
+            fallbackShape.Groups["fallback"].Value + ",";
+        return "prefix;" +
+               declaration +
+               "CompatibilityMetadata,CompatibilityInitializer=CompatibilityLoader((()=>{" +
+               anchors["fast-is-priority"] + ";" +
+               anchors["fast-fallback"] + "}));" +
+               patches["visibility"] + ";" +
+               patches["config"] + ";" +
+               anchors["config-key"] +
+               "function CompatibilitySettings(e,t,n,r){let i=(0,CompatibilityMemo.c)(41)," +
+               "compatibilityState=0;let{data:compatibilityModels," +
+               "isLoading:compatibilityModelsLoading}=CompatibilityModelsHook(s)," +
+               patches["auth-capture"] +
+               "let compatibleSelection=0;" + patches["selection"] +
+               "let compatibleOptions=0;" + patches["options"] +
+               "let compatibleResult={" + anchors["request-tier"] +
+               "};return compatibleResult};suffix";
+    }
+
     private static void ValidateRendererPatchProfile(RendererPatchProfile profile)
     {
         if (string.IsNullOrWhiteSpace(profile.Name) ||
             string.IsNullOrWhiteSpace(profile.BundleUrl) ||
             profile.SourceSha256.Length != 64 ||
             profile.SourceSha256.Any(value => !Uri.IsHexDigit(value)) ||
+            profile.PatchedSha256 != null &&
+            (profile.PatchedSha256.Length != 64 ||
+             profile.PatchedSha256.Any(value => !Uri.IsHexDigit(value))) ||
+            profile.IsCompatibilityProfile ||
             profile.PatchContract.Length == 0 ||
             profile.SemanticAnchors.Length == 0)
         {
@@ -1416,7 +2883,12 @@ internal static class CodexNativeFastBridge
         }
 
         var source = BuildReviewedRendererSource(profile);
-        var result = PatchRendererSource(profile, source, out var patched);
+        var syntheticProfile = profile with
+        {
+            SourceSha256 = SourceFingerprint(source),
+            PatchedSha256 = null
+        };
+        var result = PatchRendererSource(syntheticProfile, source, out var patched);
         if (result.Status != RendererPatchStatus.Patched ||
             profile.PatchContract.Any(contract =>
                 CountOccurrences(patched, contract.Original) != 0 ||
@@ -1426,8 +2898,7 @@ internal static class CodexNativeFastBridge
                 $"Native Fast bridge did not patch renderer profile {profile.Name} completely.");
         }
 
-        var secondPass = PatchRendererSource(profile, patched, out var secondSource);
-        var syntheticProfile = profile with { SourceSha256 = SourceFingerprint(source) };
+        var secondPass = PatchRendererSource(syntheticProfile, patched, out var secondSource);
         if (secondPass.Status != RendererPatchStatus.AlreadyPatched ||
             secondSource != patched ||
             !IsReviewedPatchedRendererSource(syntheticProfile, patched) ||
@@ -1448,7 +2919,7 @@ internal static class CodexNativeFastBridge
         }
         foreach (var rejected in rejectedSources)
         {
-            if (PatchRendererSource(profile, rejected, out var untouched).Status != RendererPatchStatus.Rejected ||
+            if (PatchRendererSource(syntheticProfile, rejected, out var untouched).Status != RendererPatchStatus.Rejected ||
                 untouched != rejected)
             {
                 throw new InvalidOperationException(
@@ -1459,7 +2930,7 @@ internal static class CodexNativeFastBridge
 
     internal static void ValidatePatchContract()
     {
-        if (RendererPatchProfiles.Length != 4 ||
+        if (RendererPatchProfiles.Length != 5 ||
             RendererPatchProfiles.Select(profile => profile.BundleUrl).Distinct(StringComparer.Ordinal).Count() !=
             RendererPatchProfiles.Length)
         {
@@ -1494,12 +2965,15 @@ internal static class CodexNativeFastBridge
             !IsRendererBundleUrl("app://-/assets/app-initial-DWsVN4CS.js") ||
             !IsRendererBundleUrl("app://-/assets/app-initial-C_Tkoze_.js") ||
             !IsRendererBundleUrl("app://-/assets/app-initial-izy3qYQi.js") ||
+            !IsRendererBundleUrl("app://-/assets/app-initial-BhpTek7p.js") ||
+            !IsRendererBundleUrl("app://-/assets/app-initial-Future_123.js") ||
             IsRendererBundleUrl(null) ||
             IsRendererBundleUrl("") ||
             IsRendererBundleUrl(" app://-/assets/app-initial-DWsVN4CS.js") ||
             IsRendererBundleUrl("APP://-/assets/app-initial-DWsVN4CS.js") ||
             IsRendererBundleUrl("APP://-/assets/app-initial-C_Tkoze_.js") ||
             IsRendererBundleUrl("APP://-/assets/app-initial-izy3qYQi.js") ||
+            IsRendererBundleUrl("APP://-/assets/app-initial-BhpTek7p.js") ||
             IsRendererBundleUrl("https://example.com/assets/app-initial-DWsVN4CS.js") ||
             IsRendererBundleUrl("file://-/assets/app-initial-DWsVN4CS.js") ||
             IsRendererBundleUrl("app://other/assets/app-initial-DWsVN4CS.js") ||
@@ -1519,6 +2993,9 @@ internal static class CodexNativeFastBridge
             IsRendererBundleUrl("app://-/assets/app-initial-DWsVN4CS.js?changed=1") ||
             IsRendererBundleUrl("app://-/assets/app-initial-C_Tkoze_.js?changed=1") ||
             IsRendererBundleUrl("app://-/assets/app-initial-izy3qYQi.js?changed=1") ||
+            IsRendererBundleUrl("app://-/assets/app-initial-BhpTek7p.js?changed=1") ||
+            IsRendererBundleUrl(
+                "app://-/assets/app-initial-" + new string('a', 81) + ".js") ||
             IsRendererBundleUrl("app://-/assets/app-initial-DWsVN4CS.js\n"))
         {
             throw new InvalidOperationException("Native Fast bridge renderer URL validation failed.");
@@ -1533,7 +3010,7 @@ internal static class CodexNativeFastBridge
                 legacyProfiles[0].BundleUrl,
                 LegacyRendererBundleUrl,
                 StringComparison.Ordinal) ||
-            currentProfiles.Count != 3 ||
+            currentProfiles.Count != 4 ||
             !currentProfiles.Any(profile => string.Equals(
                 profile.BundleUrl,
                 PreviousRendererBundleUrl,
@@ -1546,10 +3023,31 @@ internal static class CodexNativeFastBridge
                 profile.BundleUrl,
                 LatestRendererBundleUrl,
                 StringComparison.Ordinal)) ||
+            !currentProfiles.Any(profile => string.Equals(
+                profile.BundleUrl,
+                Current5229RendererBundleUrl,
+                StringComparison.Ordinal)) ||
             overlayProfiles.Count != currentProfiles.Count ||
             ReviewedRendererProfilesForPage("app://-/unreviewed.html").Count != 0)
         {
             throw new InvalidOperationException("Native Fast bridge page-to-renderer profile mapping failed.");
+        }
+
+        if (!IsRendererBundleUrlForPage(
+                "app://-/index.html",
+                "app://-/assets/app-initial-Future_123.js") ||
+            !IsRendererBundleUrlForPage(
+                "app://-/index.html?initialRoute=%2Favatar-overlay",
+                Current5229RendererBundleUrl) ||
+            IsRendererBundleUrlForPage(
+                "app://codex/",
+                "app://-/assets/app-initial-Future_123.js") ||
+            IsRendererBundleUrlForPage(
+                "app://-/unreviewed.html",
+                "app://-/assets/app-initial-Future_123.js"))
+        {
+            throw new InvalidOperationException(
+                "Native Fast bridge compatibility candidates escaped their reviewed pages.");
         }
 
         if (!IsReviewedOfficialCodexPageUrl("app://codex/") ||
@@ -1588,6 +3086,227 @@ internal static class CodexNativeFastBridge
             IsReviewedOfficialCodexPageUrl("https://codex/"))
         {
             throw new InvalidOperationException("Native Fast bridge page URL validation failed.");
+        }
+
+        var lexerFixture =
+            "function Scanner(){const quotient=(value/2)/3;" +
+            "const pattern=/[{}\\/]+/gi;" +
+            "const nested=`outer ${format({value:`inner ${count / 2}`})}`;" +
+            "// } ignored\n/* { ignored } */return {quotient,pattern,nested}}";
+        var lexerOpeningBrace = lexerFixture.IndexOf('{');
+        var lexerReturn = lexerFixture.IndexOf("return", StringComparison.Ordinal);
+        var lexerTemplateText = lexerFixture.IndexOf("outer", StringComparison.Ordinal);
+        if (!TryFindJavaScriptBlockEnd(
+                lexerFixture,
+                lexerOpeningBrace,
+                out var lexerClosingBrace) ||
+            lexerClosingBrace != lexerFixture.Length - 1 ||
+            !TryGetJavaScriptBracePaths(
+                lexerFixture,
+                new[] { 0, lexerReturn },
+                out var lexerPaths) ||
+            lexerPaths[0].Length != 0 ||
+            !lexerPaths[lexerReturn].Contains(lexerOpeningBrace) ||
+            TryGetJavaScriptBracePaths(
+                lexerFixture,
+                new[] { lexerTemplateText },
+                out _) ||
+            TryFindJavaScriptBlockEnd(
+                lexerFixture[..^1],
+                lexerOpeningBrace,
+                out _) ||
+            TryFindJavaScriptBlockEnd(
+                "function Broken(){const value='unterminated}",
+                "function Broken()".Length,
+                out _) ||
+            TryFindJavaScriptBlockEnd(
+                "function Broken(){const value=`unterminated ${value}`;",
+                "function Broken()".Length,
+                out _) ||
+            TryFindJavaScriptBlockEnd(
+                "function Broken(){const value=/unterminated\n}",
+                "function Broken()".Length,
+                out _))
+        {
+            throw new InvalidOperationException(
+                "Native Fast JavaScript lexical boundary validation failed.");
+        }
+
+        var compatibilitySourceProfiles = new[]
+        {
+            RendererPatchProfiles[2],
+            RendererPatchProfiles[3],
+            RendererPatchProfiles[4]
+        };
+        for (var index = 0; index < compatibilitySourceProfiles.Length; index++)
+        {
+            var sourceProfile = compatibilitySourceProfiles[index];
+            var candidateUrl =
+                $"app://-/assets/app-initial-Future_{index:D2}_compat.js";
+            var compatibleSource = BuildCompatibleRendererSource(sourceProfile);
+            if (!TryCreateCompatibleRendererProfile(
+                    candidateUrl,
+                    compatibleSource,
+                    out var compatibilityProfile,
+                    out var compatibilityDetail) ||
+                !compatibilityProfile.IsCompatibilityProfile ||
+                compatibilityProfile.PatchedSha256 == null ||
+                !compatibilityProfile.SourceSha256.Equals(
+                    SourceFingerprint(compatibleSource),
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"Native Fast structural compatibility rejected {sourceProfile.Name}: " +
+                    compatibilityDetail);
+            }
+
+            var compatibilityPatch = PatchRendererSource(
+                compatibilityProfile,
+                compatibleSource,
+                out var compatiblePatchedSource);
+            var compatibilitySecondPass = PatchRendererSource(
+                compatibilityProfile,
+                compatiblePatchedSource,
+                out var compatibleSecondSource);
+            CacheCompatibleRendererProfile(compatibilityProfile);
+            if (compatibilityPatch.Status != RendererPatchStatus.Patched ||
+                compatibilitySecondPass.Status != RendererPatchStatus.AlreadyPatched ||
+                !string.Equals(
+                    compatiblePatchedSource,
+                    compatibleSecondSource,
+                    StringComparison.Ordinal) ||
+                !IsReviewedPatchedRendererSource(
+                    compatibilityProfile,
+                    compatiblePatchedSource) ||
+                !TryGetCachedCompatibleRendererProfile(
+                    candidateUrl,
+                    compatibilityProfile.SourceSha256,
+                    out var cachedOriginalProfile) ||
+                !ReferenceEquals(cachedOriginalProfile, compatibilityProfile) ||
+                !TryGetCachedCompatibleRendererProfile(
+                    candidateUrl,
+                    compatibilityProfile.PatchedSha256,
+                    out var cachedPatchedProfile) ||
+                !ReferenceEquals(cachedPatchedProfile, compatibilityProfile))
+            {
+                throw new InvalidOperationException(
+                    $"Native Fast structural compatibility was not fingerprint-bound for {sourceProfile.Name}.");
+            }
+        }
+
+        var negativeProfile = RendererPatchProfiles[4];
+        var negativeSource = BuildCompatibleRendererSource(negativeProfile);
+        var negativePatches = negativeProfile.PatchContract.ToDictionary(
+            patch => patch.Name,
+            patch => patch.Original,
+            StringComparer.Ordinal);
+        const string selectionSentinel = "__native_fast_selection_sentinel__";
+        var reorderedSource = negativeSource
+            .Replace(negativePatches["selection"], selectionSentinel, StringComparison.Ordinal)
+            .Replace(
+                negativePatches["options"],
+                negativePatches["selection"],
+                StringComparison.Ordinal)
+            .Replace(
+                selectionSentinel,
+                negativePatches["options"],
+                StringComparison.Ordinal);
+        var selectionOutsideFunction =
+            negativeSource.Replace(
+                negativePatches["selection"],
+                string.Empty,
+                StringComparison.Ordinal) + negativePatches["selection"];
+        const string compatibilityAuthDeclarationPrefix =
+            "let{data:compatibilityModels,isLoading:compatibilityModelsLoading}=" +
+            "CompatibilityModelsHook(s),";
+        var authCaptureInChildBlock = negativeSource.Replace(
+            compatibilityAuthDeclarationPrefix + negativePatches["auth-capture"],
+            "{" + compatibilityAuthDeclarationPrefix +
+            negativePatches["auth-capture"] + "}",
+            StringComparison.Ordinal);
+        var mismatchedFallback = negativeSource.Replace(
+            Current5229RendererSemanticAnchors.Single(anchor =>
+                anchor.Name.Equals("fast-fallback", StringComparison.Ordinal)).Value,
+            "jEr=[AEr,{description:ok.fastDescription,iconKind:`fast`," +
+            "label:ok.fastLabel,tier:null,value:DEr}]",
+            StringComparison.Ordinal);
+        var rejectedCompatibilitySources = new[]
+        {
+            negativeSource + negativePatches["visibility"],
+            negativeSource.Replace(
+                negativePatches["config"],
+                string.Empty,
+                StringComparison.Ordinal),
+            negativeSource + "_camAuth",
+            reorderedSource,
+            selectionOutsideFunction,
+            authCaptureInChildBlock,
+            mismatchedFallback
+        };
+        foreach (var rejectedSource in rejectedCompatibilitySources)
+        {
+            if (TryCreateCompatibleRendererProfile(
+                    "app://-/assets/app-initial-Future_negative.js",
+                    rejectedSource,
+                    out _,
+                    out _))
+            {
+                throw new InvalidOperationException(
+                    "Native Fast structural compatibility accepted an ambiguous or disconnected renderer.");
+            }
+        }
+
+        if (!TryCreateCompatibleRendererProfile(
+                "app://-/assets/app-initial-Future_restart.js",
+                negativeSource,
+                out var restartProfile,
+                out _) ||
+            PatchRendererSource(
+                restartProfile,
+                negativeSource,
+                out var restartPatchedSource).Status != RendererPatchStatus.Patched ||
+            !TryCreateCompatibleRendererProfile(
+                "app://-/assets/app-initial-Future_uncached.js",
+                restartPatchedSource,
+                out var uncachedPatchedProfile,
+                out _) ||
+            !uncachedPatchedProfile.SourceSha256.Equals(
+                restartProfile.SourceSha256,
+                StringComparison.Ordinal) ||
+            !uncachedPatchedProfile.PatchedSha256!.Equals(
+                SourceFingerprint(restartPatchedSource),
+                StringComparison.Ordinal) ||
+            PatchRendererSource(
+                uncachedPatchedProfile,
+                restartPatchedSource,
+                out _).Status != RendererPatchStatus.AlreadyPatched)
+        {
+            throw new InvalidOperationException(
+                "Native Fast did not safely recover an uncached already-patched future renderer.");
+        }
+        for (var partialCount = 1;
+             partialCount < CompatibilityAuthCaptureOccurrences;
+             partialCount++)
+        {
+            if (TryCreateCompatibleRendererProfile(
+                    "app://-/assets/app-initial-Future_partial.js",
+                    negativeSource + string.Concat(
+                        Enumerable.Repeat("_camAuth", partialCount)),
+                    out _,
+                    out _))
+            {
+                throw new InvalidOperationException(
+                    "Native Fast accepted a partial compatibility auth-capture contract.");
+            }
+        }
+        if (TryCreateCompatibleRendererProfile(
+                "app://-/assets/app-initial-Future_extra.js",
+                restartPatchedSource + "_camAuth",
+                out _,
+                out _))
+        {
+            throw new InvalidOperationException(
+                "Native Fast accepted an over-complete compatibility auth-capture contract.");
         }
 
         var startInfo = BuildStartInfo(19335, "test-browser");
@@ -2146,12 +3865,6 @@ internal static class CodexNativeFastBridge
                 }
             }
 
-            if (!_reviewedProfiles.TryGetValue(observed.Url, out var profile))
-            {
-                RejectPreflight("the observed renderer URL was not mapped to this page");
-                return;
-            }
-
             var sourceResult = await _connection.SendAsync(
                 "Debugger.getScriptSource",
                 new { scriptId = observed.ScriptId },
@@ -2167,18 +3880,84 @@ internal static class CodexNativeFastBridge
             }
 
             var fingerprint = SourceFingerprint(source);
-            var patch = PatchRendererSource(profile, source, out _);
-            var alreadyPatched = patch.Status == RendererPatchStatus.AlreadyPatched;
-            var reviewedOriginal =
-                patch.Status == RendererPatchStatus.Patched &&
-                fingerprint.Equals(profile.SourceSha256, StringComparison.Ordinal);
-            var reviewedPatched =
-                alreadyPatched &&
-                IsReviewedPatchedRendererSource(profile, source);
-            if (!reviewedOriginal && !reviewedPatched)
+            RendererPatchProfile? profile = null;
+            RendererPatchResult? patch = null;
+            var alreadyPatched = false;
+            if (_reviewedProfiles.TryGetValue(observed.Url, out var reviewedProfile))
             {
-                RejectPreflight(
-                    $"sha256={fingerprint}; contract={patch.Status}; detail={patch.Detail}");
+                if (RendererSourceMatchesProfile(
+                        reviewedProfile,
+                        source,
+                        fingerprint,
+                        out var reviewedPatch,
+                        out alreadyPatched))
+                {
+                    profile = reviewedProfile;
+                    patch = reviewedPatch;
+                }
+                else
+                {
+                    RejectPreflight(
+                        $"sha256={fingerprint}; exact_profile={reviewedProfile.Name}; " +
+                        $"contract={reviewedPatch.Status}; detail={reviewedPatch.Detail}; " +
+                        "structural fallback is disabled for a known bundle URL");
+                    return;
+                }
+            }
+
+            if (profile == null &&
+                TryGetCachedCompatibleRendererProfile(
+                    observed.Url,
+                    fingerprint,
+                    out var cachedProfile) &&
+                RendererSourceMatchesProfile(
+                    cachedProfile,
+                    source,
+                    fingerprint,
+                    out var cachedPatch,
+                    out alreadyPatched))
+            {
+                profile = cachedProfile;
+                patch = cachedPatch;
+            }
+
+            if (profile == null)
+            {
+                if (!TryCreateCompatibleRendererProfile(
+                        observed.Url,
+                        source,
+                        out var compatibleProfile,
+                        out var compatibilityDetail))
+                {
+                    RejectPreflight(
+                        $"sha256={fingerprint}; no_exact_profile; " +
+                        $"compatibility={compatibilityDetail}");
+                    return;
+                }
+                CacheCompatibleRendererProfile(compatibleProfile);
+                if (!RendererSourceMatchesProfile(
+                        compatibleProfile,
+                        source,
+                        fingerprint,
+                        out var compatiblePatch,
+                        out alreadyPatched))
+                {
+                    RejectPreflight(
+                        $"sha256={fingerprint}; generated compatibility profile was not stable; " +
+                        $"contract={compatiblePatch.Status}; detail={compatiblePatch.Detail}");
+                    return;
+                }
+                profile = compatibleProfile;
+                patch = compatiblePatch;
+                Log(
+                    "renderer_compatibility_profile_verified",
+                    $"target={_targetId}; profile={profile.Name}; url={observed.Url}; " +
+                    $"sha256={profile.SourceSha256}; patched_sha256={profile.PatchedSha256}");
+            }
+
+            if (patch == null)
+            {
+                RejectPreflight("renderer preflight did not resolve a verified patch contract");
                 return;
             }
 
@@ -2364,10 +4143,22 @@ internal static class CodexNativeFastBridge
                     : 0;
             if (string.IsNullOrWhiteSpace(scriptId) ||
                 url == null ||
-                !_reviewedProfiles.ContainsKey(url) ||
+                !IsRendererBundleUrlForPage(_pageUrl, url) ||
                 !_seenScripts.TryAdd(scriptId, 0))
             {
                 return;
+            }
+            if (executionContextId <= 0 ||
+                !_executionContextEpochs.TryGetValue(executionContextId, out var contextEpoch))
+            {
+                return;
+            }
+            lock (_stateSync)
+            {
+                if (_disposed || !_readinessState.IsCurrentEpoch(contextEpoch))
+                {
+                    return;
+                }
             }
 
             if (!_preflightFinished)
@@ -2380,8 +4171,6 @@ internal static class CodexNativeFastBridge
                     url,
                     _selectedProfile?.BundleUrl,
                     StringComparison.Ordinal) ||
-                executionContextId <= 0 ||
-                !_executionContextEpochs.TryGetValue(executionContextId, out var contextEpoch) ||
                 !_fulfilledResponses.TryGetValue(url!, out var fulfilled) ||
                 fulfilled.Epoch != contextEpoch)
             {
@@ -3053,7 +4842,6 @@ internal static class CodexNativeFastBridge
         {
             epoch = 0;
             if (!CanUseCurrentDocument() ||
-                !_preflightVerified ||
                 !string.Equals(frameId, _mainFrameId, StringComparison.Ordinal))
             {
                 return false;
@@ -3061,6 +4849,11 @@ internal static class CodexNativeFastBridge
 
             epoch = _epoch;
             return true;
+        }
+
+        internal bool IsCurrentEpoch(long epoch)
+        {
+            return CanUseCurrentDocument() && epoch == _epoch;
         }
 
         internal bool TryBeginFetch(

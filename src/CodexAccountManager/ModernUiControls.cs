@@ -136,6 +136,9 @@ internal sealed class ModernButton : Button
     public bool AutoShrinkText { get; set; } = true;
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public bool AllowMultilineText { get; set; }
+
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public float MinimumFontSize { get; set; } = 7.2F;
 
     public ModernButton()
@@ -327,11 +330,12 @@ internal sealed class ModernButton : Button
         {
             content.Offset(0, 1);
         }
-        var flags = TextFormatFlags.SingleLine |
-                    TextFormatFlags.VerticalCenter |
-                    TextFormatFlags.EndEllipsis |
+        var flags = TextFormatFlags.VerticalCenter |
                     TextFormatFlags.NoPadding |
                     TextFormatFlags.NoPrefix;
+        flags |= AllowMultilineText
+            ? TextFormatFlags.WordBreak
+            : TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis;
         flags |= TextAlign switch
         {
             ContentAlignment.MiddleLeft or ContentAlignment.TopLeft or ContentAlignment.BottomLeft => TextFormatFlags.Left,
@@ -395,6 +399,23 @@ internal sealed class ModernButton : Button
         }
 
         var textBounds = UiDesign.CenterTextVertically(graphics, Text, textFont, content);
+        if (AllowMultilineText)
+        {
+            var measured = TextRenderer.MeasureText(
+                graphics,
+                string.IsNullOrEmpty(Text) ? " " : Text,
+                textFont,
+                new Size(Math.Max(1, content.Width), int.MaxValue),
+                TextFormatFlags.WordBreak |
+                TextFormatFlags.NoPadding |
+                TextFormatFlags.NoPrefix);
+            var measuredHeight = Math.Min(content.Height, Math.Max(1, measured.Height));
+            textBounds = new Rectangle(
+                content.Left,
+                content.Top + ((content.Height - measuredHeight) / 2),
+                content.Width,
+                measuredHeight);
+        }
         TextRenderer.DrawText(graphics, Text, textFont, textBounds, textColor, flags);
         fittedFont?.Dispose();
 

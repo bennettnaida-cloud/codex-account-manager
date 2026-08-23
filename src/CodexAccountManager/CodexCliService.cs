@@ -598,7 +598,7 @@ public sealed partial class CodexCliService
     public async Task<UsageLimitResetSession> OpenUsageLimitResetSessionAsync(
         AccountRecord account,
         bool fastFail = false,
-        bool preserveRunningGateway = false,
+        bool preserveRunningGateway = true,
         CancellationToken cancellationToken = default)
     {
         if (account.IsCompatibleApi)
@@ -614,14 +614,9 @@ public sealed partial class CodexCliService
         else
         {
             EnsureLocalPatAccountConfig(account);
-            if (preserveRunningGateway)
-            {
-                await LocalPatGateway.EnsureRunningForLightweightTestAsync(cancellationToken);
-            }
-            else
-            {
-                await LocalPatGateway.EnsureRunningAsync(cancellationToken);
-            }
+            await EnsureUsageLimitResetGatewayAsync(
+                preserveRunningGateway,
+                cancellationToken);
         }
 
         var authPath = Path.Combine(account.CodexHome, AuthFileName);
@@ -665,6 +660,75 @@ public sealed partial class CodexCliService
         }
 
         throw new TimeoutException("Codex 官方用量接口初始化重试后仍然超时。");
+    }
+
+    private static Task EnsureUsageLimitResetGatewayAsync(
+        bool preserveRunningGateway,
+        CancellationToken cancellationToken) =>
+        EnsureUsageLimitResetGatewayAsync(
+            preserveRunningGateway,
+            LocalPatGateway.EnsureRunningForLightweightTestAsync,
+            token => LocalPatGateway.EnsureRunningAsync(token),
+            cancellationToken);
+
+    private static Task EnsureUsageLimitResetGatewayAsync(
+        bool preserveRunningGateway,
+        Func<CancellationToken, Task> preserveGateway,
+        Func<CancellationToken, Task> restartCapableGateway,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(preserveGateway);
+        ArgumentNullException.ThrowIfNull(restartCapableGateway);
+        return preserveRunningGateway
+            ? preserveGateway(cancellationToken)
+            : restartCapableGateway(cancellationToken);
+    }
+
+    internal static void ValidateUsageLimitResetGatewaySafety()
+    {
+        var preserveCalls = 0;
+        var restartCapableCalls = 0;
+        EnsureUsageLimitResetGatewayAsync(
+                preserveRunningGateway: true,
+                _ =>
+                {
+                    preserveCalls++;
+                    return Task.CompletedTask;
+                },
+                _ =>
+                {
+                    restartCapableCalls++;
+                    return Task.CompletedTask;
+                },
+                CancellationToken.None)
+            .GetAwaiter()
+            .GetResult();
+
+        var preserveParameter = typeof(CodexCliService)
+            .GetMethod(nameof(OpenUsageLimitResetSessionAsync))?
+            .GetParameters()
+            .SingleOrDefault(parameter =>
+                parameter.Name == "preserveRunningGateway");
+        if (preserveCalls != 1 ||
+            restartCapableCalls != 0 ||
+            preserveParameter is not { HasDefaultValue: true, DefaultValue: true })
+        {
+            throw new InvalidOperationException(
+                "Usage-limit reset sessions must preserve an already-running PAT gateway by default.");
+        }
+
+        var accountHome = Path.Combine(Path.GetTempPath(), "codex-reset-auth-fixture");
+        var startInfo = BuildUsageLimitResetProcessStartInfo("codex-fixture.exe", accountHome);
+        if (!string.Equals(startInfo.FileName, "codex-fixture.exe", StringComparison.Ordinal) ||
+            !startInfo.Arguments.Equals("app-server --stdio --disable plugins", StringComparison.Ordinal) ||
+            startInfo.UseShellExecute ||
+            !string.Equals(startInfo.Environment["CODEX_HOME"], accountHome, StringComparison.Ordinal) ||
+            !string.Equals(startInfo.Environment["CODEX_SQLITE_HOME"], accountHome, StringComparison.Ordinal) ||
+            CredentialEnvironmentVariableNames.Any(startInfo.Environment.ContainsKey))
+        {
+            throw new InvalidOperationException(
+                "Usage-limit reset sessions must authenticate only from the selected account CODEX_HOME.");
+        }
     }
 
     internal bool HasStoredQuotaTestCredential(AccountRecord account)
@@ -1172,26 +1236,7 @@ public sealed partial class CodexCliService
         TimeSpan initializeTimeout,
         CancellationToken cancellationToken)
     {
-        var startInfo = new ProcessStartInfo(command, "app-server --stdio --disable plugins")
-        {
-            WorkingDirectory = Path.GetTempPath(),
-            UseShellExecute = false,
-            RedirectStandardInput = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true,
-            // JSONL over stdio is explicitly BOM-free for compatibility with the Rust reader.
-            StandardInputEncoding = new UTF8Encoding(false),
-            StandardOutputEncoding = Encoding.UTF8,
-            StandardErrorEncoding = Encoding.UTF8
-        };
-        startInfo.Environment["CODEX_HOME"] = codexHome;
-        startInfo.Environment["CODEX_SQLITE_HOME"] = codexHome;
-        foreach (var variableName in CredentialEnvironmentVariableNames)
-        {
-            startInfo.Environment.Remove(variableName);
-        }
-        ApplyProxyEnvironment(startInfo);
+        var startInfo = BuildUsageLimitResetProcessStartInfo(command, codexHome);
 
         var process = new Process { StartInfo = startInfo };
         try
@@ -1215,6 +1260,33 @@ public sealed partial class CodexCliService
             await session.DisposeAsync();
             throw;
         }
+    }
+
+    private static ProcessStartInfo BuildUsageLimitResetProcessStartInfo(
+        string command,
+        string codexHome)
+    {
+        var startInfo = new ProcessStartInfo(command, "app-server --stdio --disable plugins")
+        {
+            WorkingDirectory = Path.GetTempPath(),
+            UseShellExecute = false,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+            // JSONL over stdio is explicitly BOM-free for compatibility with the Rust reader.
+            StandardInputEncoding = new UTF8Encoding(false),
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8
+        };
+        startInfo.Environment["CODEX_HOME"] = codexHome;
+        startInfo.Environment["CODEX_SQLITE_HOME"] = codexHome;
+        foreach (var variableName in CredentialEnvironmentVariableNames)
+        {
+            startInfo.Environment.Remove(variableName);
+        }
+        ApplyProxyEnvironment(startInfo);
+        return startInfo;
     }
 
     public async Task<WindowsClientAccountProjection> PrepareWindowsClientAccountAsync(AccountRecord account)

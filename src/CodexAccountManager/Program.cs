@@ -204,6 +204,7 @@ static class Program
             AccountStore.ValidateOfficialOAuthAccountStorage();
             AccountStore.ValidatePermanentAccountDeletion();
             UsageLimitResetSession.ValidateProtocolParsing();
+            CodexCliService.ValidateUsageLimitResetGatewaySafety();
             CodexCliService.ValidateMinimalQuotaTestParsing();
             QuotaSnapshotStore.ValidateAccountIsolation();
             ProbeUsageLedger.ValidateLedger();
@@ -628,7 +629,9 @@ static class Program
 
     private static async Task<int> ReadResetCreditsAsync(AccountRecord account)
     {
-        await using var session = await new CodexCliService().OpenUsageLimitResetSessionAsync(account);
+        await using var session = await new CodexCliService().OpenUsageLimitResetSessionAsync(
+            account,
+            preserveRunningGateway: true);
         var info = await session.ReadAsync();
         Console.WriteLine($"Account={account.Name}");
         Console.WriteLine($"AvailableCount={(info.AvailableCount?.ToString() ?? "unavailable")}");

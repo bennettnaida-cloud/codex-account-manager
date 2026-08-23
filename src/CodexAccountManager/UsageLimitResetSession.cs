@@ -21,6 +21,15 @@ public sealed record UsageLimitResetInfo(
     public bool IsAvailable => AvailableCount.HasValue;
     public int? UsedPercent => Primary?.UsedPercent;
     public DateTimeOffset? ResetsAtUtc => Primary?.ResetsAtUtc;
+    public DateTimeOffset? AvailableCreditExpiresAtUtc => AvailableCount is > 0
+        ? Credits
+            .Where(credit =>
+                credit.ExpiresAtUtc.HasValue &&
+                string.Equals(credit.Status, "available", StringComparison.OrdinalIgnoreCase))
+            .Select(credit => credit.ExpiresAtUtc)
+            .OrderBy(expiresAt => expiresAt)
+            .FirstOrDefault()
+        : null;
 }
 
 public sealed record UsageCreditsSnapshot(
@@ -50,6 +59,11 @@ public enum UsageLimitResetOutcome
     NoCredit,
     AlreadyRedeemed
 }
+
+internal sealed record UsageLimitResetConsumeAttempt(
+    bool WasSent,
+    string? IdempotencyKey,
+    UsageLimitResetOutcome? Outcome);
 
 public sealed class UsageLimitResetSession : IAsyncDisposable
 {
@@ -105,20 +119,9 @@ public sealed class UsageLimitResetSession : IAsyncDisposable
         string? creditId = null,
         CancellationToken cancellationToken = default)
     {
-        if (string.IsNullOrWhiteSpace(idempotencyKey))
-        {
-            throw new ArgumentException("用量重置的幂等键不能为空。", nameof(idempotencyKey));
-        }
-
-        JsonObject BuildParameters()
-        {
-            var parameters = new JsonObject { ["idempotencyKey"] = idempotencyKey };
-            if (!string.IsNullOrWhiteSpace(creditId))
-            {
-                parameters["creditId"] = creditId;
-            }
-            return parameters;
-        }
+        // Build this once outside the retry loop. If the first response times out after the
+        // backend has already redeemed a credit, the retry must carry the exact same key.
+        var consumeParameters = BuildConsumeParameters(idempotencyKey, creditId);
 
         for (var attempt = 0; ; attempt++)
         {
@@ -126,7 +129,7 @@ public sealed class UsageLimitResetSession : IAsyncDisposable
             {
                 var result = await RequestAsync(
                     "account/rateLimitResetCredit/consume",
-                    BuildParameters(),
+                    consumeParameters,
                     ConsumeTimeout,
                     cancellationToken);
                 return ParseOutcome(result);
@@ -137,6 +140,48 @@ public sealed class UsageLimitResetSession : IAsyncDisposable
                 // Retrying with the same idempotency key prevents consuming a second credit.
             }
         }
+    }
+
+    internal static async Task<UsageLimitResetConsumeAttempt> ConsumeWhenConfirmedAsync(
+        UsageLimitResetInfo info,
+        bool confirmed,
+        Func<string, CancellationToken, Task<UsageLimitResetOutcome>> consume,
+        Func<string>? idempotencyKeyFactory = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(info);
+        ArgumentNullException.ThrowIfNull(consume);
+        if (!confirmed || info.AvailableCount is not > 0)
+        {
+            return new UsageLimitResetConsumeAttempt(false, null, null);
+        }
+
+        var idempotencyKey = (idempotencyKeyFactory ??
+                              (() => Guid.NewGuid().ToString("D")))();
+        if (string.IsNullOrWhiteSpace(idempotencyKey))
+        {
+            throw new InvalidOperationException("用量重置的幂等键生成失败。");
+        }
+
+        var outcome = await consume(idempotencyKey, cancellationToken);
+        return new UsageLimitResetConsumeAttempt(true, idempotencyKey, outcome);
+    }
+
+    internal static JsonObject BuildConsumeParameters(
+        string idempotencyKey,
+        string? creditId = null)
+    {
+        if (string.IsNullOrWhiteSpace(idempotencyKey))
+        {
+            throw new ArgumentException("用量重置的幂等键不能为空。", nameof(idempotencyKey));
+        }
+
+        var parameters = new JsonObject { ["idempotencyKey"] = idempotencyKey };
+        if (!string.IsNullOrWhiteSpace(creditId))
+        {
+            parameters["creditId"] = creditId;
+        }
+        return parameters;
     }
 
     internal static JsonObject BuildRequest(int id, string method, JsonObject? parameters)
@@ -329,6 +374,24 @@ public sealed class UsageLimitResetSession : IAsyncDisposable
                     "expiresAt": "2026-08-11T00:00:00Z",
                     "title": "Reset",
                     "description": "Reset current limits"
+                  },
+                  {
+                    "id": "credit-later",
+                    "resetType": "codexRateLimits",
+                    "status": "available",
+                    "grantedAt": "2026-07-12T00:00:00Z",
+                    "expiresAt": "2026-09-11T00:00:00Z",
+                    "title": "Reset",
+                    "description": "Reset current limits"
+                  },
+                  {
+                    "id": "credit-redeemed",
+                    "resetType": "codexRateLimits",
+                    "status": "redeemed",
+                    "grantedAt": "2026-06-11T00:00:00Z",
+                    "expiresAt": "2026-07-11T00:00:00Z",
+                    "title": "Reset",
+                    "description": "Already used"
                   }
                 ]
               }
@@ -336,7 +399,9 @@ public sealed class UsageLimitResetSession : IAsyncDisposable
             """)!.AsObject();
         var parsed = ParseRateLimits(sample);
         if (parsed.AvailableCount != 2 ||
-            parsed.Credits.Count != 1 ||
+            parsed.Credits.Count != 3 ||
+            parsed.AvailableCreditExpiresAtUtc !=
+                new DateTimeOffset(2026, 8, 11, 0, 0, 0, TimeSpan.Zero) ||
             parsed.UsedPercent != 12 ||
             parsed.Primary?.WindowMinutes != 300 ||
             parsed.Secondary?.UsedPercent != 33 ||
@@ -381,25 +446,90 @@ public sealed class UsageLimitResetSession : IAsyncDisposable
             }
             """)!.AsObject());
         if (snakeCase.AvailableCount != 1 ||
-            snakeCase.Credits is not [{ Id: "credit-snake", ResetType: "codexRateLimits" }])
+            snakeCase.Credits is not [{ Id: "credit-snake", ResetType: "codexRateLimits" }] ||
+            snakeCase.AvailableCreditExpiresAtUtc !=
+                DateTimeOffset.FromUnixTimeSeconds(1_784_246_400))
         {
             throw new InvalidOperationException(
                 "Usage-limit reset parser did not accept the safe snake_case compatibility shape.");
         }
 
         var readRequest = BuildRequest(2, "account/rateLimits/read", null);
+        var consumeParameters = BuildConsumeParameters("stable-key", "credit-1");
         var consumeRequest = BuildRequest(
             3,
             "account/rateLimitResetCredit/consume",
-            new JsonObject { ["idempotencyKey"] = "stable-key" });
-        if (readRequest.ContainsKey("params") ||
+            consumeParameters);
+        var retryRequest = BuildRequest(
+            4,
+            "account/rateLimitResetCredit/consume",
+            consumeParameters);
+        if (readRequest["method"]?.GetValue<string>() != "account/rateLimits/read" ||
+            readRequest.ContainsKey("params") ||
+            readRequest.ToJsonString().Contains("consume", StringComparison.OrdinalIgnoreCase) ||
             consumeRequest["params"]?["idempotencyKey"]?.GetValue<string>() != "stable-key" ||
+            consumeRequest["params"]?["creditId"]?.GetValue<string>() != "credit-1" ||
+            retryRequest["params"]?["idempotencyKey"]?.GetValue<string>() != "stable-key" ||
             ParseOutcome(new JsonObject { ["outcome"] = "reset" }) != UsageLimitResetOutcome.Reset ||
             ParseOutcome(new JsonObject { ["outcome"] = "nothingToReset" }) != UsageLimitResetOutcome.NothingToReset ||
             ParseOutcome(new JsonObject { ["outcome"] = "noCredit" }) != UsageLimitResetOutcome.NoCredit ||
             ParseOutcome(new JsonObject { ["outcome"] = "alreadyRedeemed" }) != UsageLimitResetOutcome.AlreadyRedeemed)
         {
             throw new InvalidOperationException("Usage-limit reset request/outcome self-test failed.");
+        }
+
+        const string mockIdempotencyKey = "5f88aa7e-b807-46e4-b13c-a91a8aa3ab53";
+        var mockConsumeCalls = 0;
+        string? observedIdempotencyKey = null;
+        Task<UsageLimitResetOutcome> MockConsume(
+            string idempotencyKey,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            mockConsumeCalls++;
+            observedIdempotencyKey = idempotencyKey;
+            return Task.FromResult(UsageLimitResetOutcome.Reset);
+        }
+
+        var confirmedAttempt = ConsumeWhenConfirmedAsync(
+                parsed,
+                confirmed: true,
+                MockConsume,
+                () => mockIdempotencyKey)
+            .GetAwaiter()
+            .GetResult();
+        var cancelledAttempt = ConsumeWhenConfirmedAsync(
+                parsed,
+                confirmed: false,
+                MockConsume,
+                () => throw new InvalidOperationException("A cancelled reset generated an idempotency key."))
+            .GetAwaiter()
+            .GetResult();
+        var zeroCreditAttempt = ConsumeWhenConfirmedAsync(
+                parsed with { AvailableCount = 0 },
+                confirmed: true,
+                MockConsume,
+                () => throw new InvalidOperationException("A zero-credit reset generated an idempotency key."))
+            .GetAwaiter()
+            .GetResult();
+        var unavailableAttempt = ConsumeWhenConfirmedAsync(
+                parsed with { AvailableCount = null },
+                confirmed: true,
+                MockConsume,
+                () => throw new InvalidOperationException("An unavailable reset generated an idempotency key."))
+            .GetAwaiter()
+            .GetResult();
+        if (!confirmedAttempt.WasSent ||
+            confirmedAttempt.Outcome != UsageLimitResetOutcome.Reset ||
+            confirmedAttempt.IdempotencyKey != mockIdempotencyKey ||
+            observedIdempotencyKey != mockIdempotencyKey ||
+            mockConsumeCalls != 1 ||
+            cancelledAttempt.WasSent ||
+            zeroCreditAttempt.WasSent ||
+            unavailableAttempt.WasSent)
+        {
+            throw new InvalidOperationException(
+                "Usage-limit reset confirmation/credit guards did not isolate the consume request.");
         }
     }
 

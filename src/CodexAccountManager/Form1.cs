@@ -2172,13 +2172,7 @@ public partial class Form1 : Form
             binding.Metrics[index].Tokens.Text = $"{FormatTokens(metrics[index].Bucket.TotalTokens)} token";
         }
 
-        var kindText = account.IsCompatibleApi
-            ? "兼容 API"
-            : GetQuotaLimitTypeLabel(quotaLimitType);
-        var officialFinancial = account.IsCompatibleApi ? null : GetOfficialFinancialSummary(usage);
-        binding.Kind.Text = string.IsNullOrWhiteSpace(officialFinancial)
-            ? kindText
-            : $"{kindText} · {officialFinancial}";
+        binding.Kind.Text = GetQuotaListSubtitle(account, quotaLimitType);
         _toolTip.SetToolTip(binding.Kind, binding.Kind.Text);
         if (!account.IsCompatibleApi)
         {
@@ -3484,7 +3478,8 @@ public partial class Form1 : Form
                 SetResetCreditState(
                     account,
                     ResetCreditStatus.Known,
-                    snapshot.AvailableCount.Value);
+                    snapshot.AvailableCount.Value,
+                    snapshot.ResetCreditExpiresAtUtc);
             }
             else
             {
@@ -4634,12 +4629,24 @@ public partial class Form1 : Form
         {
             AuthKind = AccountAuthKind.CompatibleApi
         });
+        var oauthQuotaListSubtitle = GetQuotaListSubtitle(
+            new AccountRecord { AuthKind = AccountAuthKind.OfficialOAuth },
+            AccountQuotaLimitType.FiveHourAndWeekly);
+        var accessTokenQuotaListSubtitle = GetQuotaListSubtitle(
+            new AccountRecord { AuthKind = AccountAuthKind.AccessToken },
+            AccountQuotaLimitType.FiveHourAndWeekly);
+        var compatibleApiQuotaListSubtitle = GetQuotaListSubtitle(
+            new AccountRecord { AuthKind = AccountAuthKind.CompatibleApi },
+            AccountQuotaLimitType.Unknown);
         if (oauthQuotaDetailSubtitle !=
                 "通过 ChatGPT 登录（官方） · 仅显示官方额度百分比" ||
             accessTokenQuotaDetailSubtitle !=
                 "Access Token · 仅显示官方额度百分比" ||
             compatibleApiQuotaDetailSubtitle !=
                 "兼容 API · 按 API 账单计费" ||
+            oauthQuotaListSubtitle != "周额度" ||
+            accessTokenQuotaListSubtitle != "周额度" ||
+            compatibleApiQuotaListSubtitle != "兼容 API" ||
             oauthQuotaDetailSubtitle.Contains("官方 Credits", StringComparison.Ordinal) ||
             oauthQuotaDetailSubtitle.Contains("个人限额", StringComparison.Ordinal) ||
             oauthQuotaDetailSubtitle.Contains("个人剩余", StringComparison.Ordinal))
@@ -7335,13 +7342,24 @@ public partial class Form1 : Form
 
         return state.Status switch
         {
-            ResetCreditStatus.Known => $"立即重置（{Math.Max(0, state.Count)} 次）",
+            ResetCreditStatus.Known => FormatResetActionText(
+                state.Count,
+                state.ExpiresAtUtc),
             ResetCreditStatus.Querying => "立即重置（查询中）",
             ResetCreditStatus.Unavailable => "立即重置（次数未知）",
             ResetCreditStatus.Failed => "立即重置（查询失败）",
             ResetCreditStatus.Resetting => "正在重置…",
             _ => "立即重置（未查询）"
         };
+    }
+
+    private static string FormatResetActionText(long count, DateTimeOffset? expiresAtUtc)
+    {
+        var normalizedCount = Math.Max(0, count);
+        var actionText = $"立即重置（{normalizedCount} 次）";
+        return normalizedCount > 0 && expiresAtUtc.HasValue
+            ? $"{actionText}{Environment.NewLine}到期 {expiresAtUtc.Value.ToLocalTime():MM-dd HH:mm}"
+            : actionText;
     }
 
     private string GetResetCreditToolTip(AccountRecord account)
@@ -7354,7 +7372,9 @@ public partial class Form1 : Form
         return state.Status switch
         {
             ResetCreditStatus.Known when state.Count > 0 =>
-                "点击后确认并使用一次官方 Codex 用量重置",
+                state.ExpiresAtUtc is { } expiresAt
+                    ? $"点击后确认并使用一次官方 Codex 用量重置；最近一张可用重置卡将于 {expiresAt.ToLocalTime():yyyy-MM-dd HH:mm} 到期。"
+                    : "点击后确认并使用一次官方 Codex 用量重置；官方未提供可用重置卡的到期时间。",
             ResetCreditStatus.Known => "官方明确返回可重置 0 次，不能执行重置。",
             ResetCreditStatus.Unavailable =>
                 "官方本次没有提供 rateLimitResetCredits；这不等同于可重置 0 次。",
@@ -7376,12 +7396,14 @@ public partial class Form1 : Form
         AccountRecord account,
         ResetCreditStatus status,
         long count = 0,
+        DateTimeOffset? expiresAtUtc = null,
         string? error = null)
     {
         _resetCreditState[QuotaAccountIdentity.CreateKey(account)] = new ResetCreditViewState(
             status,
             Math.Max(0, count),
             DateTimeOffset.UtcNow,
+            expiresAtUtc?.ToUniversalTime(),
             error);
     }
 
@@ -7433,7 +7455,8 @@ public partial class Form1 : Form
         SetResetCreditState(
             account,
             info.IsAvailable ? ResetCreditStatus.Known : ResetCreditStatus.Unavailable,
-            info.AvailableCount ?? 0);
+            info.AvailableCount ?? 0,
+            info.AvailableCreditExpiresAtUtc);
         try
         {
             // Keep the latest official response per credential directory so a restart does
@@ -7518,6 +7541,14 @@ public partial class Form1 : Form
             AccountQuotaLimitType.FiveHourOnly => "5h额度",
             _ => "额度待识别"
         };
+    }
+
+    private static string GetQuotaListSubtitle(AccountRecord account, string quotaLimitType)
+    {
+        ArgumentNullException.ThrowIfNull(account);
+        return account.IsCompatibleApi
+            ? "兼容 API"
+            : GetQuotaLimitTypeLabel(quotaLimitType);
     }
 
     private static (string Caption, UsageBucket Bucket)[] GetQuotaUsageMetrics(
@@ -7855,33 +7886,6 @@ public partial class Form1 : Form
         return $"{account.AuthKindLabel} · {usageSummary}";
     }
 
-    private static string? GetOfficialFinancialSummary(AccountUsageSummary usage)
-    {
-        var parts = new List<string>();
-        if (usage.CreditBalance is { Unlimited: true })
-        {
-            parts.Add("官方 Credits 不限");
-        }
-        else if (usage.CreditBalance is { HasCredits: true, Balance: { Length: > 0 } balance })
-        {
-            parts.Add($"官方 Credits {balance}");
-        }
-
-        if (usage.IndividualLimit is { } individual)
-        {
-            if (!string.IsNullOrWhiteSpace(individual.Used) && !string.IsNullOrWhiteSpace(individual.Limit))
-            {
-                parts.Add($"个人限额 {individual.Used}/{individual.Limit}");
-            }
-            if (individual.RemainingPercent.HasValue)
-            {
-                parts.Add($"个人剩余 {individual.RemainingPercent.Value:0.#}%");
-            }
-        }
-
-        return parts.Count == 0 ? null : string.Join(" · ", parts);
-    }
-
     private static string GetQuotaResetSummary(string quotaLimitType, AccountUsageSummary usage)
     {
         static string Time(DateTimeOffset? value, string format) =>
@@ -8055,15 +8059,9 @@ public partial class Form1 : Form
         name.Click += (_, _) => SelectAccount(account.Name);
         row.Controls.Add(name);
 
-        var kindText = account.IsCompatibleApi
-            ? "兼容 API"
-            : GetQuotaLimitTypeLabel(quotaLimitType);
-        var officialFinancial = account.IsCompatibleApi ? null : GetOfficialFinancialSummary(usage);
         var kind = new Label
         {
-            Text = string.IsNullOrWhiteSpace(officialFinancial)
-                ? kindText
-                : $"{kindText} · {officialFinancial}",
+            Text = GetQuotaListSubtitle(account, quotaLimitType),
             Left = 18,
             Top = infoTop + 38,
             Width = nameWidth - 26,
@@ -9058,7 +9056,14 @@ public partial class Form1 : Form
                 resetWidth,
                 true);
             resetAction.Height = controlHeight;
+            resetAction.Padding = Padding.Empty;
+            resetAction.TextAlign = ContentAlignment.MiddleCenter;
             resetAction.Font = new Font(Font.FontFamily, compact ? 8.9F : 9.4F, FontStyle.Bold);
+            if (resetAction is ModernButton modernResetAction)
+            {
+                modernResetAction.AllowMultilineText = true;
+                modernResetAction.AutoShrinkText = false;
+            }
             resetAction.Name = "UsageResetAction";
             resetAction.AccessibleDescription = account.Name;
             resetAction.Click += async (_, _) => await ResetUsageLimitAsync(account);
@@ -10712,17 +10717,41 @@ public partial class Form1 : Form
         var wideLabelWidth = ScalePixels(280, scale);
         var stackedLabelWidth = ScalePixels(AccountRowMinWidth - 36, scale);
         var horizontalInset = ScalePixels(8, scale);
+        using var resetActionFont = new Font(
+            SystemFonts.DefaultFont.FontFamily,
+            9.4F * scale,
+            FontStyle.Bold);
+        var resetActionLines = new[] { "立即重置（99 次）", "到期 12-31 23:59" };
+        var resetActionLineSizes = resetActionLines
+            .Select(line => TextRenderer.MeasureText(
+                line,
+                resetActionFont,
+                Size.Empty,
+                TextFormatFlags.SingleLine |
+                TextFormatFlags.NoPadding |
+                TextFormatFlags.NoPrefix))
+            .ToArray();
+        var resetActionTextWidth = resetActionLineSizes.Max(size => size.Width);
+        var resetActionTextHeight = resetActionLineSizes.Sum(size => size.Height);
+        // At the narrowest supported detail geometry the second-row reset button owns
+        // half of a 304px action row. WinForms DPI autoscaling grows that 152x42 box.
+        var resetActionWidth = ScalePixels(152, scale);
+        var resetActionHeight = ScalePixels(42, scale);
 
         if (textSize.Width + horizontalInset > Math.Min(wideLabelWidth, stackedLabelWidth) ||
             lineHeight < textSize.Height + ScalePixels(12, scale) ||
             secondLineTop < resetAreaTop + lineHeight ||
             secondLineBottom + actionGap > actionTop ||
-            actionTop + actionHeight + bottomPadding > rowHeight)
+            actionTop + actionHeight + bottomPadding > rowHeight ||
+            resetActionTextWidth + ScalePixels(8, scale) > resetActionWidth ||
+            resetActionTextHeight + ScalePixels(4, scale) > resetActionHeight)
         {
             throw new InvalidOperationException(
                 $"Quota reset layout clips at {scale * 100F:0}% DPI: " +
                 $"text={textSize}, line={lineHeight}, wide={wideLabelWidth}, " +
-                $"stacked={stackedLabelWidth}, row={rowHeight}.");
+                $"stacked={stackedLabelWidth}, row={rowHeight}, " +
+                $"resetText={resetActionTextWidth}x{resetActionTextHeight}, " +
+                $"resetButton={resetActionWidth}x{resetActionHeight}.");
         }
     }
 
@@ -11504,6 +11533,20 @@ public partial class Form1 : Form
     internal static void ValidateQuotaRuntimeAccountIsolation()
     {
         var now = new DateTimeOffset(2026, 7, 19, 5, 32, 0, TimeSpan.Zero);
+        var resetCreditExpiry = now.AddDays(14);
+        var expectedResetAction =
+            $"立即重置（2 次）{Environment.NewLine}到期 {resetCreditExpiry.ToLocalTime():MM-dd HH:mm}";
+        if (!string.Equals(
+                FormatResetActionText(2, resetCreditExpiry),
+                expectedResetAction,
+                StringComparison.Ordinal) ||
+            FormatResetActionText(0, resetCreditExpiry).Contains(
+                "到期",
+                StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "Reset-credit expiry text must be visible only while a reset credit is available.");
+        }
         var originalAccount = new AccountRecord
         {
             Name = "same-label",
@@ -12859,6 +12902,7 @@ public partial class Form1 : Form
             var info = await ReadUsageLimitResetInfoAsync(
                 account,
                 fastFail: true,
+                preserveRunningGateway: true,
                 cancellationToken: timeout.Token);
             if (!IsQuotaRuntimeStateCurrent(accountKey, generation) ||
                 !string.Equals(
@@ -13018,7 +13062,7 @@ public partial class Form1 : Form
         AccountRecord account,
         bool fastFail = false,
         bool retryUnavailableResetCredits = false,
-        bool preserveRunningGateway = false,
+        bool preserveRunningGateway = true,
         CancellationToken cancellationToken = default)
     {
         var requestLock = GetOfficialQuotaRequestLock(account);
@@ -13085,7 +13129,8 @@ public partial class Form1 : Form
             _statusBox.Text = $"正在只读刷新 {account.Name} 的官方额度……";
             var info = await ReadUsageLimitResetInfoAsync(
                 account,
-                retryUnavailableResetCredits: true);
+                retryUnavailableResetCredits: true,
+                preserveRunningGateway: true);
             CacheUsageLimitResetInfo(account, info);
 
             if (!info.IsAvailable)
@@ -13118,8 +13163,11 @@ public partial class Form1 : Form
                 { HasCredits: true, Balance: { Length: > 0 } balance } => $"\n官方 Credits：{balance}（协议未提供币种）",
                 _ => ""
             };
+            var expiryText = availableCount > 0 && info.AvailableCreditExpiresAtUtc is { } expiresAt
+                ? $"\n最近到期：{expiresAt.ToLocalTime():yyyy-MM-dd HH:mm}"
+                : "";
             var availabilityText =
-                $"账号 {account.Name}\n{primaryText}{secondaryText}\n可重置 {availableCount} 次。{creditsText}\n\n" +
+                $"账号 {account.Name}\n{primaryText}{secondaryText}\n可重置 {availableCount} 次。{expiryText}{creditsText}\n\n" +
                 "本次仅调用只读额度接口，没有发送提示、调用模型或消耗 Token。";
             _statusBox.Text = availabilityText +
                               (availableCount == 0 ? " 立即重置按钮已禁用。" : " 可以点击“立即重置”使用一次。");
@@ -13295,7 +13343,9 @@ public partial class Form1 : Form
             await requestLock.WaitAsync();
             try
             {
-                await using var session = await _codex.OpenUsageLimitResetSessionAsync(account);
+                await using var session = await _codex.OpenUsageLimitResetSessionAsync(
+                    account,
+                    preserveRunningGateway: true);
                 var info = await session.ReadAsync();
                 CacheUsageLimitResetInfo(account, info);
 
@@ -13317,8 +13367,7 @@ public partial class Form1 : Form
                     return;
                 }
 
-                var credit = info.Credits.FirstOrDefault();
-                var expiryText = credit?.ExpiresAtUtc is { } expiresAt
+                var expiryText = info.AvailableCreditExpiresAtUtc is { } expiresAt
                     ? $"\n该次数到期时间：{expiresAt.ToLocalTime():yyyy-MM-dd HH:mm}"
                     : "";
                 var confirmation = MessageBox.Show(
@@ -13336,10 +13385,16 @@ public partial class Form1 : Form
                     return;
                 }
 
-                var idempotencyKey = Guid.NewGuid().ToString();
                 SetResetCreditState(account, ResetCreditStatus.Resetting, availableCount);
                 _statusBox.Text = $"正在为 {account.Name} 使用一次官方用量重置……";
-                var outcome = await session.ConsumeAsync(idempotencyKey);
+                var consumeAttempt = await UsageLimitResetSession.ConsumeWhenConfirmedAsync(
+                    info,
+                    confirmed: true,
+                    (idempotencyKey, cancellationToken) => session.ConsumeAsync(
+                        idempotencyKey,
+                        cancellationToken: cancellationToken));
+                var outcome = consumeAttempt.Outcome ?? throw new InvalidOperationException(
+                    "已确认的用量重置没有进入官方 consume 请求。");
 
                 UsageLimitResetInfo? refreshed = null;
                 string? refreshWarning = null;
@@ -14343,6 +14398,7 @@ public partial class Form1 : Form
         ResetCreditStatus Status,
         long Count,
         DateTimeOffset CheckedAtUtc,
+        DateTimeOffset? ExpiresAtUtc,
         string? Error);
 
     private sealed record LiveRateLimitSnapshot(

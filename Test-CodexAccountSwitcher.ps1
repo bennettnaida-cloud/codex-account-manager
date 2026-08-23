@@ -848,12 +848,40 @@ if ($passiveQuotaMonitorLayout.Value -notmatch 'var observedSpan\s*=\s*Math\.Cla
     $formSource -match '0D,\s*3D|/3%') {
     throw 'Quota cards must show first-estimate progress only before calibration, then describe live overlapping updates without misleading current/completed rounds.'
 }
+$manualResetQuery = [regex]::Match(
+    $formSource,
+    '(?s)private async Task QueryUsageLimitResetAsync\(AccountRecord account\).*?(?=\r?\n\s*private async Task SendMinimalQuotaTestAsync)')
+$resetWorkflow = [regex]::Match(
+    $formSource,
+    '(?s)private async Task ResetUsageLimitAsync\(AccountRecord account\).*?(?=\r?\n\s*private async Task CheckStatusAsync)')
+$resetReadIndex = if ($resetWorkflow.Success) {
+    $resetWorkflow.Value.IndexOf('var info = await session.ReadAsync', [StringComparison]::Ordinal)
+}
+else { -1 }
+$resetConsumeIndex = if ($resetWorkflow.Success) {
+    $resetWorkflow.Value.IndexOf('session.ConsumeAsync', [StringComparison]::Ordinal)
+}
+else { -1 }
+$resetPreConsume = if ($resetReadIndex -ge 0 -and $resetConsumeIndex -gt $resetReadIndex) {
+    $resetWorkflow.Value.Substring($resetReadIndex, $resetConsumeIndex - $resetReadIndex)
+}
+else { '' }
+$readResetInfo = [regex]::Match(
+    $formSource,
+    '(?s)private async Task<UsageLimitResetInfo> ReadUsageLimitResetInfoAsync\(.*?(?=\r?\n\s*private static UsageLimitResetInfo MergeUsageLimitResetReads)')
+$openResetSession = [regex]::Match(
+    $cliServiceSource,
+    '(?s)public async Task<UsageLimitResetSession> OpenUsageLimitResetSessionAsync\(.*?(?=\r?\n\s*internal bool HasStoredQuotaTestCredential)')
+$consumeResetCredit = [regex]::Match(
+    $resetSessionSource,
+    '(?s)public async Task<UsageLimitResetOutcome> ConsumeAsync\(.*?(?=\r?\n\s*internal static JsonObject BuildConsumeParameters)')
 if ($formSource -notmatch 'QueryUsageLimitResetAsync' -or
     $formSource -notmatch 'ResetUsageLimitAsync' -or
     $formSource -match 'ManageUsageLimitResetAsync' -or
     $formSource -notmatch 'GetResetActionText' -or
     $formSource -notmatch 'ResetCreditStatus\.Known' -or
     $formSource -notmatch 'UsageResetAction' -or
+    $formSource -notmatch 'resetAction\.Click\s*\+=\s*async\s*\(_,\s*_\)\s*=>\s*await ResetUsageLimitAsync\(account\)' -or
     $formSource -notmatch 'rightWidth = compact \? width : horizontalGeometry\.RightWidth' -or
     $formSource -notmatch 'actionLeft, actionTop, 180' -or
     $formSource -notmatch 'MessageBoxDefaultButton\.Button2' -or
@@ -867,8 +895,32 @@ if ($formSource -notmatch 'QueryUsageLimitResetAsync' -or
     $resetSessionSource -notmatch 'account/rateLimits/read' -or
     $resetSessionSource -notmatch 'account/rateLimitResetCredit/consume' -or
     $resetSessionSource -notmatch 'idempotencyKey' -or
+    $resetSessionSource -notmatch 'ConsumeWhenConfirmedAsync' -or
+    $resetSessionSource -notmatch 'mockConsumeCalls' -or
     $resetSessionSource -notmatch 'alreadyRedeemed' -or
-    $resetSessionSource -notmatch 'rateLimitResetCredits') {
+    $resetSessionSource -notmatch 'rateLimitResetCredits' -or
+    -not $manualResetQuery.Success -or
+    $manualResetQuery.Value -notmatch 'ReadUsageLimitResetInfoAsync\([\s\S]*?preserveRunningGateway:\s*true' -or
+    -not $readResetInfo.Success -or
+    $readResetInfo.Value -notmatch 'bool preserveRunningGateway\s*=\s*true' -or
+    $readResetInfo.Value -notmatch 'OpenUsageLimitResetSessionAsync\([\s\S]*?preserveRunningGateway' -or
+    -not $openResetSession.Success -or
+    $openResetSession.Value -notmatch 'bool preserveRunningGateway\s*=\s*true' -or
+    $openResetSession.Value -notmatch 'EnsureUsageLimitResetGatewayAsync\(\s*preserveRunningGateway' -or
+    $cliServiceSource -notmatch 'BuildUsageLimitResetProcessStartInfo\(command,\s*codexHome\)' -or
+    $cliServiceSource -notmatch 'startInfo\.Environment\["CODEX_HOME"\]\s*=\s*codexHome' -or
+    $cliServiceSource -notmatch 'startInfo\.Environment\["CODEX_SQLITE_HOME"\]\s*=\s*codexHome' -or
+    $cliServiceSource -notmatch 'foreach \(var variableName in CredentialEnvironmentVariableNames\)[\s\S]*?startInfo\.Environment\.Remove\(variableName\)' -or
+    -not $resetWorkflow.Success -or
+    $resetWorkflow.Value -notmatch 'OpenUsageLimitResetSessionAsync\(\s*account,\s*preserveRunningGateway:\s*true\)' -or
+    $resetReadIndex -lt 0 -or
+    $resetConsumeIndex -le $resetReadIndex -or
+    $resetPreConsume -notmatch '!info\.IsAvailable\s*\|\|\s*availableCount\s*==\s*0[\s\S]*?return;' -or
+    $resetPreConsume -notmatch 'MessageBoxDefaultButton\.Button2[\s\S]*?confirmation\s*!=\s*DialogResult\.OK[\s\S]*?return;' -or
+    $resetWorkflow.Value -notmatch 'UsageLimitResetSession\.ConsumeWhenConfirmedAsync\([\s\S]*?confirmed:\s*true[\s\S]*?session\.ConsumeAsync\(' -or
+    -not $consumeResetCredit.Success -or
+    $consumeResetCredit.Value -notmatch 'var consumeParameters\s*=\s*BuildConsumeParameters\(idempotencyKey,\s*creditId\);[\s\S]*?for \(var attempt = 0; ; attempt\+\+\)[\s\S]*?RequestAsync\([\s\S]*?consumeParameters' -or
+    $programSource -notmatch 'OpenUsageLimitResetSessionAsync\(\s*account,\s*preserveRunningGateway:\s*true\)') {
     throw 'Quota view must expose the official usage-limit reset-credit flow and size its detail card to real content.'
 }
 $modelTonalArcMethod = [regex]::Match(
@@ -1038,6 +1090,15 @@ $quotaDetailInPlaceUpdater = [regex]::Match(
 $quotaDetailInitialRenderer = [regex]::Match(
     $formSource,
     '(?s)private Control CreateQuotaUsageDetailCard\(AccountRecord account, AccountUsageSummary usage, int cardWidth\)\s*\{.*?(?=\r?\n\s*private static \(Rectangle Subtitle,)')
+$quotaListSubtitleHelper = [regex]::Match(
+    $formSource,
+    '(?s)private static string GetQuotaListSubtitle\(AccountRecord account, string quotaLimitType\)\s*\{.*?\r?\n\s*\}')
+$quotaListInPlaceUpdater = [regex]::Match(
+    $formSource,
+    '(?s)private void UpdateQuotaUsageRow\(.*?(?=\r?\n\s*private static void UpdateQuotaPill)')
+$quotaListInitialRenderer = [regex]::Match(
+    $formSource,
+    '(?s)private Control CreateQuotaUsageRow\(AccountRecord account, AccountUsageSummary usage, int width\)\s*\{.*?(?=\r?\n\s*private QuotaProgressBar MakeQuotaProgressBar)')
 if (-not $quotaDetailSubtitleHelper.Success -or
     -not $quotaDetailInPlaceUpdater.Success -or
     -not $quotaDetailInitialRenderer.Success -or
@@ -1050,6 +1111,18 @@ if (-not $quotaDetailSubtitleHelper.Success -or
     $quotaDetailSubtitleHelper.Value -notmatch 'return\s+\$"\{account\.AuthKindLabel\}\s*·\s*\{usageSummary\}"\s*;' -or
     $quotaDetailSubtitleHelper.Value -match 'AccountUsageSummary|GetOfficialFinancialSummary|Credits|个人限额|个人剩余') {
     throw 'Quota detail initial rendering and in-place refresh must share the same concise authentication-only subtitle helper.'
+}
+if (-not $quotaListSubtitleHelper.Success -or
+    -not $quotaListInPlaceUpdater.Success -or
+    -not $quotaListInitialRenderer.Success -or
+    ([regex]::Matches($quotaListInPlaceUpdater.Value, 'GetQuotaListSubtitle\(account,\s*quotaLimitType\)')).Count -ne 1 -or
+    ([regex]::Matches($quotaListInitialRenderer.Value, 'GetQuotaListSubtitle\(account,\s*quotaLimitType\)')).Count -ne 1 -or
+    ([regex]::Matches($formSource, 'GetQuotaListSubtitle\(account,\s*quotaLimitType\)')).Count -ne 2 -or
+    $quotaListSubtitleHelper.Value -notmatch 'account\.IsCompatibleApi\s*\?\s*"兼容 API"\s*:\s*GetQuotaLimitTypeLabel\(quotaLimitType\)' -or
+    $quotaListInPlaceUpdater.Value -match 'GetOfficialFinancialSummary|officialFinancial|个人限额|个人剩余' -or
+    $quotaListInitialRenderer.Value -match 'GetOfficialFinancialSummary|officialFinancial|个人限额|个人剩余' -or
+    $formSource -match 'private static string\? GetOfficialFinancialSummary') {
+    throw 'Quota list subtitles and their tooltips must show only the concise quota type, without personal-limit or balance details.'
 }
 if ($accountRecordSource -notmatch 'public const string WeeklyOnly = "weekly_only"' -or
     $accountRecordSource -notmatch 'public const string FiveHourOnly = "five_hour_only"' -or
@@ -1334,18 +1407,29 @@ $reviewedRendererProfiles = @(
         SourceHash = 'F09FC19171315B858E31481FCE919366387D67CB04CE0BD7322FDD2D68983B26'
         PatchContract = 'LatestRendererPatchContract'
         SemanticAnchors = 'LatestRendererSemanticAnchors'
+    },
+    [pscustomobject]@{
+        Name = 'current-2026-08-23-5229'
+        BundleConstant = 'Current5229RendererBundleUrl'
+        BundleUrl = 'app://-/assets/app-initial-BhpTek7p.js'
+        SourceHashConstant = 'Current5229RendererSourceSha256'
+        SourceHash = '7359EEFF35A798A68C0E610CA65F3B12946E08FDAC68CD988A903F061CFCE7A0'
+        PatchedHashConstant = 'Current5229RendererPatchedSha256'
+        PatchedHash = '479E9B7F2419B7DC90874D863016A2AE513E4F2BE2E1E70B0FE5B8C3166F8ADB'
+        PatchContract = 'Current5229RendererPatchContract'
+        SemanticAnchors = 'Current5229RendererSemanticAnchors'
     }
 )
 $rendererPatchProfileRecord = [regex]::Match(
     $nativeFastBridgeSource,
-    '(?s)private sealed record RendererPatchProfile\(\s*string Name,\s*string BundleUrl,\s*string SourceSha256,\s*\(string Name, string Original, string Patched\)\[\] PatchContract,\s*\(string Name, string Value\)\[\] SemanticAnchors\s*\);')
+    '(?s)private sealed record RendererPatchProfile\(\s*string Name,\s*string BundleUrl,\s*string SourceSha256,\s*\(string Name, string Original, string Patched\)\[\] PatchContract,\s*\(string Name, string Value\)\[\] SemanticAnchors,\s*string\? PatchedSha256 = null,\s*bool IsCompatibilityProfile = false\s*\);')
 $rendererPatchProfilesDeclaration = [regex]::Match(
     $nativeFastBridgeSource,
     '(?s)private static readonly RendererPatchProfile\[\] RendererPatchProfiles\s*=\s*\[(?<Body>.*?)\r?\n\s*\];')
 if (-not $rendererPatchProfileRecord.Success -or
     -not $rendererPatchProfilesDeclaration.Success -or
-    ([regex]::Matches($rendererPatchProfilesDeclaration.Groups['Body'].Value, '\bnew\(')).Count -ne 4) {
-    throw 'Native Fast must declare exactly four URL/SHA/contract-scoped renderer profiles.'
+    ([regex]::Matches($rendererPatchProfilesDeclaration.Groups['Body'].Value, '\bnew\(')).Count -ne 5) {
+    throw 'Native Fast must declare exactly five URL/SHA/contract-scoped renderer profiles.'
 }
 foreach ($profile in $reviewedRendererProfiles) {
     $bundleConstantPattern = 'private\s+const\s+string\s+' +
@@ -1354,15 +1438,31 @@ foreach ($profile in $reviewedRendererProfiles) {
     $hashConstantPattern = 'private\s+const\s+string\s+' +
         [regex]::Escape($profile.SourceHashConstant) + '\s*=\s*"' +
         [regex]::Escape($profile.SourceHash) + '"\s*;'
+    $profileTail = [regex]::Escape($profile.SemanticAnchors)
+    $patchedHashProperty = $profile.PSObject.Properties['PatchedHashConstant']
+    if ($null -ne $patchedHashProperty) {
+        $profileTail += '\s*,\s*' + [regex]::Escape($profile.PatchedHashConstant)
+    }
     $profilePattern = 'new\(\s*"' + [regex]::Escape($profile.Name) + '"\s*,\s*' +
         [regex]::Escape($profile.BundleConstant) + '\s*,\s*' +
         [regex]::Escape($profile.SourceHashConstant) + '\s*,\s*' +
         [regex]::Escape($profile.PatchContract) + '\s*,\s*' +
-        [regex]::Escape($profile.SemanticAnchors) + '\s*\)'
+        $profileTail + '\s*\)'
     if ($nativeFastBridgeSource -notmatch $bundleConstantPattern -or
         $nativeFastBridgeSource -notmatch $hashConstantPattern -or
         $rendererPatchProfilesDeclaration.Groups['Body'].Value -notmatch $profilePattern) {
         throw "Native Fast renderer profile $($profile.Name) is not bound to its reviewed URL, SHA, patch contract, and semantic anchors."
+    }
+    if ($null -ne $patchedHashProperty) {
+        $patchedHashConstantPattern = 'private\s+const\s+string\s+' +
+            [regex]::Escape($profile.PatchedHashConstant) + '\s*=\s*"' +
+            [regex]::Escape($profile.PatchedHash) + '"\s*;'
+        if ($nativeFastBridgeSource -notmatch $patchedHashConstantPattern -or
+            $rendererPatchProfilesDeclaration.Groups['Body'].Value -notmatch
+                ([regex]::Escape($profile.SemanticAnchors) + '\s*,\s*' +
+                 [regex]::Escape($profile.PatchedHashConstant))) {
+            throw "Native Fast renderer profile $($profile.Name) is not bound to its reviewed patched SHA."
+        }
     }
 }
 $rendererContractShapes = @(
@@ -1384,6 +1484,13 @@ $rendererContractShapes = @(
         Name = 'latest'
         PatchContract = 'LatestRendererPatchContract'
         SemanticAnchors = 'LatestRendererSemanticAnchors'
+        RequiredAnchors = @('fast-is-priority', 'fast-fallback', 'config-key', 'request-tier')
+        AnchorCount = 4
+    },
+    [pscustomobject]@{
+        Name = 'current-5229'
+        PatchContract = 'Current5229RendererPatchContract'
+        SemanticAnchors = 'Current5229RendererSemanticAnchors'
         RequiredAnchors = @('fast-is-priority', 'fast-fallback', 'config-key', 'request-tier')
         AnchorCount = 4
     }
@@ -1439,6 +1546,16 @@ $currentRendererExactConstants = [ordered]@{
     LatestServiceTierOptionsPatched = 'T=p,E=o.hostId,w=(()=>{let e=eTr(s);return(_camAuth===`personalAccessToken`||_camAuth===`apikey`)&&!e.some(e=>e.value===uTr)?[...e,...hTr.filter(e=>e.value===uTr)]:e})(),'
     LatestServiceTierSelectionOriginal = 'S=e!=null&&(u?.serviceTier!==void 0||d!==void 0)?y?k:null:oTr(s,k,y),x=S==null?null:aTr(s,S);'
     LatestServiceTierSelectionPatched = 'S=e!=null&&(u?.serviceTier!==void 0||d!==void 0)?y?k:null:oTr(s,k,y),x=S==null?null:aTr(s,S)??((_camAuth===`personalAccessToken`||_camAuth===`apikey`)&&S===uTr?uTr:null);'
+    Current5229VisibilityGateOriginal = 'function $os(e){let t=(0,ess.c)(6),n=Y(Hk),r=e?.hostId??n,i=FA(r),a=i?.authMethod===`chatgpt`,o=i?.authMethod??null,s;t[0]!==r||t[1]!==o?(s={authMethod:o,hostId:r},t[0]=r,t[1]=o,t[2]=s):s=t[2];let{data:c,isPending:l}=hs(Lb,s),u=!!i?.isLoading||a&&l,d=a&&!u&&c!=null&&c?.requirements?.featureRequirements?.fast_mode!==!1,f;return t[3]!==u||t[4]!==d?(f={isServiceTierAllowed:d,isLoading:u},t[3]=u,t[4]=d,t[5]=f):f=t[5],f}'
+    Current5229VisibilityGatePatched = 'function $os(e){let t=(0,ess.c)(6),n=Y(Hk),r=e?.hostId??n,i=FA(r),a=i?.authMethod===`chatgpt`,o=i?.authMethod??null,s;t[0]!==r||t[1]!==o?(s={authMethod:o,hostId:r},t[0]=r,t[1]=o,t[2]=s):s=t[2];let{data:c,isPending:l}=hs(Lb,s),u=!!i?.isLoading||a&&l,d=!u&&(a?c!=null&&c?.requirements?.featureRequirements?.fast_mode!==!1:o===`personalAccessToken`||o===`apikey`),f;return t[3]!==u||t[4]!==d?(f={isServiceTierAllowed:d,isLoading:u},t[3]=u,t[4]=d,t[5]=f):f=t[5],f}'
+    Current5229ConfigReadGateOriginal = 'async function Yii(e,t){let n=await Kii(e,t);if(n!==`chatgpt`)return!1;let r=await F0t(e,t,{priority:`critical`});return e.query.setData(Lb,{authMethod:n,hostId:t},r),r.requirements?.featureRequirements?.fast_mode!==!1}'
+    Current5229ConfigReadGatePatched = 'async function Yii(e,t){let n=await Kii(e,t);if(n===`personalAccessToken`||n===`apikey`)return!0;if(n!==`chatgpt`)return!1;let r=await F0t(e,t,{priority:`critical`});return e.query.setData(Lb,{authMethod:n,hostId:t},r),r.requirements?.featureRequirements?.fast_mode!==!1}'
+    Current5229ServiceTierAuthCaptureOriginal = 'u=hs(Dk,e),d=hs(dls,e),f=FA(o.hostId)?.authMethod??null,p;'
+    Current5229ServiceTierAuthCapturePatched = 'u=hs(Dk,e),d=hs(dls,e),f=FA(o.hostId)?.authMethod??null,p,_camAuth;_camAuth=f;'
+    Current5229ServiceTierOptionsOriginal = 'T=p,E=o.hostId,w=gEr(s),'
+    Current5229ServiceTierOptionsPatched = 'T=p,E=o.hostId,w=(()=>{let e=gEr(s);return(_camAuth===`personalAccessToken`||_camAuth===`apikey`)&&!e.some(e=>e.value===EEr)?[...e,...jEr.filter(e=>e.value===EEr)]:e})(),'
+    Current5229ServiceTierSelectionOriginal = 'S=e!=null&&(u?.serviceTier!==void 0||d!==void 0)?y?k:null:SEr(s,k,y),x=S==null?null:xEr(s,S);'
+    Current5229ServiceTierSelectionPatched = 'S=e!=null&&(u?.serviceTier!==void 0||d!==void 0)?y?k:null:SEr(s,k,y),x=S==null?null:xEr(s,S)??((_camAuth===`personalAccessToken`||_camAuth===`apikey`)&&S===EEr?EEr:null);'
 }
 foreach ($constant in $currentRendererExactConstants.GetEnumerator()) {
     $constantMatch = [regex]::Match(
@@ -1454,6 +1571,7 @@ $rejectedRendererBundleUrls = @(
     'APP://-/assets/app-initial-DWsVN4CS.js',
     'APP://-/assets/app-initial-C_Tkoze_.js',
     'APP://-/assets/app-initial-izy3qYQi.js',
+    'APP://-/assets/app-initial-BhpTek7p.js',
     'https://example.com/assets/app-initial-DWsVN4CS.js',
     'app://user@-/assets/app-initial-DWsVN4CS.js',
     'app://-:19335/assets/app-initial-DWsVN4CS.js',
@@ -1465,17 +1583,19 @@ $rejectedRendererBundleUrls = @(
     'app://-/assets/app-initial-DWsVN4CS.js#fragment',
     'app://-/assets/app-initial-DWsVN4CS.js?changed=1',
     'app://-/assets/app-initial-C_Tkoze_.js?changed=1',
-    'app://-/assets/app-initial-izy3qYQi.js?changed=1'
+    'app://-/assets/app-initial-izy3qYQi.js?changed=1',
+    'app://-/assets/app-initial-BhpTek7p.js?changed=1'
 )
 $rendererBundleValidator = [regex]::Match(
     $nativeFastBridgeSource,
     '(?s)private static bool IsRendererBundleUrl\(string\? value\)\s*\{.*?\r?\n\s*\}')
 if (-not $rendererBundleValidator.Success -or
-    $rendererBundleValidator.Value -match 'Uri\.TryCreate|Regex|OrdinalIgnoreCase' -or
+    $rendererBundleValidator.Value -match 'Uri\.TryCreate|OrdinalIgnoreCase' -or
     $rendererBundleValidator.Value -notmatch 'RendererPatchProfiles\.Any' -or
     $rendererBundleValidator.Value -notmatch 'profile\.BundleUrl' -or
+    $rendererBundleValidator.Value -notmatch 'ModernRendererBundlePattern\.IsMatch' -or
     $rendererBundleValidator.Value -notmatch 'StringComparison\.Ordinal') {
-    throw 'Native Fast renderer bundle validation must remain an exact profile-backed raw URL allow-list.'
+    throw 'Native Fast renderer bundle validation must keep exact profiles plus the strict raw modern candidate pattern.'
 }
 foreach ($profile in $reviewedRendererProfiles) {
     $bundleUrl = $profile.BundleUrl
@@ -1494,6 +1614,12 @@ foreach ($bundleUrl in $rejectedRendererBundleUrls) {
 }
 if ($nativeFastBridgeSource -notmatch '(?<!!)IsRendererBundleUrl\(null\)') {
     throw 'Native Fast renderer URL contract must reject a missing bundle URL.'
+}
+if ($nativeFastBridgeSource -notmatch
+        '!\s*IsRendererBundleUrl\(\s*"app://-/assets/app-initial-Future_123\.js"\s*\)' -or
+    $nativeFastBridgeSource -notmatch
+        'ModernRendererBundlePattern\s*=\s*new\(\s*"\\\\Aapp://-/assets/app-initial-\[A-Za-z0-9_\-\]\{6,80\}\\\\\.js\\\\z"') {
+    throw 'Native Fast future renderer URLs must use the bounded raw app-initial hash pattern.'
 }
 $profilePatchMethod = [regex]::Match(
     $nativeFastBridgeSource,
@@ -1521,14 +1647,44 @@ if (-not $profilePatchMethod.Success -or
     $reviewedProfilesForPageMethod.Value -notmatch 'PreviousRendererBundleUrl' -or
     $reviewedProfilesForPageMethod.Value -notmatch 'CurrentRendererBundleUrl' -or
     $reviewedProfilesForPageMethod.Value -notmatch 'LatestRendererBundleUrl' -or
-    $nativeFastBridgeSource -notmatch '_reviewedProfiles\.TryGetValue\(observed\.Url, out var profile\)' -or
-    $rendererPreflightMethod.Value -notmatch '(?s)alreadyPatched\s*&&\s*IsReviewedPatchedRendererSource\(profile, source\)' -or
+    $reviewedProfilesForPageMethod.Value -notmatch 'Current5229RendererBundleUrl' -or
+    $nativeFastBridgeSource -notmatch '_reviewedProfiles\.TryGetValue\(observed\.Url, out var reviewedProfile\)' -or
+    $nativeFastBridgeSource -notmatch
+        '(?s)private static bool RendererSourceMatchesProfile\(.*?alreadyPatched\s*&&\s*IsReviewedPatchedRendererSource\(profile, source\)' -or
     ([regex]::Matches(
             $nativeFastBridgeSource,
             '(?:fingerprint|originalFingerprint)\.Equals\(profile\.SourceSha256, StringComparison\.Ordinal\)')).Count -lt 2 -or
     $nativeFastBridgeSource -notmatch 'PatchRendererSource\(profile,\s*body\.Source,\s*out var patchedSource\)' -or
     $nativeFastBridgeSource -match '\bReviewedRendererSourceSha256\b') {
     throw 'Native Fast patching must select one page-compatible renderer profile and use only that profile''s SHA, source replacements, and anchors.'
+}
+$dynamicRendererCompatibilityRequirements = [ordered]@{
+    'bounded modern bundle candidate' = 'ModernRendererBundlePattern'
+    'original structural discovery' = 'TryCreateCompatibleRendererProfileFromOriginal'
+    'already-patched structural discovery' = 'TryCreateCompatibleRendererProfileFromPatched'
+    'six auth-capture occurrences' = 'CompatibilityAuthCaptureOccurrences\s*=\s*6'
+    'unique settings function' = 'TryFindUniqueServiceTierFunction'
+    'JavaScript lexical scope paths' = 'TryGetJavaScriptBracePaths'
+    'shared lexical scope proof' = 'IsBracePathPrefix'
+    'runtime original SHA binding' = 'originalSha256\s*=\s*SourceFingerprint\(source\)'
+    'runtime patched SHA binding' = 'patchedSha256\s*=\s*SourceFingerprint\(patchedSource\)'
+    'known URL downgrade refusal' = 'structural fallback is disabled for a known bundle URL'
+    'current main-context filtering' = '_readinessState\.IsCurrentEpoch\(contextEpoch\)'
+}
+foreach ($requirement in $dynamicRendererCompatibilityRequirements.GetEnumerator()) {
+    if ($nativeFastBridgeSource -notmatch $requirement.Value) {
+        throw "Native Fast dynamic compatibility is missing $($requirement.Key)."
+    }
+}
+if ($nativeFastBridgeSource -notmatch
+        '`priority`\)\?\[\.\.\.e,\.\.\.' -or
+    $nativeFastBridgeSource -notmatch
+        '`priority`\?`priority`:null' -or
+    $nativeFastBridgeSource -notmatch
+        'renderer structural matches were not executable code in one verified lexical scope' -or
+    $nativeFastBridgeSource -notmatch
+        'strict already-patched structural compatibility profile verified') {
+    throw 'Native Fast dynamic compatibility must use literal priority and verify executable lexical scope in both directions.'
 }
 $nativeFastPatchContractValidation = [regex]::Match(
     $nativeFastBridgeSource,
