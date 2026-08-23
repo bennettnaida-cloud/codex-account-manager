@@ -26,10 +26,10 @@ jobs:
         id: release-version
         shell: pwsh
         run: |
-          # Runs 1-24 used the workflow run number directly. Reserve 2.1.25-2.1.28
-          # because those versions already existed in local development builds; run 28
-          # therefore publishes 2.1.32 and later runs remain monotonic.
-          $version = '2.1.{0}' -f (([int]'${{ github.run_number }}') + 4)
+          # Run 28 calculated 2.1.32 but failed during the Windows UI self-test before
+          # publishing any release assets. Starting with run 29, reuse that unreleased
+          # patch number; later runs remain monotonic.
+          $version = '2.1.{0}' -f (([int]'${{ github.run_number }}') + 3)
           "CAM_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 

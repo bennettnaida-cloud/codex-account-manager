@@ -6,6 +6,7 @@ internal sealed class ThreadSectionNameDialog : Form
 
     private readonly HashSet<string> _blockedNames;
     private readonly ThemePalette _palette;
+    private readonly Panel _layoutCanvas = new();
     private readonly Label _heading = new();
     private readonly Label _description = new();
     private readonly RoundedPanel _card = new();
@@ -52,6 +53,11 @@ internal sealed class ThreadSectionNameDialog : Form
         DoubleBuffered = true;
         ThemeStyler.ApplyDialog(this, palette);
 
+        _layoutCanvas.Name = "ThreadSectionNameLayoutCanvas";
+        _layoutCanvas.Dock = DockStyle.Fill;
+        _layoutCanvas.BackColor = palette.SurfaceColor;
+        Controls.Add(_layoutCanvas);
+
         _heading.Text = Text;
         _heading.SetBounds(28, 18, 584, 42);
         _heading.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
@@ -61,7 +67,7 @@ internal sealed class ThreadSectionNameDialog : Form
         _heading.UseCompatibleTextRendering = true;
         _heading.UseMnemonic = false;
         ThemeStyler.ApplyLabel(_heading, palette);
-        Controls.Add(_heading);
+        _layoutCanvas.Controls.Add(_heading);
 
         _description.Text = "目录名称会显示在 Codex 左侧栏，也会用于聊天记录页的折叠分组。";
         _description.SetBounds(28, 62, 584, 30);
@@ -72,7 +78,7 @@ internal sealed class ThreadSectionNameDialog : Form
         _description.UseCompatibleTextRendering = true;
         _description.UseMnemonic = false;
         ThemeStyler.ApplyLabel(_description, palette, true);
-        Controls.Add(_description);
+        _layoutCanvas.Controls.Add(_description);
 
         _card.SetBounds(20, 104, 600, 142);
         _card.Name = "ThreadSectionNameCard";
@@ -85,7 +91,7 @@ internal sealed class ThreadSectionNameDialog : Form
         _card.AccentColor = palette.AccentColor;
         _card.AccentWidth = 3;
         _card.ShadowColor = Color.FromArgb(22, palette.ShadowColor);
-        Controls.Add(_card);
+        _layoutCanvas.Controls.Add(_card);
 
         _nameLabel.Text = "聊天目录名称";
         _nameLabel.SetBounds(20, 10, 560, 28);
@@ -130,14 +136,14 @@ internal sealed class ThreadSectionNameDialog : Form
         _confirmButton.AccessibleName = _confirmButton.Text;
         ThemeStyler.ApplyPrimaryButton(_confirmButton, palette);
         _confirmButton.Click += (_, _) => ConfirmName();
-        Controls.Add(_confirmButton);
+        _layoutCanvas.Controls.Add(_confirmButton);
 
         _cancelButton.Text = "取消";
         _cancelButton.SetBounds(488, 274, 124, 44);
         _cancelButton.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
         _cancelButton.DialogResult = DialogResult.Cancel;
         ThemeStyler.ApplySoftButton(_cancelButton, palette);
-        Controls.Add(_cancelButton);
+        _layoutCanvas.Controls.Add(_cancelButton);
 
         AcceptButton = _confirmButton;
         CancelButton = _cancelButton;
@@ -264,7 +270,7 @@ internal sealed class ThreadSectionNameDialog : Form
     internal static void ValidateLayout()
     {
         var palette = new ThemeService(Path.GetTempPath()).GetPalette(ThemeMode.Light);
-        foreach (var scale in new[] { 1F, 1.25F, 1.5F, 2F })
+        foreach (var scale in new[] { 1F, 1.25F, 1.5F, 2F, 3F })
         {
             using var dialog = new ThreadSectionNameDialog(
                 "重命名聊天目录",
@@ -272,28 +278,66 @@ internal sealed class ThreadSectionNameDialog : Form
                 "一个用于布局验证的聊天目录",
                 new[] { "已有目录", "另一个目录" },
                 palette);
-            if (scale > 1F)
+            dialog.PerformLayout();
+            if (dialog._layoutCanvas.Dock != DockStyle.Fill ||
+                dialog._layoutCanvas.Bounds != dialog.ClientRectangle)
             {
-                dialog.Scale(new SizeF(scale, scale));
+                throw new InvalidOperationException(
+                    "Thread section name dialog layout canvas must fill the production dialog.");
             }
 
-            dialog.PerformLayout();
+            // Scale the content canvas instead of the top-level Form. Windows caps a Form
+            // at SystemInformation.MaxWindowTrackSize, which made 200% DPI validation depend
+            // on the runner's virtual desktop width even though the logical layout was valid.
+            var logicalCanvasSize = dialog._layoutCanvas.ClientSize;
+            dialog._layoutCanvas.Dock = DockStyle.None;
+            dialog._layoutCanvas.ClientSize = logicalCanvasSize;
+            if (scale > 1F)
+            {
+                dialog._layoutCanvas.Scale(new SizeF(scale, scale));
+            }
+
+            dialog._layoutCanvas.PerformLayout();
             dialog._card.PerformLayout();
             dialog._nameShell.PerformLayout();
 
+            var failures = CollectLayoutFailures(dialog);
+            if (scale == 2F)
+            {
+                // Reproduce a 200% DPI dialog constrained by a 1024-pixel runner/screen.
+                // The fill canvas must reflow its anchored children inside the actual width.
+                dialog._layoutCanvas.Width = Math.Min(dialog._layoutCanvas.Width, 1000);
+                dialog._layoutCanvas.PerformLayout();
+                dialog._card.PerformLayout();
+                dialog._nameShell.PerformLayout();
+                failures.AddRange(
+                    CollectLayoutFailures(dialog).Select(failure => "constrained-" + failure));
+            }
+
+            if (failures.Count > 0)
+            {
+                throw new InvalidOperationException(
+                    $"Thread section name dialog layout failed at scale {scale:0.##}: " +
+                    string.Join(", ", failures) + ".");
+            }
+        }
+
+        static List<string> CollectLayoutFailures(ThreadSectionNameDialog dialog)
+        {
             var failures = new List<string>();
-            if (dialog._heading.Parent != dialog) failures.Add("heading-parent");
-            if (dialog._description.Parent != dialog) failures.Add("description-parent");
-            if (dialog._card.Parent != dialog) failures.Add("card-parent");
+            if (dialog._layoutCanvas.Parent != dialog) failures.Add("canvas-parent");
+            if (dialog._heading.Parent != dialog._layoutCanvas) failures.Add("heading-parent");
+            if (dialog._description.Parent != dialog._layoutCanvas) failures.Add("description-parent");
+            if (dialog._card.Parent != dialog._layoutCanvas) failures.Add("card-parent");
             if (dialog._nameLabel.Parent != dialog._card) failures.Add("name-label-parent");
             if (dialog._nameShell.Parent != dialog._card) failures.Add("name-shell-parent");
             if (dialog._nameBox.Parent != dialog._nameShell) failures.Add("name-box-parent");
             if (dialog._validationLabel.Parent != dialog._card) failures.Add("validation-parent");
-            if (!dialog.ClientRectangle.Contains(dialog._heading.Bounds)) failures.Add("heading-outside-dialog");
-            if (!dialog.ClientRectangle.Contains(dialog._description.Bounds)) failures.Add("description-outside-dialog");
-            if (!dialog.ClientRectangle.Contains(dialog._card.Bounds)) failures.Add("card-outside-dialog");
-            if (!dialog.ClientRectangle.Contains(dialog._confirmButton.Bounds)) failures.Add("confirm-outside-dialog");
-            if (!dialog.ClientRectangle.Contains(dialog._cancelButton.Bounds)) failures.Add("cancel-outside-dialog");
+            if (!dialog._layoutCanvas.ClientRectangle.Contains(dialog._heading.Bounds)) failures.Add("heading-outside-canvas");
+            if (!dialog._layoutCanvas.ClientRectangle.Contains(dialog._description.Bounds)) failures.Add("description-outside-canvas");
+            if (!dialog._layoutCanvas.ClientRectangle.Contains(dialog._card.Bounds)) failures.Add("card-outside-canvas");
+            if (!dialog._layoutCanvas.ClientRectangle.Contains(dialog._confirmButton.Bounds)) failures.Add("confirm-outside-canvas");
+            if (!dialog._layoutCanvas.ClientRectangle.Contains(dialog._cancelButton.Bounds)) failures.Add("cancel-outside-canvas");
             if (!dialog._card.ClientRectangle.Contains(dialog._nameLabel.Bounds)) failures.Add("name-label-outside-card");
             if (!dialog._card.ClientRectangle.Contains(dialog._nameShell.Bounds)) failures.Add("name-shell-outside-card");
             if (!dialog._card.ClientRectangle.Contains(dialog._validationLabel.Bounds)) failures.Add("validation-outside-card");
@@ -309,12 +353,7 @@ internal sealed class ThreadSectionNameDialog : Form
             if (dialog.AcceptButton != dialog._confirmButton) failures.Add("accept-button");
             if (dialog.CancelButton != dialog._cancelButton) failures.Add("cancel-button");
             if (dialog._nameBox.MaxLength != MaximumNameLength) failures.Add("max-length");
-            if (failures.Count > 0)
-            {
-                throw new InvalidOperationException(
-                    $"Thread section name dialog layout failed at scale {scale:0.##}: " +
-                    string.Join(", ", failures) + ".");
-            }
+            return failures;
         }
 
         static bool TextFits(Label label)
