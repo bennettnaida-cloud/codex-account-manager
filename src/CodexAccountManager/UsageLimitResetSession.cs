@@ -61,18 +61,15 @@ public sealed record UsageLimitResetInfo(
                 Math.Max(0, applicableAvailableCount.Value));
         }
 
-        // Older app-server builds omit applicableAvailableCount. In that compatibility
-        // shape, a fully consumed official window is the only safe evidence that a reset
-        // card can be used now. A known non-exhausted window must not enable consume.
-        var knownPercentages = new[] { primary?.UsedPercent, secondary?.UsedPercent }
-            .Where(value => value.HasValue)
-            .Select(value => value!.Value)
-            .ToArray();
-        if (knownPercentages.Any(value => value >= 100))
-        {
-            return normalizedAvailable;
-        }
-        return knownPercentages.Length > 0 ? 0 : null;
+        _ = primary;
+        _ = secondary;
+
+        // The supported app-server schema exposes availableCount as the authoritative
+        // earned-reset total and does not expose applicableAvailableCount. Eligibility is
+        // decided by the consume outcome (reset/nothingToReset/noCredit), so a client must
+        // not invent a stricter usedPercent == 100 gate. Keep honoring an explicit
+        // applicability value when a compatible server extension provides one.
+        return normalizedAvailable;
     }
 }
 
@@ -526,7 +523,7 @@ public sealed class UsageLimitResetSession : IAsyncDisposable
               }
             }
             """)!.AsObject());
-        var legacyNotApplicable = ParseRateLimits(JsonNode.Parse(
+        var officialSchemaWithoutApplicability = ParseRateLimits(JsonNode.Parse(
             """
             {
               "rateLimits": {
@@ -538,7 +535,7 @@ public sealed class UsageLimitResetSession : IAsyncDisposable
               }
             }
             """)!.AsObject());
-        var legacyExhausted = ParseRateLimits(JsonNode.Parse(
+        var officialSchemaWithoutApplicabilityAtExhaustion = ParseRateLimits(JsonNode.Parse(
             """
             {
               "rateLimits": {
@@ -553,13 +550,13 @@ public sealed class UsageLimitResetSession : IAsyncDisposable
         if (unavailableExpiryAndNotApplicable.AvailableCreditExpiresAtUtc.HasValue ||
             unavailableExpiryAndNotApplicable.EffectiveApplicableAvailableCount != 0 ||
             unavailableExpiryAndNotApplicable.CanConsumeResetCredit ||
-            legacyNotApplicable.EffectiveApplicableAvailableCount != 0 ||
-            legacyNotApplicable.CanConsumeResetCredit ||
-            legacyExhausted.EffectiveApplicableAvailableCount != 1 ||
-            !legacyExhausted.CanConsumeResetCredit)
+            officialSchemaWithoutApplicability.EffectiveApplicableAvailableCount != 1 ||
+            !officialSchemaWithoutApplicability.CanConsumeResetCredit ||
+            officialSchemaWithoutApplicabilityAtExhaustion.EffectiveApplicableAvailableCount != 1 ||
+            !officialSchemaWithoutApplicabilityAtExhaustion.CanConsumeResetCredit)
         {
             throw new InvalidOperationException(
-                "Reset-credit applicability fallback did not handle credits=null safely.");
+                "Reset-credit applicability did not honor the official availableCount or an explicit compatibility override.");
         }
 
         var readRequest = BuildRequest(2, "account/rateLimits/read", null);
@@ -587,15 +584,16 @@ public sealed class UsageLimitResetSession : IAsyncDisposable
         }
 
         const string mockIdempotencyKey = "5f88aa7e-b807-46e4-b13c-a91a8aa3ab53";
+        const string officialSchemaIdempotencyKey = "6b5ef0d1-684a-4ca4-a86f-aedb6611c73d";
         var mockConsumeCalls = 0;
-        string? observedIdempotencyKey = null;
+        var observedIdempotencyKeys = new List<string>();
         Task<UsageLimitResetOutcome> MockConsume(
             string idempotencyKey,
             CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
             mockConsumeCalls++;
-            observedIdempotencyKey = idempotencyKey;
+            observedIdempotencyKeys.Add(idempotencyKey);
             return Task.FromResult(UsageLimitResetOutcome.Reset);
         }
 
@@ -635,11 +633,22 @@ public sealed class UsageLimitResetSession : IAsyncDisposable
                     "A non-applicable reset generated an idempotency key."))
             .GetAwaiter()
             .GetResult();
+        var officialSchemaAttempt = ConsumeWhenConfirmedAsync(
+                officialSchemaWithoutApplicability,
+                confirmed: true,
+                MockConsume,
+                () => officialSchemaIdempotencyKey)
+            .GetAwaiter()
+            .GetResult();
         if (!confirmedAttempt.WasSent ||
             confirmedAttempt.Outcome != UsageLimitResetOutcome.Reset ||
             confirmedAttempt.IdempotencyKey != mockIdempotencyKey ||
-            observedIdempotencyKey != mockIdempotencyKey ||
-            mockConsumeCalls != 1 ||
+            !officialSchemaAttempt.WasSent ||
+            officialSchemaAttempt.Outcome != UsageLimitResetOutcome.Reset ||
+            officialSchemaAttempt.IdempotencyKey != officialSchemaIdempotencyKey ||
+            mockConsumeCalls != 2 ||
+            !observedIdempotencyKeys.SequenceEqual(
+                [mockIdempotencyKey, officialSchemaIdempotencyKey]) ||
             cancelledAttempt.WasSent ||
             zeroCreditAttempt.WasSent ||
             unavailableAttempt.WasSent ||

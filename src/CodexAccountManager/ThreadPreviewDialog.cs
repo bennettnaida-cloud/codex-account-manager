@@ -10,7 +10,9 @@ public sealed class ThreadPreviewDialog : Form
     private readonly TextBox _findBox = new();
     private readonly Label _findStatusLabel = new();
     private readonly Label _noticeLabel = new();
+    private readonly ToolTip _toolTip = new();
     private readonly string _copyText;
+    private readonly string _exportFileName;
 
     public ThreadPreviewDialog(
         UnifiedThreadRecord thread,
@@ -33,8 +35,10 @@ public sealed class ThreadPreviewDialog : Form
         KeyPreview = true;
         ShowInTaskbar = false;
         ThemeStyler.ApplyDialog(this, palette);
+        Disposed += (_, _) => _toolTip.Dispose();
 
         _copyText = BuildCopyText(thread, transcript);
+        _exportFileName = BuildExportFileName(thread.Title);
 
         var root = new TableLayoutPanel
         {
@@ -81,20 +85,28 @@ public sealed class ThreadPreviewDialog : Form
 
         var readOnlyBadge = new PillLabel
         {
-            Text = "本地只读",
+            Text = transcript.OfficialIndexLagging ? "索引滞后" : "本地只读",
             Dock = DockStyle.Fill,
             Margin = new Padding(12, 7, 0, 7),
             Font = new Font(Font.FontFamily, 8.5F, FontStyle.Bold),
             TextAlign = ContentAlignment.MiddleCenter,
-            FillColor = Color.FromArgb(34, palette.AccentColor),
-            StrokeColor = Color.FromArgb(94, palette.AccentColor),
-            ForeColor = palette.PrimaryColor
+            FillColor = Color.FromArgb(
+                34,
+                transcript.OfficialIndexLagging ? palette.WarningColor : palette.AccentColor),
+            StrokeColor = Color.FromArgb(
+                94,
+                transcript.OfficialIndexLagging ? palette.WarningColor : palette.AccentColor),
+            ForeColor = transcript.OfficialIndexLagging
+                ? palette.WarningColor
+                : palette.PrimaryColor
         };
         header.Controls.Add(readOnlyBadge, 1, 0);
 
         var subtitle = new Label
         {
-            Text = $"{transcript.Messages.Count} 条对话消息 · 已过滤系统信息与工具日志",
+            Text = transcript.OfficialIndexLagging
+                ? $"原始记录读取 {transcript.Messages.Count} 条消息 · Codex 官方分页索引滞后"
+                : $"{transcript.Messages.Count} 条对话消息 · 已过滤系统信息与工具日志",
             Dock = DockStyle.Fill,
             AutoEllipsis = true,
             Font = new Font(Font.FontFamily, 8.8F),
@@ -221,13 +233,14 @@ public sealed class ThreadPreviewDialog : Form
         {
             Dock = DockStyle.Fill,
             BackColor = Color.Transparent,
-            ColumnCount = 3,
+            ColumnCount = 4,
             RowCount = 1,
             Margin = new Padding(0)
         };
         footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-        footer.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 132F));
-        footer.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120F));
+        footer.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 124F));
+        footer.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 124F));
+        footer.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 112F));
         footer.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
         root.Controls.Add(footer, 0, 3);
 
@@ -243,17 +256,29 @@ public sealed class ThreadPreviewDialog : Form
         _noticeLabel.UseMnemonic = false;
         ThemeStyler.ApplyLabel(_noticeLabel, palette, true);
         footer.Controls.Add(_noticeLabel, 0, 0);
+        _toolTip.SetToolTip(_noticeLabel, _noticeLabel.Text);
+
+        var export = new ModernButton
+        {
+            Text = "导出 TXT",
+            Dock = DockStyle.Fill,
+            Margin = new Padding(0, 14, 10, 14),
+            AccessibleName = "导出全部聊天正文为文本文件"
+        };
+        ThemeStyler.ApplySoftButton(export, palette);
+        export.Click += (_, _) => ExportAll();
+        footer.Controls.Add(export, 1, 0);
 
         var copy = new ModernButton
         {
             Text = "复制全部",
             Dock = DockStyle.Fill,
-            Margin = new Padding(0, 14, 12, 14),
+            Margin = new Padding(0, 14, 10, 14),
             AccessibleName = "复制全部聊天正文"
         };
         ThemeStyler.ApplySoftButton(copy, palette);
         copy.Click += (_, _) => CopyAll();
-        footer.Controls.Add(copy, 1, 0);
+        footer.Controls.Add(copy, 2, 0);
 
         var close = new ModernButton
         {
@@ -264,7 +289,7 @@ public sealed class ThreadPreviewDialog : Form
             AccessibleName = "关闭聊天阅读窗口"
         };
         ThemeStyler.ApplyPrimaryButton(close, palette);
-        footer.Controls.Add(close, 2, 0);
+        footer.Controls.Add(close, 3, 0);
         CancelButton = close;
 
         KeyDown += (_, eventArgs) =>
@@ -325,7 +350,8 @@ public sealed class ThreadPreviewDialog : Form
             !text.Contains("answer fixture", StringComparison.Ordinal) ||
             text.Contains("fixture notice", StringComparison.Ordinal) ||
             partialTitle.Contains("完整", StringComparison.Ordinal) ||
-            CountMatches("alpha beta ALPHA", "alpha") != 2)
+            CountMatches("alpha beta ALPHA", "alpha") != 2 ||
+            BuildExportFileName("a<b>:c").IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
         {
             throw new InvalidOperationException("Thread preview dialog formatting validation failed.");
         }
@@ -389,10 +415,55 @@ public sealed class ThreadPreviewDialog : Form
         {
             Clipboard.SetText(_copyText, TextDataFormat.UnicodeText);
             _noticeLabel.Text = "已复制全部聊天正文。";
+            _toolTip.SetToolTip(_noticeLabel, _noticeLabel.Text);
         }
         catch (ExternalException)
         {
             _noticeLabel.Text = "剪贴板暂时被占用；可选中文字后按 Ctrl+C 重试。";
+            _toolTip.SetToolTip(_noticeLabel, _noticeLabel.Text);
+        }
+    }
+
+    private void ExportAll()
+    {
+        if (string.IsNullOrEmpty(_copyText))
+        {
+            return;
+        }
+
+        using var dialog = new SaveFileDialog
+        {
+            AddExtension = true,
+            DefaultExt = "txt",
+            Filter = "文本文件 (*.txt)|*.txt|所有文件 (*.*)|*.*",
+            FileName = _exportFileName,
+            InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+            RestoreDirectory = true,
+            Title = "导出完整本地聊天"
+        };
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        try
+        {
+            File.WriteAllText(
+                dialog.FileName,
+                _copyText,
+                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            _noticeLabel.Text = "已导出全部聊天正文：" + dialog.FileName;
+            _toolTip.SetToolTip(_noticeLabel, _noticeLabel.Text);
+        }
+        catch (Exception ex) when (
+            ex is IOException or
+            UnauthorizedAccessException or
+            ArgumentException or
+            NotSupportedException or
+            PathTooLongException)
+        {
+            _noticeLabel.Text = "导出失败：" + ex.Message;
+            _toolTip.SetToolTip(_noticeLabel, _noticeLabel.Text);
         }
     }
 
@@ -500,6 +571,22 @@ public sealed class ThreadPreviewDialog : Form
         }
 
         return builder.ToString().TrimEnd();
+    }
+
+    private static string BuildExportFileName(string title)
+    {
+        var invalid = Path.GetInvalidFileNameChars().ToHashSet();
+        var safe = new string(title
+            .Trim()
+            .Select(character => invalid.Contains(character) ? '_' : character)
+            .Take(80)
+            .ToArray())
+            .Trim(' ', '.');
+        if (string.IsNullOrWhiteSpace(safe))
+        {
+            safe = "Codex-聊天记录";
+        }
+        return safe + ".txt";
     }
 
     private static string BuildWindowTitle(UnifiedThreadTranscript transcript) =>

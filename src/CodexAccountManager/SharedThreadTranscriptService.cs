@@ -29,7 +29,29 @@ public sealed record UnifiedThreadTranscript(
     bool IsTruncated,
     int IgnoredMalformedLines,
     int IgnoredOversizedLines,
-    string Notice);
+    string Notice,
+    bool OfficialIndexLagging = false,
+    long OfficialIndexPendingBytes = 0,
+    int OfficialIndexedTurns = 0);
+
+internal readonly record struct ThreadProjectionHealth(
+    bool IsPaginated,
+    bool IsLagging,
+    long SourceBytes,
+    long ProjectedBytes,
+    long PendingBytes,
+    int IndexedTurns,
+    bool HasOrdinalRegression)
+{
+    internal static ThreadProjectionHealth NotApplicable { get; } = new(
+        IsPaginated: false,
+        IsLagging: false,
+        SourceBytes: 0,
+        ProjectedBytes: 0,
+        PendingBytes: 0,
+        IndexedTurns: 0,
+        HasOrdinalRegression: false);
+}
 
 /// <summary>
 /// Reads a small, read-only transcript from a Codex rollout JSONL file.
@@ -42,6 +64,8 @@ public sealed class SharedThreadTranscriptService
     private const long DefaultMaxSourceBytes = 32L * 1024 * 1024;
     private const int DefaultMaxJsonLineCharacters = 512 * 1024;
     private const int CompleteMaxProjectedJsonCharacters = 16 * 1024 * 1024;
+    private const long SignificantProjectionLagBytes = 4L * 1024 * 1024;
+    private const int MaxOrdinalBoundarySearchBytes = 8 * 1024 * 1024;
 
     public UnifiedThreadTranscript Load(
         string codexHome,
@@ -72,7 +96,7 @@ public sealed class SharedThreadTranscriptService
         UnifiedThreadRecord thread)
     {
         ArgumentNullException.ThrowIfNull(thread);
-        return LoadCore(
+        var transcript = LoadCore(
             codexHome,
             thread,
             int.MaxValue,
@@ -80,6 +104,7 @@ public sealed class SharedThreadTranscriptService
             long.MaxValue,
             CompleteMaxProjectedJsonCharacters,
             projectNonTranscriptStrings: true);
+        return AttachOfficialProjectionHealth(codexHome, thread, transcript);
     }
 
     internal static void ValidateReader()
@@ -271,6 +296,8 @@ public sealed class SharedThreadTranscriptService
                     "A partially written active rollout was incorrectly reported as complete.");
             }
 
+            ValidateProjectionLagDetection(root, sessions, startedAt);
+
             var repeatedRealMessages = Deduplicate(
             [
                 new MessageCandidate(
@@ -325,6 +352,426 @@ public sealed class SharedThreadTranscriptService
                 // A temporary fixture still held by an antivirus must not hide the validation result.
             }
         }
+    }
+
+    private UnifiedThreadTranscript AttachOfficialProjectionHealth(
+        string codexHome,
+        UnifiedThreadRecord thread,
+        UnifiedThreadTranscript transcript)
+    {
+        if (transcript.Status is UnifiedThreadTranscriptStatus.SourceMissing or
+            UnifiedThreadTranscriptStatus.Unavailable)
+        {
+            return transcript;
+        }
+
+        try
+        {
+            var health = InspectOfficialProjectionHealth(codexHome, thread.Id);
+            if (!health.IsLagging)
+            {
+                return transcript;
+            }
+
+            var indexedText = health.IndexedTurns > 0
+                ? $"当前官方索引只收录 {health.IndexedTurns} 轮"
+                : "当前官方索引没有覆盖后续内容";
+            var pendingText = FormatByteCount(health.PendingBytes);
+            return transcript with
+            {
+                Notice = transcript.Notice +
+                         $" 本窗口已绕过滞后的官方分页索引，直接读取原始聊天文件；" +
+                         $"{indexedText}，约 {pendingText} 原始记录尚未进入索引，" +
+                         "所以 Codex 主界面可能停留在较早消息。原始聊天仍在，且未被本软件修改。",
+                OfficialIndexLagging = true,
+                OfficialIndexPendingBytes = health.PendingBytes,
+                OfficialIndexedTurns = health.IndexedTurns
+            };
+        }
+        catch (Exception ex) when (
+            ex is IOException or
+            UnauthorizedAccessException or
+            SqliteException or
+            ArgumentException or
+            NotSupportedException or
+            PathTooLongException)
+        {
+            // Projection diagnostics are supplemental. A locked or older index must never
+            // hide a transcript that was successfully recovered from its source JSONL.
+            return transcript;
+        }
+    }
+
+    internal static ThreadProjectionHealth InspectOfficialProjectionHealth(
+        string codexHome,
+        string threadId)
+    {
+        if (!Guid.TryParse(threadId, out _))
+        {
+            return ThreadProjectionHealth.NotApplicable;
+        }
+
+        var home = Path.GetFullPath(codexHome);
+        var statePath = Path.Combine(home, "state_5.sqlite");
+        if (!File.Exists(statePath))
+        {
+            return ThreadProjectionHealth.NotApplicable;
+        }
+
+        CodexCliService.EnsureSqliteProvider();
+        string historyMode;
+        string rolloutPath;
+        using (var state = OpenReadOnlyDatabase(statePath))
+        {
+            if (!TableHasColumn(state, "threads", "history_mode") ||
+                !TableHasColumn(state, "threads", "rollout_path"))
+            {
+                return ThreadProjectionHealth.NotApplicable;
+            }
+
+            using var command = state.CreateCommand();
+            command.CommandText =
+                "SELECT COALESCE(history_mode, ''), COALESCE(rollout_path, '') " +
+                "FROM threads WHERE id = $id LIMIT 1;";
+            command.Parameters.AddWithValue("$id", threadId);
+            using var reader = command.ExecuteReader();
+            if (!reader.Read())
+            {
+                return ThreadProjectionHealth.NotApplicable;
+            }
+
+            historyMode = reader.GetString(0);
+            rolloutPath = reader.GetString(1);
+        }
+
+        if (!historyMode.Equals("paginated", StringComparison.OrdinalIgnoreCase) ||
+            string.IsNullOrWhiteSpace(rolloutPath))
+        {
+            return ThreadProjectionHealth.NotApplicable;
+        }
+
+        var fullRolloutPath = ToCandidatePath(home, rolloutPath);
+        if (string.IsNullOrWhiteSpace(fullRolloutPath) ||
+            !IsInsideDirectory(fullRolloutPath, home) ||
+            !File.Exists(fullRolloutPath))
+        {
+            return ThreadProjectionHealth.NotApplicable;
+        }
+
+        var sourceLength = new FileInfo(fullRolloutPath).Length;
+        IEnumerable<string> historyDatabases;
+        try
+        {
+            historyDatabases = Directory
+                .EnumerateFiles(home, "thread_history_*.sqlite", SearchOption.TopDirectoryOnly)
+                .OrderByDescending(File.GetLastWriteTimeUtc)
+                .ToArray();
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return ThreadProjectionHealth.NotApplicable;
+        }
+
+        foreach (var historyPath in historyDatabases)
+        {
+            using var history = OpenReadOnlyDatabase(historyPath);
+            if (!TableHasColumn(history, "thread_history_projection_state", "thread_id") ||
+                !TableHasColumn(
+                    history,
+                    "thread_history_projection_state",
+                    "next_rollout_byte_offset"))
+            {
+                continue;
+            }
+
+            using var projection = history.CreateCommand();
+            projection.CommandText =
+                "SELECT next_rollout_byte_offset FROM thread_history_projection_state " +
+                "WHERE thread_id = $id LIMIT 1;";
+            projection.Parameters.AddWithValue("$id", threadId);
+            var value = projection.ExecuteScalar();
+            if (value == null || value == DBNull.Value)
+            {
+                continue;
+            }
+
+            var projectedBytes = Math.Max(0, Convert.ToInt64(value));
+            var pendingBytes = Math.Max(0, sourceLength - projectedBytes);
+            var indexedTurns = 0;
+            if (TableHasColumn(history, "thread_turns", "thread_id"))
+            {
+                using var count = history.CreateCommand();
+                count.CommandText = "SELECT COUNT(*) FROM thread_turns WHERE thread_id = $id;";
+                count.Parameters.AddWithValue("$id", threadId);
+                indexedTurns = checked((int)Math.Min(int.MaxValue, Convert.ToInt64(count.ExecuteScalar())));
+            }
+
+            var ordinalRegression = pendingBytes > 0 &&
+                                    HasNonIncreasingOrdinalAtBoundary(
+                                        fullRolloutPath,
+                                        Math.Min(projectedBytes, sourceLength));
+            return new ThreadProjectionHealth(
+                IsPaginated: true,
+                IsLagging: ordinalRegression || pendingBytes >= SignificantProjectionLagBytes,
+                SourceBytes: sourceLength,
+                ProjectedBytes: projectedBytes,
+                PendingBytes: pendingBytes,
+                IndexedTurns: indexedTurns,
+                HasOrdinalRegression: ordinalRegression);
+        }
+
+        return new ThreadProjectionHealth(
+            IsPaginated: true,
+            IsLagging: sourceLength >= SignificantProjectionLagBytes,
+            SourceBytes: sourceLength,
+            ProjectedBytes: 0,
+            PendingBytes: sourceLength,
+            IndexedTurns: 0,
+            HasOrdinalRegression: false);
+    }
+
+    private static SqliteConnection OpenReadOnlyDatabase(string path)
+    {
+        var connection = new SqliteConnection(
+            new SqliteConnectionStringBuilder
+            {
+                DataSource = path,
+                Mode = SqliteOpenMode.ReadOnly,
+                Cache = SqliteCacheMode.Private,
+                Pooling = false,
+                DefaultTimeout = 5
+            }.ToString());
+        connection.Open();
+        return connection;
+    }
+
+    private static bool HasNonIncreasingOrdinalAtBoundary(string path, long boundary)
+    {
+        if (boundary <= 0)
+        {
+            return false;
+        }
+
+        using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete,
+            bufferSize: 4096,
+            FileOptions.RandomAccess);
+        if (boundary >= stream.Length)
+        {
+            return false;
+        }
+
+        var currentStart = FindLineStartAtOrAfter(stream, boundary);
+        if (currentStart <= 0 || currentStart >= stream.Length)
+        {
+            return false;
+        }
+
+        if (!TryFindNearestOrdinalBefore(stream, currentStart, out var previousOrdinal) ||
+            !TryFindNearestOrdinalAtOrAfter(stream, currentStart, out var currentOrdinal))
+        {
+            return false;
+        }
+
+        return currentOrdinal <= previousOrdinal;
+    }
+
+    private static long FindLineStartAtOrAfter(FileStream stream, long boundary)
+    {
+        if (boundary == 0)
+        {
+            return 0;
+        }
+
+        stream.Position = boundary - 1;
+        if (stream.ReadByte() == (byte)'\n')
+        {
+            return boundary;
+        }
+
+        stream.Position = boundary;
+        var remaining = Math.Min(
+            MaxOrdinalBoundarySearchBytes,
+            Math.Max(0, stream.Length - boundary));
+        while (remaining-- > 0)
+        {
+            if (stream.ReadByte() == (byte)'\n')
+            {
+                return stream.Position;
+            }
+        }
+        return -1;
+    }
+
+    private static bool TryFindNearestOrdinalBefore(
+        FileStream stream,
+        long currentStart,
+        out long ordinal)
+    {
+        ordinal = 0;
+        var windowStart = Math.Max(0, currentStart - MaxOrdinalBoundarySearchBytes);
+        var buffer = ReadWindow(stream, windowStart, checked((int)(currentStart - windowStart)));
+        var lineEnd = buffer.Length;
+        while (lineEnd > 0)
+        {
+            while (lineEnd > 0 && buffer[lineEnd - 1] is (byte)'\r' or (byte)'\n')
+            {
+                lineEnd--;
+            }
+            if (lineEnd == 0)
+            {
+                break;
+            }
+
+            var previousNewline = buffer.AsSpan(0, lineEnd).LastIndexOf((byte)'\n');
+            var lineStart = previousNewline + 1;
+            if (TryReadOrdinal(buffer.AsSpan(lineStart, lineEnd - lineStart), out ordinal))
+            {
+                return true;
+            }
+            lineEnd = lineStart;
+        }
+        return false;
+    }
+
+    private static bool TryFindNearestOrdinalAtOrAfter(
+        FileStream stream,
+        long currentStart,
+        out long ordinal)
+    {
+        ordinal = 0;
+        var count = checked((int)Math.Min(
+            MaxOrdinalBoundarySearchBytes,
+            Math.Max(0, stream.Length - currentStart)));
+        var buffer = ReadWindow(stream, currentStart, count);
+        var lineStart = 0;
+        while (lineStart < buffer.Length)
+        {
+            var relativeEnd = buffer.AsSpan(lineStart).IndexOf((byte)'\n');
+            var lineEnd = relativeEnd < 0 ? buffer.Length : lineStart + relativeEnd;
+            var contentEnd = lineEnd;
+            if (contentEnd > lineStart && buffer[contentEnd - 1] == (byte)'\r')
+            {
+                contentEnd--;
+            }
+            if (TryReadOrdinal(buffer.AsSpan(lineStart, contentEnd - lineStart), out ordinal))
+            {
+                return true;
+            }
+            if (relativeEnd < 0)
+            {
+                break;
+            }
+            lineStart = lineEnd + 1;
+        }
+        return false;
+    }
+
+    private static byte[] ReadWindow(FileStream stream, long start, int count)
+    {
+        if (count <= 0)
+        {
+            return [];
+        }
+
+        var buffer = new byte[count];
+        stream.Position = start;
+        var totalRead = 0;
+        while (totalRead < count)
+        {
+            var read = stream.Read(buffer, totalRead, count - totalRead);
+            if (read == 0)
+            {
+                break;
+            }
+            totalRead += read;
+        }
+        return totalRead == buffer.Length ? buffer : buffer[..totalRead];
+    }
+
+    private static bool TryReadOrdinal(ReadOnlySpan<byte> line, out long ordinal)
+    {
+        ordinal = 0;
+        ReadOnlySpan<byte> marker = "\"ordinal\""u8;
+        var searchStart = 0;
+        while (searchStart <= line.Length - marker.Length)
+        {
+            var relativeMarker = line[searchStart..].IndexOf(marker);
+            if (relativeMarker < 0)
+            {
+                return false;
+            }
+
+            var markerStart = searchStart + relativeMarker;
+            var cursor = markerStart + marker.Length;
+            if (!IsEscapedJsonToken(line, markerStart))
+            {
+                while (cursor < line.Length && IsJsonWhitespace(line[cursor]))
+                {
+                    cursor++;
+                }
+                if (cursor < line.Length && line[cursor] == (byte)':')
+                {
+                    cursor++;
+                    while (cursor < line.Length && IsJsonWhitespace(line[cursor]))
+                    {
+                        cursor++;
+                    }
+
+                    var value = 0L;
+                    var digits = 0;
+                    var overflowed = false;
+                    while (cursor < line.Length && line[cursor] is >= (byte)'0' and <= (byte)'9')
+                    {
+                        var digit = line[cursor] - (byte)'0';
+                        if (value > (long.MaxValue - digit) / 10)
+                        {
+                            overflowed = true;
+                            break;
+                        }
+                        value = (value * 10) + digit;
+                        digits++;
+                        cursor++;
+                    }
+                    if (digits > 0 && !overflowed)
+                    {
+                        ordinal = value;
+                        return true;
+                    }
+                }
+            }
+            searchStart = markerStart + marker.Length;
+        }
+        return false;
+    }
+
+    private static bool IsEscapedJsonToken(ReadOnlySpan<byte> line, int index)
+    {
+        var slashCount = 0;
+        for (var cursor = index - 1; cursor >= 0 && line[cursor] == (byte)'\\'; cursor--)
+        {
+            slashCount++;
+        }
+        return (slashCount & 1) != 0;
+    }
+
+    private static bool IsJsonWhitespace(byte value) =>
+        value is (byte)' ' or (byte)'\t' or (byte)'\r' or (byte)'\n';
+
+    private static string FormatByteCount(long bytes)
+    {
+        if (bytes >= 1024L * 1024)
+        {
+            return $"{bytes / (1024D * 1024D):0.0} MB";
+        }
+        if (bytes >= 1024)
+        {
+            return $"{bytes / 1024D:0.0} KB";
+        }
+        return $"{bytes} 字节";
     }
 
     private UnifiedThreadTranscript LoadCore(
@@ -955,6 +1402,138 @@ public sealed class SharedThreadTranscriptService
         }
     }
 
+    private static void ValidateProjectionLagDetection(
+        string root,
+        string sessions,
+        DateTimeOffset startedAt)
+    {
+        var threadId = "019f5c10-7f43-7a84-89c6-b94ba0c82457";
+        var rolloutPath = Path.Combine(sessions, $"rollout-fixture-{threadId}.jsonl");
+        var firstLine = MakeOrdinalResponseMessageFixture(
+            startedAt.AddMinutes(1),
+            ordinal: 42,
+            role: "user",
+            text: "before projection boundary");
+        var eventBeforeBoundary = MakeEventMessageFixture(
+            startedAt.AddMinutes(1).AddSeconds(10),
+            "token_count",
+            "event without an ordinal before boundary");
+        var eventAfterBoundary = MakeEventMessageFixture(
+            startedAt.AddMinutes(1).AddSeconds(20),
+            "token_count",
+            "event without an ordinal after boundary");
+        var duplicateLine = MakeLateOrdinalResponseMessageFixture(
+            startedAt.AddMinutes(2),
+            ordinal: 42,
+            role: "assistant",
+            text: "after duplicate ordinal " + new string('x', 2048));
+        File.WriteAllText(
+            rolloutPath,
+            firstLine + "\n" +
+            eventBeforeBoundary + "\n" +
+            eventAfterBoundary + "\n" +
+            duplicateLine + "\n",
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        var boundary = Encoding.UTF8.GetByteCount(
+            firstLine + "\n" + eventBeforeBoundary + "\n");
+
+        using (var state = new SqliteConnection(
+                   new SqliteConnectionStringBuilder
+                   {
+                       DataSource = Path.Combine(root, "state_5.sqlite"),
+                       Pooling = false
+                   }.ToString()))
+        {
+            state.Open();
+            using var command = state.CreateCommand();
+            command.CommandText = """
+                ALTER TABLE threads ADD COLUMN history_mode TEXT;
+                INSERT INTO threads (id, rollout_path, history_mode)
+                VALUES ($id, $path, 'paginated');
+                """;
+            command.Parameters.AddWithValue("$id", threadId);
+            command.Parameters.AddWithValue("$path", rolloutPath);
+            command.ExecuteNonQuery();
+        }
+
+        var historyPath = Path.Combine(root, "thread_history_1.sqlite");
+        using (var history = new SqliteConnection(
+                   new SqliteConnectionStringBuilder
+                   {
+                       DataSource = historyPath,
+                       Pooling = false
+                   }.ToString()))
+        {
+            history.Open();
+            using var command = history.CreateCommand();
+            command.CommandText = """
+                CREATE TABLE thread_history_projection_state (
+                    thread_id TEXT PRIMARY KEY,
+                    next_rollout_byte_offset INTEGER NOT NULL,
+                    next_rollout_ordinal INTEGER NOT NULL
+                );
+                CREATE TABLE thread_turns (thread_id TEXT NOT NULL);
+                INSERT INTO thread_history_projection_state
+                    (thread_id, next_rollout_byte_offset, next_rollout_ordinal)
+                VALUES ($id, $offset, 42);
+                INSERT INTO thread_turns (thread_id) VALUES ($id);
+                """;
+            command.Parameters.AddWithValue("$id", threadId);
+            command.Parameters.AddWithValue("$offset", boundary);
+            command.ExecuteNonQuery();
+        }
+
+        var service = new SharedThreadTranscriptService();
+        var health = InspectOfficialProjectionHealth(root, threadId);
+        var transcript = service.LoadComplete(root, MakeFixtureThread(threadId));
+        if (!health.IsPaginated ||
+            !health.IsLagging ||
+            !health.HasOrdinalRegression ||
+            health.ProjectedBytes != boundary ||
+            health.PendingBytes <= 0 ||
+            health.PendingBytes >= SignificantProjectionLagBytes ||
+            health.IndexedTurns != 1 ||
+            !transcript.OfficialIndexLagging ||
+            transcript.OfficialIndexedTurns != 1 ||
+            !transcript.Notice.Contains("官方分页索引", StringComparison.Ordinal) ||
+            transcript.Messages.Count != 2)
+        {
+            throw new InvalidOperationException(
+                "Paginated thread-history lag was not detected without mutating its source.");
+        }
+
+        using (var history = new SqliteConnection(
+                   new SqliteConnectionStringBuilder
+                   {
+                       DataSource = historyPath,
+                       Pooling = false
+                   }.ToString()))
+        {
+            history.Open();
+            using var command = history.CreateCommand();
+            command.CommandText = """
+                UPDATE thread_history_projection_state
+                SET next_rollout_byte_offset = $offset,
+                    next_rollout_ordinal = 43
+                WHERE thread_id = $id;
+                """;
+            command.Parameters.AddWithValue("$id", threadId);
+            command.Parameters.AddWithValue("$offset", new FileInfo(rolloutPath).Length);
+            command.ExecuteNonQuery();
+        }
+
+        var caughtUp = InspectOfficialProjectionHealth(root, threadId);
+        var caughtUpTranscript = service.LoadComplete(root, MakeFixtureThread(threadId));
+        if (caughtUp.IsLagging ||
+            caughtUp.PendingBytes != 0 ||
+            caughtUpTranscript.OfficialIndexLagging ||
+            caughtUpTranscript.Notice.Contains("官方分页索引", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "A caught-up paginated thread-history index was reported as stale.");
+        }
+    }
+
     private static string LimitText(string value, int maxCharacters, out bool truncated)
     {
         truncated = value.Length > maxCharacters;
@@ -1397,6 +1976,46 @@ public sealed class SharedThreadTranscriptService
                 role,
                 content = new[] { new { type = role == "assistant" ? "output_text" : "input_text", text } }
             }
+        });
+    }
+
+    private static string MakeOrdinalResponseMessageFixture(
+        DateTimeOffset timestamp,
+        long ordinal,
+        string role,
+        string text)
+    {
+        return JsonSerializer.Serialize(new
+        {
+            timestamp = timestamp.ToString("O"),
+            ordinal,
+            type = "response_item",
+            payload = new
+            {
+                type = "message",
+                role,
+                content = new[] { new { type = role == "assistant" ? "output_text" : "input_text", text } }
+            }
+        });
+    }
+
+    private static string MakeLateOrdinalResponseMessageFixture(
+        DateTimeOffset timestamp,
+        long ordinal,
+        string role,
+        string text)
+    {
+        return JsonSerializer.Serialize(new
+        {
+            timestamp = timestamp.ToString("O"),
+            type = "response_item",
+            payload = new
+            {
+                type = "message",
+                role,
+                content = new[] { new { type = role == "assistant" ? "output_text" : "input_text", text } }
+            },
+            ordinal
         });
     }
 

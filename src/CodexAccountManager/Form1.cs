@@ -246,7 +246,7 @@ public partial class Form1 : Form
     // official read. Opening the quota workspace and loading an account never opt it in.
     private static readonly TimeSpan OfficialQuotaActiveRefreshInterval = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan ResetCreditUnavailableRetryDelay = TimeSpan.FromSeconds(1);
-    private static readonly TimeSpan MinimalQuotaPostRefreshTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan MinimalQuotaPostRefreshTimeout = TimeSpan.FromSeconds(30);
     private readonly AccountStore _store = new();
     private readonly CodexCliService _codex = new();
     private readonly SharedHistoryService _sharedHistory = new();
@@ -2801,7 +2801,7 @@ public partial class Form1 : Form
         // Runtime-created WinForms controls keep physical bounds while GDI text grows with
         // monitor DPI. Exercise representative 100%-250% text widths, including the 130 px
         // measurement observed for "更新 Token" at 200% scaling.
-        foreach (var measuredTextWidth in new[] { 66, 98, 130, 164, 182 })
+        foreach (var measuredTextWidth in new[] { 66, 98, 130, 164, 182, 220 })
         {
             var actionWidth = CalculateStatusTokenActionWidth(measuredTextWidth);
             foreach (var width in new[] { AccountRowMinWidth, 720, 899, 900, 928, 1_280, 1_600 })
@@ -4620,12 +4620,14 @@ public partial class Form1 : Form
             contentIndexLoading
                 ? $"已显示 {renderedCount}/{visibleThreads.Count} 条标题结果；正在索引对话正文…"
                 : _unifiedHistorySyncedWithCodex
-                    ? $"已显示 {renderedCount}/{visibleThreads.Count} 条聊天；分类目录已与 Codex 同步。"
+                    ? $"已显示 {renderedCount}/{visibleThreads.Count} 条聊天；官方目录数据已核验。Codex 侧栏仅在其“分区”功能开放时显示目录。"
                     : $"已显示 {renderedCount}/{visibleThreads.Count} 条聊天；Codex 同步暂不可用，当前为本地缓存。";
         _toolTip.SetToolTip(
             _statusBox,
             $"聊天目录：{sharedHome}；总计 {allThreads.Count} 条；" +
-            (_unifiedHistorySyncedWithCodex ? "已与 Codex 同步。" : "当前为本地缓存。") +
+            (_unifiedHistorySyncedWithCodex
+                ? "目录及分类已通过 Codex 官方 app-server 核验；桌面侧栏是否渲染分区由 Codex 客户端功能开放状态决定。"
+                : "当前为本地缓存。") +
             "可搜索标题与对话正文；系统信息和工具日志已过滤。");
     }
 
@@ -4929,7 +4931,7 @@ public partial class Form1 : Form
             $"聊天库 · {total} 条 · {_unifiedHistorySections.Count(section => !section.IsPinned)} 个目录";
         var detailText =
             $"活动 {total - archived} · 归档 {archived} · 显示 {rendered}/{visible} · " +
-            (_unifiedHistorySyncedWithCodex ? "已与 Codex 同步" : "本地缓存") +
+            (_unifiedHistorySyncedWithCodex ? "官方目录数据已核验（侧栏分区由 Codex 决定）" : "本地缓存") +
             (string.IsNullOrWhiteSpace(contentSearchStatus) ? "" : $" · {contentSearchStatus}");
         var geometry = CalculateUnifiedHistorySummaryGeometry(
             width,
@@ -5371,8 +5373,8 @@ public partial class Form1 : Form
             InvalidateUnifiedHistoryCache(clearCachedData: false);
             await RefreshUnifiedHistoryAsync(force: true, _workspaceLoadGeneration);
             _statusBox.Text =
-                $"已创建聊天目录：{section.Name}。Account Manager 已刷新；" +
-                "Codex 左侧栏若未立即变化，切换页面或重新打开 Codex 即可。";
+                $"已创建聊天目录：{section.Name}。目录数据已通过 Codex 官方接口保存；" +
+                "桌面侧栏仅在 Codex 的“分区”功能开放时显示。";
         });
     }
 
@@ -5406,8 +5408,8 @@ public partial class Form1 : Form
             InvalidateUnifiedHistoryCache(clearCachedData: false);
             await RefreshUnifiedHistoryAsync(force: true, _workspaceLoadGeneration);
             _statusBox.Text =
-                $"已将目录“{section.Name}”重命名为“{renamed.Name}”。Account Manager 已刷新；" +
-                "Codex 左侧栏若未立即变化，切换页面或重新打开 Codex 即可。";
+                $"已将目录“{section.Name}”重命名为“{renamed.Name}”。目录数据已通过 Codex 官方接口保存；" +
+                "桌面侧栏仅在 Codex 的“分区”功能开放时显示。";
         });
     }
 
@@ -5452,8 +5454,8 @@ public partial class Form1 : Form
             InvalidateUnifiedHistoryCache(clearCachedData: false);
             await RefreshUnifiedHistoryAsync(force: true, _workspaceLoadGeneration);
             _statusBox.Text =
-                $"已删除空目录：{section.Name}。Account Manager 已刷新；" +
-                "Codex 左侧栏若未立即变化，切换页面或重新打开 Codex 即可。";
+                $"已删除空目录：{section.Name}。目录数据已通过 Codex 官方接口保存；" +
+                "桌面侧栏仅在 Codex 的“分区”功能开放时显示。";
         });
     }
 
@@ -5487,8 +5489,8 @@ public partial class Form1 : Form
             InvalidateUnifiedHistoryCache(clearCachedData: false);
             await RefreshUnifiedHistoryAsync(force: true, _workspaceLoadGeneration);
             _statusBox.Text =
-                $"已将“{thread.Title}”移动到“{targetName}”。Account Manager 已刷新；" +
-                "Codex 左侧栏若未立即变化，切换页面或重新打开 Codex 即可。";
+                $"已将“{thread.Title}”移动到“{targetName}”。目录数据已通过 Codex 官方接口保存；" +
+                "桌面侧栏仅在 Codex 的“分区”功能开放时显示。";
         });
     }
 
@@ -5844,7 +5846,7 @@ public partial class Form1 : Form
         var fontFamily = SystemFonts.DefaultFont.FontFamily;
         const string summaryTitle = "聊天库 · 10000 条 · 36 个目录";
         const string summaryDetail =
-            "活动 9990 · 归档 10 · 显示 288/10000 · 已与 Codex 同步 · 标题与正文搜索已就绪";
+            "活动 9990 · 归档 10 · 显示 288/10000 · 官方目录数据已核验（侧栏分区由 Codex 决定） · 标题与正文搜索已就绪";
         const string threadTitle = "一个用于验证窄窗口和高 DPI 分类按钮布局的聊天标题";
         const string threadMeta =
             "2026-08-24 12:34    C:\\very-long-workspace\\project    gpt-5.6-sol";
@@ -8177,7 +8179,7 @@ public partial class Form1 : Form
     }
 
     private static int CalculateStatusTokenActionWidth(int measuredTextWidth) =>
-        Math.Clamp(measuredTextWidth + 34, 164, 216);
+        Math.Clamp(measuredTextWidth + 48, 184, 288);
 
     private static StatusTokenRowGeometry CalculateStatusTokenRowGeometry(
         int width,
@@ -8186,7 +8188,7 @@ public partial class Form1 : Form
         const int side = 18;
         const int gap = 10;
         const int badgeWidth = 148;
-        var actionWidth = Math.Clamp(measuredActionWidth, 164, 216);
+        var actionWidth = Math.Clamp(measuredActionWidth, 184, 288);
         var badgeRowWidth = (badgeWidth * 2) + gap;
         var actionRowWidth = (actionWidth * 2) + gap;
         var rightWidth = Math.Max(badgeRowWidth, actionRowWidth);
@@ -8673,7 +8675,8 @@ public partial class Form1 : Form
         {
             ResetCreditStatus.Known => FormatResetActionText(
                 state.Count,
-                state.ExpiresAtUtc),
+                state.ExpiresAtUtc,
+                state.ApplicableCount),
             ResetCreditStatus.Querying => "立即重置（查询中）",
             ResetCreditStatus.Unavailable => "立即重置（次数未知）",
             ResetCreditStatus.Failed => "立即重置（查询失败）",
@@ -8682,10 +8685,17 @@ public partial class Form1 : Form
         };
     }
 
-    private static string FormatResetActionText(long count, DateTimeOffset? expiresAtUtc)
+    private static string FormatResetActionText(
+        long count,
+        DateTimeOffset? expiresAtUtc,
+        long? applicableCount)
     {
         var normalizedCount = Math.Max(0, count);
-        var actionText = $"立即重置（{normalizedCount} 次）";
+        var actionText = normalizedCount > 0 && applicableCount == 0
+            ? $"重置卡 {normalizedCount} 次（当前不适用）"
+            : normalizedCount > 0 && !applicableCount.HasValue
+                ? $"重置卡 {normalizedCount} 次（适用性未知）"
+                : $"立即重置（{normalizedCount} 次）";
         if (normalizedCount == 0)
         {
             return actionText;
@@ -8744,8 +8754,12 @@ public partial class Form1 : Form
                     : "到期时间：官方未提供。"),
             ResetCreditStatus.Known when state.Count > 0 =>
                 state.ExpiresAtUtc is { } expiresAt
-                    ? $"点击后确认并使用一次官方 Codex 用量重置；最近一张可用重置卡将于 {expiresAt.ToLocalTime():yyyy-MM-dd HH:mm} 到期。"
-                    : "点击后确认并使用一次官方 Codex 用量重置；到期时间：官方未提供。",
+                    ? $"点击后会先重新读取次数并要求二次确认；确认后才调用官方 Codex 用量重置。" +
+                      Environment.NewLine +
+                      $"最近一张可用重置卡将于 {expiresAt.ToLocalTime():yyyy-MM-dd HH:mm} 到期；如果官方判定没有符合条件的窗口，会返回 nothingToReset。"
+                    : "点击后会先重新读取次数并要求二次确认；确认后才调用官方 Codex 用量重置。" +
+                      Environment.NewLine +
+                      "到期时间：官方未提供；如果官方判定没有符合条件的窗口，会返回 nothingToReset。",
             ResetCreditStatus.Known => "官方明确返回可重置 0 次，不能执行重置。",
             ResetCreditStatus.Unavailable =>
                 "官方本次没有提供 rateLimitResetCredits；这不等同于可重置 0 次。",
@@ -12936,15 +12950,21 @@ public partial class Form1 : Form
             $"立即重置（2 次）{Environment.NewLine}到期时间：{resetCreditExpiry.ToLocalTime():MM-dd HH:mm}";
         var expectedUnknownExpiryAction =
             $"立即重置（1 次）{Environment.NewLine}到期时间：官方未提供";
+        var expectedNotApplicableAction =
+            $"重置卡 1 次（当前不适用）{Environment.NewLine}到期时间：{resetCreditExpiry.ToLocalTime():MM-dd HH:mm}";
         if (!string.Equals(
-                FormatResetActionText(2, resetCreditExpiry),
+                FormatResetActionText(2, resetCreditExpiry, applicableCount: 2),
                 expectedResetAction,
                 StringComparison.Ordinal) ||
             !string.Equals(
-                FormatResetActionText(1, expiresAtUtc: null),
+                FormatResetActionText(1, expiresAtUtc: null, applicableCount: 1),
                 expectedUnknownExpiryAction,
                 StringComparison.Ordinal) ||
-            FormatResetActionText(0, resetCreditExpiry).Contains(
+            !string.Equals(
+                FormatResetActionText(1, resetCreditExpiry, applicableCount: 0),
+                expectedNotApplicableAction,
+                StringComparison.Ordinal) ||
+            FormatResetActionText(0, resetCreditExpiry, applicableCount: 0).Contains(
                 "到期",
                 StringComparison.Ordinal))
         {
@@ -14366,31 +14386,31 @@ public partial class Form1 : Form
         }
     }
 
-    private bool StartOfficialQuotaRefreshAfterMinimalTest(string accountKey, long generation)
+    private Task<bool> StartOfficialQuotaRefreshAfterMinimalTestAsync(
+        string accountKey,
+        long generation)
     {
         if (_formClosed || IsDisposed || !IsQuotaRuntimeStateCurrent(accountKey, generation))
         {
-            return false;
+            return Task.FromResult(false);
         }
 
         var currentAccount = _accounts.FirstOrDefault(candidate =>
             QuotaAccountIdentity.CreateKey(candidate).Equals(accountKey, StringComparison.Ordinal));
         if (currentAccount == null || currentAccount.IsCompatibleApi)
         {
-            return false;
+            return Task.FromResult(false);
         }
 
-        if (!_officialQuotaRefreshInProgress.Add(accountKey))
-        {
-            return true;
-        }
-
+        // A model test must always enqueue its own official read.  Reusing an already-running
+        // launch refresh can surface the response that was captured before this test; the
+        // per-account request lock inside ReadUsageLimitResetInfoAsync serializes this read
+        // behind any older one without sending a second model request.
         _officialQuotaRefreshAttemptedAt[accountKey] = DateTimeOffset.UtcNow;
-        _ = RefreshOfficialQuotaAfterMinimalTestAsync(currentAccount, accountKey, generation);
-        return true;
+        return RefreshOfficialQuotaAfterMinimalTestAsync(currentAccount, accountKey, generation);
     }
 
-    private async Task RefreshOfficialQuotaAfterMinimalTestAsync(
+    private async Task<bool> RefreshOfficialQuotaAfterMinimalTestAsync(
         AccountRecord account,
         string accountKey,
         long generation)
@@ -14409,14 +14429,18 @@ public partial class Form1 : Form
                 !_accounts.Any(candidate =>
                     QuotaAccountIdentity.CreateKey(candidate).Equals(accountKey, StringComparison.Ordinal)))
             {
-                return;
+                return false;
             }
 
             CacheUsageLimitResetInfo(account, info);
             _officialQuotaRefreshedAt[accountKey] = DateTimeOffset.UtcNow;
+            if (_quotaUsageCache == null)
+            {
+                await RefreshQuotaUsageAsync(force: true, _workspaceLoadGeneration);
+            }
             if (_quotaUsageCache == null || _formClosed || IsDisposed)
             {
-                return;
+                return false;
             }
 
             ApplyLiveRateLimitSnapshots(_quotaUsageCache);
@@ -14424,7 +14448,7 @@ public partial class Form1 : Form
             RefreshActivePassiveQuotaMonitoring(_quotaUsageCache);
             if (_activeView != WorkspaceView.QuotaUsage)
             {
-                return;
+                return true;
             }
 
             var updatedInPlace = _showAccountDetail
@@ -14434,21 +14458,17 @@ public partial class Form1 : Form
             {
                 RenderCards();
             }
+            return true;
         }
         catch (OperationCanceledException)
         {
             // The model test is already complete; keep the last quota snapshot silently.
+            return false;
         }
         catch
         {
             // Background quota refresh is best effort. Manual querying remains available.
-        }
-        finally
-        {
-            if (IsQuotaRuntimeStateCurrent(accountKey, generation))
-            {
-                _officialQuotaRefreshInProgress.Remove(accountKey);
-            }
+            return false;
         }
     }
 
@@ -14576,22 +14596,35 @@ public partial class Form1 : Form
                     ? $"\n最近到期：{expiresAt.ToLocalTime():yyyy-MM-dd HH:mm}"
                     : "\n到期时间：官方未提供"
                 : "";
+            var applicableCount = info.EffectiveApplicableAvailableCount;
+            var resetAvailabilityText = availableCount == 0
+                ? "可重置 0 次"
+                : applicableCount == 0
+                    ? $"重置卡总数 {availableCount} 次；当前适用 0 次"
+                    : !applicableCount.HasValue
+                        ? $"重置卡总数 {availableCount} 次；当前适用次数未知"
+                        : $"可发起重置 {applicableCount.Value} 次（重置卡总数 {availableCount} 次）";
             var availabilityText =
-                $"账号 {account.Name}\n{primaryText}{secondaryText}\n可重置 {availableCount} 次。{expiryText}{creditsText}\n\n" +
+                $"账号 {account.Name}\n{primaryText}{secondaryText}\n{resetAvailabilityText}。{expiryText}{creditsText}\n\n" +
                 "本次仅调用只读额度接口，没有发送提示、调用模型或消耗 Token。";
             var actionAvailabilityText = availableCount == 0
                 ? " 立即重置按钮已禁用。"
                 : info.CanConsumeResetCredit
-                    ? " 可以点击“立即重置”使用一次。"
-                    : info.EffectiveApplicableAvailableCount == 0
-                        ? " 当前没有达到可重置条件的额度窗口，立即重置按钮已禁用。"
+                    ? " 可以点击“立即重置”；软件会重新读取次数并要求二次确认，最终由官方返回 reset 或 nothingToReset。"
+                    : applicableCount == 0
+                        ? " 官方明确返回当前适用 0 次，立即重置按钮已禁用。"
                         : " 官方未提供当前适用次数，为避免误触发，立即重置按钮已禁用。";
             var completeAvailabilityText = availabilityText + actionAvailabilityText;
             _statusBox.Text = completeAvailabilityText;
+            var dialogTitle = availableCount > 0 && info.CanConsumeResetCredit
+                ? $"查询完成：可发起重置 {applicableCount ?? availableCount} 次"
+                : availableCount > 0
+                    ? $"查询完成：重置卡 {availableCount} 次，当前不可用"
+                    : "查询完成：可重置 0 次";
             MessageBox.Show(
                 this,
                 completeAvailabilityText,
-                $"查询完成：可重置 {availableCount} 次",
+                dialogTitle,
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
         });
@@ -14692,13 +14725,23 @@ public partial class Form1 : Form
                       ? $"（输入 {input:N0}，输出 {output:N0}）"
                       : string.Empty)
                 : "测试请求已成功（响应未提供 token 汇总）";
+            _statusBox.Text = $"账号 {account.Name}：模型测试完成，正在回读最新官方额度……";
+            var quotaRefreshSucceeded = await StartOfficialQuotaRefreshAfterMinimalTestAsync(
+                accountKey,
+                testGeneration);
+            if (_formClosed || IsDisposed)
+            {
+                return;
+            }
+
             _minimalQuotaTestsInProgress.Remove(accountKey);
             testStateCleared = true;
             RenderCards();
-            var quotaRefreshActive = StartOfficialQuotaRefreshAfterMinimalTest(accountKey, testGeneration);
-            var refreshText = quotaRefreshActive
-                ? "该账号的官方额度正在后台刷新，不会阻塞测试结果，也不会再次发送模型请求。"
-                : "测试期间账号状态发生了变化，因此没有继续回读官方额度。";
+            var refreshText = quotaRefreshSucceeded
+                ? "该账号的最新官方额度与重置时间已刷新；没有再次发送模型请求。"
+                : IsQuotaRuntimeStateCurrent(accountKey, testGeneration)
+                    ? "官方额度回读暂未完成，已保留上一份快照，可以稍后点击“查询重置次数”只读刷新。"
+                    : "测试期间账号状态发生了变化，因此没有继续回读官方额度。";
             var resultText =
                 $"账号：{account.Name}\n测试模型：{CodexCliService.MinimalQuotaTestModelId}\n" +
                 $"{tokenText}\n\n模型测试已经完成；{refreshText}";
@@ -14787,7 +14830,7 @@ public partial class Form1 : Form
                 if (!info.CanConsumeResetCredit)
                 {
                     var notApplicableText = info.EffectiveApplicableAvailableCount == 0
-                        ? $"账号 {account.Name} 有 {availableCount} 次重置卡，但当前没有达到可重置条件的额度窗口，未发送重置请求。"
+                        ? $"账号 {account.Name} 有 {availableCount} 次重置卡，但官方明确返回当前适用 0 次，未发送重置请求。"
                         : $"账号 {account.Name} 有 {availableCount} 次重置卡，但官方未提供当前适用次数，为避免误触发，未发送重置请求。";
                     _statusBox.Text = notApplicableText;
                     MessageBox.Show(
@@ -14804,9 +14847,11 @@ public partial class Form1 : Form
                     : "\n到期时间：官方未提供";
                 var confirmation = MessageBox.Show(
                     this,
-                    $"账号：{account.Name}\n当前可重置：{availableCount} 次{expiryText}\n\n" +
+                    $"账号：{account.Name}\n当前重置卡：{availableCount} 次{expiryText}\n\n" +
                     "这会消耗一次官方获得的 reset credit，并重置当前符合条件的 Codex 用量窗口。" +
-                    "该操作不可撤销，也不是清空本地 Token 统计或重连次数。\n\n确定现在使用一次吗？",
+                    "该操作不可撤销，也不是清空本地 Token 统计或重连次数。" +
+                    "官方会在请求时最终判断是否存在符合条件的窗口；若返回 nothingToReset，软件不会显示为重置成功。" +
+                    "\n\n确定现在使用一次吗？",
                     "确认使用用量重置次数",
                     MessageBoxButtons.OKCancel,
                     MessageBoxIcon.Warning,
@@ -15346,12 +15391,23 @@ public partial class Form1 : Form
         _patGatewayActionRunning = true;
         _patGatewayRuntimeStatus = _appSettings.PatGatewayEnabled
             ? "正在启动..."
-            : "正在关闭...";
+            : _preserveExistingPatGatewayOnStartup
+                ? "正在保留现有网关..."
+                : "正在关闭...";
         UpdatePatGatewayControls();
         try
         {
             if (!_appSettings.PatGatewayEnabled)
             {
+                // The updater launches the new UI with this preservation flag while the
+                // gateway may still be owned by the previous version.  Never mutate that
+                // gateway during the hand-off, even when this UI's saved setting is off.
+                if (_preserveExistingPatGatewayOnStartup)
+                {
+                    _patGatewayRuntimeStatus = "已保留现有网关（未关闭）";
+                    return;
+                }
+
                 _ = await LocalPatGateway.ShutdownOwnedGatewayAsync();
                 _patGatewayRuntimeRunning = false;
                 _patGatewayRuntimeStatus = "已关闭";

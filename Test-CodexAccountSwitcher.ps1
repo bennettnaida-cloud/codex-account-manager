@@ -147,8 +147,32 @@ if ($appUpdateServiceSource -notmatch 'CodexAccountManager["'']\s*,\s*["'']versi
     $appUpdateServiceSource -notmatch '\$_\.CommandLine\.IndexOf\(\$gatewayArgument,[^\r\n]+\)\s+-lt\s+0' -or
     $programSource -notmatch 'PreserveExistingGatewayArgument' -or
     $formSource -notmatch 'restartOnProxyMismatch:\s*!_preserveExistingPatGatewayOnStartup' -or
+    $formSource -notmatch 'if\s*\(_preserveExistingPatGatewayOnStartup\)[\s\S]{0,500}return;[\s\S]{0,500}ShutdownOwnedGatewayAsync' -or
     $formSource -notmatch 'TryRefreshNativeFastBridgeAfterUpdate') {
     throw 'Automatic updates must use versioned side-by-side installs and preserve the running PAT gateway on the first updated launch.'
+}
+if ($appUpdateServiceSource -notmatch 'Timeout\s*=\s*Timeout\.InfiniteTimeSpan' -or
+    $appUpdateServiceSource -notmatch 'windows-update\.partial' -or
+    $appUpdateServiceSource -notmatch 'windows-update\.verified\.zip' -or
+    $appUpdateServiceSource -notmatch 'PublishAndCopyVerifiedDownloadAsync' -or
+    $appUpdateServiceSource -notmatch 'CopyVerifiedDownloadToSessionAsync' -or
+    $appUpdateServiceSource -notmatch 'new RangeHeaderValue\(existingLength,\s*null\)' -or
+    $appUpdateServiceSource -notmatch 'HttpStatusCode\.PartialContent' -or
+    $appUpdateServiceSource -notmatch 'SendWithIdleTimeoutAsync' -or
+    $appUpdateServiceSource -notmatch 'ReadWithIdleTimeoutAsync' -or
+    $appUpdateServiceSource -notmatch 'CodexCliService\.GetConfiguredProxyUri\(\)' -or
+    $appUpdateServiceSource -notmatch 'UpdateSessionMarkerFileName' -or
+    $appUpdateServiceSource -notmatch 'FileAttributes\.ReparsePoint' -or
+    $appUpdateServiceSource -notmatch 'FileMatchesSha256Async' -or
+    $appUpdateServiceSource -notmatch 'metadata\.LastModifiedUtc\.Value\s*!=\s*responseLastModified\.Value' -or
+    $appUpdateServiceSource -notmatch '\$previousProcessExited\s*=\s*\$false' -or
+    $appUpdateServiceSource -notmatch '\$pathsValidated\s+-and\s+\$previousProcessExited\s+-and' -or
+    $appUpdateServiceSource -notmatch 'function Get-ExactNativeFastBridgeProcess' -or
+    $appUpdateServiceSource -notmatch '!waitProbe\.HasExited' -or
+    $appUpdateServiceSource -notmatch 'ValidateResumableDownload' -or
+    $programSource -notmatch 'AppUpdateService\.ValidateResumableDownload\(\)' -or
+    $appUpdateServiceSource -match 'Wait-Process\s+-Id[^\r\n]+-Timeout') {
+    throw 'Automatic updates must retain identity-bound partial and verified caches, enforce idle timeouts and proxy selection, and use safe PowerShell process handoff.'
 }
 if ($windowsInstallerSource -notmatch 'function\s+Copy-InstallerFileWithRetry' -or
     $windowsInstallerSource -notmatch "temporaryUpdateRoot\s*=\s*Join-Path\s+\(\[IO\.Path\]::GetTempPath\(\)\)\s+'CAM-update'" -or
@@ -943,8 +967,11 @@ if ($resetSessionSource -notmatch 'public long\? ApplicableAvailableCount \{ get
     $resetSessionSource -notmatch '"credits": null' -or
     $resetSessionSource -notmatch 'unavailableExpiryAndNotApplicable\.AvailableCreditExpiresAtUtc\.HasValue' -or
     $resetSessionSource -notmatch 'unavailableExpiryAndNotApplicable\.EffectiveApplicableAvailableCount != 0' -or
+    $resetSessionSource -notmatch 'officialSchemaWithoutApplicability\.EffectiveApplicableAvailableCount != 1' -or
+    $resetSessionSource -notmatch '!officialSchemaWithoutApplicability\.CanConsumeResetCredit' -or
     $resetSessionSource -notmatch 'notApplicableAttempt\.WasSent' -or
-    $resetSessionSource -notmatch 'mockConsumeCalls != 1' -or
+    $resetSessionSource -notmatch '!officialSchemaAttempt\.WasSent' -or
+    $resetSessionSource -notmatch 'mockConsumeCalls != 2' -or
     $quotaSnapshotStoreSource -notmatch 'ApplicableAvailableCount' -or
     -not $consumeWhenConfirmed.Success -or
     $consumeWhenConfirmed.Value -notmatch '!confirmed\s*\|\|\s*!info\.CanConsumeResetCredit[\s\S]*?return new UsageLimitResetConsumeAttempt\(false, null, null\)' -or
@@ -954,8 +981,10 @@ if ($resetSessionSource -notmatch 'public long\? ApplicableAvailableCount \{ get
     -not $canResetUsage.Success -or
     $canResetUsage.Value -notmatch 'state\.ApplicableCount is > 0' -or
     $resetPreConsume -notmatch 'if \(!info\.CanConsumeResetCredit\)[\s\S]*?return;' -or
+    $programSource -notmatch 'ApplicableAvailableCount=' -or
+    $programSource -notmatch 'CanConsumeResetCredit=' -or
     $programSource -notmatch 'UsageLimitResetSession\.ValidateProtocolParsing\(\)') {
-    throw 'Reset-card expiry and applicability must survive credits=null, show an explicit unknown-expiry state, and never send consume for a non-applicable card.'
+    throw 'Reset cards must honor official availableCount when applicability is omitted, preserve an explicit zero override, and send consume only after confirmation.'
 }
 $modelTonalArcMethod = [regex]::Match(
     $modelUsageDistributionSource,
@@ -2810,6 +2839,12 @@ if ($threadTranscriptSource -notmatch 'public sealed class SharedThreadTranscrip
     $threadTranscriptSource -notmatch 'CompleteMaxProjectedJsonCharacters\s*=\s*16 \* 1024 \* 1024' -or
     $threadTranscriptSource -notmatch 'projectNonTranscriptStrings:\s*true' -or
     $threadTranscriptSource -notmatch 'ReadProjectedJsonLines\(reader, maxJsonLineCharacters\)' -or
+    $threadTranscriptSource -notmatch 'InspectOfficialProjectionHealth\(codexHome, thread\.Id\)' -or
+    $threadTranscriptSource -notmatch 'thread_history_\*\.sqlite' -or
+    $threadTranscriptSource -notmatch 'HasNonIncreasingOrdinalAtBoundary' -or
+    $threadTranscriptSource -notmatch 'OfficialIndexLagging = true' -or
+    $threadTranscriptSource -notmatch 'ValidateProjectionLagDetection\(root, sessions, startedAt\)' -or
+    $threadTranscriptSource -notmatch '原始聊天仍在，且未被本软件修改' -or
     $threadTranscriptSource -notmatch 'UnifiedThreadTranscriptStatus' -or
     $threadTranscriptSource -notmatch 'IReadOnlyList<UnifiedThreadMessage> Messages' -or
     $threadTranscriptSource -notmatch 'maxMessages = Math\.Clamp\(maxMessages, 1, 200\)' -or
@@ -2846,6 +2881,9 @@ if ($threadPreviewDialogSource -notmatch 'public sealed class ThreadPreviewDialo
     $threadPreviewDialogSource -notmatch 'private void FindMatch\(bool forward, bool restart = false\)' -or
     $threadPreviewDialogSource -notmatch 'private static int CountMatches\(string text, string query\)' -or
     $threadPreviewDialogSource -notmatch 'Text = "复制全部"' -or
+    $threadPreviewDialogSource -notmatch 'Text = "导出 TXT"' -or
+    $threadPreviewDialogSource -notmatch 'private void ExportAll\(\)' -or
+    $threadPreviewDialogSource -notmatch 'transcript\.OfficialIndexLagging' -or
     $threadPreviewDialogSource -notmatch 'private void RenderTranscript\(UnifiedThreadTranscript transcript, ThemePalette palette\)' -or
     $threadPreviewDialogSource -notmatch 'BuildWindowTitle\(transcript\)' -or
     $threadPreviewDialogSource -notmatch 'partialTitle\.Contains\("完整", StringComparison\.Ordinal\)' -or
@@ -2853,6 +2891,12 @@ if ($threadPreviewDialogSource -notmatch 'public sealed class ThreadPreviewDialo
     $threadPreviewDialogSource -notmatch 'BuildCopyText\(thread, transcript\)' -or
     $programSource -notmatch 'ThreadPreviewDialog\.ValidateFormatting\(\)') {
     throw 'The local chat preview dialog must be DPI-aware, resizable, read-only, copyable, role-formatted, and covered by offline formatting validation.'
+}
+if ($formSource -notmatch '官方目录数据已核验' -or
+    $formSource -notmatch '桌面侧栏仅在 Codex 的“分区”功能开放时显示' -or
+    $formSource -match '分类目录已与 Codex 同步' -or
+    $formSource -match 'Codex 左侧栏若未立即变化') {
+    throw 'Thread-section status must distinguish verified official data from the Codex desktop sidebar feature rollout.'
 }
 if ($formSource -notmatch '搜索标题或对话内容' -or
     $formSource -notmatch 'EnsureUnifiedHistoryContentIndex' -or
@@ -2913,7 +2957,7 @@ if ($formSource -notmatch 'QuotaMinimumRefreshInterval\s*=\s*TimeSpan\.FromMilli
 }
 $automaticQuotaRefresh = [regex]::Match(
     $formSource,
-    '(?s)private void StartOfficialQuotaRefreshAfterLaunch\(AccountRecord account\).*?(?=\r?\n\s*private bool StartOfficialQuotaRefreshAfterMinimalTest)')
+    '(?s)private void StartOfficialQuotaRefreshAfterLaunch\(AccountRecord account\).*?(?=\r?\n\s*private Task<bool> StartOfficialQuotaRefreshAfterMinimalTestAsync)')
 if (-not $automaticQuotaRefresh.Success -or
     $formSource -notmatch 'OfficialQuotaActiveRefreshInterval\s*=\s*TimeSpan\.FromSeconds\(10\)' -or
     $formSource -match 'OfficialQuotaBackgroundRefreshInterval' -or
@@ -2932,6 +2976,20 @@ if (-not $automaticQuotaRefresh.Success -or
     $automaticQuotaRefresh.Value -notmatch 'catch \(OperationCanceledException\)' -or
     $automaticQuotaRefresh.Value -match '_accounts|foreach\s*\(|ConsumeAsync\(|LoginWith|EnsureAccountCanRunMinimalRequest|thread/start|turn/start') {
     throw 'Official quota refresh must poll only the launched account every 10 seconds and avoid model/reset-credit actions.'
+}
+$postTestQuotaRefresh = [regex]::Match(
+    $formSource,
+    '(?s)private Task<bool> StartOfficialQuotaRefreshAfterMinimalTestAsync\(.*?(?=\r?\n\s*private SemaphoreSlim GetOfficialQuotaRequestLock)')
+if (-not $postTestQuotaRefresh.Success -or
+    $formSource -notmatch 'MinimalQuotaPostRefreshTimeout\s*=\s*TimeSpan\.FromSeconds\(30\)' -or
+    $postTestQuotaRefresh.Value -match '_officialQuotaRefreshInProgress\.Add\(accountKey\)' -or
+    $postTestQuotaRefresh.Value -notmatch 'return RefreshOfficialQuotaAfterMinimalTestAsync\(currentAccount, accountKey, generation\)' -or
+    $postTestQuotaRefresh.Value -notmatch 'ReadUsageLimitResetInfoAsync\([\s\S]*?account,[\s\S]*?fastFail:\s*true' -or
+    $postTestQuotaRefresh.Value -notmatch 'RefreshQuotaUsageAsync\(force:\s*true,\s*_workspaceLoadGeneration\)' -or
+    $postTestQuotaRefresh.Value -notmatch 'ApplyLiveRateLimitSnapshots\(_quotaUsageCache\)' -or
+    $postTestQuotaRefresh.Value -match 'ConsumeAsync\(|rateLimitResetCredit/consume|SendMinimalQuotaTestAsync' -or
+    $formSource -notmatch 'await StartOfficialQuotaRefreshAfterMinimalTestAsync\(\s*accountKey,\s*testGeneration\)') {
+    throw 'A completed minimal test must enqueue one fresh account-scoped read-only quota refresh and apply it before reporting completion.'
 }
 $readOnlyQuotaRequest = [regex]::Match(
     $resetSessionSource,

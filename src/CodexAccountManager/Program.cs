@@ -231,6 +231,7 @@ static class Program
             Form1.ValidateCodexAppearanceLayouts();
             Form1.ValidateModelPricingGridLayout();
             AppUpdateService.ValidateUpdateHelperScript();
+            AppUpdateService.ValidateResumableDownload();
             ModelCatalogService.ValidatePersistenceAndProxy();
             var officialCatalogProxy = Environment.GetEnvironmentVariable(
                 "CODEX_ACCOUNT_MANAGER_SELF_TEST_MODEL_CATALOG_PROXY");
@@ -639,6 +640,11 @@ static class Program
         var info = await session.ReadAsync();
         Console.WriteLine($"Account={account.Name}");
         Console.WriteLine($"AvailableCount={(info.AvailableCount?.ToString() ?? "unavailable")}");
+        Console.WriteLine(
+            $"ApplicableAvailableCount={(info.ApplicableAvailableCount?.ToString() ?? "not-provided")}");
+        Console.WriteLine(
+            $"EffectiveApplicableAvailableCount={(info.EffectiveApplicableAvailableCount?.ToString() ?? "unavailable")}");
+        Console.WriteLine($"CanConsumeResetCredit={info.CanConsumeResetCredit}");
         Console.WriteLine($"UsedPercent={(info.UsedPercent?.ToString("0.##") ?? "unknown")}");
         Console.WriteLine($"PrimaryWindowMinutes={(info.Primary?.WindowMinutes?.ToString() ?? "unknown")}");
         Console.WriteLine($"SecondaryUsedPercent={(info.Secondary?.UsedPercent?.ToString("0.##") ?? "unknown")}");
