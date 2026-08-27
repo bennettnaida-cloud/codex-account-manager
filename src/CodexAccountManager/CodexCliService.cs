@@ -112,9 +112,25 @@ public sealed partial class CodexCliService
     private const int OfficialNativeFastCdpMaxResponseBytes = 512 * 1024;
     private static readonly TimeSpan OfficialNativeFastRendererReadyTimeout =
         TimeSpan.FromSeconds(40);
+    private static readonly TimeSpan OfficialNativeFastBridgeStopTimeout =
+        TimeSpan.FromSeconds(2);
+    // The primary renderer can legitimately spend more than 45 seconds mounting routes on a
+    // cold profile.  Do not reload it until the renderer-to-main ready handshake has completed.
+    private static readonly TimeSpan OfficialCodexPrimaryPageReadyTimeout =
+        TimeSpan.FromSeconds(75);
+    private static readonly TimeSpan OfficialCodexPostPatchPageReadyTimeout =
+        TimeSpan.FromSeconds(45);
+    private static readonly TimeSpan OfficialCodexRecoveryReleaseTimeout =
+        TimeSpan.FromSeconds(8);
+    private static readonly TimeSpan OfficialAccountDisplayTimeout =
+        TimeSpan.FromSeconds(6);
+    private static readonly TimeSpan OfficialCodexReadyStableDuration =
+        TimeSpan.FromMilliseconds(500);
     private const uint ErrorInsufficientBuffer = 122;
     private const int AddressFamilyInterNetwork = 2;
     private const int TcpTableOwnerPidListener = 3;
+    private const uint ToolhelpSnapshotProcesses = 0x00000002;
+    private static readonly IntPtr InvalidNativeHandle = new(-1);
     private static readonly string[] ProxyEnvironmentVariableNames =
     [
         "HTTP_PROXY",
@@ -148,6 +164,8 @@ public sealed partial class CodexCliService
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
     private static readonly SemaphoreSlim OfficialOAuthLoginLock = new(1, 1);
     private static long _windowsClientLaunchGeneration;
+    private static long _officialAccountDisplayGeneration;
+    private static readonly SemaphoreSlim OfficialAccountDisplayGate = new(1, 1);
     private static readonly SemaphoreSlim CodexPlusPlusTaskOperationLock = new(1, 1);
     private static readonly TimeSpan CodexPlusPlusOpenThreadTimeout = TimeSpan.FromSeconds(12);
     // Codex++ 1.2.x can spend close to a minute discovering the packaged Codex app and
@@ -181,6 +199,35 @@ public sealed partial class CodexCliService
                IsChatGptDesktopAuthJson(Path.Combine(account.CodexHome, AuthFileName));
     }
 
+    public bool HasVerifiableChatGptFeatureLogin(AccountRecord account)
+    {
+        ArgumentNullException.ThrowIfNull(account);
+        return account.IsOfficialOAuth &&
+               TryReadChatGptAuthAccountId(
+                   Path.Combine(account.CodexHome, AuthFileName),
+                   out _);
+    }
+
+    public string GetDesktopAccountBindingKey(AccountRecord account)
+    {
+        ArgumentNullException.ThrowIfNull(account);
+        return GetDesktopAccountKey(account);
+    }
+
+    public string? GetChatGptFeatureIdentityBindingKey(AccountRecord account)
+    {
+        ArgumentNullException.ThrowIfNull(account);
+        if (!account.IsOfficialOAuth ||
+            !TryReadChatGptAuthAccountId(
+                Path.Combine(account.CodexHome, AuthFileName),
+                out var accountId))
+        {
+            return null;
+        }
+
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(accountId)));
+    }
+
     internal static string MinimalQuotaTestModelId => MinimalQuotaTestModel;
 
     public bool IsSharedCredentialAlreadySelected(AccountRecord account)
@@ -191,14 +238,60 @@ public sealed partial class CodexCliService
             Path.Combine(GetDefaultCodexHome(), AuthFileName));
     }
 
-    public bool IsSharedProfileAlreadySelected(AccountRecord account)
+    public bool IsSharedProfileAlreadySelected(
+        AccountRecord account,
+        bool routeOfficialOAuthThroughGateway = false)
     {
         ArgumentNullException.ThrowIfNull(account);
         PersistSharedServiceTierToSelectedAccount();
         return CanReuseSharedProfileWithoutNetwork(
             account,
             Path.Combine(account.CodexHome, ConfigFileName),
-            AccessTokenSharedProfileMode.ApiCompatible);
+            AccessTokenSharedProfileMode.ApiCompatible,
+            chatGptFeatureAccount: null,
+            routeOfficialOAuthThroughGateway);
+    }
+
+    public bool IsSharedChatGptFeatureProfileAlreadySelected(
+        AccountRecord account,
+        AccountRecord chatGptFeatureAccount)
+    {
+        ArgumentNullException.ThrowIfNull(account);
+        ArgumentNullException.ThrowIfNull(chatGptFeatureAccount);
+        PersistSharedServiceTierToSelectedAccount();
+        return CanReuseChatGptFeatureProfileForLaunchWithoutNetwork(
+            account,
+            Path.Combine(account.CodexHome, ConfigFileName),
+            chatGptFeatureAccount);
+    }
+
+    public bool IsOfficialWindowsClientRunning()
+    {
+        var clientPath = ResolveCodexWindowsClientPath();
+        var packageRoot = string.IsNullOrWhiteSpace(clientPath)
+            ? null
+            : Path.GetDirectoryName(clientPath);
+        foreach (var process in Process.GetProcessesByName("ChatGPT"))
+        {
+            using (process)
+            {
+                try
+                {
+                    if (!process.HasExited &&
+                        TryClassifyCodexWindowsClientProcess(process, packageRoot, out var isOfficial) &&
+                        isOfficial)
+                    {
+                        return true;
+                    }
+                }
+                catch
+                {
+                    // A vanished or inaccessible process cannot prove that the official
+                    // client is running, so continue looking for an immutable live match.
+                }
+            }
+        }
+        return false;
     }
 
     public void CaptureActiveServiceTier()
@@ -209,41 +302,104 @@ public sealed partial class CodexCliService
     public bool DeleteSharedCredentialIfSelected(AccountRecord account)
     {
         ArgumentNullException.ThrowIfNull(account);
-        PersistSharedServiceTierToSelectedAccount();
-        var sharedHome = GetDefaultCodexHome();
-        var accountKey = GetDesktopAccountKey(account);
-        var hasActiveAccountState = TryReadActiveAccountState(
-            sharedHome,
-            out var activeAccountKey,
-            out _,
-            out _);
-        var sharedCredentialSelected = hasActiveAccountState
-            ? activeAccountKey.Equals(accountKey, StringComparison.OrdinalIgnoreCase)
-            : IsSharedCredentialAlreadySelected(account);
-
-        if (sharedCredentialSelected)
+        using var switchMutex = new Mutex(false, WindowsClientSwitchMutexName);
+        var mutexAcquired = false;
+        try
         {
-            foreach (var fileName in new[]
-                     {
-                         AuthFileName,
-                         CockpitAuthFileName,
-                         DesktopSelectionFileName,
-                         ActiveAccountStateFileName
-                     })
+            try
             {
-                var path = Path.Combine(sharedHome, fileName);
-                if (!File.Exists(path))
+                mutexAcquired = switchMutex.WaitOne(TimeSpan.FromSeconds(15));
+            }
+            catch (AbandonedMutexException)
+            {
+                mutexAcquired = true;
+            }
+            if (!mutexAcquired)
+            {
+                throw new TimeoutException(
+                    "另一个 Codex 账号切换仍在进行；为避免删除到一半，请稍后重试。");
+            }
+
+            PersistSharedServiceTierToSelectedAccount();
+            var sharedHome = GetDefaultCodexHome();
+            var accountKey = GetDesktopAccountKey(account);
+            var hasActiveAccountState = TryReadActiveAccountState(
+                sharedHome,
+                out var activeAccountKey,
+                out _,
+                out _);
+            var sharedCredentialSelected = hasActiveAccountState
+                ? activeAccountKey.Equals(accountKey, StringComparison.OrdinalIgnoreCase)
+                : IsSharedCredentialAlreadySelected(account);
+            var sharedChatGptAuthSelected =
+                IsDesktopAuthSelectionForAccount(sharedHome, account);
+            var sharedSelectionAffected =
+                sharedCredentialSelected || sharedChatGptAuthSelected;
+            string? deletedModelSecret = null;
+            if (!account.IsOfficialOAuth)
+            {
+                try
                 {
-                    continue;
+                    deletedModelSecret = ReadAccessTokenCredential(
+                        Path.Combine(account.CodexHome, AuthFileName));
+                }
+                catch (Exception ex) when (
+                    ex is IOException or UnauthorizedAccessException or JsonException or
+                    InvalidDataException or FormatException)
+                {
+                    // Ownership sidecars still provide the authoritative selected-account
+                    // cleanup path when the source credential is already corrupt.
+                }
+            }
+
+            DeleteMatchingGlobalDesktopAuth(sharedHome, account, sharedChatGptAuthSelected);
+            ScrubAccountSwitcherBackups(sharedHome, account);
+
+            if (sharedSelectionAffected)
+            {
+                foreach (var fileName in new[]
+                         {
+                             AuthFileName,
+                             CockpitAuthFileName,
+                             DesktopSelectionFileName,
+                             ActiveAccountStateFileName
+                         })
+                {
+                    var path = Path.Combine(sharedHome, fileName);
+                    if (!File.Exists(path))
+                    {
+                        continue;
+                    }
+
+                    ClearReadOnlyAttribute(path);
+                    File.Delete(path);
                 }
 
-                ClearReadOnlyAttribute(path);
-                File.Delete(path);
+            }
+
+            if (sharedSelectionAffected)
+            {
+                RemoveExperimentalBearerTokenLines(
+                    Path.Combine(sharedHome, ConfigFileName),
+                    matchingSecret: null);
+            }
+            else if (!string.IsNullOrWhiteSpace(deletedModelSecret))
+            {
+                RemoveExperimentalBearerTokenLines(
+                    Path.Combine(sharedHome, ConfigFileName),
+                    deletedModelSecret);
+            }
+
+            DeleteStoredDesktopAuth(sharedHome, account);
+            return sharedSelectionAffected;
+        }
+        finally
+        {
+            if (mutexAcquired)
+            {
+                switchMutex.ReleaseMutex();
             }
         }
-
-        DeleteStoredDesktopAuth(sharedHome, account);
-        return sharedCredentialSelected;
     }
 
     public async Task<LoginStatus> GetLoginStatusAsync(AccountRecord account)
@@ -498,9 +654,8 @@ public sealed partial class CodexCliService
         }
 
         // Commit the new OAuth file to the exact account snapshot before asking the app server
-        // for status. Otherwise a still-selected shared profile could copy its older refresh
-        // token back over the just-created account auth.json during GetLoginStatusAsync().
-        DeleteStoredDesktopAuth(GetDefaultCodexHome(), account);
+        // for status. This must not hot-swap the running shared profile: a different account_id
+        // is applied only by the normal mutex + clean-shutdown projection path.
         PersistSuccessfulOfficialOAuthLogin(account);
         return await GetLoginStatusAsync(account);
     }
@@ -1532,22 +1687,78 @@ public sealed partial class CodexCliService
 
     public async Task<WindowsClientAccountProjection> PrepareWindowsClientAccountAsync(AccountRecord account)
     {
-        PersistSharedServiceTierToSelectedAccount();
-        var status = await ValidateWindowsClientAccountAsync(
-            account,
-            accessTokenMode: AccessTokenSharedProfileMode.ApiCompatible);
-        return CanReuseSharedProfileWithoutNetwork(
-            account,
-            Path.Combine(account.CodexHome, ConfigFileName),
-            AccessTokenSharedProfileMode.ApiCompatible)
-            ? CreateReusedSharedProfileProjection(
-                account,
-                status,
-                AccessTokenSharedProfileMode.ApiCompatible)
-            : ProjectWindowsClientAccount(
-                account,
-                status,
-                AccessTokenSharedProfileMode.ApiCompatible);
+        return await Task.Run(() =>
+        {
+            using var switchMutex = new Mutex(false, WindowsClientSwitchMutexName);
+            var mutexAcquired = false;
+            try
+            {
+                try
+                {
+                    mutexAcquired = switchMutex.WaitOne(TimeSpan.FromSeconds(15));
+                }
+                catch (AbandonedMutexException)
+                {
+                    mutexAcquired = true;
+                }
+                if (!mutexAcquired)
+                {
+                    throw new TimeoutException(
+                        "Another Codex account switch is still running. Please retry shortly.");
+                }
+
+                PersistSharedServiceTierToSelectedAccount();
+                var status = ValidateWindowsClientAccountAsync(
+                        account,
+                        accessTokenMode: AccessTokenSharedProfileMode.ApiCompatible)
+                    .GetAwaiter()
+                    .GetResult();
+
+                // CLI preparation writes the same shared profile used by the desktop client.
+                // Serialize it with desktop switches and re-check after taking the lock so a CLI
+                // click cannot rewrite credentials under an in-flight renderer launch/reload.
+                if (CanReuseSharedProfileWithoutNetwork(
+                        account,
+                        Path.Combine(account.CodexHome, ConfigFileName),
+                        AccessTokenSharedProfileMode.ApiCompatible))
+                {
+                    return CreateReusedSharedProfileProjection(
+                        account,
+                        status,
+                        AccessTokenSharedProfileMode.ApiCompatible);
+                }
+
+                var launchGeneration = BeginWindowsClientLaunchGeneration();
+                var shutdownTargets = CaptureWindowsClientProcessSnapshots();
+                var shutdownNativeFastPorts = CaptureOfficialNativeFastPortsOwnedBy(shutdownTargets);
+                StopWindowsClientProcesses(shutdownTargets);
+                if (!WaitForWindowsClientProcessAndPortRelease(
+                        shutdownTargets,
+                        shutdownNativeFastPorts,
+                        launchGeneration,
+                        OfficialCodexRecoveryReleaseTimeout) ||
+                    !WaitForOfficialCodexSwitchQuiescence(
+                        launchGeneration,
+                        OfficialCodexRecoveryReleaseTimeout))
+                {
+                    throw new TimeoutException(
+                        "Codex did not remain fully closed before CLI credential preparation. " +
+                        "Shared credentials were not changed; close Codex completely and retry.");
+                }
+
+                return ProjectWindowsClientAccount(
+                    account,
+                    status,
+                    AccessTokenSharedProfileMode.ApiCompatible);
+            }
+            finally
+            {
+                if (mutexAcquired)
+                {
+                    switchMutex.ReleaseMutex();
+                }
+            }
+        });
     }
 
     public Task<WindowsClientAccountProjection> SwitchWindowsClientAccountAsync(
@@ -1594,7 +1805,63 @@ public sealed partial class CodexCliService
         bool useDreamSkin,
         ThemeMode appearanceMode,
         string appearancePresetId = "manager",
+        string? appearanceLabel = null,
+        bool routeOfficialOAuthThroughGateway = false)
+    {
+        return await SwitchWindowsClientAccountCoreAsync(
+            account,
+            projectPath,
+            mode,
+            useDreamSkin,
+            appearanceMode,
+            appearancePresetId,
+            appearanceLabel,
+            AccessTokenSharedProfileMode.ApiCompatible,
+            chatGptFeatureAccount: null,
+            routeOfficialOAuthThroughGateway);
+    }
+
+    public async Task<WindowsClientAccountProjection> SwitchWindowsClientAccountWithChatGptFeaturesAsync(
+        AccountRecord account,
+        AccountRecord chatGptFeatureAccount,
+        string projectPath,
+        bool useDreamSkin,
+        ThemeMode appearanceMode,
+        string appearancePresetId = "manager",
         string? appearanceLabel = null)
+    {
+        ArgumentNullException.ThrowIfNull(account);
+        ArgumentNullException.ThrowIfNull(chatGptFeatureAccount);
+        if (account.IsOfficialOAuth)
+        {
+            throw new InvalidOperationException(
+                "官方 ChatGPT 账号请直接使用 Codex 启动；双登录入口只适用于 Access Token 或兼容 API 账号。");
+        }
+
+        return await SwitchWindowsClientAccountCoreAsync(
+            account,
+            projectPath,
+            WindowsClientMode.OfficialCodex,
+            useDreamSkin,
+            appearanceMode,
+            appearancePresetId,
+            appearanceLabel,
+            AccessTokenSharedProfileMode.ChatGptDesktop,
+            chatGptFeatureAccount,
+            routeOfficialOAuthThroughGateway: false);
+    }
+
+    private async Task<WindowsClientAccountProjection> SwitchWindowsClientAccountCoreAsync(
+        AccountRecord account,
+        string projectPath,
+        WindowsClientMode mode,
+        bool useDreamSkin,
+        ThemeMode appearanceMode,
+        string appearancePresetId,
+        string? appearanceLabel,
+        AccessTokenSharedProfileMode accessTokenMode,
+        AccountRecord? chatGptFeatureAccount,
+        bool routeOfficialOAuthThroughGateway)
     {
         if (!Directory.Exists(projectPath))
         {
@@ -1610,6 +1877,11 @@ public sealed partial class CodexCliService
         // represented by this click.
         PersistSharedServiceTierToSelectedAccount();
 
+        if (accessTokenMode == AccessTokenSharedProfileMode.ChatGptDesktop)
+        {
+            PrepareChatGptFeatureAccount(account, chatGptFeatureAccount);
+        }
+
         // A normal desktop switch only validates local files. Running login status, debug
         // models, or a minimal model request here could consume quota and block this click for
         // one or more 120-second CLI timeouts. Codex++ performs the online validation when the
@@ -1617,7 +1889,8 @@ public sealed partial class CodexCliService
         var status = await ValidateWindowsClientAccountAsync(
             account,
             localOnly: true,
-            accessTokenMode: AccessTokenSharedProfileMode.ApiCompatible);
+            accessTokenMode: accessTokenMode,
+            chatGptFeatureAccount: chatGptFeatureAccount);
         if (account.IsCompatibleApi)
         {
             // A compatible-API switch is destructive to the currently open client once the
@@ -1626,7 +1899,8 @@ public sealed partial class CodexCliService
             // looking at a blank Codex window after the old profile has already been replaced.
             await EnsureCompatibleApiLaunchPreflightAsync(account);
         }
-        return await Task.Run(() =>
+        long successfulLaunchGeneration = 0;
+        var projectionResult = await Task.Run(() =>
         {
             using var switchMutex = new Mutex(false, WindowsClientSwitchMutexName);
             var mutexAcquired = false;
@@ -1652,11 +1926,36 @@ public sealed partial class CodexCliService
 
                 // Re-check after taking the cross-process switch lock. Another installed/copy of
                 // Account Manager may have changed the shared profile while this click was waiting.
-                var sharedProfileAlreadySelected = IsSharedProfileAlreadySelected(account);
+                var exactSharedProfileAlreadySelected = CanReuseSharedProfileWithoutNetwork(
+                    account,
+                    Path.Combine(account.CodexHome, ConfigFileName),
+                    accessTokenMode,
+                    chatGptFeatureAccount,
+                    routeOfficialOAuthThroughGateway);
+                var sharedProfileAlreadySelected = exactSharedProfileAlreadySelected ||
+                    accessTokenMode == AccessTokenSharedProfileMode.ChatGptDesktop &&
+                    chatGptFeatureAccount != null &&
+                    CanIdentifySharedChatGptFeatureProfileWithoutNetwork(
+                        account,
+                        chatGptFeatureAccount);
+                if (sharedProfileAlreadySelected && !exactSharedProfileAlreadySelected)
+                {
+                    // Codex can persist harmless runtime preferences while it is open. The
+                    // immutable model bearer, endpoint, OAuth owner, selection sidecar and
+                    // active-account state still prove this is the same dual-login profile, so
+                    // preserve the healthy process instead of closing it merely to canonicalize
+                    // unrelated config text.
+                    WriteCodexPlusPlusLaunchDiagnostic(
+                        "official-dual-profile-reused-with-runtime-drift",
+                        "the verified model/OAuth owners were unchanged; existing Codex was preserved");
+                }
                 var switchRequired = RequiresWindowsClientShutdown(sharedProfileAlreadySelected);
                 var shutdownTargets = switchRequired
                     ? CaptureWindowsClientProcessSnapshots()
                     : Array.Empty<WindowsClientProcessSnapshot>();
+                var shutdownNativeFastPorts = switchRequired
+                    ? CaptureOfficialNativeFastPortsOwnedBy(shutdownTargets)
+                    : Array.Empty<int>();
             WindowsClientAccountProjection projection;
             if (sharedProfileAlreadySelected)
             {
@@ -1665,20 +1964,39 @@ public sealed partial class CodexCliService
                 projection = CreateReusedSharedProfileProjection(
                     account,
                     status,
-                    AccessTokenSharedProfileMode.ApiCompatible);
+                    accessTokenMode,
+                    chatGptFeatureAccount);
             }
             else
             {
                 // Only a real credential change is allowed to close the previous client. Work
                 // from the operation-start snapshot so a delayed shutdown cannot hit a newer PID.
                 StopWindowsClientProcesses(shutdownTargets);
+                if (!WaitForWindowsClientProcessAndPortRelease(
+                        shutdownTargets,
+                        shutdownNativeFastPorts,
+                        launchGeneration,
+                        OfficialCodexRecoveryReleaseTimeout) ||
+                    !WaitForOfficialCodexSwitchQuiescence(
+                        launchGeneration,
+                        OfficialCodexRecoveryReleaseTimeout))
+                {
+                    // Do not rewrite the shared profile while an old renderer or CDP owner can
+                    // still read it. The global second gate also rejects a new official client
+                    // that was manually activated after the operation-start snapshot.
+                    throw new TimeoutException(
+                        "Codex did not remain fully closed, or a native bridge port did not release cleanly. " +
+                        "Account credentials were not changed; close Codex completely and retry.");
+                }
                 WindowsClientAccountProjection? pendingProjection = null;
                 try
                 {
                     pendingProjection = ProjectWindowsClientAccount(
                         account,
                         status,
-                        AccessTokenSharedProfileMode.ApiCompatible);
+                        accessTokenMode,
+                        chatGptFeatureAccount,
+                        routeOfficialOAuthThroughGateway);
                     NormalizeDesktopSidebarState(pendingProjection);
                     AlignDesktopProfileModelState(account, pendingProjection);
                     SanitizeProjectModelOverrides(projectPath, pendingProjection);
@@ -1720,7 +2038,15 @@ public sealed partial class CodexCliService
                     appearanceMode,
                     appearancePresetId,
                     appearanceLabel,
-                    launchGeneration);
+                    allowOfficialRendererPatch: ShouldApplyOfficialRendererPatch(
+                        account,
+                        accessTokenMode,
+                        chatGptFeatureAccount),
+                    expectedLaunchGeneration: launchGeneration);
+                if (projection.ClientLaunchStarted)
+                {
+                    successfulLaunchGeneration = launchGeneration;
+                }
                 projection.CodexPlusPlusLaunchStarted =
                     mode == WindowsClientMode.CodexPlusPlus && projection.ClientLaunchStarted;
             }
@@ -1752,6 +2078,20 @@ public sealed partial class CodexCliService
                 }
             }
         });
+
+        if (projectionResult.ClientLaunchStarted && mode == WindowsClientMode.OfficialCodex)
+        {
+            var displayAccount = chatGptFeatureAccount ?? (account.IsOfficialOAuth ? account : null);
+            if (displayAccount != null)
+            {
+                QueueOfficialAccountDisplay(
+                    account,
+                    displayAccount,
+                    isDualLogin: chatGptFeatureAccount != null,
+                    successfulLaunchGeneration);
+            }
+        }
+        return projectionResult;
     }
 
     private static bool RequiresWindowsClientShutdown(bool sharedProfileAlreadySelected)
@@ -1759,10 +2099,415 @@ public sealed partial class CodexCliService
         return !sharedProfileAlreadySelected;
     }
 
+    private static bool ShouldApplyOfficialRendererPatch(
+        AccountRecord modelAccount,
+        AccessTokenSharedProfileMode accessTokenMode,
+        AccountRecord? chatGptFeatureAccount)
+    {
+        ArgumentNullException.ThrowIfNull(modelAccount);
+        return accessTokenMode == AccessTokenSharedProfileMode.ApiCompatible &&
+               chatGptFeatureAccount == null &&
+               (modelAccount.IsAccessToken || modelAccount.IsCompatibleApi);
+    }
+
+    private void PrepareChatGptFeatureAccount(
+        AccountRecord modelAccount,
+        AccountRecord? chatGptFeatureAccount)
+    {
+        ArgumentNullException.ThrowIfNull(modelAccount);
+        if (chatGptFeatureAccount == null || !chatGptFeatureAccount.IsOfficialOAuth)
+        {
+            throw new InvalidOperationException(
+                "语音与手机连接需要绑定一个“通过 ChatGPT 登录（官方）”账号；" +
+                "PAT 或兼容 API 仍只负责普通模型请求。");
+        }
+        if (PathsEqual(modelAccount.CodexHome, chatGptFeatureAccount.CodexHome))
+        {
+            throw new InvalidOperationException(
+                "模型账号与 ChatGPT 功能账号必须使用不同的独立凭据目录。");
+        }
+
+        EnsureOfficialOAuthAccountConfig(chatGptFeatureAccount);
+        var authPath = Path.Combine(chatGptFeatureAccount.CodexHome, AuthFileName);
+        if (!IsChatGptDesktopAuthJson(authPath) ||
+            !TryReadChatGptAuthAccountId(authPath, out _))
+        {
+            throw new InvalidOperationException(
+                $"账号 {chatGptFeatureAccount.Name} 没有可验证身份的 ChatGPT 官方登录态。\n\n" +
+                "请先在该账号上完成“通过 ChatGPT 登录”，再使用语音/手机功能启动。");
+        }
+    }
+
+    private void QueueOfficialAccountDisplay(
+        AccountRecord modelAccount,
+        AccountRecord chatGptAccount,
+        bool isDualLogin,
+        long launchGeneration,
+        AccountRecord? projectedModelAccount = null,
+        long? displayGeneration = null)
+    {
+        var modelSnapshot = SnapshotAccountForDisplay(modelAccount);
+        var chatGptSnapshot = SnapshotAccountForDisplay(chatGptAccount);
+        var projectedModelSnapshot = projectedModelAccount == null
+            ? null
+            : SnapshotAccountForDisplay(projectedModelAccount);
+        var currentDisplayGeneration = displayGeneration ??
+                                       Interlocked.Increment(
+                                           ref _officialAccountDisplayGeneration);
+        _ = Task.Run(() => TryApplyOfficialAccountDisplayAsync(
+            modelSnapshot,
+            chatGptSnapshot,
+            isDualLogin,
+            launchGeneration,
+            currentDisplayGeneration,
+            projectedModelSnapshot));
+    }
+
+    public void QueueCurrentOfficialAccountDisplay(IReadOnlyList<AccountRecord> accounts)
+    {
+        ArgumentNullException.ThrowIfNull(accounts);
+        var snapshots = accounts.Select(SnapshotAccountForDisplay).ToArray();
+        var launchGeneration = Volatile.Read(ref _windowsClientLaunchGeneration);
+        var displayGeneration = Interlocked.Increment(
+            ref _officialAccountDisplayGeneration);
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                var oauthAccounts = snapshots.Where(account => account.IsOfficialOAuth).ToArray();
+                var dualSelections = new List<(AccountRecord Model, AccountRecord ChatGpt)>();
+                foreach (var modelAccount in snapshots.Where(account => !account.IsOfficialOAuth))
+                {
+                    foreach (var chatGptAccount in oauthAccounts)
+                    {
+                        if (CanIdentifySharedChatGptFeatureProfileWithoutNetwork(
+                                modelAccount,
+                                chatGptAccount))
+                        {
+                            dualSelections.Add((modelAccount, chatGptAccount));
+                        }
+                    }
+                }
+
+                var oauthSelections = oauthAccounts
+                    .Where(account => CanReuseOfficialOAuthSharedProfile(account))
+                    .ToArray();
+                WriteCodexPlusPlusLaunchDiagnostic(
+                    "official-account-display-discovery",
+                    $"oauth_count={oauthAccounts.Length}; " +
+                    $"dual_selection_count={dualSelections.Count}; " +
+                    $"pure_oauth_selection_count={oauthSelections.Length}");
+
+                if (dualSelections.Count == 1)
+                {
+                    var selected = dualSelections[0];
+                    QueueOfficialAccountDisplay(
+                        selected.Model,
+                        selected.ChatGpt,
+                        isDualLogin: true,
+                        launchGeneration,
+                        displayGeneration: displayGeneration);
+                    return;
+                }
+                if (dualSelections.Count != 0)
+                {
+                    return;
+                }
+
+                if (oauthSelections.Length == 1)
+                {
+                    QueueOfficialAccountDisplay(
+                        oauthSelections[0],
+                        oauthSelections[0],
+                        isDualLogin: false,
+                        launchGeneration,
+                        displayGeneration: displayGeneration);
+                }
+            }
+            catch (Exception ex)
+            {
+                WriteCodexPlusPlusLaunchDiagnostic(
+                    "official-account-display-discovery-unavailable",
+                    "stage failed with " + ex.GetType().Name);
+            }
+        });
+    }
+
+    public void QueueHotRotatedOfficialAccountDisplay(
+        AccountRecord modelAccount,
+        IReadOnlyList<AccountRecord> accounts)
+    {
+        ArgumentNullException.ThrowIfNull(modelAccount);
+        ArgumentNullException.ThrowIfNull(accounts);
+        if (modelAccount.IsOfficialOAuth)
+        {
+            return;
+        }
+
+        var targetKey = QuotaAccountIdentity.CreateKey(modelAccount);
+        var snapshots = accounts.Select(SnapshotAccountForDisplay).ToArray();
+        var targetSnapshot = snapshots.FirstOrDefault(account =>
+            QuotaAccountIdentity.CreateKey(account).Equals(
+                targetKey,
+                StringComparison.Ordinal));
+        if (targetSnapshot == null)
+        {
+            return;
+        }
+
+        var launchGeneration = Volatile.Read(ref _windowsClientLaunchGeneration);
+        var displayGeneration = Interlocked.Increment(
+            ref _officialAccountDisplayGeneration);
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                if (!IsCurrentOfficialAccountDisplayGeneration(displayGeneration))
+                {
+                    return;
+                }
+
+                var oauthAccounts = snapshots.Where(account => account.IsOfficialOAuth).ToArray();
+                var selectedProfiles = new List<(AccountRecord Model, AccountRecord ChatGpt)>();
+                foreach (var projectedModel in snapshots.Where(account => !account.IsOfficialOAuth))
+                {
+                    foreach (var chatGptAccount in oauthAccounts)
+                    {
+                        if (CanIdentifySharedChatGptFeatureProfileWithoutNetwork(
+                                projectedModel,
+                                chatGptAccount))
+                        {
+                            selectedProfiles.Add((projectedModel, chatGptAccount));
+                        }
+                    }
+                }
+
+                WriteCodexPlusPlusLaunchDiagnostic(
+                    "official-account-display-hot-rotation",
+                    $"selected_profile_count={selectedProfiles.Count}; " +
+                    $"target_kind={(targetSnapshot.IsCompatibleApi ? "api" : "pat")}");
+                if (selectedProfiles.Count != 1 ||
+                    !IsCurrentOfficialAccountDisplayGeneration(displayGeneration))
+                {
+                    return;
+                }
+
+                var selected = selectedProfiles[0];
+                QueueOfficialAccountDisplay(
+                    targetSnapshot,
+                    selected.ChatGpt,
+                    isDualLogin: true,
+                    launchGeneration,
+                    projectedModelAccount: selected.Model,
+                    displayGeneration: displayGeneration);
+            }
+            catch (Exception ex)
+            {
+                WriteCodexPlusPlusLaunchDiagnostic(
+                    "official-account-display-hot-rotation-unavailable",
+                    "stage failed with " + ex.GetType().Name);
+            }
+        });
+    }
+
+    private async Task TryApplyOfficialAccountDisplayAsync(
+        AccountRecord modelAccount,
+        AccountRecord chatGptAccount,
+        bool isDualLogin,
+        long launchGeneration,
+        long displayGeneration,
+        AccountRecord? projectedModelAccount)
+    {
+        await OfficialAccountDisplayGate.WaitAsync();
+        try
+        {
+            using var timeout = new CancellationTokenSource(OfficialAccountDisplayTimeout);
+            if (!IsCurrentWindowsClientLaunchGeneration(launchGeneration) ||
+                !IsCurrentOfficialAccountDisplayGeneration(displayGeneration))
+            {
+                return;
+            }
+
+            var identityBefore = GetChatGptFeatureIdentityBindingKey(chatGptAccount);
+            if (identityBefore == null)
+            {
+                return;
+            }
+
+            var identity = await _appServer.ReadAccountIdentityAsync(
+                chatGptAccount.CodexHome,
+                timeout.Token);
+            var identityAfter = GetChatGptFeatureIdentityBindingKey(chatGptAccount);
+            if (identity == null ||
+                identityAfter == null ||
+                !identityBefore.Equals(identityAfter, StringComparison.Ordinal))
+            {
+                WriteCodexPlusPlusLaunchDiagnostic(
+                    "official-account-display-skipped",
+                    "the OAuth account/read identity did not remain bound to one account_id");
+                return;
+            }
+
+            using var switchMutex = new Mutex(false, WindowsClientSwitchMutexName);
+            var mutexAcquired = false;
+            try
+            {
+                try
+                {
+                    // Identity decoration is optional. If any Account Manager is switching the
+                    // shared profile, abandon this stale display attempt instead of waiting.
+                    mutexAcquired = switchMutex.WaitOne(TimeSpan.Zero);
+                }
+                catch (AbandonedMutexException)
+                {
+                    mutexAcquired = true;
+                }
+                if (!mutexAcquired)
+                {
+                    WriteCodexPlusPlusLaunchDiagnostic(
+                        "official-account-display-deferred",
+                        "an account switch owns the identity display gate");
+                    return;
+                }
+
+                var profileModelAccount = projectedModelAccount ?? modelAccount;
+                var selected = isDualLogin
+                    ? CanIdentifySharedChatGptFeatureProfileWithoutNetwork(
+                        profileModelAccount,
+                        chatGptAccount)
+                    : modelAccount.IsOfficialOAuth &&
+                      PathsEqual(modelAccount.CodexHome, chatGptAccount.CodexHome) &&
+                      CanReuseOfficialOAuthSharedProfile(chatGptAccount);
+                var finalIdentityBinding = GetChatGptFeatureIdentityBindingKey(chatGptAccount);
+                if (!IsCurrentWindowsClientLaunchGeneration(launchGeneration) ||
+                    !IsCurrentOfficialAccountDisplayGeneration(displayGeneration) ||
+                    !selected ||
+                    finalIdentityBinding == null ||
+                    !identityAfter.Equals(finalIdentityBinding, StringComparison.Ordinal))
+                {
+                    WriteCodexPlusPlusLaunchDiagnostic(
+                        "official-account-display-skipped",
+                        "the shared model/OAuth projection changed before display injection");
+                    return;
+                }
+
+                var endpoints = new List<(int Port, string BrowserId, WindowsClientActivationIdentity Owner)>();
+                foreach (var port in OfficialNativeFastCdpPortCandidates())
+                {
+                    if (TryCaptureOfficialNativeFastEndpoint(
+                            port,
+                            out var browserId,
+                            out var listenerIdentity))
+                    {
+                        endpoints.Add((port, browserId, listenerIdentity));
+                    }
+                }
+                if (endpoints.Count != 1)
+                {
+                    WriteCodexPlusPlusLaunchDiagnostic(
+                        "official-account-display-deferred",
+                        $"verified_endpoint_count={endpoints.Count}; exactly one official owner is required");
+                    return;
+                }
+
+                var ownerRoot = GetCodexWindowsClientAppDirectory();
+                if (ownerRoot == null)
+                {
+                    return;
+                }
+                var display = new CodexAccountDisplay(
+                    isDualLogin ? NormalizeModelAccountDisplayLabel(modelAccount.Name) : null,
+                    identity.Email)
+                {
+                    ModelAccountTypeLabel = isDualLogin
+                        ? modelAccount.IsCompatibleApi
+                            ? "API 模型账号"
+                            : "PAT 模型账号"
+                        : null
+                };
+                var endpoint = endpoints[0];
+                var applied = CodexNativeFastBridge.TryApplyAccountDisplayAsync(
+                        endpoint.Port,
+                        endpoint.BrowserId,
+                        endpoint.Owner.ProcessId,
+                        endpoint.Owner.StartTimeUtcTicks ?? 0,
+                        ownerRoot,
+                        display,
+                        timeout.Token)
+                    .GetAwaiter()
+                    .GetResult();
+                if (!applied)
+                {
+                    WriteCodexPlusPlusLaunchDiagnostic(
+                        "official-account-display-deferred",
+                        "the unique verified primary Codex renderer rejected the optional identity display");
+                }
+            }
+            finally
+            {
+                if (mutexAcquired)
+                {
+                    switchMutex.ReleaseMutex();
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            WriteCodexPlusPlusLaunchDiagnostic(
+                "official-account-display-unavailable",
+                "optional identity display timed out or was superseded");
+        }
+        catch (Exception ex)
+        {
+            // Identity decoration is optional. It must never turn an otherwise healthy launch
+            // into a failure or expose an email/token in diagnostics.
+            WriteCodexPlusPlusLaunchDiagnostic(
+                "official-account-display-unavailable",
+                "stage failed with " + ex.GetType().Name);
+        }
+        finally
+        {
+            OfficialAccountDisplayGate.Release();
+        }
+    }
+
+    private static bool IsCurrentOfficialAccountDisplayGeneration(long generation) =>
+        Volatile.Read(ref _officialAccountDisplayGeneration) == generation;
+
+    private static AccountRecord SnapshotAccountForDisplay(AccountRecord account)
+    {
+        ArgumentNullException.ThrowIfNull(account);
+        return new AccountRecord
+        {
+            Name = account.Name,
+            CodexHome = account.CodexHome,
+            AuthKind = account.AuthKind,
+            ApiProviderName = account.ApiProviderName,
+            ApiBaseUrl = account.ApiBaseUrl,
+            ApiModel = account.ApiModel,
+            ApiWireApi = account.ApiWireApi,
+            QuotaLimitType = account.QuotaLimitType,
+            QuotaPrimaryWindowMinutes = account.QuotaPrimaryWindowMinutes,
+            QuotaSecondaryWindowMinutes = account.QuotaSecondaryWindowMinutes,
+            QuotaLimitObservedAtUtc = account.QuotaLimitObservedAtUtc
+        };
+    }
+
+    private static string NormalizeModelAccountDisplayLabel(string value)
+    {
+        var normalized = (value ?? string.Empty).Trim();
+        if (normalized.Length > 180)
+        {
+            normalized = normalized[..180];
+        }
+        return normalized;
+    }
+
     private async Task<LoginStatus> ValidateWindowsClientAccountAsync(
         AccountRecord account,
         bool localOnly = false,
-        AccessTokenSharedProfileMode accessTokenMode = AccessTokenSharedProfileMode.ChatGptDesktop)
+        AccessTokenSharedProfileMode accessTokenMode = AccessTokenSharedProfileMode.ChatGptDesktop,
+        AccountRecord? chatGptFeatureAccount = null)
     {
         if (account.IsAccessToken)
         {
@@ -1821,10 +2566,18 @@ public sealed partial class CodexCliService
             ProjectAccessTokenSourceConfig(sourceConfigPath);
         }
 
-        var sharedProfileCanBeReused = CanReuseSharedProfileWithoutNetwork(
-            account,
-            sourceConfigPath,
-            accessTokenMode);
+        var sharedProfileCanBeReused =
+            accessTokenMode == AccessTokenSharedProfileMode.ChatGptDesktop &&
+            chatGptFeatureAccount != null
+                ? CanReuseChatGptFeatureProfileForLaunchWithoutNetwork(
+                    account,
+                    sourceConfigPath,
+                    chatGptFeatureAccount)
+                : CanReuseSharedProfileWithoutNetwork(
+                    account,
+                    sourceConfigPath,
+                    accessTokenMode,
+                    chatGptFeatureAccount);
         var emptySharedProfileCanBeInitialized =
             CanInitializeEmptySharedProfileWithoutNetwork(account, sourceAuthPath, sourceConfigPath);
         var localProjectionIsSufficient =
@@ -1868,11 +2621,15 @@ public sealed partial class CodexCliService
     private static bool CanReuseSharedProfileWithoutNetwork(
         AccountRecord account,
         string sourceConfigPath,
-        AccessTokenSharedProfileMode accessTokenMode = AccessTokenSharedProfileMode.ChatGptDesktop)
+        AccessTokenSharedProfileMode accessTokenMode = AccessTokenSharedProfileMode.ChatGptDesktop,
+        AccountRecord? chatGptFeatureAccount = null,
+        bool routeOfficialOAuthThroughGateway = false)
     {
         if (account.IsOfficialOAuth)
         {
-            return CanReuseOfficialOAuthSharedProfile(account);
+            return CanReuseOfficialOAuthSharedProfile(
+                account,
+                routeOfficialOAuthThroughGateway);
         }
 
         var sharedHome = GetDefaultCodexHome();
@@ -1888,6 +2645,26 @@ public sealed partial class CodexCliService
             if (!IsAccessTokenDesktopSessionSelected(account, sharedHome, sharedAuthPath))
             {
                 return false;
+            }
+            if (chatGptFeatureAccount != null &&
+                (!chatGptFeatureAccount.IsOfficialOAuth ||
+                 !IsDesktopAuthSelectionForAccount(sharedHome, chatGptFeatureAccount)))
+            {
+                return false;
+            }
+            if (chatGptFeatureAccount != null)
+            {
+                var featureAuthPath = Path.Combine(
+                    chatGptFeatureAccount.CodexHome,
+                    AuthFileName);
+                var storedFeatureAuthPath = GetStoredDesktopAuthPath(
+                    sharedHome,
+                    chatGptFeatureAccount);
+                if (!ChatGptAuthAccountsMatch(sharedAuthPath, featureAuthPath) &&
+                    !ChatGptAuthAccountsMatch(sharedAuthPath, storedFeatureAuthPath))
+                {
+                    return false;
+                }
             }
         }
         else if (account.IsCompatibleApi)
@@ -1956,10 +2733,291 @@ public sealed partial class CodexCliService
                 NormalizeTextForFingerprint(projectedSharedConfig)));
             return CryptographicOperations.FixedTimeEquals(currentFingerprint, projectedFingerprint);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (
+            ex is IOException or UnauthorizedAccessException or JsonException or
+            InvalidDataException or FormatException or ArgumentException or NotSupportedException)
         {
             return false;
         }
+    }
+
+    private static bool CanIdentifySharedChatGptFeatureProfileWithoutNetwork(
+        AccountRecord modelAccount,
+        AccountRecord chatGptFeatureAccount)
+    {
+        ArgumentNullException.ThrowIfNull(modelAccount);
+        ArgumentNullException.ThrowIfNull(chatGptFeatureAccount);
+        if (modelAccount.IsOfficialOAuth ||
+            !chatGptFeatureAccount.IsOfficialOAuth ||
+            PathsEqual(modelAccount.CodexHome, chatGptFeatureAccount.CodexHome))
+        {
+            return false;
+        }
+
+        var sharedHome = Path.GetFullPath(GetDefaultCodexHome());
+        var sharedAuthPath = Path.Combine(sharedHome, AuthFileName);
+        if (File.Exists(Path.Combine(sharedHome, CockpitAuthFileName)) ||
+            !TryReadDesktopSelectionKeys(
+                sharedHome,
+                out var selectedModelKey,
+                out var selectedAuthKey,
+                out var selectedAuthHome) ||
+            !selectedModelKey.Equals(
+                GetDesktopAccountKey(modelAccount),
+                StringComparison.OrdinalIgnoreCase) ||
+            !selectedAuthKey.Equals(
+                GetDesktopAccountKey(chatGptFeatureAccount),
+                StringComparison.OrdinalIgnoreCase) ||
+            !PathsEqual(selectedAuthHome, chatGptFeatureAccount.CodexHome) ||
+            !TryReadActiveAccountState(
+                sharedHome,
+                out var activeAccountKey,
+                out var activeAccountHome,
+                out var activeMode) ||
+            !activeAccountKey.Equals(selectedModelKey, StringComparison.OrdinalIgnoreCase) ||
+            !PathsEqual(activeAccountHome, modelAccount.CodexHome) ||
+            !activeMode.Equals(
+                GetActiveAccountMode(
+                    modelAccount,
+                    AccessTokenSharedProfileMode.ChatGptDesktop),
+                StringComparison.Ordinal) ||
+            !IsChatGptDesktopAuthJson(sharedAuthPath))
+        {
+            return false;
+        }
+
+        var featureAuthPath = Path.Combine(chatGptFeatureAccount.CodexHome, AuthFileName);
+        var storedFeatureAuthPath = GetStoredDesktopAuthPath(
+            sharedHome,
+            chatGptFeatureAccount);
+        if (!ChatGptAuthAccountsMatch(sharedAuthPath, featureAuthPath) &&
+            !ChatGptAuthAccountsMatch(sharedAuthPath, storedFeatureAuthPath))
+        {
+            return false;
+        }
+
+        return IsManagedDesktopModelCredentialBoundToAccount(
+            modelAccount,
+            Path.Combine(sharedHome, ConfigFileName));
+    }
+
+    private static bool CanReuseChatGptFeatureProfileForLaunchWithoutNetwork(
+        AccountRecord modelAccount,
+        string sourceConfigPath,
+        AccountRecord chatGptFeatureAccount)
+    {
+        ArgumentNullException.ThrowIfNull(modelAccount);
+        ArgumentNullException.ThrowIfNull(chatGptFeatureAccount);
+        return CanReuseSharedProfileWithoutNetwork(
+                   modelAccount,
+                   sourceConfigPath,
+                   AccessTokenSharedProfileMode.ChatGptDesktop,
+                   chatGptFeatureAccount) ||
+               CanIdentifySharedChatGptFeatureProfileWithoutNetwork(
+                   modelAccount,
+                   chatGptFeatureAccount);
+    }
+
+    private static bool IsManagedDesktopModelCredentialBoundToAccount(
+        AccountRecord account,
+        string sharedConfigPath)
+    {
+        try
+        {
+            if (account.IsOfficialOAuth || !File.Exists(sharedConfigPath))
+            {
+                return false;
+            }
+
+            var configLines = File.ReadAllText(sharedConfigPath)
+                .Replace("\r\n", "\n", StringComparison.Ordinal)
+                .Replace('\r', '\n')
+                .Split('\n');
+            var providerId = account.IsCompatibleApi
+                ? AccountStore.CompatibleApiProviderId
+                : AccountStore.AccessTokenProviderId;
+            if (!TomlTopLevelRawValueMatches(
+                    configLines,
+                    "model_provider",
+                    TomlString(providerId)) ||
+                !TomlTopLevelRawValueMatches(
+                    configLines,
+                    "cli_auth_credentials_store",
+                    "\"file\""))
+            {
+                return false;
+            }
+
+            var providerHeaders = new[]
+            {
+                "[model_providers." + providerId + "]",
+                "[model_providers." + TomlString(providerId) + "]"
+            };
+            if (!TryFindUniqueTomlSection(
+                    configLines,
+                    providerHeaders,
+                    out var sectionStart,
+                    out var sectionEnd))
+            {
+                return false;
+            }
+
+            var sourceToken = ReadAccessTokenCredential(
+                Path.Combine(account.CodexHome, AuthFileName));
+            var expectedBaseUrl = account.IsCompatibleApi
+                ? account.ApiBaseUrl.TrimEnd('/')
+                : AccountStore.AccessTokenBaseUrl;
+            var expectedWireApi = account.IsCompatibleApi
+                ? account.ApiWireApi
+                : "responses";
+            return TomlSectionRawValueMatches(
+                       configLines,
+                       sectionStart,
+                       sectionEnd,
+                       "base_url",
+                       TomlString(expectedBaseUrl)) &&
+                   TomlSectionRawValueMatches(
+                       configLines,
+                       sectionStart,
+                       sectionEnd,
+                       "wire_api",
+                       TomlString(expectedWireApi)) &&
+                   TomlSectionRawValueMatches(
+                       configLines,
+                       sectionStart,
+                       sectionEnd,
+                       "requires_openai_auth",
+                       "true") &&
+                   TomlSectionRawValueMatches(
+                       configLines,
+                       sectionStart,
+                       sectionEnd,
+                       "supports_websockets",
+                       "false") &&
+                   TomlSectionRawValueMatches(
+                       configLines,
+                       sectionStart,
+                       sectionEnd,
+                       "experimental_bearer_token",
+                       TomlString(sourceToken),
+                       sensitive: true);
+        }
+        catch (Exception ex) when (
+            ex is IOException or UnauthorizedAccessException or JsonException or
+            InvalidDataException or FormatException or ArgumentException or NotSupportedException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TomlTopLevelRawValueMatches(
+        IReadOnlyList<string> lines,
+        string key,
+        string expectedValue)
+    {
+        var matches = 0;
+        foreach (var line in lines)
+        {
+            var trimmed = line.Trim();
+            if (IsTomlTableHeader(trimmed))
+            {
+                break;
+            }
+            if (!TomlKeyEquals(trimmed, key))
+            {
+                continue;
+            }
+
+            matches++;
+            if (!TomlRawValueEquals(trimmed, expectedValue, sensitive: false))
+            {
+                return false;
+            }
+        }
+
+        return matches == 1;
+    }
+
+    private static bool TryFindUniqueTomlSection(
+        IReadOnlyList<string> lines,
+        IReadOnlyList<string> expectedHeaders,
+        out int sectionStart,
+        out int sectionEnd)
+    {
+        sectionStart = -1;
+        sectionEnd = -1;
+        for (var index = 0; index < lines.Count; index++)
+        {
+            var trimmed = lines[index].Trim();
+            if (!expectedHeaders.Contains(trimmed, StringComparer.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            if (sectionStart >= 0)
+            {
+                return false;
+            }
+
+            sectionStart = index + 1;
+        }
+        if (sectionStart < 0)
+        {
+            return false;
+        }
+
+        sectionEnd = lines.Count;
+        for (var index = sectionStart; index < lines.Count; index++)
+        {
+            if (IsTomlTableHeader(lines[index].Trim()))
+            {
+                sectionEnd = index;
+                break;
+            }
+        }
+        return true;
+    }
+
+    private static bool TomlSectionRawValueMatches(
+        IReadOnlyList<string> lines,
+        int sectionStart,
+        int sectionEnd,
+        string key,
+        string expectedValue,
+        bool sensitive = false)
+    {
+        var matches = 0;
+        for (var index = sectionStart; index < sectionEnd; index++)
+        {
+            var trimmed = lines[index].Trim();
+            if (!TomlKeyEquals(trimmed, key))
+            {
+                continue;
+            }
+
+            matches++;
+            if (!TomlRawValueEquals(trimmed, expectedValue, sensitive))
+            {
+                return false;
+            }
+        }
+        return matches == 1;
+    }
+
+    private static bool TomlRawValueEquals(
+        string trimmedLine,
+        string expectedValue,
+        bool sensitive)
+    {
+        var equalsIndex = trimmedLine.IndexOf('=');
+        if (equalsIndex <= 0)
+        {
+            return false;
+        }
+
+        var actualValue = trimmedLine[(equalsIndex + 1)..].Trim();
+        return sensitive
+            ? SecretValuesEqual(actualValue, expectedValue)
+            : actualValue.Equals(expectedValue, StringComparison.Ordinal);
     }
 
     private static bool CanInitializeEmptySharedProfileWithoutNetwork(
@@ -2053,39 +3111,50 @@ public sealed partial class CodexCliService
     private static WindowsClientAccountProjection ProjectWindowsClientAccount(
         AccountRecord account,
         LoginStatus status,
-        AccessTokenSharedProfileMode accessTokenMode)
+        AccessTokenSharedProfileMode accessTokenMode,
+        AccountRecord? chatGptFeatureAccount = null,
+        bool routeOfficialOAuthThroughGateway = false)
     {
         return account.IsOfficialOAuth
-            ? ProjectOfficialOAuthAccount(account, status)
+            ? ProjectOfficialOAuthAccount(account, status, routeOfficialOAuthThroughGateway)
             : account.IsCompatibleApi
-            ? ProjectCompatibleApiAccount(account, status, accessTokenMode)
-            : ProjectAccessTokenAccount(account, status, accessTokenMode);
+            ? ProjectCompatibleApiAccount(account, status, accessTokenMode, chatGptFeatureAccount)
+            : ProjectAccessTokenAccount(account, status, accessTokenMode, chatGptFeatureAccount);
     }
 
     private static WindowsClientAccountProjection ProjectAccessTokenAccount(
         AccountRecord account,
         LoginStatus status,
-        AccessTokenSharedProfileMode mode)
+        AccessTokenSharedProfileMode mode,
+        AccountRecord? chatGptFeatureAccount = null)
     {
-        return ProjectSharedAccountProfile(account, status, mode);
+        return ProjectSharedAccountProfile(account, status, mode, chatGptFeatureAccount);
     }
 
     private static WindowsClientAccountProjection ProjectCompatibleApiAccount(
         AccountRecord account,
         LoginStatus status,
-        AccessTokenSharedProfileMode mode = AccessTokenSharedProfileMode.ApiCompatible)
+        AccessTokenSharedProfileMode mode = AccessTokenSharedProfileMode.ApiCompatible,
+        AccountRecord? chatGptFeatureAccount = null)
     {
-        return ProjectSharedAccountProfile(account, status, mode);
+        return ProjectSharedAccountProfile(account, status, mode, chatGptFeatureAccount);
     }
 
-    private static bool CanReuseOfficialOAuthSharedProfile(AccountRecord account)
+    private static bool CanReuseOfficialOAuthSharedProfile(
+        AccountRecord account,
+        bool routeThroughGateway = false)
     {
         var profileHome = Path.GetFullPath(GetDefaultCodexHome());
         var targetServiceTier = ReadAccountServiceTier(account.CodexHome);
         var sharedAuthPath = Path.Combine(profileHome, AuthFileName);
+        var accountAuthPath = Path.Combine(account.CodexHome, AuthFileName);
+        var storedAuthPath = GetStoredDesktopAuthPath(profileHome, account);
         var sharedConfigPath = Path.Combine(profileHome, ConfigFileName);
         if (!IsDesktopSelectionForAccount(profileHome, account) ||
+            !IsDesktopAuthSelectionForAccount(profileHome, account) ||
             !IsChatGptDesktopAuthJson(sharedAuthPath) ||
+            (!ChatGptAuthAccountsMatch(sharedAuthPath, accountAuthPath) &&
+             !ChatGptAuthAccountsMatch(sharedAuthPath, storedAuthPath)) ||
             !File.Exists(sharedConfigPath) ||
             File.Exists(Path.Combine(profileHome, CockpitAuthFileName)))
         {
@@ -2097,10 +3166,15 @@ public sealed partial class CodexCliService
             var current = File.ReadAllText(sharedConfigPath);
             return string.Equals(
                 current,
-                ProjectOfficialOAuthConfigText(current, targetServiceTier),
+                ProjectOfficialOAuthConfigText(
+                    current,
+                    targetServiceTier,
+                    routeThroughGateway),
                 StringComparison.Ordinal);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (
+            ex is IOException or UnauthorizedAccessException or JsonException or
+            InvalidDataException or FormatException or ArgumentException or NotSupportedException)
         {
             return false;
         }
@@ -2108,7 +3182,8 @@ public sealed partial class CodexCliService
 
     private static WindowsClientAccountProjection ProjectOfficialOAuthAccount(
         AccountRecord account,
-        LoginStatus status)
+        LoginStatus status,
+        bool routeThroughGateway = false)
     {
         var accountHome = Path.GetFullPath(account.CodexHome);
         var profileHome = Path.GetFullPath(GetDefaultCodexHome());
@@ -2126,15 +3201,18 @@ public sealed partial class CodexCliService
         // the official App for the account that is currently selected. The snapshot is
         // keyed only by that account's CODEX_HOME hash; OAuth accounts never use a global
         // or "newest available" fallback because that could cross account boundaries.
-        if (!IsDesktopSelectionForAccount(profileHome, account))
+        if (!IsDesktopAuthSelectionForAccount(profileHome, account))
         {
             PersistSelectedDesktopChatGptAuth(profileHome, sharedAuthPath);
         }
         SyncStoredOfficialOAuthAuthToAccount(account);
         var sourceAuthPath = GetPreferredOfficialOAuthAuthPath(profileHome, account);
         var authFileReused = IsDesktopSelectionForAccount(profileHome, account) &&
+                             IsDesktopAuthSelectionForAccount(profileHome, account) &&
                              IsChatGptDesktopAuthJson(sharedAuthPath);
-        var sharedProfileReused = CanReuseOfficialOAuthSharedProfile(account);
+        var sharedProfileReused = CanReuseOfficialOAuthSharedProfile(
+            account,
+            routeThroughGateway);
         var backupDirectory = CreateBackupDirectory(profileHome);
         var authExisted = File.Exists(sharedAuthPath);
         var cockpitAuthExisted = File.Exists(cockpitAuthPath);
@@ -2158,7 +3236,8 @@ public sealed partial class CodexCliService
                 : "";
             var projectedConfig = ProjectOfficialOAuthConfigText(
                 currentConfig,
-                ReadAccountServiceTier(accountHome));
+                ReadAccountServiceTier(accountHome),
+                routeThroughGateway);
             if (!string.Equals(currentConfig, projectedConfig, StringComparison.Ordinal))
             {
                 WriteTextAtomically(sharedConfigPath, projectedConfig);
@@ -2232,7 +3311,8 @@ public sealed partial class CodexCliService
     private static WindowsClientAccountProjection CreateReusedSharedProfileProjection(
         AccountRecord account,
         LoginStatus status,
-        AccessTokenSharedProfileMode mode = AccessTokenSharedProfileMode.ChatGptDesktop)
+        AccessTokenSharedProfileMode mode = AccessTokenSharedProfileMode.ChatGptDesktop,
+        AccountRecord? chatGptFeatureAccount = null)
     {
         var accountHome = Path.GetFullPath(account.CodexHome);
         var profileHome = Path.GetFullPath(GetDefaultCodexHome());
@@ -2246,6 +3326,10 @@ public sealed partial class CodexCliService
             // A login can complete inside the official App after the previous switch. Keep
             // the snapshot fresh even when the next launch reuses the same projected profile.
             PersistSelectedDesktopChatGptAuth(profileHome, authPath);
+            if (chatGptFeatureAccount != null)
+            {
+                SyncStoredOfficialOAuthAuthToAccount(chatGptFeatureAccount);
+            }
             PersistGlobalDesktopChatGptAuth(profileHome, authPath);
         }
         WriteActiveAccountState(profileHome, account, mode);
@@ -2264,6 +3348,7 @@ public sealed partial class CodexCliService
             DesktopLoginRequired =
                 !account.IsOfficialOAuth &&
                 mode == AccessTokenSharedProfileMode.ChatGptDesktop &&
+                chatGptFeatureAccount == null &&
                 !IsChatGptDesktopAuthJson(Path.Combine(profileHome, AuthFileName))
         };
     }
@@ -2271,7 +3356,8 @@ public sealed partial class CodexCliService
     private static WindowsClientAccountProjection ProjectSharedAccountProfile(
         AccountRecord account,
         LoginStatus status,
-        AccessTokenSharedProfileMode accessTokenMode)
+        AccessTokenSharedProfileMode accessTokenMode,
+        AccountRecord? chatGptFeatureAccount = null)
     {
         var accountHome = Path.GetFullPath(account.CodexHome);
         var profileHome = Path.GetFullPath(GetDefaultCodexHome());
@@ -2287,18 +3373,42 @@ public sealed partial class CodexCliService
         var activeAccountStatePath = Path.Combine(profileHome, ActiveAccountStateFileName);
         var useChatGptDesktopAuth =
             accessTokenMode == AccessTokenSharedProfileMode.ChatGptDesktop;
+        if (useChatGptDesktopAuth &&
+            chatGptFeatureAccount != null &&
+            !chatGptFeatureAccount.IsOfficialOAuth)
+        {
+            throw new InvalidOperationException(
+                "ChatGPT 功能身份必须来自“通过 ChatGPT 登录（官方）”账号。");
+        }
 
         PersistSelectedDesktopChatGptAuth(profileHome, authPath);
         PersistGlobalDesktopChatGptAuth(profileHome, authPath);
+        if (chatGptFeatureAccount != null)
+        {
+            SyncStoredOfficialOAuthAuthToAccount(chatGptFeatureAccount);
+        }
+        var explicitFeatureAuthPath = chatGptFeatureAccount == null
+            ? null
+            : Path.Combine(chatGptFeatureAccount.CodexHome, AuthFileName);
         var currentDesktopAuthAvailable =
-            useChatGptDesktopAuth && IsChatGptDesktopAuthJson(authPath);
+            useChatGptDesktopAuth &&
+            IsChatGptDesktopAuthJson(authPath) &&
+            (chatGptFeatureAccount == null ||
+             IsDesktopAuthSelectionForAccount(profileHome, chatGptFeatureAccount) &&
+             explicitFeatureAuthPath != null &&
+             ChatGptAuthAccountsMatch(authPath, explicitFeatureAuthPath));
         var authFileReused = useChatGptDesktopAuth
-            ? IsAccessTokenDesktopSessionSelected(account, profileHome, authPath)
+            ? IsAccessTokenDesktopSessionSelected(account, profileHome, authPath) &&
+              (chatGptFeatureAccount == null ||
+               IsDesktopAuthSelectionForAccount(profileHome, chatGptFeatureAccount) &&
+               explicitFeatureAuthPath != null &&
+               ChatGptAuthAccountsMatch(authPath, explicitFeatureAuthPath))
             : IsAccessTokenDesktopAuthSelected(sourceAuthPath, authPath);
         var sharedProfileReused = CanReuseSharedProfileWithoutNetwork(
             account,
             sourceConfigPath,
-            accessTokenMode);
+            accessTokenMode,
+            chatGptFeatureAccount);
         var backupDirectory = CreateBackupDirectory(profileHome);
         var authExisted = File.Exists(authPath);
         var cockpitAuthExisted = File.Exists(cockpitAuthPath);
@@ -2368,11 +3478,13 @@ public sealed partial class CodexCliService
 
             if (!authFileReused && useChatGptDesktopAuth)
             {
-                var storedDesktopAuthPath = FindRestorableDesktopAuthPath(
-                    profileHome,
-                    account,
-                    authPath,
-                    currentDesktopAuthAvailable);
+                var storedDesktopAuthPath = chatGptFeatureAccount != null
+                    ? GetPreferredOfficialOAuthAuthPath(profileHome, chatGptFeatureAccount)
+                    : FindRestorableDesktopAuthPath(
+                        profileHome,
+                        account,
+                        authPath,
+                        currentDesktopAuthAvailable);
                 if (storedDesktopAuthPath != null &&
                     !PathsEqual(storedDesktopAuthPath, authPath))
                 {
@@ -2385,6 +3497,12 @@ public sealed partial class CodexCliService
                     {
                         File.Delete(authPath);
                     }
+                }
+
+                if (chatGptFeatureAccount != null && !IsChatGptDesktopAuthJson(authPath))
+                {
+                    throw new InvalidDataException(
+                        $"账号 {chatGptFeatureAccount.Name} 的 ChatGPT 官方登录态无法投放到 Codex。");
                 }
             }
             else if (!authFileReused && account.IsCompatibleApi && !PathsEqual(sourceAuthPath, authPath))
@@ -2410,7 +3528,7 @@ public sealed partial class CodexCliService
 
             if (useChatGptDesktopAuth)
             {
-                WriteDesktopSelection(profileHome, account);
+                WriteDesktopSelection(profileHome, account, chatGptFeatureAccount);
             }
             else if (File.Exists(selectionPath))
             {
@@ -2451,7 +3569,9 @@ public sealed partial class CodexCliService
             ActiveAccountStateExisted = activeAccountStateExisted,
             SharedCredentialsReused = sharedProfileReused,
             ProfileChanged = !sharedProfileReused,
-            DesktopLoginRequired = useChatGptDesktopAuth && !IsChatGptDesktopAuthJson(authPath)
+            DesktopLoginRequired = useChatGptDesktopAuth &&
+                                   chatGptFeatureAccount == null &&
+                                   !IsChatGptDesktopAuthJson(authPath)
         };
     }
 
@@ -2540,7 +3660,8 @@ public sealed partial class CodexCliService
             useDreamSkin: false,
             appearanceMode: ThemeMode.System,
             appearancePresetId: "manager",
-            appearanceLabel: null);
+            appearanceLabel: null,
+            allowOfficialRendererPatch: true);
     }
 
     private bool LaunchWindowsClient(
@@ -2554,6 +3675,7 @@ public sealed partial class CodexCliService
         ThemeMode appearanceMode,
         string appearancePresetId,
         string? appearanceLabel,
+        bool allowOfficialRendererPatch,
         long? expectedLaunchGeneration = null)
     {
         ArgumentNullException.ThrowIfNull(account);
@@ -2570,12 +3692,49 @@ public sealed partial class CodexCliService
 
         SanitizeCuratedPluginManifests(codexHome);
         var launchGeneration = expectedLaunchGeneration ?? BeginWindowsClientLaunchGeneration();
+        var hasExistingOfficialWindow =
+            mode == WindowsClientMode.OfficialCodex &&
+            HasWindowsClientMainWindowSince(DateTime.MinValue);
+        if (ShouldPreserveExistingOfficialWindow(
+                switchRequired,
+                mode,
+                useDreamSkin,
+                hasExistingOfficialWindow,
+                allowOfficialRendererPatch))
+        {
+            // A same-profile dual-login/OAuth click is an activation request, never a
+            // recovery transaction. Runtime health can be transiently false while a turn
+            // is busy, IPC is back-pressured, or the app-server is rotating state. Closing
+            // that visible verified Codex window would kill the in-flight task. Preserve it
+            // unconditionally; a best-effort deep link may focus/open the requested project
+            // but its failure must not mutate the existing process tree.
+            try
+            {
+                Process.Start(new ProcessStartInfo(BuildNewThreadDeepLink(projectPath))
+                {
+                    UseShellExecute = true
+                });
+            }
+            catch (Exception ex)
+            {
+                WriteCodexPlusPlusLaunchDiagnostic(
+                    "official-project-deep-link-unavailable",
+                    MaskSensitive(ex.Message));
+            }
+            WriteCodexPlusPlusLaunchDiagnostic(
+                "official-same-profile-window-preserved",
+                "renderer patch and runtime-health shutdown were disabled for the existing dual-login/OAuth window");
+            return true;
+        }
+
         if (!switchRequired &&
             mode == WindowsClientMode.OfficialCodex &&
             !useDreamSkin &&
-            HasWindowsClientMainWindowSince(DateTime.MinValue))
+            hasExistingOfficialWindow)
         {
-            if (IsWindowsClientRuntimeHealthySince(DateTime.MinValue) &&
+            var existingOfficialClientHealthy =
+                IsWindowsClientRuntimeHealthySince(DateTime.MinValue);
+            if (existingOfficialClientHealthy &&
                 TryAttachNativeFastBridgeToExistingOfficialCodex())
             {
                 Process.Start(new ProcessStartInfo(BuildNewThreadDeepLink(projectPath))
@@ -2591,7 +3750,23 @@ public sealed partial class CodexCliService
             // Otherwise Electron cannot enable CDP after startup, so one controlled restart is
             // required to make the native Standard/Fast picker available. A merely visible or
             // spoofed shell is never reused.
-            StopWindowsClientProcesses(CaptureWindowsClientProcessSnapshots());
+            var sameAccountShutdownTargets = CaptureWindowsClientProcessSnapshots();
+            var sameAccountNativeFastPorts = CaptureOfficialNativeFastPortsOwnedBy(
+                sameAccountShutdownTargets);
+            StopWindowsClientProcesses(sameAccountShutdownTargets);
+            if (!WaitForWindowsClientProcessAndPortRelease(
+                    sameAccountShutdownTargets,
+                    sameAccountNativeFastPorts,
+                    launchGeneration,
+                    OfficialCodexRecoveryReleaseTimeout) ||
+                !WaitForOfficialCodexSwitchQuiescence(
+                    launchGeneration,
+                    OfficialCodexRecoveryReleaseTimeout))
+            {
+                throw new TimeoutException(
+                    "The existing Codex process did not remain globally closed, or its native bridge port did not release cleanly; " +
+                    "a replacement official client was not activated.");
+            }
         }
 
         return mode switch
@@ -2608,9 +3783,24 @@ public sealed partial class CodexCliService
                 appearanceMode,
                 appearancePresetId,
                 appearanceLabel,
+                allowOfficialRendererPatch,
                 launchGeneration),
             _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unsupported Windows client mode.")
         };
+    }
+
+    private static bool ShouldPreserveExistingOfficialWindow(
+        bool switchRequired,
+        WindowsClientMode mode,
+        bool useDreamSkin,
+        bool hasExistingOfficialWindow,
+        bool allowOfficialRendererPatch)
+    {
+        return !switchRequired &&
+               mode == WindowsClientMode.OfficialCodex &&
+               !useDreamSkin &&
+               hasExistingOfficialWindow &&
+               !allowOfficialRendererPatch;
     }
 
     private bool LaunchCodexPlusPlus(
@@ -2732,6 +3922,7 @@ public sealed partial class CodexCliService
         ThemeMode appearanceMode,
         string appearancePresetId,
         string? appearanceLabel,
+        bool allowRendererPatch,
         long launchGeneration)
     {
         var clientPath = ResolveCodexWindowsClientPath();
@@ -2763,54 +3954,704 @@ public sealed partial class CodexCliService
             return true;
         }
 
-        // Activate the MSIX package first so its renderer and app-server can finish
-        // initialization before the project deep link is delivered. A protocol activation is
-        // retained as a compatibility fallback for older Windows package registrations.
-        var launchStartedUtc = DateTime.UtcNow;
+        // The native Fast bridge performs one controlled renderer reload.  The unmodified
+        // primary page must finish its renderer-to-main ready handshake before that reload, and
+        // the patched page must complete the same handshake again afterwards.  Treating the
+        // bridge's script-verification event as application readiness can strand Electron on a
+        // white shell while persisted atoms are still synchronizing.
+        var launchLogBaseline = CaptureOfficialCodexLaunchLogBaseline();
+        WindowsClientActivationIdentity activationIdentity;
+        int? nativeFastPort = null;
         try
         {
-            WindowsClientActivationIdentity activationIdentity;
-            Task<bool>? nativeFastReadyTask = null;
             try
             {
-                var nativeFastPort = SelectOfficialNativeFastCdpPort();
-                activationIdentity = ActivateOfficialCodexPackage(nativeFastPort);
-                nativeFastReadyTask = AttachNativeFastBridgeWhenOfficialCodexIsReady(
-                    nativeFastPort,
-                    activationIdentity,
-                    launchGeneration);
+                nativeFastPort = SelectOfficialNativeFastCdpPort();
+                activationIdentity = ActivateOfficialCodexPackage(nativeFastPort.Value);
+            }
+            catch (OfficialCodexActivationIdentityException)
+            {
+                // COM returned a PID but Windows never exposed an immutable start time, and the
+                // exact activation cannot participate in PID/start-time recovery. Even if its
+                // held root handle was terminated, helpers are not proven globally quiescent, so
+                // a second package activation would risk attaching to an orphaned shell.
+                throw;
             }
             catch (Exception nativeFastError)
             {
-                // Fast is an additive renderer feature. Port selection, bridge process startup,
-                // or CDP activation must never prevent the signed official client from opening.
+                // Native Fast is additive.  If CDP activation itself is unavailable, open the
+                // signed client without debugging and still require its primary ready handshake.
                 WriteCodexPlusPlusLaunchDiagnostic(
                     "official-native-fast-unavailable",
                     MaskSensitive(nativeFastError.Message));
+                nativeFastPort = null;
                 activationIdentity = ActivateOfficialCodexPackage();
             }
-            OpenNewTaskAfterOfficialCodexLaunchInBackground(
-                projectPath,
-                launchStartedUtc,
-                activationIdentity,
-                launchGeneration,
-                nativeFastReadyTask);
-            return true;
         }
         catch (Exception packageActivationError)
         {
-            try
+            // A codex:// launch does not return an immutable PID/start-time identity and delivers
+            // the project deep link before the primary renderer is ready. Reporting that shell
+            // hand-off as success would bypass both readiness and clean recovery. Fail closed so
+            // the UI reports the activation error without leaving an untracked white shell.
+            throw new InvalidOperationException(
+                "Official Codex package activation failed before a verifiable client process was created.",
+                packageActivationError);
+        }
+
+        var observedFirstAttemptProcessTree = new List<WindowsClientProcessSnapshot>();
+        RememberWindowsClientProcessTree(
+            activationIdentity,
+            observedFirstAttemptProcessTree);
+        var firstAttempt = CompleteOfficialCodexLaunchAttempt(
+            projectPath,
+            launchLogBaseline,
+            activationIdentity,
+            nativeFastPort,
+            allowRendererPatch,
+            launchGeneration,
+            observedFirstAttemptProcessTree);
+        if (firstAttempt is OfficialCodexLaunchAttemptOutcome.Ready or
+            OfficialCodexLaunchAttemptOutcome.ReadyWithoutRendererPatch)
+        {
+            return true;
+        }
+        if (firstAttempt == OfficialCodexLaunchAttemptOutcome.Superseded)
+        {
+            return false;
+        }
+
+        if (DecideOfficialCodexRecovery(firstAttempt, recoveryAlreadyAttempted: false) !=
+            OfficialCodexRecoveryDecision.RestartWithoutRendererPatch ||
+            !TryRecoverOfficialCodexLaunchWithoutRendererPatch(
+                projectPath,
+                activationIdentity,
+                nativeFastPort,
+                launchGeneration,
+                observedFirstAttemptProcessTree))
+        {
+            throw new TimeoutException(
+                "Official Codex did not finish mounting its primary page. " +
+                "One clean restart without the renderer patch was attempted or could not be performed safely; " +
+                "the account credentials and existing Codex data were preserved.");
+        }
+
+        return true;
+    }
+
+    private static OfficialCodexLaunchAttemptOutcome CompleteOfficialCodexLaunchAttempt(
+        string projectPath,
+        OfficialCodexLogBaseline launchLogBaseline,
+        WindowsClientActivationIdentity activationIdentity,
+        int? nativeFastPort,
+        bool allowRendererPatch,
+        long launchGeneration,
+        ICollection<WindowsClientProcessSnapshot>? observedProcessTree = null)
+    {
+        var initialReadiness = WaitForOfficialCodexMainPageReady(
+            launchLogBaseline,
+            activationIdentity,
+            OfficialCodexPrimaryPageReadyTimeout,
+            launchGeneration,
+            OfficialCodexLogReadinessStage.InitialLaunch,
+            observedProcessTree);
+        if (initialReadiness == OfficialCodexMainPageWaitOutcome.Superseded)
+        {
+            return OfficialCodexLaunchAttemptOutcome.Superseded;
+        }
+        if (initialReadiness != OfficialCodexMainPageWaitOutcome.Ready)
+        {
+            WriteCodexPlusPlusLaunchDiagnostic(
+                "official-primary-page-not-ready",
+                $"stage=before-patch; outcome={initialReadiness}; pid={activationIdentity.ProcessId}");
+            return OfficialCodexLaunchAttemptOutcome.RecoverableFailure;
+        }
+
+        if (!nativeFastPort.HasValue || !allowRendererPatch)
+        {
+            if (nativeFastPort.HasValue && !allowRendererPatch)
             {
-                Process.Start(BuildOfficialCodexActivationStartInfo(projectPath));
-                return true;
+                // ChatGPT OAuth already supplies the feature identity used by the dual-login
+                // entry. Keep the verified CDP owner for optional account-label injection, but
+                // do not reload a healthy renderer merely to apply the PAT/API Fast picker.
+                WriteCodexPlusPlusLaunchDiagnostic(
+                    "official-renderer-patch-not-required",
+                    $"pid={activationIdentity.ProcessId}; port={nativeFastPort.Value}; primary-ready=true");
             }
-            catch (Exception protocolActivationError)
+            if (!IsWindowsClientActivationIdentityAlive(activationIdentity))
             {
-                throw new InvalidOperationException(
-                    "Official Codex package activation failed, and the registered codex:// fallback was unavailable.",
-                    new AggregateException(packageActivationError, protocolActivationError));
+                return OfficialCodexLaunchAttemptOutcome.RecoverableFailure;
+            }
+            TryOpenOfficialCodexProject(projectPath, activationIdentity, launchGeneration);
+            return OfficialCodexLaunchAttemptOutcome.ReadyWithoutRendererPatch;
+        }
+
+        // Capture a second cursor only after the unmodified page has acknowledged ready.  A
+        // successful controlled reload must produce a fresh routes + ready IPC sequence.
+        var postPatchBaseline = CaptureOfficialCodexLaunchLogBaseline();
+        if (!postPatchBaseline.IsUsable)
+        {
+            // Without a complete cursor, pre-patch bytes could be mistaken for post-reload
+            // readiness. Keep the already-ready unmodified page and do not start the bridge.
+            WriteCodexPlusPlusLaunchDiagnostic(
+                "official-post-patch-baseline-unavailable",
+                "the fresh log cursor was incomplete; renderer patch was skipped before reload");
+            if (!IsWindowsClientActivationIdentityAlive(activationIdentity))
+            {
+                return OfficialCodexLaunchAttemptOutcome.RecoverableFailure;
+            }
+            TryOpenOfficialCodexProject(projectPath, activationIdentity, launchGeneration);
+            return OfficialCodexLaunchAttemptOutcome.ReadyWithoutRendererPatch;
+        }
+        var nativeFastAttachOutcome = AttachNativeFastBridgeWhenOfficialCodexIsReady(
+                nativeFastPort.Value,
+                activationIdentity,
+                launchGeneration)
+            .GetAwaiter()
+            .GetResult();
+        if (!IsCurrentWindowsClientLaunchGeneration(launchGeneration))
+        {
+            return OfficialCodexLaunchAttemptOutcome.Superseded;
+        }
+
+        if (nativeFastAttachOutcome == OfficialCodexNativeFastAttachOutcome.AlreadyPatched)
+        {
+            // The immutable owner-scoped bridge event was already signaled before this attach
+            // call. The primary routes/IPC sequence observed above therefore belongs to the
+            // patched renderer and does not need a second reload-generation marker.
+            if (!IsVerifiedOfficialNativeFastEndpointOwner(nativeFastPort.Value, activationIdentity))
+            {
+                return OfficialCodexLaunchAttemptOutcome.RecoverableFailure;
+            }
+            TryOpenOfficialCodexProject(projectPath, activationIdentity, launchGeneration);
+            return OfficialCodexLaunchAttemptOutcome.Ready;
+        }
+
+        if (nativeFastAttachOutcome == OfficialCodexNativeFastAttachOutcome.NoReload)
+        {
+            // No bridge process reached the controlled-reload phase. Keep the primary page that
+            // already completed routes + IPC instead of restarting a healthy unsupported build.
+            WriteCodexPlusPlusLaunchDiagnostic(
+                "official-native-fast-unpatched",
+                "the primary page is ready, but the optional reviewed renderer patch was unavailable");
+            if (!IsWindowsClientActivationIdentityAlive(activationIdentity))
+            {
+                return OfficialCodexLaunchAttemptOutcome.RecoverableFailure;
+            }
+            TryOpenOfficialCodexProject(projectPath, activationIdentity, launchGeneration);
+            return OfficialCodexLaunchAttemptOutcome.ReadyWithoutRendererPatch;
+        }
+
+        var postPatchReadiness = WaitForOfficialCodexMainPageReady(
+            postPatchBaseline,
+            activationIdentity,
+            OfficialCodexPostPatchPageReadyTimeout,
+            launchGeneration,
+            OfficialCodexLogReadinessStage.RendererReload,
+            observedProcessTree);
+        if (postPatchReadiness == OfficialCodexMainPageWaitOutcome.Superseded)
+        {
+            return OfficialCodexLaunchAttemptOutcome.Superseded;
+        }
+        if (postPatchReadiness != OfficialCodexMainPageWaitOutcome.Ready)
+        {
+            WriteCodexPlusPlusLaunchDiagnostic(
+                "official-post-patch-page-not-ready",
+                $"outcome={postPatchReadiness}; attach={nativeFastAttachOutcome}; " +
+                $"pid={activationIdentity.ProcessId}; port={nativeFastPort.Value}");
+            return OfficialCodexLaunchAttemptOutcome.RecoverableFailure;
+        }
+
+        if (!IsVerifiedOfficialNativeFastEndpointOwner(nativeFastPort.Value, activationIdentity))
+        {
+            WriteCodexPlusPlusLaunchDiagnostic(
+                "official-post-patch-owner-lost",
+                $"pid={activationIdentity.ProcessId}; port={nativeFastPort.Value}");
+            return OfficialCodexLaunchAttemptOutcome.RecoverableFailure;
+        }
+
+        TryOpenOfficialCodexProject(projectPath, activationIdentity, launchGeneration);
+        return nativeFastAttachOutcome == OfficialCodexNativeFastAttachOutcome.PatchedAfterThisCall
+            ? OfficialCodexLaunchAttemptOutcome.Ready
+            : OfficialCodexLaunchAttemptOutcome.ReadyWithoutRendererPatch;
+    }
+
+    private static OfficialCodexMainPageWaitOutcome WaitForOfficialCodexMainPageReady(
+        OfficialCodexLogBaseline baseline,
+        WindowsClientActivationIdentity activationIdentity,
+        TimeSpan timeout,
+        long launchGeneration,
+        OfficialCodexLogReadinessStage stage,
+        ICollection<WindowsClientProcessSnapshot>? observedProcessTree = null)
+    {
+        var probe = baseline.CreateProbe(
+            activationIdentity.ProcessId,
+            activationIdentity.StartTimeUtcTicks,
+            stage);
+        if (!probe.IsAvailable)
+        {
+            return OfficialCodexMainPageWaitOutcome.ProbeUnavailable;
+        }
+
+        var deadline = DateTime.UtcNow + timeout;
+        DateTime? readySinceUtc = null;
+        while (DateTime.UtcNow < deadline)
+        {
+            RememberWindowsClientProcessTree(activationIdentity, observedProcessTree);
+            if (!IsCurrentWindowsClientLaunchGeneration(launchGeneration))
+            {
+                return OfficialCodexMainPageWaitOutcome.Superseded;
+            }
+
+            var logState = probe.Poll();
+            if (logState == OfficialCodexLogReadinessState.PersistedAtomSyncFailed)
+            {
+                return OfficialCodexMainPageWaitOutcome.PersistedAtomSyncFailed;
+            }
+            if (!IsWindowsClientActivationIdentityAlive(activationIdentity))
+            {
+                return OfficialCodexMainPageWaitOutcome.ProcessExited;
+            }
+            if (logState == OfficialCodexLogReadinessState.Ready)
+            {
+                readySinceUtc ??= DateTime.UtcNow;
+                if (DateTime.UtcNow - readySinceUtc.Value >= OfficialCodexReadyStableDuration)
+                {
+                    return OfficialCodexMainPageWaitOutcome.Ready;
+                }
+            }
+            else
+            {
+                readySinceUtc = null;
+            }
+
+            Thread.Sleep(200);
+        }
+
+        return OfficialCodexMainPageWaitOutcome.TimedOut;
+    }
+
+    private static bool TryRecoverOfficialCodexLaunchWithoutRendererPatch(
+        string projectPath,
+        WindowsClientActivationIdentity failedActivationIdentity,
+        int? failedNativeFastPort,
+        long launchGeneration,
+        ICollection<WindowsClientProcessSnapshot> observedFailedProcessTree)
+    {
+        if (!IsCurrentWindowsClientLaunchGeneration(launchGeneration) ||
+            !failedActivationIdentity.StartTimeUtcTicks.HasValue)
+        {
+            return false;
+        }
+
+        // Resolve only the exact activation root and its captured descendants. A time-window
+        // filter can accidentally include a newer manual activation or another manager copy.
+        RememberWindowsClientProcessTree(
+            failedActivationIdentity,
+            observedFailedProcessTree);
+        var shutdownTargets = observedFailedProcessTree.ToArray();
+        var failedIdentityStillAlive = IsWindowsClientActivationIdentityAlive(
+            failedActivationIdentity);
+        if (failedIdentityStillAlive &&
+            !shutdownTargets.Any(snapshot =>
+                snapshot.ProcessId == failedActivationIdentity.ProcessId &&
+                snapshot.StartTimeUtcTicks == failedActivationIdentity.StartTimeUtcTicks.Value))
+        {
+            WriteCodexPlusPlusLaunchDiagnostic(
+                "official-clean-restart-refused",
+                "the failed activation PID/start-time identity was not present in the exact shutdown snapshot");
+            return false;
+        }
+        var releasePorts = CaptureOfficialNativeFastPortsOwnedBy(shutdownTargets).ToList();
+        if (failedNativeFastPort.HasValue && !releasePorts.Contains(failedNativeFastPort.Value))
+        {
+            // This manager selected the port while it was free. Require it to be free again even
+            // if the owner vanished between the endpoint snapshot and recovery capture.
+            releasePorts.Add(failedNativeFastPort.Value);
+        }
+        if (!IsCurrentWindowsClientLaunchGeneration(launchGeneration))
+        {
+            return false;
+        }
+
+        WriteCodexPlusPlusLaunchDiagnostic(
+            "official-clean-restart-started",
+            $"pid={failedActivationIdentity.ProcessId}; port={failedNativeFastPort?.ToString() ?? "none"}; patch=disabled-on-retry");
+        StopWindowsClientProcesses(shutdownTargets);
+        if (!WaitForWindowsClientProcessAndPortRelease(
+                shutdownTargets,
+                releasePorts,
+                launchGeneration,
+                OfficialCodexRecoveryReleaseTimeout) ||
+            !WaitForOfficialCodexSwitchQuiescence(
+                launchGeneration,
+                OfficialCodexRecoveryReleaseTimeout))
+        {
+            WriteCodexPlusPlusLaunchDiagnostic(
+                "official-clean-restart-release-timeout",
+                "the failed process tree did not become globally quiescent, or its CDP listener did not release cleanly; retry activation was suppressed");
+            return false;
+        }
+        if (!IsCurrentWindowsClientLaunchGeneration(launchGeneration))
+        {
+            return false;
+        }
+
+        var retryLogBaseline = CaptureOfficialCodexLaunchLogBaseline();
+        WindowsClientActivationIdentity retryIdentity;
+        try
+        {
+            // Recovery deliberately has no CDP argument, bridge process, or controlled reload.
+            retryIdentity = ActivateOfficialCodexPackage();
+        }
+        catch (Exception ex)
+        {
+            WriteCodexPlusPlusLaunchDiagnostic(
+                "official-clean-restart-activation-failed",
+                MaskSensitive(ex.Message));
+            return false;
+        }
+
+        var observedRetryProcessTree = new List<WindowsClientProcessSnapshot>();
+        RememberWindowsClientProcessTree(retryIdentity, observedRetryProcessTree);
+        var retryOutcome = CompleteOfficialCodexLaunchAttempt(
+            projectPath,
+            retryLogBaseline,
+            retryIdentity,
+            nativeFastPort: null,
+            allowRendererPatch: false,
+            launchGeneration,
+            observedRetryProcessTree);
+        var succeeded = retryOutcome is OfficialCodexLaunchAttemptOutcome.Ready or
+            OfficialCodexLaunchAttemptOutcome.ReadyWithoutRendererPatch;
+        WriteCodexPlusPlusLaunchDiagnostic(
+            succeeded ? "official-clean-restart-ready" : "official-clean-restart-not-ready",
+            $"outcome={retryOutcome}; pid={retryIdentity.ProcessId}; retryCount=1");
+        if (!succeeded &&
+            retryOutcome != OfficialCodexLaunchAttemptOutcome.Superseded)
+        {
+            CleanupFailedOfficialCodexRetry(
+                retryIdentity,
+                observedRetryProcessTree,
+                launchGeneration);
+        }
+        return succeeded;
+    }
+
+    private static void RememberWindowsClientProcessTree(
+        WindowsClientActivationIdentity activationIdentity,
+        ICollection<WindowsClientProcessSnapshot>? observedProcessTree)
+    {
+        if (observedProcessTree == null)
+        {
+            return;
+        }
+
+        foreach (var snapshot in CaptureWindowsClientProcessTreeSnapshots(activationIdentity))
+        {
+            if (!observedProcessTree.Any(existing =>
+                    existing.ProcessId == snapshot.ProcessId &&
+                    existing.StartTimeUtcTicks == snapshot.StartTimeUtcTicks))
+            {
+                observedProcessTree.Add(snapshot);
             }
         }
+    }
+
+    private static void CleanupFailedOfficialCodexRetry(
+        WindowsClientActivationIdentity retryIdentity,
+        ICollection<WindowsClientProcessSnapshot> observedProcessTree,
+        long launchGeneration)
+    {
+        if (!IsCurrentWindowsClientLaunchGeneration(launchGeneration) ||
+            !retryIdentity.StartTimeUtcTicks.HasValue)
+        {
+            WriteCodexPlusPlusLaunchDiagnostic(
+                "official-clean-restart-cleanup-refused",
+                "the retry activation no longer owned the launch generation or lacked a PID/start-time identity");
+            return;
+        }
+
+        RememberWindowsClientProcessTree(retryIdentity, observedProcessTree);
+        var shutdownTargets = observedProcessTree.ToArray();
+        var retryIdentityStillAlive = IsWindowsClientActivationIdentityAlive(retryIdentity);
+        if (retryIdentityStillAlive &&
+            !shutdownTargets.Any(snapshot =>
+                snapshot.ProcessId == retryIdentity.ProcessId &&
+                snapshot.StartTimeUtcTicks == retryIdentity.StartTimeUtcTicks.Value))
+        {
+            WriteCodexPlusPlusLaunchDiagnostic(
+                "official-clean-restart-cleanup-refused",
+                "the retry PID/start-time identity was not present in its exact process-tree snapshot");
+            return;
+        }
+
+        var releasePorts = CaptureOfficialNativeFastPortsOwnedBy(shutdownTargets);
+        StopWindowsClientProcesses(shutdownTargets);
+        var released = WaitForWindowsClientProcessAndPortRelease(
+            shutdownTargets,
+            releasePorts,
+            launchGeneration,
+            OfficialCodexRecoveryReleaseTimeout);
+        WriteCodexPlusPlusLaunchDiagnostic(
+            released
+                ? "official-clean-restart-cleanup-complete"
+                : "official-clean-restart-cleanup-timeout",
+            $"pid={retryIdentity.ProcessId}; processCount={shutdownTargets.Length}; dataPreserved=true");
+    }
+
+    private static bool WaitForWindowsClientProcessAndPortRelease(
+        IReadOnlyList<WindowsClientProcessSnapshot> shutdownTargets,
+        IReadOnlyCollection<int> nativeFastPorts,
+        long launchGeneration,
+        TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        var stableReleasedSamples = 0;
+        while (DateTime.UtcNow < deadline)
+        {
+            if (!IsCurrentWindowsClientLaunchGeneration(launchGeneration))
+            {
+                return false;
+            }
+
+            var processesReleased = AreWindowsClientProcessSnapshotsReleased(shutdownTargets);
+            var portsReleased = nativeFastPorts.All(IsOfficialNativeFastCdpPortAvailable);
+            if (processesReleased && portsReleased)
+            {
+                stableReleasedSamples++;
+                if (stableReleasedSamples >= 2)
+                {
+                    return true;
+                }
+            }
+            else
+            {
+                stableReleasedSamples = 0;
+            }
+
+            Thread.Sleep(200);
+        }
+
+        return false;
+    }
+
+    private static bool WaitForOfficialCodexSwitchQuiescence(
+        long launchGeneration,
+        TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        var stableQuiescentSamples = 0;
+        while (DateTime.UtcNow < deadline)
+        {
+            if (!IsCurrentWindowsClientLaunchGeneration(launchGeneration))
+            {
+                return false;
+            }
+
+            var processScanAvailable = TryAreOfficialCodexProcessesAbsent(out var processesAbsent);
+            var managerOwnedCdpOwnerAbsent = !OfficialNativeFastCdpPortCandidates().Any(
+                port => TryGetOfficialCodexLoopbackListenerIdentity(port, out _));
+            if (processScanAvailable && processesAbsent && managerOwnedCdpOwnerAbsent)
+            {
+                stableQuiescentSamples++;
+                if (stableQuiescentSamples >= 2)
+                {
+                    return true;
+                }
+            }
+            else
+            {
+                stableQuiescentSamples = 0;
+            }
+
+            Thread.Sleep(200);
+        }
+
+        return false;
+    }
+
+    private static bool TryAreOfficialCodexProcessesAbsent(out bool processesAbsent)
+    {
+        processesAbsent = false;
+        var clientPath = ResolveCodexWindowsClientPath();
+        var packageRoot = string.IsNullOrWhiteSpace(clientPath)
+            ? null
+            : Path.GetDirectoryName(clientPath);
+        if (string.IsNullOrWhiteSpace(packageRoot))
+        {
+            return false;
+        }
+
+        Process[] processes;
+        try
+        {
+            processes = Process.GetProcesses();
+        }
+        catch
+        {
+            return false;
+        }
+
+        try
+        {
+            foreach (var process in processes)
+            {
+                string processName;
+                try
+                {
+                    processName = process.ProcessName;
+                }
+                catch
+                {
+                    // Process.GetProcesses can include protected system processes whose names are
+                    // unavailable. They cannot be confused with a successfully named Codex image.
+                    continue;
+                }
+
+                if (!processName.Equals("ChatGPT", StringComparison.OrdinalIgnoreCase) &&
+                    !processName.Equals("Codex", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    if (process.HasExited)
+                    {
+                        continue;
+                    }
+                }
+                catch
+                {
+                    return false;
+                }
+
+                if (!TryClassifyCodexWindowsClientProcess(process, packageRoot, out var isOfficial))
+                {
+                    // A named candidate whose immutable executable path cannot be inspected makes
+                    // absence unprovable, so credential projection must fail closed.
+                    return false;
+                }
+                if (isOfficial)
+                {
+                    return true;
+                }
+            }
+
+            processesAbsent = true;
+            return true;
+        }
+        finally
+        {
+            foreach (var process in processes)
+            {
+                process.Dispose();
+            }
+        }
+    }
+
+    private static bool AreWindowsClientProcessSnapshotsReleased(
+        IReadOnlyList<WindowsClientProcessSnapshot> snapshots)
+    {
+        var clientPath = ResolveCodexWindowsClientPath();
+        var packageRoot = string.IsNullOrWhiteSpace(clientPath)
+            ? null
+            : Path.GetDirectoryName(clientPath);
+        foreach (var snapshot in snapshots)
+        {
+            if (!TryOpenWindowsClientSnapshot(snapshot, packageRoot, out var process))
+            {
+                continue;
+            }
+
+            process!.Dispose();
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool IsWindowsClientActivationIdentityAlive(
+        WindowsClientActivationIdentity activationIdentity)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(activationIdentity.ProcessId);
+            var clientPath = ResolveCodexWindowsClientPath();
+            var packageRoot = string.IsNullOrWhiteSpace(clientPath)
+                ? null
+                : Path.GetDirectoryName(clientPath);
+            return !process.HasExited &&
+                   IsCodexWindowsClientProcess(process, packageRoot) &&
+                   MatchesWindowsClientActivationIdentity(process, activationIdentity);
+        }
+        catch (Exception ex) when (
+            ex is ArgumentException or InvalidOperationException or Win32Exception or NotSupportedException)
+        {
+            return false;
+        }
+    }
+
+    private static void TryOpenOfficialCodexProject(
+        string projectPath,
+        WindowsClientActivationIdentity activationIdentity,
+        long launchGeneration)
+    {
+        if (!IsCurrentWindowsClientLaunchGeneration(launchGeneration) ||
+            !IsWindowsClientActivationIdentityAlive(activationIdentity))
+        {
+            return;
+        }
+
+        try
+        {
+            Process.Start(new ProcessStartInfo(BuildNewThreadDeepLink(projectPath))
+            {
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex)
+        {
+            // The application-ready official client remains usable if the optional project
+            // selection activation cannot be delivered.
+            WriteCodexPlusPlusLaunchDiagnostic(
+                "official-project-deep-link-unavailable",
+                MaskSensitive(ex.Message));
+        }
+    }
+
+    private static OfficialCodexLogBaseline CaptureOfficialCodexLaunchLogBaseline()
+    {
+        return OfficialCodexLogBaseline.Capture(ResolveOfficialCodexLogDirectory());
+    }
+
+    private static string? ResolveOfficialCodexLogDirectory()
+    {
+        var appUserModelId = ResolveCodexWindowsClientAppUserModelId();
+        var separator = appUserModelId?.IndexOf('!') ?? -1;
+        if (separator <= 0)
+        {
+            return null;
+        }
+
+        var packageFamilyName = appUserModelId![..separator];
+        if (!Regex.IsMatch(
+                packageFamilyName,
+                "^[A-Za-z0-9._-]{1,200}$",
+                RegexOptions.CultureInvariant))
+        {
+            return null;
+        }
+
+        return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Packages",
+            packageFamilyName,
+            "LocalCache",
+            "Local",
+            "Codex",
+            "Logs");
     }
 
     public string GetCodexDreamSkinStatus() => CodexDreamSkinService.GetStatusText();
@@ -2821,10 +4662,9 @@ public sealed partial class CodexCliService
         string appearanceLabel,
         string projectPath)
     {
-        return Task.Run(() =>
+        return Task.Run(() => RunWithWindowsClientSwitchMutex(launchGeneration =>
         {
-            var shutdownTargets = CaptureWindowsClientProcessSnapshots();
-            StopWindowsClientProcesses(shutdownTargets);
+            StopWindowsClientForAppearanceChange(launchGeneration);
             ApplyAndStartDreamSkinOrRestore(
                 appearanceMode,
                 presetId,
@@ -2832,8 +4672,8 @@ public sealed partial class CodexCliService
                 projectPath);
             // Dream Skin Start has already reopened Codex; return whether the optional project
             // deep link was accepted so the UI can show a non-fatal hint when it was not.
-            return TryLaunchOfficialCodexFallback(projectPath);
-        });
+            return TryLaunchOfficialCodexFallback(projectPath, launchGeneration);
+        }));
     }
 
     private static void ApplyAndStartDreamSkinOrRestore(
@@ -2888,10 +4728,9 @@ public sealed partial class CodexCliService
 
     public Task<bool> RestoreOfficialCodexAppearanceAsync(string projectPath)
     {
-        return Task.Run(() =>
+        return Task.Run(() => RunWithWindowsClientSwitchMutex(launchGeneration =>
         {
-            var shutdownTargets = CaptureWindowsClientProcessSnapshots();
-            StopWindowsClientProcesses(shutdownTargets);
+            StopWindowsClientForAppearanceChange(launchGeneration);
             Exception? restoreError = null;
             try
             {
@@ -2902,7 +4741,7 @@ public sealed partial class CodexCliService
                 restoreError = ex;
             }
 
-            var relaunched = TryLaunchOfficialCodexFallback(projectPath);
+            var relaunched = TryLaunchOfficialCodexFallback(projectPath, launchGeneration);
             if (restoreError != null)
             {
                 throw new InvalidOperationException(
@@ -2915,7 +4754,58 @@ public sealed partial class CodexCliService
             // operation: the caller still needs to persist UseCodexDreamSkin=false. Returning the
             // activation result lets the UI show a separate "please start Codex manually" hint.
             return relaunched;
-        });
+        }));
+    }
+
+    private static T RunWithWindowsClientSwitchMutex<T>(Func<long, T> operation)
+    {
+        ArgumentNullException.ThrowIfNull(operation);
+        using var switchMutex = new Mutex(false, WindowsClientSwitchMutexName);
+        var mutexAcquired = false;
+        try
+        {
+            try
+            {
+                mutexAcquired = switchMutex.WaitOne(TimeSpan.FromSeconds(15));
+            }
+            catch (AbandonedMutexException)
+            {
+                mutexAcquired = true;
+            }
+            if (!mutexAcquired)
+            {
+                throw new TimeoutException(
+                    "Another Codex account switch is still running. Please retry shortly.");
+            }
+
+            return operation(BeginWindowsClientLaunchGeneration());
+        }
+        finally
+        {
+            if (mutexAcquired)
+            {
+                switchMutex.ReleaseMutex();
+            }
+        }
+    }
+
+    private static void StopWindowsClientForAppearanceChange(long launchGeneration)
+    {
+        var shutdownTargets = CaptureWindowsClientProcessSnapshots();
+        var nativeFastPorts = CaptureOfficialNativeFastPortsOwnedBy(shutdownTargets);
+        StopWindowsClientProcesses(shutdownTargets);
+        if (!WaitForWindowsClientProcessAndPortRelease(
+                shutdownTargets,
+                nativeFastPorts,
+                launchGeneration,
+                OfficialCodexRecoveryReleaseTimeout) ||
+            !WaitForOfficialCodexSwitchQuiescence(
+                launchGeneration,
+                OfficialCodexRecoveryReleaseTimeout))
+        {
+            throw new TimeoutException(
+                "Codex did not remain fully closed before the appearance change; no new client was started.");
+        }
     }
 
     private static bool TryLaunchOfficialCodexFallback(
@@ -2933,6 +4823,13 @@ public sealed partial class CodexCliService
                 activationIdentity,
                 launchGeneration);
             return true;
+        }
+        catch (OfficialCodexActivationIdentityException)
+        {
+            // COM created a PID but its immutable identity could not be proven. The activation
+            // helper has already failed closed; a protocol launch here would create or attach a
+            // second untracked shell and bypass the readiness/recovery contract.
+            return false;
         }
         catch
         {
@@ -3066,30 +4963,111 @@ public sealed partial class CodexCliService
         }
 
         var managedProcessId = (int)processId;
-        var deadline = DateTime.UtcNow.AddSeconds(2);
+        Process? activationProcess = null;
+        var handleDeadline = DateTime.UtcNow.AddSeconds(2);
         do
         {
+            Process? candidate = null;
             try
             {
-                using var process = Process.GetProcessById(managedProcessId);
-                if (!process.HasExited)
-                {
-                    return new WindowsClientActivationIdentity(
-                        managedProcessId,
-                        process.StartTime.ToUniversalTime().Ticks);
-                }
+                candidate = Process.GetProcessById(managedProcessId);
+                // Force a native process handle to be opened immediately. Keeping this exact
+                // handle alive prevents a later PID reuse from retargeting identity cleanup.
+                _ = candidate.Handle;
+                activationProcess = candidate;
+                candidate = null;
+                break;
             }
             catch (Exception ex) when (
                 ex is ArgumentException or InvalidOperationException or Win32Exception or NotSupportedException)
             {
-                // The packaged process can take a short moment to become queryable after COM
-                // activation. Keep the PID even if Windows never exposes its start time.
+                candidate?.Dispose();
+                activationProcess?.Dispose();
+                activationProcess = null;
             }
 
             Thread.Sleep(50);
-        } while (DateTime.UtcNow < deadline);
+        } while (DateTime.UtcNow < handleDeadline);
 
-        return new WindowsClientActivationIdentity(managedProcessId, StartTimeUtcTicks: null);
+        if (activationProcess == null)
+        {
+            // No stable handle means the COM-returned PID cannot be distinguished from a later
+            // reused PID. Never reopen and terminate it by number alone.
+            throw new OfficialCodexActivationIdentityException(
+                managedProcessId,
+                cleanupSucceeded: false);
+        }
+
+        using (activationProcess)
+        {
+            var identityDeadline = DateTime.UtcNow.AddSeconds(5);
+            do
+            {
+                try
+                {
+                    if (activationProcess.HasExited)
+                    {
+                        throw new OfficialCodexActivationIdentityException(
+                            managedProcessId,
+                            cleanupSucceeded: true);
+                    }
+
+                    return new WindowsClientActivationIdentity(
+                        managedProcessId,
+                        activationProcess.StartTime.ToUniversalTime().Ticks);
+                }
+                catch (OfficialCodexActivationIdentityException)
+                {
+                    throw;
+                }
+                catch (Exception ex) when (
+                    ex is ArgumentException or InvalidOperationException or Win32Exception or NotSupportedException)
+                {
+                    // The handle is immutable even while packaged-process metadata is delayed.
+                }
+
+                Thread.Sleep(50);
+            } while (DateTime.UtcNow < identityDeadline);
+
+            var cleanupSucceeded = TryStopOfficialCodexActivationWithoutStartTime(
+                activationProcess);
+            throw new OfficialCodexActivationIdentityException(
+                managedProcessId,
+                cleanupSucceeded);
+        }
+    }
+
+    private static bool TryStopOfficialCodexActivationWithoutStartTime(Process activationProcess)
+    {
+        try
+        {
+            if (activationProcess.HasExited)
+            {
+                return true;
+            }
+
+            var clientPath = ResolveCodexWindowsClientPath();
+            var packageRoot = string.IsNullOrWhiteSpace(clientPath)
+                ? null
+                : Path.GetDirectoryName(clientPath);
+            if (!IsCodexWindowsClientProcess(activationProcess, packageRoot))
+            {
+                return false;
+            }
+
+            // The overload without entireProcessTree terminates through the immutable handle that
+            // was opened immediately after COM activation. Tree enumeration would reopen the root
+            // by its now-reusable PID and defeat the purpose of holding that handle.
+            activationProcess.Kill();
+            return activationProcess.WaitForExit(
+                       (int)OfficialCodexRecoveryReleaseTimeout.TotalMilliseconds) ||
+                   activationProcess.HasExited;
+        }
+        catch (Exception ex) when (
+            ex is InvalidOperationException or Win32Exception or NotSupportedException)
+        {
+            return false;
+        }
     }
 
     internal static string BuildOfficialNativeFastActivationArguments(int port)
@@ -3168,19 +5146,27 @@ public sealed partial class CodexCliService
         }
     }
 
-    private static Task<bool> AttachNativeFastBridgeWhenOfficialCodexIsReady(
+    private static Task<OfficialCodexNativeFastAttachOutcome> AttachNativeFastBridgeWhenOfficialCodexIsReady(
         int port,
         WindowsClientActivationIdentity activationIdentity,
         long launchGeneration)
     {
         return Task.Run(() =>
         {
+            Process? bridgeProcess = null;
+            string? bridgeBrowserId = null;
+            var bridgeOwnerPid = 0;
+            long bridgeOwnerStartTicks = 0;
             try
             {
                 var deadline = DateTime.UtcNow.AddSeconds(45);
                 while (DateTime.UtcNow < deadline &&
                        IsCurrentWindowsClientLaunchGeneration(launchGeneration))
                 {
+                    if (!IsWindowsClientActivationIdentityAlive(activationIdentity))
+                    {
+                        return OfficialCodexNativeFastAttachOutcome.NoReload;
+                    }
                     if (TryCaptureOfficialNativeFastEndpoint(
                             port,
                             out var browserId,
@@ -3196,30 +5182,63 @@ public sealed partial class CodexCliService
                                 listenerIdentity.StartTimeUtcTicks ?? 0,
                                 TimeSpan.Zero))
                         {
-                            return true;
+                            return OfficialCodexNativeFastAttachOutcome.AlreadyPatched;
                         }
-                        using var bridgeProcess = CodexNativeFastBridge.StartDetached(
+                        bridgeBrowserId = browserId;
+                        bridgeOwnerPid = listenerIdentity.ProcessId;
+                        bridgeOwnerStartTicks = listenerIdentity.StartTimeUtcTicks ?? 0;
+                        bridgeProcess = CodexNativeFastBridge.StartDetached(
                             port,
                             browserId,
-                            listenerIdentity.ProcessId,
-                            listenerIdentity.StartTimeUtcTicks ?? 0,
+                            bridgeOwnerPid,
+                            bridgeOwnerStartTicks,
                             GetCodexWindowsClientAppDirectory() ??
                             throw new InvalidOperationException(
                                 "The installed Codex application directory could not be verified."),
                             allowRendererReload: true);
-                        if (CodexNativeFastBridge.WaitForRendererPatch(
+                        var patchOutcome = CodexNativeFastBridge.WaitForRendererPatchOutcome(
+                            port,
+                            browserId,
+                            bridgeOwnerPid,
+                            bridgeOwnerStartTicks,
+                            OfficialNativeFastRendererReadyTimeout);
+                        if (patchOutcome == NativeFastPatchWaitOutcome.Patched)
+                        {
+                            return OfficialCodexNativeFastAttachOutcome.PatchedAfterThisCall;
+                        }
+                        if (patchOutcome is
+                            NativeFastPatchWaitOutcome.SkippedWithoutReload or
+                            NativeFastPatchWaitOutcome.TimedOutWithoutReload)
+                        {
+                            WriteCodexPlusPlusLaunchDiagnostic(
+                                patchOutcome == NativeFastPatchWaitOutcome.SkippedWithoutReload
+                                    ? "official-native-fast-renderer-skipped"
+                                    : "official-native-fast-renderer-timeout-no-reload",
+                                patchOutcome == NativeFastPatchWaitOutcome.SkippedWithoutReload
+                                    ? $"verified renderer preflight rejected the patch on port {port}; reload=false"
+                                    : $"verified bridge did not finish preflight on port {port}; reload=false");
+                            // Stop the exact helper and then re-read the owner-scoped events. A
+                            // timeout/skip is only a snapshot; a Page.reload signal can arrive at
+                            // that boundary and must permanently forbid a NoReload result.
+                            return StopOwnedNativeFastBridgeAndResolveNoReload(
+                                bridgeProcess,
                                 port,
                                 browserId,
-                                listenerIdentity.ProcessId,
-                                listenerIdentity.StartTimeUtcTicks ?? 0,
-                                OfficialNativeFastRendererReadyTimeout))
+                                bridgeOwnerPid,
+                                bridgeOwnerStartTicks);
+                        }
+                        if (patchOutcome != NativeFastPatchWaitOutcome.TimedOutAfterReloadAttempt)
                         {
-                            return true;
+                            throw new InvalidOperationException(
+                                $"Unsupported native Fast patch outcome: {patchOutcome}.");
                         }
                         WriteCodexPlusPlusLaunchDiagnostic(
                             "official-native-fast-renderer-timeout",
-                            $"verified bridge did not report a patched renderer on port {port}");
-                        return false;
+                            $"verified bridge attempted renderer reload but did not report readiness on port {port}");
+                        // Only the owner-scoped ReloadAttempted event permits this recovery path.
+                        // Starting a helper process alone says nothing about whether Page.reload
+                        // ran and must never cause a healthy Codex process to be restarted.
+                        return OfficialCodexNativeFastAttachOutcome.ReloadMayHaveStarted;
                     }
 
                     Thread.Sleep(250);
@@ -3230,7 +5249,7 @@ public sealed partial class CodexCliService
                         "official-native-fast-endpoint-timeout",
                         $"no verified official Codex app page CDP endpoint appeared on port {port}");
                 }
-                return false;
+                return OfficialCodexNativeFastAttachOutcome.NoReload;
             }
             catch (Exception ex)
             {
@@ -3239,9 +5258,118 @@ public sealed partial class CodexCliService
                 WriteCodexPlusPlusLaunchDiagnostic(
                     "official-native-fast-attach-unavailable",
                     MaskSensitive(ex.Message));
-                return false;
+                var reloadMayHaveStarted = false;
+                if (bridgeBrowserId != null && bridgeOwnerPid > 0 && bridgeOwnerStartTicks > 0)
+                {
+                    try
+                    {
+                        var finalOutcome = CodexNativeFastBridge.WaitForRendererPatchOutcome(
+                                port,
+                                bridgeBrowserId,
+                                bridgeOwnerPid,
+                                bridgeOwnerStartTicks,
+                                TimeSpan.Zero);
+                        reloadMayHaveStarted = NativeFastPatchOutcomeRequiresReloadReadiness(
+                            finalOutcome);
+                        if (!reloadMayHaveStarted)
+                        {
+                            reloadMayHaveStarted =
+                                StopOwnedNativeFastBridgeAndResolveNoReload(
+                                    bridgeProcess,
+                                    port,
+                                    bridgeBrowserId,
+                                    bridgeOwnerPid,
+                                    bridgeOwnerStartTicks) ==
+                                OfficialCodexNativeFastAttachOutcome.ReloadMayHaveStarted;
+                        }
+                    }
+                    catch
+                    {
+                        // If the exact helper cannot be finalized against its owner-scoped
+                        // events, do not claim that a late reload was impossible even when the
+                        // process handle itself can be stopped.
+                        _ = StopOwnedNativeFastBridgeProcess(bridgeProcess);
+                        reloadMayHaveStarted = true;
+                    }
+                }
+                else
+                {
+                    reloadMayHaveStarted = !StopOwnedNativeFastBridgeProcess(bridgeProcess);
+                }
+                return reloadMayHaveStarted
+                    ? OfficialCodexNativeFastAttachOutcome.ReloadMayHaveStarted
+                    : OfficialCodexNativeFastAttachOutcome.NoReload;
+            }
+            finally
+            {
+                bridgeProcess?.Dispose();
             }
         });
+    }
+
+    private static bool NativeFastPatchOutcomeRequiresReloadReadiness(
+        NativeFastPatchWaitOutcome outcome)
+    {
+        return outcome is
+            NativeFastPatchWaitOutcome.Patched or
+            NativeFastPatchWaitOutcome.TimedOutAfterReloadAttempt;
+    }
+
+    private static OfficialCodexNativeFastAttachOutcome StopOwnedNativeFastBridgeAndResolveNoReload(
+        Process? bridgeProcess,
+        int port,
+        string browserId,
+        int ownerPid,
+        long ownerStartTicks)
+    {
+        var helperStopped = StopOwnedNativeFastBridgeProcess(bridgeProcess);
+        var finalOutcome = CodexNativeFastBridge.WaitForRendererPatchOutcome(
+            port,
+            browserId,
+            ownerPid,
+            ownerStartTicks,
+            TimeSpan.Zero);
+        return helperStopped &&
+               !NativeFastPatchOutcomeRequiresReloadReadiness(finalOutcome)
+            ? OfficialCodexNativeFastAttachOutcome.NoReload
+            : OfficialCodexNativeFastAttachOutcome.ReloadMayHaveStarted;
+    }
+
+    private static bool StopOwnedNativeFastBridgeProcess(Process? bridgeProcess)
+    {
+        if (bridgeProcess == null)
+        {
+            return true;
+        }
+
+        try
+        {
+            if (bridgeProcess.HasExited)
+            {
+                return true;
+            }
+
+            // This Process object owns the exact helper handle returned by StartDetached;
+            // no process-name or PID-only lookup is used here.
+            bridgeProcess.Kill();
+            if (!bridgeProcess.WaitForExit(
+                    (int)OfficialNativeFastBridgeStopTimeout.TotalMilliseconds))
+            {
+                WriteCodexPlusPlusLaunchDiagnostic(
+                    "official-native-fast-helper-stop-timeout",
+                    "the exact helper did not confirm exit before final reload-state inspection");
+                return false;
+            }
+            return bridgeProcess.HasExited;
+        }
+        catch (Exception ex) when (
+            ex is InvalidOperationException or Win32Exception or NotSupportedException)
+        {
+            WriteCodexPlusPlusLaunchDiagnostic(
+                "official-native-fast-helper-stop-unavailable",
+                ex.GetType().Name);
+            return false;
+        }
     }
 
     private static bool TryAttachNativeFastBridgeToExistingOfficialCodex()
@@ -3253,12 +5381,34 @@ public sealed partial class CodexCliService
 
     internal static bool TryRefreshNativeFastBridgeAfterUpdate()
     {
+        using var switchMutex = new Mutex(false, WindowsClientSwitchMutexName);
+        var mutexAcquired = false;
         try
         {
+            try
+            {
+                // A post-update refresh is optional. Never let it race account switching, and do
+                // not reload an already healthy renderer here: this maintenance path has no fresh
+                // routes + ready IPC probe or clean-recovery transaction. The next normal official
+                // launch can apply the reviewed patch through the fully gated launch path.
+                mutexAcquired = switchMutex.WaitOne(TimeSpan.Zero);
+            }
+            catch (AbandonedMutexException)
+            {
+                mutexAcquired = true;
+            }
+            if (!mutexAcquired)
+            {
+                WriteCodexPlusPlusLaunchDiagnostic(
+                    "official-native-fast-update-refresh-deferred",
+                    "an account switch owns the renderer readiness gate");
+                return false;
+            }
+
             return TryAttachNativeFastBridgeToExistingOfficialCodex(
                        OfficialNativeFastCdpPortCandidates(),
                        out var rendererReady,
-                       allowRendererReload: true) &&
+                       allowRendererReload: false) &&
                    rendererReady;
         }
         catch (Exception ex)
@@ -3267,6 +5417,13 @@ public sealed partial class CodexCliService
                 "official-native-fast-update-refresh-unavailable",
                 MaskSensitive(ex.Message));
             return false;
+        }
+        finally
+        {
+            if (mutexAcquired)
+            {
+                switchMutex.ReleaseMutex();
+            }
         }
     }
 
@@ -3358,6 +5515,19 @@ public sealed partial class CodexCliService
 
         listenerIdentity = after;
         return true;
+    }
+
+    private static bool IsVerifiedOfficialNativeFastEndpointOwner(
+        int port,
+        WindowsClientActivationIdentity expectedIdentity)
+    {
+        return TryCaptureOfficialNativeFastEndpoint(
+                   port,
+                   out _,
+                   out var actualIdentity) &&
+               actualIdentity.ProcessId == expectedIdentity.ProcessId &&
+               (!expectedIdentity.StartTimeUtcTicks.HasValue ||
+                actualIdentity.StartTimeUtcTicks == expectedIdentity.StartTimeUtcTicks);
     }
 
     private static bool TryGetOfficialCodexLoopbackListenerIdentity(
@@ -3615,6 +5785,21 @@ public sealed partial class CodexCliService
         return Volatile.Read(ref _windowsClientLaunchGeneration) == generation;
     }
 
+    private static OfficialCodexRecoveryDecision DecideOfficialCodexRecovery(
+        OfficialCodexLaunchAttemptOutcome outcome,
+        bool recoveryAlreadyAttempted)
+    {
+        return outcome switch
+        {
+            OfficialCodexLaunchAttemptOutcome.Ready or
+            OfficialCodexLaunchAttemptOutcome.ReadyWithoutRendererPatch =>
+                OfficialCodexRecoveryDecision.Complete,
+            OfficialCodexLaunchAttemptOutcome.RecoverableFailure when !recoveryAlreadyAttempted =>
+                OfficialCodexRecoveryDecision.RestartWithoutRendererPatch,
+            _ => OfficialCodexRecoveryDecision.Stop
+        };
+    }
+
     internal static ProcessStartInfo BuildOfficialCodexActivationStartInfo(string projectPath)
     {
         return new ProcessStartInfo(BuildNewThreadDeepLink(projectPath))
@@ -3774,6 +5959,132 @@ public sealed partial class CodexCliService
         ValidateWindowsClientSurfaceAnalysis();
     }
 
+    internal static void ValidateOfficialCodexLaunchRecovery()
+    {
+        if (OfficialCodexPrimaryPageReadyTimeout < TimeSpan.FromSeconds(60) ||
+            OfficialCodexPostPatchPageReadyTimeout < TimeSpan.FromSeconds(30) ||
+            OfficialCodexReadyStableDuration < TimeSpan.FromMilliseconds(400) ||
+            DecideOfficialCodexRecovery(
+                OfficialCodexLaunchAttemptOutcome.Ready,
+                recoveryAlreadyAttempted: false) != OfficialCodexRecoveryDecision.Complete ||
+            DecideOfficialCodexRecovery(
+                OfficialCodexLaunchAttemptOutcome.ReadyWithoutRendererPatch,
+                recoveryAlreadyAttempted: false) != OfficialCodexRecoveryDecision.Complete ||
+            DecideOfficialCodexRecovery(
+                OfficialCodexLaunchAttemptOutcome.RecoverableFailure,
+                recoveryAlreadyAttempted: false) !=
+                OfficialCodexRecoveryDecision.RestartWithoutRendererPatch ||
+            DecideOfficialCodexRecovery(
+                OfficialCodexLaunchAttemptOutcome.RecoverableFailure,
+                recoveryAlreadyAttempted: true) != OfficialCodexRecoveryDecision.Stop ||
+            DecideOfficialCodexRecovery(
+                OfficialCodexLaunchAttemptOutcome.Superseded,
+                recoveryAlreadyAttempted: false) != OfficialCodexRecoveryDecision.Stop)
+        {
+            throw new InvalidOperationException(
+                "Official Codex launch recovery must preserve a ready/degraded client, " +
+                "restart a failed first attempt once, and never recurse after recovery.");
+        }
+
+        var patAccount = new AccountRecord { AuthKind = AccountAuthKind.AccessToken };
+        var apiAccount = new AccountRecord { AuthKind = AccountAuthKind.CompatibleApi };
+        var oauthAccount = new AccountRecord { AuthKind = AccountAuthKind.OfficialOAuth };
+        if (!ShouldApplyOfficialRendererPatch(
+                patAccount,
+                AccessTokenSharedProfileMode.ApiCompatible,
+                chatGptFeatureAccount: null) ||
+            !ShouldApplyOfficialRendererPatch(
+                apiAccount,
+                AccessTokenSharedProfileMode.ApiCompatible,
+                chatGptFeatureAccount: null) ||
+            ShouldApplyOfficialRendererPatch(
+                patAccount,
+                AccessTokenSharedProfileMode.ChatGptDesktop,
+                oauthAccount) ||
+            ShouldApplyOfficialRendererPatch(
+                oauthAccount,
+                AccessTokenSharedProfileMode.ApiCompatible,
+                chatGptFeatureAccount: null))
+        {
+            throw new InvalidOperationException(
+                "Dual-login and official OAuth launches must preserve the primary renderer, " +
+                "while pure PAT/API launches may still request the optional Fast patch.");
+        }
+        if (!ShouldPreserveExistingOfficialWindow(
+                switchRequired: false,
+                mode: WindowsClientMode.OfficialCodex,
+                useDreamSkin: false,
+                hasExistingOfficialWindow: true,
+                allowOfficialRendererPatch: false) ||
+            ShouldPreserveExistingOfficialWindow(
+                switchRequired: true,
+                mode: WindowsClientMode.OfficialCodex,
+                useDreamSkin: false,
+                hasExistingOfficialWindow: true,
+                allowOfficialRendererPatch: false) ||
+            ShouldPreserveExistingOfficialWindow(
+                switchRequired: false,
+                mode: WindowsClientMode.CodexPlusPlus,
+                useDreamSkin: false,
+                hasExistingOfficialWindow: true,
+                allowOfficialRendererPatch: false) ||
+            ShouldPreserveExistingOfficialWindow(
+                switchRequired: false,
+                mode: WindowsClientMode.OfficialCodex,
+                useDreamSkin: false,
+                hasExistingOfficialWindow: false,
+                allowOfficialRendererPatch: false) ||
+            ShouldPreserveExistingOfficialWindow(
+                switchRequired: false,
+                mode: WindowsClientMode.OfficialCodex,
+                useDreamSkin: false,
+                hasExistingOfficialWindow: true,
+                allowOfficialRendererPatch: true))
+        {
+            throw new InvalidOperationException(
+                "Only an existing same-profile dual-login/OAuth official window may bypass runtime-health replacement.");
+        }
+        if (!NativeFastPatchOutcomeRequiresReloadReadiness(
+                NativeFastPatchWaitOutcome.Patched) ||
+            !NativeFastPatchOutcomeRequiresReloadReadiness(
+                NativeFastPatchWaitOutcome.TimedOutAfterReloadAttempt) ||
+            NativeFastPatchOutcomeRequiresReloadReadiness(
+                NativeFastPatchWaitOutcome.SkippedWithoutReload) ||
+            NativeFastPatchOutcomeRequiresReloadReadiness(
+                NativeFastPatchWaitOutcome.TimedOutWithoutReload))
+        {
+            throw new InvalidOperationException(
+                "Native Fast finalization must never classify a patched or reload-attempted owner as NoReload.");
+        }
+
+        var syntheticSnapshots = new[]
+        {
+            new WindowsClientProcessSnapshot(10, 100, "ChatGPT", 0, 0),
+            new WindowsClientProcessSnapshot(11, 110, "ChatGPT", 1, 10),
+            new WindowsClientProcessSnapshot(12, 120, "Codex", 2, 11),
+            new WindowsClientProcessSnapshot(20, 200, "ChatGPT", 0, 0),
+            new WindowsClientProcessSnapshot(21, 210, "Codex", 2, 20)
+        };
+        var selectedTree = SelectWindowsClientProcessTreeSnapshots(
+            syntheticSnapshots,
+            new WindowsClientActivationIdentity(10, 100));
+        if (!selectedTree.Select(snapshot => snapshot.ProcessId).Order().SequenceEqual(
+                new[] { 10, 11, 12 }))
+        {
+            throw new InvalidOperationException(
+                "Official Codex clean recovery selected processes outside the exact activation tree.");
+        }
+
+        using var currentProcess = Process.GetCurrentProcess();
+        if (!CaptureProcessParentIds().ContainsKey(currentProcess.Id))
+        {
+            throw new InvalidOperationException(
+                "Windows process-parent capture could not identify the current self-test process.");
+        }
+
+        OfficialCodexLogReadiness.Validate();
+    }
+
     public Task OpenWindowsClientThreadAsync(
         string threadId,
         CancellationToken cancellationToken = default)
@@ -3786,6 +6097,19 @@ public sealed partial class CodexCliService
                 "Codex++ 增强桥接尚未就绪。请先手动打开 Codex++，再打开聊天记录。不会请求管理员 PowerShell。");
         }
 
+        Process.Start(new ProcessStartInfo(threadUrl)
+        {
+            UseShellExecute = true
+        });
+        return Task.CompletedTask;
+    }
+
+    public Task OpenOfficialCodexThreadAsync(
+        string threadId,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var threadUrl = BuildThreadDeepLink(threadId);
         Process.Start(new ProcessStartInfo(threadUrl)
         {
             UseShellExecute = true
@@ -4059,7 +6383,7 @@ public sealed partial class CodexCliService
         var clientPath = ResolveCodexWindowsClientPath();
         var packageRoot = string.IsNullOrWhiteSpace(clientPath)
             ? null
-            : Directory.GetParent(Path.GetDirectoryName(clientPath)!)?.FullName;
+            : Path.GetDirectoryName(clientPath);
         if (string.IsNullOrWhiteSpace(packageRoot))
         {
             return false;
@@ -6544,6 +8868,38 @@ catch {
         }
     }
 
+    internal static async Task EnsureCompatibleApiRotationPreflightAsync(
+        AccountRecord account,
+        CancellationToken cancellationToken = default)
+    {
+        if (GetCompatibleApiRotationBaseUrlValidationError(account.ApiBaseUrl) is { } urlError)
+        {
+            throw BuildCompatibleApiLaunchPreflightError(account, urlError);
+        }
+
+        await EnsureCompatibleApiLaunchPreflightAsync(account, cancellationToken);
+    }
+
+    private static string? GetCompatibleApiRotationBaseUrlValidationError(string? value)
+    {
+        if (!Uri.TryCreate(value?.Trim(), UriKind.Absolute, out var baseUri) ||
+            baseUri.Scheme is not ("http" or "https") ||
+            string.IsNullOrWhiteSpace(baseUri.Host) ||
+            !string.IsNullOrEmpty(baseUri.UserInfo) ||
+            !string.IsNullOrEmpty(baseUri.Query) ||
+            !string.IsNullOrEmpty(baseUri.Fragment))
+        {
+            return "API 轮换地址必须是没有内嵌账号密码、查询参数或片段的完整 http/https 地址。";
+        }
+        if (baseUri.Scheme.Equals("http", StringComparison.OrdinalIgnoreCase) &&
+            !LocalProxyDetector.IsLoopbackHost(baseUri.Host))
+        {
+            return "为避免 API Key 明文泄露，远程 API 轮换地址必须使用 HTTPS；HTTP 仅允许本机回环地址。";
+        }
+
+        return null;
+    }
+
     private static async Task EnsureCompatibleApiLaunchPreflightAsync(
         AccountRecord account,
         CancellationToken cancellationToken = default)
@@ -6912,6 +9268,15 @@ catch {
         if (modelsUri.AbsoluteUri != "https://example.invalid/openai/v1/models")
         {
             throw new InvalidOperationException("Compatible API model-catalog URI self-test failed.");
+        }
+
+        if (GetCompatibleApiRotationBaseUrlValidationError("https://example.invalid/openai/v1") != null ||
+            GetCompatibleApiRotationBaseUrlValidationError("http://127.0.0.1:8080/v1") != null ||
+            GetCompatibleApiRotationBaseUrlValidationError("http://example.invalid/v1") is not { } httpError ||
+            !httpError.Contains("HTTPS", StringComparison.Ordinal) ||
+            GetCompatibleApiRotationBaseUrlValidationError("https://example.invalid/v1?key=unsafe") == null)
+        {
+            throw new InvalidOperationException("Compatible API rotation URL safety self-test failed.");
         }
 
         var catalog = Encoding.UTF8.GetBytes(
@@ -8297,6 +10662,537 @@ catch {
         }
     }
 
+    internal static void ValidateExplicitChatGptFeatureProjection()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            "codex-explicit-chatgpt-feature-" + Guid.NewGuid().ToString("N"));
+        var tokenHome = Path.Combine(root, "token");
+        var apiHome = Path.Combine(root, "api");
+        var oauthAHome = Path.Combine(root, "oauth-a");
+        var oauthBHome = Path.Combine(root, "oauth-b");
+        var invalidOAuthHome = Path.Combine(root, "oauth-invalid");
+        var sharedHome = Path.Combine(root, "shared");
+        var oldSharedHome = Environment.GetEnvironmentVariable(SharedCodexHomeOverrideVariable);
+
+        try
+        {
+            Environment.SetEnvironmentVariable(SharedCodexHomeOverrideVariable, sharedHome);
+            foreach (var path in new[]
+                     {
+                         tokenHome,
+                         apiHome,
+                         oauthAHome,
+                         oauthBHome,
+                         invalidOAuthHome,
+                         sharedHome
+                     })
+            {
+                Directory.CreateDirectory(path);
+            }
+
+            File.WriteAllText(
+                Path.Combine(tokenHome, AuthFileName),
+                "{\"OPENAI_API_KEY\":\"virtual-pat\",\"personal_access_token\":\"virtual-pat\"}");
+            File.WriteAllText(
+                Path.Combine(tokenHome, ConfigFileName),
+                "service_tier = \"priority\"\n");
+            File.WriteAllText(
+                Path.Combine(apiHome, AuthFileName),
+                "{\"OPENAI_API_KEY\":\"virtual-api\"}");
+            File.WriteAllText(
+                Path.Combine(apiHome, ConfigFileName),
+                "service_tier = \"default\"\n");
+            File.WriteAllText(
+                Path.Combine(oauthAHome, AuthFileName),
+                BuildTestOAuthAuth("a-original", "account-A"));
+            File.WriteAllText(
+                Path.Combine(oauthBHome, AuthFileName),
+                BuildTestOAuthAuth("b-original", "account-B"));
+            File.WriteAllText(
+                Path.Combine(invalidOAuthHome, AuthFileName),
+                BuildTestOAuthAuth("missing-account-id"));
+            File.WriteAllText(
+                Path.Combine(oauthAHome, ConfigFileName),
+                AccountStore.BuildOfficialOAuthConfig());
+            File.WriteAllText(
+                Path.Combine(oauthBHome, ConfigFileName),
+                AccountStore.BuildOfficialOAuthConfig());
+            File.WriteAllText(
+                Path.Combine(invalidOAuthHome, ConfigFileName),
+                AccountStore.BuildOfficialOAuthConfig());
+
+            var tokenAccount = new AccountRecord
+            {
+                Name = "feature-token",
+                CodexHome = tokenHome,
+                AuthKind = AccountAuthKind.AccessToken
+            };
+            var apiAccount = new AccountRecord
+            {
+                Name = "feature-api",
+                CodexHome = apiHome,
+                AuthKind = AccountAuthKind.CompatibleApi,
+                ApiProviderName = "OpenAI",
+                ApiBaseUrl = "https://example.invalid",
+                ApiModel = CompatibleApiDefaultModel,
+                ApiWireApi = "responses"
+            };
+            var oauthA = new AccountRecord
+            {
+                Name = "feature-oauth-a",
+                CodexHome = oauthAHome,
+                AuthKind = AccountAuthKind.OfficialOAuth
+            };
+            var oauthB = new AccountRecord
+            {
+                Name = "feature-oauth-b",
+                CodexHome = oauthBHome,
+                AuthKind = AccountAuthKind.OfficialOAuth
+            };
+            var invalidOAuth = new AccountRecord
+            {
+                Name = "feature-oauth-invalid",
+                CodexHome = invalidOAuthHome,
+                AuthKind = AccountAuthKind.OfficialOAuth
+            };
+            var sameHomeOAuth = new AccountRecord
+            {
+                Name = "feature-oauth-same-home",
+                CodexHome = tokenHome,
+                AuthKind = AccountAuthKind.OfficialOAuth
+            };
+            var service = new CodexCliService();
+
+            static string SnapshotSharedProfile(string path)
+            {
+                return string.Join(
+                    "|",
+                    Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories)
+                        .OrderBy(file => file, StringComparer.OrdinalIgnoreCase)
+                        .Select(file =>
+                            Path.GetRelativePath(path, file) + ":" +
+                            Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(file)))));
+            }
+
+            static void ExpectInvalidFeatureBinding(Action action, string sharedProfileHome)
+            {
+                var before = SnapshotSharedProfile(sharedProfileHome);
+                try
+                {
+                    action();
+                }
+                catch (InvalidOperationException)
+                {
+                    if (SnapshotSharedProfile(sharedProfileHome) != before)
+                    {
+                        throw new InvalidOperationException(
+                            "An invalid ChatGPT feature binding modified the shared profile.");
+                    }
+                    return;
+                }
+
+                throw new InvalidOperationException(
+                    "An invalid explicit ChatGPT feature binding was accepted.");
+            }
+
+            ExpectInvalidFeatureBinding(() =>
+                service.PrepareChatGptFeatureAccount(tokenAccount, null), sharedHome);
+            ExpectInvalidFeatureBinding(() =>
+                service.PrepareChatGptFeatureAccount(tokenAccount, apiAccount), sharedHome);
+            ExpectInvalidFeatureBinding(() =>
+                service.PrepareChatGptFeatureAccount(tokenAccount, sameHomeOAuth), sharedHome);
+            ExpectInvalidFeatureBinding(() =>
+                service.PrepareChatGptFeatureAccount(tokenAccount, invalidOAuth), sharedHome);
+            ExpectInvalidFeatureBinding(
+                () => service.SwitchWindowsClientAccountWithChatGptFeaturesAsync(
+                        oauthA,
+                        oauthB,
+                        Path.Combine(root, "missing-project-path"),
+                        useDreamSkin: false,
+                        ThemeMode.System)
+                    .GetAwaiter()
+                    .GetResult(),
+                sharedHome);
+
+            var globalAuthPath = GetGlobalStoredDesktopAuthPath(sharedHome);
+            Directory.CreateDirectory(Path.GetDirectoryName(globalAuthPath)!);
+            File.WriteAllText(
+                globalAuthPath,
+                BuildTestOAuthAuth("b-newest-global", "account-B"));
+            File.SetLastWriteTimeUtc(globalAuthPath, DateTime.UtcNow.AddMinutes(1));
+
+            service.PrepareChatGptFeatureAccount(tokenAccount, oauthA);
+            var tokenProjection = ProjectAccessTokenAccount(
+                tokenAccount,
+                new LoginStatus(),
+                AccessTokenSharedProfileMode.ChatGptDesktop,
+                oauthA);
+            var sharedAuthPath = Path.Combine(sharedHome, AuthFileName);
+            var sharedConfigPath = Path.Combine(sharedHome, ConfigFileName);
+            var selectionPath = Path.Combine(sharedHome, DesktopSelectionFileName);
+            var storedAPath = GetStoredDesktopAuthPath(sharedHome, oauthA);
+            var storedBPath = GetStoredDesktopAuthPath(sharedHome, oauthB);
+            var storedTokenPath = GetStoredDesktopAuthPath(sharedHome, tokenAccount);
+            var storedApiPath = GetStoredDesktopAuthPath(sharedHome, apiAccount);
+            var tokenConfig = File.ReadAllText(sharedConfigPath);
+            using var selectionDocument = JsonDocument.Parse(File.ReadAllText(selectionPath));
+            var selectionRoot = selectionDocument.RootElement;
+            if (tokenProjection.DesktopLoginRequired ||
+                !TryReadChatGptAuthAccountId(sharedAuthPath, out var projectedAccountId) ||
+                projectedAccountId != "account-A" ||
+                tokenConfig.Split("experimental_bearer_token", StringSplitOptions.None).Length - 1 != 1 ||
+                !tokenConfig.Contains(
+                    "experimental_bearer_token = \"virtual-pat\"",
+                    StringComparison.Ordinal) ||
+                !tokenConfig.Contains("requires_openai_auth = true", StringComparison.Ordinal) ||
+                !tokenConfig.Contains(
+                    "cli_auth_credentials_store = \"file\"",
+                    StringComparison.Ordinal) ||
+                File.ReadAllText(Path.Combine(tokenHome, ConfigFileName)).Contains(
+                    "experimental_bearer_token",
+                    StringComparison.Ordinal) ||
+                !TryReadDesktopSelectionKeys(
+                    sharedHome,
+                    out var selectedModelKey,
+                    out var selectedAuthKey,
+                    out var selectedAuthHome) ||
+                selectedModelKey != GetDesktopAccountKey(tokenAccount) ||
+                selectedAuthKey != GetDesktopAccountKey(oauthA) ||
+                !PathsEqual(selectedAuthHome, oauthAHome) ||
+                !selectionRoot.TryGetProperty("schemaVersion", out var schemaVersion) ||
+                schemaVersion.GetInt32() != 2 ||
+                 !TryReadJsonString(selectionRoot, "mode", out var selectionMode) ||
+                 selectionMode != DesktopSelectionModeChatGptAccessToken ||
+                 !CanIdentifySharedChatGptFeatureProfileWithoutNetwork(tokenAccount, oauthA) ||
+                 CanIdentifySharedChatGptFeatureProfileWithoutNetwork(tokenAccount, oauthB) ||
+                 CanIdentifySharedChatGptFeatureProfileWithoutNetwork(apiAccount, oauthA) ||
+                 !CanReuseSharedProfileWithoutNetwork(
+                    tokenAccount,
+                    Path.Combine(tokenHome, ConfigFileName),
+                    AccessTokenSharedProfileMode.ChatGptDesktop,
+                    oauthA) ||
+                 !CanReuseChatGptFeatureProfileForLaunchWithoutNetwork(
+                    tokenAccount,
+                    Path.Combine(tokenHome, ConfigFileName),
+                    oauthA) ||
+                CanReuseSharedProfileWithoutNetwork(
+                    tokenAccount,
+                    Path.Combine(tokenHome, ConfigFileName),
+                    AccessTokenSharedProfileMode.ChatGptDesktop,
+                    oauthB))
+            {
+                throw new InvalidOperationException(
+                    "Explicit PAT + ChatGPT feature projection did not keep model and OAuth owners separate.");
+            }
+
+            // Identity discovery is deliberately narrower than full config reuse. Codex may
+            // update a non-identity model preference while it is running; that must not hide the
+            // already-selected model/OAuth owners. A changed bearer must still fail closed.
+            var runtimePreferenceConfig = Regex.Replace(
+                tokenConfig,
+                "(?m)^model_reasoning_effort\\s*=.*$",
+                "model_reasoning_effort = \"low\"");
+            if (runtimePreferenceConfig.Equals(tokenConfig, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "The dual-login display discovery fixture had no mutable runtime preference.");
+            }
+            File.WriteAllText(sharedConfigPath, runtimePreferenceConfig);
+            if (CanReuseSharedProfileWithoutNetwork(
+                    tokenAccount,
+                    Path.Combine(tokenHome, ConfigFileName),
+                    AccessTokenSharedProfileMode.ChatGptDesktop,
+                    oauthA) ||
+                !CanIdentifySharedChatGptFeatureProfileWithoutNetwork(tokenAccount, oauthA) ||
+                !CanReuseChatGptFeatureProfileForLaunchWithoutNetwork(
+                    tokenAccount,
+                    Path.Combine(tokenHome, ConfigFileName),
+                    oauthA))
+            {
+                throw new InvalidOperationException(
+                    "A harmless runtime preference change would restart the selected dual-login profile.");
+            }
+
+            var mismatchedBearerConfig = tokenConfig.Replace(
+                "experimental_bearer_token = \"virtual-pat\"",
+                "experimental_bearer_token = \"other-account-secret\"",
+                StringComparison.Ordinal);
+            File.WriteAllText(sharedConfigPath, mismatchedBearerConfig);
+            if (CanIdentifySharedChatGptFeatureProfileWithoutNetwork(tokenAccount, oauthA) ||
+                CanReuseChatGptFeatureProfileForLaunchWithoutNetwork(
+                    tokenAccount,
+                    Path.Combine(tokenHome, ConfigFileName),
+                    oauthA))
+            {
+                throw new InvalidOperationException(
+                    "Dual-login display discovery accepted a mismatched model bearer.");
+            }
+            File.WriteAllText(sharedConfigPath, tokenConfig);
+
+            // With no live/global auth, a newer snapshot belonging to B must still never be
+            // selected for an explicit A binding.
+            foreach (var fileName in new[]
+                     {
+                         AuthFileName,
+                         CockpitAuthFileName,
+                         ConfigFileName,
+                         DesktopSelectionFileName,
+                         ActiveAccountStateFileName
+                     })
+            {
+                DeleteFileIfPresent(Path.Combine(sharedHome, fileName));
+            }
+            DeleteFileIfPresent(globalAuthPath);
+            Directory.CreateDirectory(Path.GetDirectoryName(storedAPath)!);
+            Directory.CreateDirectory(Path.GetDirectoryName(storedBPath)!);
+            File.WriteAllText(storedAPath, BuildTestOAuthAuth("a-stored", "account-A"));
+            File.WriteAllText(storedBPath, BuildTestOAuthAuth("b-newest-store", "account-B"));
+            File.SetLastWriteTimeUtc(storedBPath, DateTime.UtcNow.AddMinutes(2));
+            _ = ProjectAccessTokenAccount(
+                tokenAccount,
+                new LoginStatus(),
+                AccessTokenSharedProfileMode.ChatGptDesktop,
+                oauthA);
+            if (!TryReadChatGptAuthAccountId(sharedAuthPath, out projectedAccountId) ||
+                projectedAccountId != "account-A")
+            {
+                throw new InvalidOperationException(
+                    "An explicit OAuth binding fell back to another account's newest snapshot.");
+            }
+
+            // A manual login to B must not be accepted merely because the sidecar still claims A.
+            var manualBAuth = BuildTestOAuthAuth("b-manual-login", "account-B");
+            File.WriteAllText(
+                sharedAuthPath,
+                manualBAuth);
+             service.PrepareChatGptFeatureAccount(tokenAccount, oauthA);
+             if (File.ReadAllText(sharedAuthPath) != manualBAuth ||
+                 CanIdentifySharedChatGptFeatureProfileWithoutNetwork(tokenAccount, oauthA) ||
+                 CanReuseSharedProfileWithoutNetwork(
+                    tokenAccount,
+                    Path.Combine(tokenHome, ConfigFileName),
+                    AccessTokenSharedProfileMode.ChatGptDesktop,
+                    oauthA))
+            {
+                throw new InvalidOperationException(
+                    "Prepare mutated or accepted a mismatched live ChatGPT identity before shutdown.");
+            }
+
+            _ = ProjectAccessTokenAccount(
+                tokenAccount,
+                new LoginStatus(),
+                AccessTokenSharedProfileMode.ChatGptDesktop,
+                oauthA);
+            if (!TryReadChatGptAuthAccountId(sharedAuthPath, out projectedAccountId) ||
+                projectedAccountId != "account-A" ||
+                !TryReadChatGptAuthAccountId(storedAPath, out var storedAccountId) ||
+                storedAccountId != "account-A" ||
+                File.Exists(storedTokenPath))
+            {
+                throw new InvalidOperationException(
+                    "A mismatched live OAuth session polluted the explicit owner or model account store.");
+            }
+
+            // A normal refresh for A must rotate the OAuth owner's snapshot, never the PAT key.
+            Thread.Sleep(15);
+            var storedBBeforeRefresh = File.ReadAllText(storedBPath);
+            File.WriteAllText(
+                sharedAuthPath,
+                BuildTestOAuthAuth("a-refreshed", "account-A"));
+            _ = CreateReusedSharedProfileProjection(
+                tokenAccount,
+                new LoginStatus(),
+                AccessTokenSharedProfileMode.ChatGptDesktop,
+                oauthA);
+            if (!AuthJsonFilesSemanticallyEqual(sharedAuthPath, storedAPath) ||
+                !AuthJsonFilesSemanticallyEqual(
+                    sharedAuthPath,
+                    Path.Combine(oauthAHome, AuthFileName)) ||
+                !AuthJsonFilesSemanticallyEqual(sharedAuthPath, globalAuthPath) ||
+                File.ReadAllText(storedBPath) != storedBBeforeRefresh ||
+                File.Exists(storedTokenPath) ||
+                File.Exists(storedApiPath))
+            {
+                throw new InvalidOperationException(
+                    "OAuth refresh rotation was not saved exclusively under the explicit owner during reuse.");
+            }
+
+            service.PrepareChatGptFeatureAccount(apiAccount, oauthA);
+            var apiProjection = ProjectCompatibleApiAccount(
+                apiAccount,
+                new LoginStatus(),
+                AccessTokenSharedProfileMode.ChatGptDesktop,
+                oauthA);
+            var apiConfig = File.ReadAllText(sharedConfigPath);
+            if (apiProjection.DesktopLoginRequired ||
+                !apiConfig.Contains(
+                    "experimental_bearer_token = \"virtual-api\"",
+                    StringComparison.Ordinal) ||
+                !TryReadChatGptAuthAccountId(sharedAuthPath, out projectedAccountId) ||
+                projectedAccountId != "account-A" ||
+                !TryReadDesktopSelectionKeys(
+                    sharedHome,
+                    out selectedModelKey,
+                    out selectedAuthKey,
+                    out selectedAuthHome) ||
+                 selectedModelKey != GetDesktopAccountKey(apiAccount) ||
+                 selectedAuthKey != GetDesktopAccountKey(oauthA) ||
+                 !PathsEqual(selectedAuthHome, oauthAHome) ||
+                 !CanIdentifySharedChatGptFeatureProfileWithoutNetwork(apiAccount, oauthA) ||
+                 CanIdentifySharedChatGptFeatureProfileWithoutNetwork(apiAccount, oauthB) ||
+                 CanIdentifySharedChatGptFeatureProfileWithoutNetwork(tokenAccount, oauthA) ||
+                 !CanReuseSharedProfileWithoutNetwork(
+                    apiAccount,
+                    Path.Combine(apiHome, ConfigFileName),
+                    AccessTokenSharedProfileMode.ChatGptDesktop,
+                    oauthA) ||
+                CanReuseSharedProfileWithoutNetwork(
+                    apiAccount,
+                    Path.Combine(apiHome, ConfigFileName),
+                    AccessTokenSharedProfileMode.ChatGptDesktop,
+                    oauthB))
+            {
+                throw new InvalidOperationException(
+                    "Explicit compatible API + ChatGPT feature projection lost either credential owner.");
+            }
+
+            // Deleting a selected model account must scrub its bearer from both the live
+            // config and manager-created backups without deleting the OAuth owner's auth.
+            var apiBackupDirectory = Path.Combine(
+                sharedHome,
+                "account-switcher-backups",
+                "delete-api-fixture");
+            Directory.CreateDirectory(apiBackupDirectory);
+            File.WriteAllText(
+                Path.Combine(apiBackupDirectory, AuthFileName),
+                File.ReadAllText(sharedAuthPath));
+            File.WriteAllText(
+                Path.Combine(apiBackupDirectory, ConfigFileName),
+                "experimental_bearer_token = \"virtual-api\"\n");
+            WriteDesktopSelection(apiBackupDirectory, apiAccount, oauthA);
+            WriteActiveAccountState(
+                apiBackupDirectory,
+                apiAccount,
+                AccessTokenSharedProfileMode.ChatGptDesktop);
+            var apiSourceBeforeDelete = File.ReadAllText(Path.Combine(apiHome, AuthFileName));
+            if (!service.DeleteSharedCredentialIfSelected(apiAccount) ||
+                File.Exists(sharedAuthPath) ||
+                File.Exists(selectionPath) ||
+                File.Exists(GetActiveAccountStatePath(sharedHome)) ||
+                File.ReadAllText(sharedConfigPath).Contains(
+                    "experimental_bearer_token",
+                    StringComparison.Ordinal) ||
+                File.ReadAllText(Path.Combine(apiBackupDirectory, ConfigFileName)).Contains(
+                    "virtual-api",
+                    StringComparison.Ordinal) ||
+                !File.Exists(Path.Combine(apiBackupDirectory, AuthFileName)) ||
+                File.ReadAllText(Path.Combine(apiHome, AuthFileName)) != apiSourceBeforeDelete ||
+                !File.Exists(globalAuthPath) ||
+                !File.Exists(storedAPath))
+            {
+                throw new InvalidOperationException(
+                    "Deleting a selected API model left a bearer behind or deleted the OAuth owner.");
+            }
+
+            _ = ProjectCompatibleApiAccount(
+                apiAccount,
+                new LoginStatus(),
+                AccessTokenSharedProfileMode.ChatGptDesktop,
+                oauthA);
+            var oauthBackupDirectory = Path.Combine(
+                sharedHome,
+                "account-switcher-backups",
+                "delete-oauth-fixture");
+            Directory.CreateDirectory(oauthBackupDirectory);
+            File.WriteAllText(
+                Path.Combine(oauthBackupDirectory, AuthFileName),
+                File.ReadAllText(sharedAuthPath));
+            File.WriteAllText(
+                Path.Combine(oauthBackupDirectory, ConfigFileName),
+                "experimental_bearer_token = \"virtual-api\"\n");
+            WriteDesktopSelection(oauthBackupDirectory, apiAccount, oauthA);
+            WriteActiveAccountState(
+                oauthBackupDirectory,
+                apiAccount,
+                AccessTokenSharedProfileMode.ChatGptDesktop);
+            var tokenSourceBeforeDelete = File.ReadAllText(Path.Combine(tokenHome, AuthFileName));
+            if (!service.DeleteSharedCredentialIfSelected(oauthA) ||
+                File.Exists(sharedAuthPath) ||
+                File.Exists(selectionPath) ||
+                File.Exists(GetActiveAccountStatePath(sharedHome)) ||
+                File.Exists(storedAPath) ||
+                File.Exists(globalAuthPath) ||
+                File.Exists(Path.Combine(oauthBackupDirectory, AuthFileName)) ||
+                !File.ReadAllText(Path.Combine(oauthBackupDirectory, ConfigFileName)).Contains(
+                    "virtual-api",
+                    StringComparison.Ordinal) ||
+                File.ReadAllText(sharedConfigPath).Contains(
+                    "experimental_bearer_token",
+                    StringComparison.Ordinal) ||
+                File.ReadAllText(storedBPath) != storedBBeforeRefresh ||
+                File.ReadAllText(Path.Combine(tokenHome, AuthFileName)) != tokenSourceBeforeDelete ||
+                File.ReadAllText(Path.Combine(apiHome, AuthFileName)) != apiSourceBeforeDelete)
+            {
+                throw new InvalidOperationException(
+                    "Deleting the OAuth owner left live/keyed/global auth behind or damaged another account.");
+            }
+
+            // PAT uses the same hybrid bearer channel and must receive the same deletion scrub.
+            _ = ProjectAccessTokenAccount(
+                tokenAccount,
+                new LoginStatus(),
+                AccessTokenSharedProfileMode.ChatGptDesktop,
+                oauthB);
+            _ = CreateReusedSharedProfileProjection(
+                tokenAccount,
+                new LoginStatus(),
+                AccessTokenSharedProfileMode.ChatGptDesktop,
+                oauthB);
+            if (!File.ReadAllText(sharedConfigPath).Contains(
+                    "experimental_bearer_token = \"virtual-pat\"",
+                    StringComparison.Ordinal) ||
+                !service.DeleteSharedCredentialIfSelected(tokenAccount) ||
+                File.ReadAllText(sharedConfigPath).Contains(
+                    "experimental_bearer_token",
+                    StringComparison.Ordinal) ||
+                File.Exists(sharedAuthPath) ||
+                File.ReadAllText(Path.Combine(tokenHome, AuthFileName)) != tokenSourceBeforeDelete ||
+                !TryReadChatGptAuthAccountId(globalAuthPath, out var remainingGlobalAccountId) ||
+                remainingGlobalAccountId != "account-B")
+            {
+                throw new InvalidOperationException(
+                    "Deleting a selected PAT model left its bearer behind or damaged the OAuth owner.");
+            }
+
+            // Corrupt/missing ownership sidecars must not leave the deleted model's exact
+            // secret in a stale live config, nor scrub a different account's value.
+            File.WriteAllText(
+                sharedConfigPath,
+                "experimental_bearer_token = \"virtual-api\"\n" +
+                "experimental_bearer_token = \"other-account-secret\"\n");
+            if (service.DeleteSharedCredentialIfSelected(apiAccount) ||
+                File.ReadAllText(sharedConfigPath).Contains(
+                    "virtual-api",
+                    StringComparison.Ordinal) ||
+                !File.ReadAllText(sharedConfigPath).Contains(
+                    "other-account-secret",
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "Deleting an unselected model did not precisely scrub its stale live bearer.");
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(SharedCodexHomeOverrideVariable, oldSharedHome);
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
     internal static void ValidateServiceTierAccountIsolation()
     {
         var root = Path.Combine(
@@ -8575,8 +11471,8 @@ catch {
             };
             var authAPath = Path.Combine(accountAHome, AuthFileName);
             var authBPath = Path.Combine(accountBHome, AuthFileName);
-            File.WriteAllText(authAPath, BuildTestOAuthAuth("a-original"));
-            File.WriteAllText(authBPath, BuildTestOAuthAuth("b-original"));
+            File.WriteAllText(authAPath, BuildTestOAuthAuth("a-original", "official-account-A"));
+            File.WriteAllText(authBPath, BuildTestOAuthAuth("b-original", "official-account-B"));
             File.WriteAllText(
                 Path.Combine(accountAHome, ConfigFileName),
                 AccountStore.BuildOfficialOAuthConfig());
@@ -8595,7 +11491,9 @@ catch {
 
             // Simulate the official App rotating A's refresh token while A is selected.
             Thread.Sleep(15);
-            File.WriteAllText(sharedAuthPath, BuildTestOAuthAuth("a-refreshed"));
+            File.WriteAllText(
+                sharedAuthPath,
+                BuildTestOAuthAuth("a-refreshed", "official-account-A"));
             _ = ProjectOfficialOAuthAccount(accountB, new LoginStatus());
             if (!File.ReadAllText(sharedAuthPath).Contains("b-original", StringComparison.Ordinal) ||
                 File.ReadAllText(authBPath).Contains("a-refreshed", StringComparison.Ordinal))
@@ -8616,17 +11514,39 @@ catch {
                 );
             }
 
-            // A successful browser re-login must replace the exact selected account snapshot
-            // before a status query can restore an older shared refresh token.
-            File.WriteAllText(authAPath, BuildTestOAuthAuth("a-relogin"));
+            // A successful browser re-login updates the exact owner snapshot, but must never
+            // hot-swap auth.json underneath a running official App.
+            var liveSharedBeforeRelogin = File.ReadAllText(sharedAuthPath);
+            File.WriteAllText(
+                authAPath,
+                BuildTestOAuthAuth("a-relogin", "official-account-A"));
             PersistSuccessfulOfficialOAuthLogin(accountA);
             var storedAPath = GetStoredDesktopAuthPath(sharedHome, accountA);
-            if (!File.ReadAllText(sharedAuthPath).Contains("a-relogin", StringComparison.Ordinal) ||
+            if (File.ReadAllText(sharedAuthPath) != liveSharedBeforeRelogin ||
                 !File.ReadAllText(storedAPath).Contains("a-relogin", StringComparison.Ordinal))
             {
                 throw new InvalidOperationException(
-                    "A successful OAuth re-login was overwritten by an older shared credential snapshot.");
+                    "A successful OAuth re-login was not isolated from the running shared credential.");
             }
+
+            // Reusing the same local OAuth record for a different ChatGPT account must invalidate
+            // reuse; applying the new account requires the normal clean restart path.
+            File.WriteAllText(
+                authAPath,
+                BuildTestOAuthAuth("a-rebound", "official-account-C"));
+            PersistSuccessfulOfficialOAuthLogin(accountA);
+            if (File.ReadAllText(sharedAuthPath) != liveSharedBeforeRelogin ||
+                !File.ReadAllText(storedAPath).Contains("a-rebound", StringComparison.Ordinal) ||
+                CanReuseOfficialOAuthSharedProfile(accountA))
+            {
+                throw new InvalidOperationException(
+                    "A different ChatGPT identity hot-replaced or reused the running OAuth session.");
+            }
+
+            File.WriteAllText(
+                authAPath,
+                BuildTestOAuthAuth("a-relogin", "official-account-A"));
+            PersistSuccessfulOfficialOAuthLogin(accountA);
 
             // A failed login must restore the prior account auth.json from its retained backup.
             var restoreBackupPath = authAPath + ".restore-test";
@@ -8655,6 +11575,9 @@ catch {
                 """;
             var repairedPreferences = ProjectOfficialOAuthConfigText(staleOfficialPreferences);
             var emptyProjectedConfig = ProjectOfficialOAuthConfigText("");
+            var routedProjectedConfig = ProjectOfficialOAuthConfigText(
+                projectedConfig,
+                routeThroughGateway: true);
             var officialProviderHeader =
                 "[model_providers." + AccountStore.OfficialOAuthProviderId + "]";
             var forbidden = new[]
@@ -8715,6 +11638,27 @@ catch {
                     "Official ChatGPT projection retained PAT/API routing or was not idempotent."
                 );
             }
+            if (!routedProjectedConfig.Contains(
+                    "base_url = " + TomlString(LocalPatGateway.ProviderBaseUrl),
+                    StringComparison.Ordinal) ||
+                routedProjectedConfig.Contains(
+                    "base_url = " + TomlString(AccountStore.OfficialOAuthBaseUrl),
+                    StringComparison.Ordinal) ||
+                !routedProjectedConfig.Contains("requires_openai_auth = true", StringComparison.Ordinal) ||
+                !string.Equals(
+                    routedProjectedConfig,
+                    ProjectOfficialOAuthConfigText(
+                        routedProjectedConfig,
+                        routeThroughGateway: true),
+                    StringComparison.Ordinal) ||
+                !ProjectOfficialOAuthConfigText(routedProjectedConfig).Contains(
+                    "base_url = " + TomlString(AccountStore.OfficialOAuthBaseUrl),
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "Official ChatGPT rotation routing did not stay conditional, idempotent, and reversible."
+                );
+            }
         }
         finally
         {
@@ -8726,7 +11670,7 @@ catch {
         }
     }
 
-    private static string BuildTestOAuthAuth(string marker)
+    private static string BuildTestOAuthAuth(string marker, string? accountId = null)
     {
         return JsonSerializer.Serialize(
             new
@@ -8736,7 +11680,8 @@ catch {
                 {
                     id_token = "id-" + marker,
                     access_token = "access-" + marker,
-                    refresh_token = "refresh-" + marker
+                    refresh_token = "refresh-" + marker,
+                    account_id = accountId
                 }
             },
             new JsonSerializerOptions { WriteIndented = true });
@@ -8826,7 +11771,8 @@ catch {
 
     internal static string ProjectOfficialOAuthConfigText(
         string currentConfig,
-        string? serviceTier = null)
+        string? serviceTier = null,
+        bool routeThroughGateway = false)
     {
         var desktopServiceTier = serviceTier == null
             ? ReadDesktopServiceTier(currentConfig)
@@ -8924,7 +11870,10 @@ catch {
         output.Add("");
         output.Add("[model_providers." + AccountStore.OfficialOAuthProviderId + "]");
         output.Add("name = " + TomlString(AccountStore.OfficialOAuthProviderName));
-        output.Add("base_url = " + TomlString(AccountStore.OfficialOAuthBaseUrl));
+        output.Add("base_url = " + TomlString(
+            routeThroughGateway
+                ? LocalPatGateway.ProviderBaseUrl
+                : AccountStore.OfficialOAuthBaseUrl));
         output.Add("wire_api = \"responses\"");
         output.Add("requires_openai_auth = true");
         output.Add("supports_websockets = false");
@@ -9537,7 +12486,8 @@ catch {
         var clientPath = ResolveCodexWindowsClientPath();
         var packageRoot = string.IsNullOrWhiteSpace(clientPath)
             ? null
-            : Directory.GetParent(Path.GetDirectoryName(clientPath)!)?.FullName;
+            : Path.GetDirectoryName(clientPath);
+        var parentProcessIds = CaptureProcessParentIds();
 
         var snapshots = new List<WindowsClientProcessSnapshot>();
         foreach (var process in Process.GetProcesses())
@@ -9559,7 +12509,10 @@ catch {
                         process.Id,
                         process.StartTime.ToUniversalTime().Ticks,
                         process.ProcessName,
-                        GetShutdownPriority(process, packageRoot)));
+                        GetShutdownPriority(process, packageRoot),
+                        parentProcessIds.TryGetValue(process.Id, out var parentProcessId)
+                            ? parentProcessId
+                            : 0));
                 }
                 catch
                 {
@@ -9575,6 +12528,111 @@ catch {
             .ToArray();
     }
 
+    private static IReadOnlyList<WindowsClientProcessSnapshot> CaptureWindowsClientProcessTreeSnapshots(
+        WindowsClientActivationIdentity rootIdentity)
+    {
+        return SelectWindowsClientProcessTreeSnapshots(
+            CaptureWindowsClientProcessSnapshots(),
+            rootIdentity);
+    }
+
+    private static IReadOnlyList<WindowsClientProcessSnapshot> SelectWindowsClientProcessTreeSnapshots(
+        IReadOnlyList<WindowsClientProcessSnapshot> snapshots,
+        WindowsClientActivationIdentity rootIdentity)
+    {
+        var root = snapshots.FirstOrDefault(snapshot =>
+            snapshot.ProcessId == rootIdentity.ProcessId &&
+            (!rootIdentity.StartTimeUtcTicks.HasValue ||
+             snapshot.StartTimeUtcTicks == rootIdentity.StartTimeUtcTicks.Value));
+        if (root == null)
+        {
+            return Array.Empty<WindowsClientProcessSnapshot>();
+        }
+
+        var ownedProcessIds = new HashSet<int> { root.ProcessId };
+        var changed = true;
+        while (changed)
+        {
+            changed = false;
+            foreach (var snapshot in snapshots)
+            {
+                if (!ownedProcessIds.Contains(snapshot.ProcessId) &&
+                    ownedProcessIds.Contains(snapshot.ParentProcessId))
+                {
+                    ownedProcessIds.Add(snapshot.ProcessId);
+                    changed = true;
+                }
+            }
+        }
+
+        return snapshots
+            .Where(snapshot => ownedProcessIds.Contains(snapshot.ProcessId))
+            .ToArray();
+    }
+
+    private static IReadOnlyList<int> CaptureOfficialNativeFastPortsOwnedBy(
+        IReadOnlyList<WindowsClientProcessSnapshot> snapshots)
+    {
+        if (snapshots.Count == 0)
+        {
+            return Array.Empty<int>();
+        }
+
+        var identities = snapshots.ToDictionary(
+            snapshot => snapshot.ProcessId,
+            snapshot => snapshot.StartTimeUtcTicks);
+        var ports = new List<int>();
+        foreach (var port in OfficialNativeFastCdpPortCandidates())
+        {
+            if (TryGetOfficialCodexLoopbackListenerIdentity(port, out var identity) &&
+                identities.TryGetValue(identity.ProcessId, out var expectedStartTicks) &&
+                identity.StartTimeUtcTicks == expectedStartTicks)
+            {
+                ports.Add(port);
+            }
+        }
+
+        return ports;
+    }
+
+    private static IReadOnlyDictionary<int, int> CaptureProcessParentIds()
+    {
+        var parentProcessIds = new Dictionary<int, int>();
+        var snapshotHandle = CreateToolhelp32Snapshot(ToolhelpSnapshotProcesses, 0);
+        if (snapshotHandle == InvalidNativeHandle)
+        {
+            return parentProcessIds;
+        }
+
+        try
+        {
+            var entry = new NativeProcessEntry
+            {
+                Size = checked((uint)Marshal.SizeOf<NativeProcessEntry>())
+            };
+            if (!Process32First(snapshotHandle, ref entry))
+            {
+                return parentProcessIds;
+            }
+
+            do
+            {
+                if (entry.ProcessId is > 0 and <= int.MaxValue &&
+                    entry.ParentProcessId <= int.MaxValue)
+                {
+                    parentProcessIds[(int)entry.ProcessId] = (int)entry.ParentProcessId;
+                }
+                entry.Size = checked((uint)Marshal.SizeOf<NativeProcessEntry>());
+            } while (Process32Next(snapshotHandle, ref entry));
+        }
+        finally
+        {
+            _ = CloseHandle(snapshotHandle);
+        }
+
+        return parentProcessIds;
+    }
+
     private static void StopWindowsClientProcesses(
         IReadOnlyList<WindowsClientProcessSnapshot> shutdownTargets)
     {
@@ -9586,7 +12644,7 @@ catch {
         var clientPath = ResolveCodexWindowsClientPath();
         var packageRoot = string.IsNullOrWhiteSpace(clientPath)
             ? null
-            : Directory.GetParent(Path.GetDirectoryName(clientPath)!)?.FullName;
+            : Path.GetDirectoryName(clientPath);
         var processes = new List<Process>();
         foreach (var target in shutdownTargets)
         {
@@ -9779,13 +12837,23 @@ catch {
 
     private static bool IsCodexWindowsClientProcess(Process process, string? packageRoot)
     {
+        return TryClassifyCodexWindowsClientProcess(process, packageRoot, out var isOfficial) &&
+               isOfficial;
+    }
+
+    private static bool TryClassifyCodexWindowsClientProcess(
+        Process process,
+        string? packageRoot,
+        out bool isOfficial)
+    {
+        isOfficial = false;
         try
         {
             if (!process.ProcessName.Equals("ChatGPT", StringComparison.OrdinalIgnoreCase) &&
                 !process.ProcessName.Equals("Codex", StringComparison.OrdinalIgnoreCase) &&
                 !process.ProcessName.Equals("codex", StringComparison.OrdinalIgnoreCase))
             {
-                return false;
+                return true;
             }
 
             if (string.IsNullOrWhiteSpace(packageRoot))
@@ -9800,20 +12868,120 @@ catch {
             }
 
             var fullFileName = Path.GetFullPath(fileName);
+            var executableName = Path.GetFileName(fullFileName);
+            if (!executableName.Equals("ChatGPT.exe", StringComparison.OrdinalIgnoreCase) &&
+                !executableName.Equals("Codex.exe", StringComparison.OrdinalIgnoreCase) &&
+                !executableName.Equals("codex.exe", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
             var root = Path.GetFullPath(packageRoot)
                 .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-            var rootPrefix = root + Path.DirectorySeparatorChar;
-            if (!fullFileName.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase))
+            if (IsPathWithinDirectory(fullFileName, root))
+            {
+                isOfficial = true;
+                return true;
+            }
+
+            // A Store update can register a new package version while processes from the old
+            // version are still shutting down. Trust sibling versions only when both paths are
+            // below the real WindowsApps directory and have the exact same package identity and
+            // publisher ID; an arbitrary CODEX_WINDOWS_CLIENT_PATH override remains exact-root
+            // only and cannot broaden process termination to another directory.
+            if (TryGetWindowsAppsPackageFamily(
+                    root,
+                    out var trustedWindowsAppsRoot,
+                    out var trustedIdentityName,
+                    out var trustedPublisherId) &&
+                trustedIdentityName.Equals("OpenAI.Codex", StringComparison.OrdinalIgnoreCase) &&
+                TryGetWindowsAppsPackageFamily(
+                    fullFileName,
+                    out var candidateWindowsAppsRoot,
+                    out var candidateIdentityName,
+                    out var candidatePublisherId) &&
+                PathsEqual(trustedWindowsAppsRoot, candidateWindowsAppsRoot) &&
+                trustedIdentityName.Equals(candidateIdentityName, StringComparison.OrdinalIgnoreCase) &&
+                trustedPublisherId.Equals(candidatePublisherId, StringComparison.OrdinalIgnoreCase))
+            {
+                isOfficial = true;
+            }
+
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool IsPathWithinDirectory(string candidatePath, string directoryPath)
+    {
+        var candidate = Path.GetFullPath(candidatePath);
+        var directory = Path.GetFullPath(directoryPath)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return candidate.StartsWith(
+            directory + Path.DirectorySeparatorChar,
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool TryGetWindowsAppsPackageFamily(
+        string path,
+        out string windowsAppsRoot,
+        out string identityName,
+        out string publisherId)
+    {
+        windowsAppsRoot = "";
+        identityName = "";
+        publisherId = "";
+        try
+        {
+            var candidateWindowsAppsRoot = Path.GetFullPath(Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                    "WindowsApps"))
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var fullPath = Path.GetFullPath(path);
+            if (!IsPathWithinDirectory(fullPath, candidateWindowsAppsRoot))
             {
                 return false;
             }
 
-            var executableName = Path.GetFileName(fullFileName);
-            return executableName.Equals("ChatGPT.exe", StringComparison.OrdinalIgnoreCase) ||
-                   executableName.Equals("Codex.exe", StringComparison.OrdinalIgnoreCase) ||
-                   executableName.Equals("codex.exe", StringComparison.OrdinalIgnoreCase);
+            var relativePath = Path.GetRelativePath(candidateWindowsAppsRoot, fullPath);
+            var separatorIndex = relativePath.IndexOfAny(
+                [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar]);
+            var packageFolderName = separatorIndex < 0
+                ? relativePath
+                : relativePath[..separatorIndex];
+            var identitySeparator = packageFolderName.IndexOf('_');
+            var publisherSeparator = packageFolderName.LastIndexOf("__", StringComparison.Ordinal);
+            if (identitySeparator <= 0 ||
+                publisherSeparator <= identitySeparator + 1 ||
+                publisherSeparator + 2 >= packageFolderName.Length)
+            {
+                return false;
+            }
+
+            var parsedIdentityName = packageFolderName[..identitySeparator];
+            var parsedPublisherId = packageFolderName[(publisherSeparator + 2)..];
+            if (!Regex.IsMatch(
+                    parsedIdentityName,
+                    "^[A-Za-z0-9.-]{1,128}$",
+                    RegexOptions.CultureInvariant) ||
+                !Regex.IsMatch(
+                    parsedPublisherId,
+                    "^[A-Za-z0-9]{1,64}$",
+                    RegexOptions.CultureInvariant))
+            {
+                return false;
+            }
+
+            windowsAppsRoot = candidateWindowsAppsRoot;
+            identityName = parsedIdentityName;
+            publisherId = parsedPublisherId;
+            return true;
         }
-        catch
+        catch (Exception ex) when (
+            ex is ArgumentException or IOException or NotSupportedException or UnauthorizedAccessException)
         {
             return false;
         }
@@ -11261,9 +14429,43 @@ catch {
                selectedKey.Equals(GetDesktopAccountKey(account), StringComparison.OrdinalIgnoreCase);
     }
 
+    private static bool IsDesktopAuthSelectionForAccount(string profileHome, AccountRecord account)
+    {
+        return TryReadDesktopSelectionKeys(
+                   profileHome,
+                   out _,
+                   out var selectedAuthKey) &&
+               selectedAuthKey.Equals(
+                   GetDesktopAccountKey(account),
+                   StringComparison.OrdinalIgnoreCase);
+    }
+
     private static bool TryReadDesktopSelectionKey(string profileHome, out string accountKey)
     {
+        return TryReadDesktopSelectionKeys(profileHome, out accountKey, out _);
+    }
+
+    private static bool TryReadDesktopSelectionKeys(
+        string profileHome,
+        out string accountKey,
+        out string authAccountKey)
+    {
+        return TryReadDesktopSelectionKeys(
+            profileHome,
+            out accountKey,
+            out authAccountKey,
+            out _);
+    }
+
+    private static bool TryReadDesktopSelectionKeys(
+        string profileHome,
+        out string accountKey,
+        out string authAccountKey,
+        out string authAccountHome)
+    {
         accountKey = "";
+        authAccountKey = "";
+        authAccountHome = "";
         var path = Path.Combine(profileHome, DesktopSelectionFileName);
         if (!File.Exists(path))
         {
@@ -11283,35 +14485,89 @@ catch {
             if (root.ValueKind != JsonValueKind.Object ||
                 !root.TryGetProperty("schemaVersion", out var schemaVersion) ||
                 !schemaVersion.TryGetInt32(out var version) ||
-                version != 1 ||
+                version is not (1 or 2) ||
                 !TryReadJsonString(root, "accountKey", out var value) ||
                 !IsDesktopAccountKey(value))
             {
                 return false;
             }
 
+            var authValue = value;
+            var authHomeValue = "";
+            if (version == 2 &&
+                (!TryReadJsonString(root, "authAccountKey", out authValue) ||
+                 !IsDesktopAccountKey(authValue) ||
+                 !TryReadJsonString(root, "authAccountHome", out authHomeValue)))
+            {
+                return false;
+            }
+            if (version == 2)
+            {
+                var normalizedAuthHome = Path.GetFullPath(authHomeValue);
+                if (PathsEqual(normalizedAuthHome, profileHome) ||
+                    !GetDesktopAccountKeyForHome(normalizedAuthHome).Equals(
+                        authValue,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+                authHomeValue = normalizedAuthHome;
+            }
+
             accountKey = value;
+            authAccountKey = authValue;
+            authAccountHome = authHomeValue;
             return true;
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        catch (Exception ex) when (
+            ex is IOException or UnauthorizedAccessException or JsonException or
+            ArgumentException or NotSupportedException)
         {
             return false;
         }
     }
 
-    private static void WriteDesktopSelection(string profileHome, AccountRecord account)
+    private static void WriteDesktopSelection(
+        string profileHome,
+        AccountRecord account,
+        AccountRecord? chatGptFeatureAccount = null)
     {
-        var contents = JsonSerializer.Serialize(
-            new
-            {
-                schemaVersion = 1,
-                accountKey = GetDesktopAccountKey(account),
-                accountName = account.Name,
-                mode = account.IsOfficialOAuth
-                    ? "chatgpt-official-oauth"
-                    : "chatgpt-app-plus-personal-access-token"
-            },
-            new JsonSerializerOptions { WriteIndented = true });
+        var authAccount = chatGptFeatureAccount ?? account;
+        if (chatGptFeatureAccount != null && !authAccount.IsOfficialOAuth)
+        {
+            throw new InvalidOperationException(
+                "Desktop ChatGPT auth selection must reference an official OAuth account.");
+        }
+
+        var jsonOptions = new JsonSerializerOptions { WriteIndented = true };
+        var contents = chatGptFeatureAccount == null && !account.IsOfficialOAuth
+            ? JsonSerializer.Serialize(
+                new
+                {
+                    schemaVersion = 1,
+                    accountKey = GetDesktopAccountKey(account),
+                    accountName = account.Name,
+                    mode = account.IsCompatibleApi
+                        ? "chatgpt-app-plus-compatible-api"
+                        : "chatgpt-app-plus-personal-access-token"
+                },
+                jsonOptions)
+            : JsonSerializer.Serialize(
+                new
+                {
+                    schemaVersion = 2,
+                    accountKey = GetDesktopAccountKey(account),
+                    accountName = account.Name,
+                    authAccountKey = GetDesktopAccountKey(authAccount),
+                    authAccountName = authAccount.Name,
+                    authAccountHome = Path.GetFullPath(authAccount.CodexHome),
+                    mode = account.IsOfficialOAuth
+                        ? "chatgpt-official-oauth"
+                        : account.IsCompatibleApi
+                            ? "chatgpt-app-plus-compatible-api"
+                            : "chatgpt-app-plus-personal-access-token"
+                },
+                jsonOptions);
         WriteTextAtomically(Path.Combine(profileHome, DesktopSelectionFileName), contents);
     }
 
@@ -11368,8 +14624,15 @@ catch {
     {
         var accountPath = Path.Combine(account.CodexHome, AuthFileName);
         var storedPath = GetStoredDesktopAuthPath(profileHome, account);
+        var identityReferencePath = TryReadChatGptAuthAccountId(accountPath, out _)
+            ? accountPath
+            : TryReadChatGptAuthAccountId(storedPath, out _)
+                ? storedPath
+                : null;
         var candidates = new[] { accountPath, storedPath }
             .Where(IsChatGptDesktopAuthJson)
+            .Where(path => identityReferencePath == null ||
+                           ChatGptAuthAccountsMatch(path, identityReferencePath))
             .OrderByDescending(File.GetLastWriteTimeUtc)
             .ThenBy(path => PathsEqual(path, accountPath) ? 0 : 1)
             .ToList();
@@ -11413,18 +14676,36 @@ catch {
                 $"账号 {account.Name} 的官方 ChatGPT 登录凭据无效，无法保存账号快照。");
         }
 
-        var profileHome = Path.GetFullPath(GetDefaultCodexHome());
-        var storedPath = GetStoredDesktopAuthPath(profileHome, account);
-        Directory.CreateDirectory(Path.GetDirectoryName(storedPath)!);
-        CopyFileAtomically(accountPath, storedPath);
-
-        if (!IsDesktopSelectionForAccount(profileHome, account))
+        using var switchMutex = new Mutex(false, WindowsClientSwitchMutexName);
+        var mutexAcquired = false;
+        try
         {
-            return;
-        }
+            try
+            {
+                mutexAcquired = switchMutex.WaitOne(TimeSpan.FromSeconds(15));
+            }
+            catch (AbandonedMutexException)
+            {
+                mutexAcquired = true;
+            }
+            if (!mutexAcquired)
+            {
+                throw new TimeoutException(
+                    "另一个 Codex 账号切换仍在进行，新的 ChatGPT 登录已保留在账号目录；请稍后重试启动。");
+            }
 
-        Directory.CreateDirectory(profileHome);
-        CopyFileAtomically(accountPath, Path.Combine(profileHome, AuthFileName));
+            var profileHome = Path.GetFullPath(GetDefaultCodexHome());
+            var storedPath = GetStoredDesktopAuthPath(profileHome, account);
+            Directory.CreateDirectory(Path.GetDirectoryName(storedPath)!);
+            CopyFileAtomically(accountPath, storedPath);
+        }
+        finally
+        {
+            if (mutexAcquired)
+            {
+                switchMutex.ReleaseMutex();
+            }
+        }
     }
 
     private static void SyncStoredOfficialOAuthAuthToAccount(AccountRecord account)
@@ -11438,17 +14719,28 @@ catch {
         var accountPath = Path.Combine(account.CodexHome, AuthFileName);
         var storedPath = GetStoredDesktopAuthPath(profileHome, account);
         var sharedPath = Path.Combine(profileHome, AuthFileName);
-        var sharedSelected = IsDesktopSelectionForAccount(profileHome, account);
+        var sharedSelected = IsDesktopAuthSelectionForAccount(profileHome, account);
+        var identityReferencePath = TryReadChatGptAuthAccountId(accountPath, out _)
+            ? accountPath
+            : TryReadChatGptAuthAccountId(storedPath, out _)
+                ? storedPath
+                : null;
+        bool IsIdentitySafeCandidate(string path) =>
+            identityReferencePath == null ||
+            ChatGptAuthAccountsMatch(path, identityReferencePath);
         var candidates = new List<(string Path, int TieBreak)>();
         if (IsChatGptDesktopAuthJson(accountPath))
         {
             candidates.Add((accountPath, 0));
         }
-        if (sharedSelected && IsChatGptDesktopAuthJson(sharedPath))
+        if (sharedSelected &&
+            IsChatGptDesktopAuthJson(sharedPath) &&
+            IsIdentitySafeCandidate(sharedPath))
         {
             candidates.Add((sharedPath, 1));
         }
-        if (IsChatGptDesktopAuthJson(storedPath))
+        if (IsChatGptDesktopAuthJson(storedPath) &&
+            IsIdentitySafeCandidate(storedPath))
         {
             candidates.Add((storedPath, 2));
         }
@@ -11473,22 +14765,36 @@ catch {
         {
             CopyFileAtomically(preferred, accountPath);
         }
-        if (sharedSelected && !PathsEqual(preferred, sharedPath))
-        {
-            Directory.CreateDirectory(profileHome);
-            CopyFileAtomically(preferred, sharedPath);
-        }
+        // Never rewrite the live shared auth from a status/login check. Projection into the
+        // official App is allowed only after the switch mutex is held and the old renderer,
+        // native bridge and CDP owner have reached quiescence.
     }
 
     private static void PersistSelectedDesktopChatGptAuth(string profileHome, string sharedAuthPath)
     {
-        if (!TryReadDesktopSelectionKey(profileHome, out var selectedKey) ||
+        if (!TryReadDesktopSelectionKeys(
+                profileHome,
+                out _,
+                out var selectedAuthKey,
+                out var selectedAuthHome) ||
             !IsChatGptDesktopAuthJson(sharedAuthPath))
         {
             return;
         }
 
-        var storedAuthPath = GetStoredDesktopAuthPath(profileHome, selectedKey);
+        var storedAuthPath = GetStoredDesktopAuthPath(profileHome, selectedAuthKey);
+        if (!string.IsNullOrWhiteSpace(selectedAuthHome))
+        {
+            var accountAuthPath = Path.Combine(selectedAuthHome, AuthFileName);
+            if (!ChatGptAuthAccountsMatch(sharedAuthPath, accountAuthPath) &&
+                !ChatGptAuthAccountsMatch(sharedAuthPath, storedAuthPath))
+            {
+                // The user may have signed into a different ChatGPT account inside Codex.
+                // Never save that live token under the bound OAuth owner's key.
+                return;
+            }
+        }
+
         Directory.CreateDirectory(Path.GetDirectoryName(storedAuthPath)!);
         CopyFileAtomically(sharedAuthPath, storedAuthPath);
     }
@@ -11557,6 +14863,223 @@ catch {
         }
     }
 
+    private static void DeleteMatchingGlobalDesktopAuth(
+        string profileHome,
+        AccountRecord account,
+        bool sharedAuthSelected)
+    {
+        if (!account.IsOfficialOAuth)
+        {
+            return;
+        }
+
+        var globalAuthPath = GetGlobalStoredDesktopAuthPath(profileHome);
+        if (!IsChatGptDesktopAuthJson(globalAuthPath))
+        {
+            return;
+        }
+
+        var identityCandidates = new List<string>
+        {
+            Path.Combine(account.CodexHome, AuthFileName),
+            GetStoredDesktopAuthPath(profileHome, account)
+        };
+        if (sharedAuthSelected)
+        {
+            identityCandidates.Add(Path.Combine(profileHome, AuthFileName));
+        }
+
+        if (!identityCandidates.Any(path =>
+                ChatGptAuthAccountsMatch(globalAuthPath, path)))
+        {
+            return;
+        }
+
+        ClearReadOnlyAttribute(globalAuthPath);
+        File.Delete(globalAuthPath);
+        DeleteDirectoryIfEmpty(Path.GetDirectoryName(globalAuthPath)!);
+    }
+
+    private static void ScrubAccountSwitcherBackups(
+        string profileHome,
+        AccountRecord account)
+    {
+        var backupRoot = Path.Combine(profileHome, "account-switcher-backups");
+        if (!Directory.Exists(backupRoot))
+        {
+            return;
+        }
+
+        var accountKey = GetDesktopAccountKey(account);
+        var sourceAuthPath = Path.Combine(account.CodexHome, AuthFileName);
+        var storedAuthPath = GetStoredDesktopAuthPath(profileHome, account);
+        string? modelSecret = null;
+        if (!account.IsOfficialOAuth)
+        {
+            try
+            {
+                modelSecret = ReadAccessTokenCredential(sourceAuthPath);
+            }
+            catch (Exception ex) when (
+                ex is IOException or UnauthorizedAccessException or JsonException or
+                InvalidDataException or FormatException)
+            {
+                // Metadata ownership below still removes manager-generated backups. The
+                // credential comparison fallback is unavailable for an already-corrupt source.
+            }
+        }
+
+        foreach (var backupDirectory in Directory.EnumerateDirectories(backupRoot))
+        {
+            var hasSelection = TryReadDesktopSelectionKeys(
+                backupDirectory,
+                out var selectedModelKey,
+                out var selectedAuthKey,
+                out _);
+            var hasActiveState = TryReadActiveAccountState(
+                backupDirectory,
+                out var activeAccountKey,
+                out _,
+                out _);
+            var modelOwned =
+                (hasSelection && selectedModelKey.Equals(
+                    accountKey,
+                    StringComparison.OrdinalIgnoreCase)) ||
+                (hasActiveState && activeAccountKey.Equals(
+                    accountKey,
+                    StringComparison.OrdinalIgnoreCase));
+            var authOwned = hasSelection
+                ? selectedAuthKey.Equals(accountKey, StringComparison.OrdinalIgnoreCase)
+                : modelOwned;
+
+            var backupAuthPath = Path.Combine(backupDirectory, AuthFileName);
+            var authMatches = File.Exists(backupAuthPath) &&
+                              (authOwned ||
+                               (account.IsOfficialOAuth
+                                   ? ChatGptAuthAccountsMatch(backupAuthPath, sourceAuthPath) ||
+                                     ChatGptAuthAccountsMatch(backupAuthPath, storedAuthPath)
+                                   : !string.IsNullOrWhiteSpace(modelSecret) &&
+                                     IsAccessTokenDesktopAuthSelected(
+                                       sourceAuthPath,
+                                       backupAuthPath)));
+            if (authMatches)
+            {
+                ClearReadOnlyAttribute(backupAuthPath);
+                File.Delete(backupAuthPath);
+            }
+
+            var backupConfigPath = Path.Combine(backupDirectory, ConfigFileName);
+            if (modelOwned)
+            {
+                RemoveExperimentalBearerTokenLines(
+                    backupConfigPath,
+                    matchingSecret: null);
+            }
+            else if (!string.IsNullOrWhiteSpace(modelSecret))
+            {
+                RemoveExperimentalBearerTokenLines(backupConfigPath, modelSecret);
+            }
+
+            if (hasSelection && (modelOwned || authOwned))
+            {
+                DeleteFileIfPresent(Path.Combine(
+                    backupDirectory,
+                    DesktopSelectionFileName));
+            }
+            if (hasActiveState && modelOwned)
+            {
+                DeleteFileIfPresent(Path.Combine(
+                    backupDirectory,
+                    ActiveAccountStateFileName));
+            }
+
+            DeleteDirectoryIfEmpty(backupDirectory);
+        }
+
+        DeleteDirectoryIfEmpty(backupRoot);
+    }
+
+    private static void RemoveExperimentalBearerTokenLines(
+        string configPath,
+        string? matchingSecret)
+    {
+        if (!File.Exists(configPath))
+        {
+            return;
+        }
+
+        var original = File.ReadAllText(configPath);
+        var normalized = original.Replace("\r\n", "\n").Replace('\r', '\n');
+        var endsWithNewLine = normalized.EndsWith('\n');
+        var lines = normalized.Split('\n').ToList();
+        if (endsWithNewLine && lines.Count > 0 && lines[^1].Length == 0)
+        {
+            lines.RemoveAt(lines.Count - 1);
+        }
+
+        var expectedValue = string.IsNullOrWhiteSpace(matchingSecret)
+            ? null
+            : TomlString(matchingSecret.Trim());
+        var changed = false;
+        var filtered = new List<string>(lines.Count);
+        foreach (var line in lines)
+        {
+            var trimmed = line.Trim();
+            if (!IsExperimentalBearerTokenLine(trimmed))
+            {
+                filtered.Add(line);
+                continue;
+            }
+
+            var equalsIndex = trimmed.IndexOf('=');
+            var value = equalsIndex >= 0
+                ? trimmed[(equalsIndex + 1)..].Trim()
+                : "";
+            if (expectedValue != null &&
+                !value.Equals(expectedValue, StringComparison.Ordinal))
+            {
+                filtered.Add(line);
+                continue;
+            }
+
+            changed = true;
+        }
+
+        if (!changed)
+        {
+            return;
+        }
+
+        var newLine = original.Contains("\r\n", StringComparison.Ordinal)
+            ? "\r\n"
+            : "\n";
+        var updated = string.Join(newLine, filtered);
+        if (endsWithNewLine && filtered.Count > 0)
+        {
+            updated += newLine;
+        }
+        WriteTextAtomically(configPath, updated);
+    }
+
+    private static void DeleteFileIfPresent(string path)
+    {
+        if (!File.Exists(path))
+        {
+            return;
+        }
+
+        ClearReadOnlyAttribute(path);
+        File.Delete(path);
+    }
+
+    private static void DeleteDirectoryIfEmpty(string path)
+    {
+        if (Directory.Exists(path) && !Directory.EnumerateFileSystemEntries(path).Any())
+        {
+            Directory.Delete(path);
+        }
+    }
+
     private static void DeleteStoredDesktopAuth(string profileHome, AccountRecord account)
     {
         var storedAuthPath = GetStoredDesktopAuthPath(profileHome, account);
@@ -11567,10 +15090,7 @@ catch {
         }
 
         var accountDirectory = Path.GetDirectoryName(storedAuthPath)!;
-        if (Directory.Exists(accountDirectory) && !Directory.EnumerateFileSystemEntries(accountDirectory).Any())
-        {
-            Directory.Delete(accountDirectory);
-        }
+        DeleteDirectoryIfEmpty(accountDirectory);
     }
 
     internal static bool IsOfficialOAuthCredentialFile(string path)
@@ -11614,6 +15134,47 @@ catch {
         {
             return false;
         }
+    }
+
+    private static bool TryReadChatGptAuthAccountId(string path, out string accountId)
+    {
+        accountId = "";
+        if (!IsChatGptDesktopAuthJson(path))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var input = new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            using var document = JsonDocument.Parse(input);
+            var root = document.RootElement;
+            if (!root.TryGetProperty("tokens", out var tokens) ||
+                tokens.ValueKind != JsonValueKind.Object ||
+                !TryReadJsonString(tokens, "account_id", out var value) ||
+                !IsSafeChatGptAccountId(value))
+            {
+                return false;
+            }
+
+            accountId = value;
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static bool ChatGptAuthAccountsMatch(string firstPath, string secondPath)
+    {
+        return TryReadChatGptAuthAccountId(firstPath, out var firstAccountId) &&
+               TryReadChatGptAuthAccountId(secondPath, out var secondAccountId) &&
+               firstAccountId.Equals(secondAccountId, StringComparison.Ordinal);
     }
 
     private static bool IsAccessTokenDesktopAuthSelected(
@@ -11684,7 +15245,7 @@ catch {
         return JsonSerializer.Serialize(auth, new JsonSerializerOptions { WriteIndented = true });
     }
 
-    private static string ReadAccessTokenCredential(string authPath)
+    internal static string ReadAccessTokenCredential(string authPath)
     {
         if (!File.Exists(authPath))
         {
@@ -12112,6 +15673,23 @@ catch {
         public uint OwningProcessId;
     }
 
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct NativeProcessEntry
+    {
+        public uint Size;
+        public uint UsageCount;
+        public uint ProcessId;
+        public UIntPtr DefaultHeapId;
+        public uint ModuleId;
+        public uint ThreadCount;
+        public uint ParentProcessId;
+        public int BasePriority;
+        public uint Flags;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string ExecutableFile;
+    }
+
     [DllImport("iphlpapi.dll", SetLastError = true)]
     private static extern uint GetExtendedTcpTable(
         IntPtr tcpTable,
@@ -12120,6 +15698,21 @@ catch {
         int ipVersion,
         int tableClass,
         uint reserved);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint processId);
+
+    [DllImport("kernel32.dll", EntryPoint = "Process32FirstW", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool Process32First(IntPtr snapshot, ref NativeProcessEntry entry);
+
+    [DllImport("kernel32.dll", EntryPoint = "Process32NextW", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool Process32Next(IntPtr snapshot, ref NativeProcessEntry entry);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr handle);
 
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -12361,14 +15954,63 @@ catch {
 
     private sealed record CommandResult(int ExitCode, string StdOut, string StdErr);
     private sealed record ProcessRunResult(int ExitCode, string StdOut, string StdErr);
+    private enum OfficialCodexLaunchAttemptOutcome
+    {
+        Ready,
+        ReadyWithoutRendererPatch,
+        RecoverableFailure,
+        Superseded
+    }
+
+    private enum OfficialCodexRecoveryDecision
+    {
+        Complete,
+        RestartWithoutRendererPatch,
+        Stop
+    }
+
+    private enum OfficialCodexNativeFastAttachOutcome
+    {
+        AlreadyPatched,
+        PatchedAfterThisCall,
+        NoReload,
+        ReloadMayHaveStarted
+    }
+
+    private enum OfficialCodexMainPageWaitOutcome
+    {
+        Ready,
+        PersistedAtomSyncFailed,
+        ProcessExited,
+        TimedOut,
+        Superseded,
+        ProbeUnavailable
+    }
+
     private sealed record WindowsClientProcessSnapshot(
         int ProcessId,
         long StartTimeUtcTicks,
         string ProcessName,
-        int ShutdownPriority);
+        int ShutdownPriority,
+        int ParentProcessId);
     private sealed record WindowsClientActivationIdentity(
         int ProcessId,
         long? StartTimeUtcTicks);
+    private sealed class OfficialCodexActivationIdentityException : InvalidOperationException
+    {
+        internal OfficialCodexActivationIdentityException(int processId, bool cleanupSucceeded)
+            : base(
+                $"Windows activated official Codex as PID {processId}, but its immutable start-time " +
+                "identity could not be captured within 5 seconds. " +
+                (cleanupSucceeded
+                    ? "The untracked packaged process was removed before launch recovery continued."
+                    : "The untracked packaged process could not be removed safely; no second activation was attempted."))
+        {
+            CleanupSucceeded = cleanupSucceeded;
+        }
+
+        internal bool CleanupSucceeded { get; }
+    }
     private sealed record CompatibleApiPreflightCacheEntry(
         string Fingerprint,
         DateTimeOffset CompletedAtUtc);

@@ -25,6 +25,8 @@ internal sealed record CodexThreadSection(
         StringComparison.OrdinalIgnoreCase);
 }
 
+internal sealed record CodexAccountIdentity(string Email, string PlanType);
+
 internal sealed class CodexAppServerClient
 {
     internal const string PinnedSectionId = "01984de2-8f74-7c91-a3b2-5c5e937cf318";
@@ -32,6 +34,21 @@ internal sealed class CodexAppServerClient
     private const int MaxPagesPerArchiveState = 100;
     private const int MaxThreadSectionNameLength = 80;
     private static readonly TimeSpan OperationTimeout = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan AccountReadTimeout = TimeSpan.FromSeconds(8);
+
+    public async Task<CodexAccountIdentity?> ReadAccountIdentityAsync(
+        string codexHome,
+        CancellationToken cancellationToken = default)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(AccountReadTimeout);
+        await using var session = await AppServerSession.StartAsync(codexHome, timeout.Token);
+        var result = await session.RequestAsync(
+            "account/read",
+            new JsonObject { ["refreshToken"] = false },
+            timeout.Token);
+        return ParseAccountIdentity(result);
+    }
 
     public async Task<IReadOnlyList<CodexThreadSummary>> ListThreadsAsync(
         string codexHome,
@@ -286,6 +303,32 @@ internal sealed class CodexAppServerClient
         ValidateThreadSectionCandidateFallback();
     }
 
+    internal static void ValidateAccountIdentityProtocol()
+    {
+        var parsed = ParseAccountIdentity(JsonNode.Parse(
+            """{"account":{"type":"chatgpt","email":"person@example.com","planType":"team"},"requiresOpenaiAuth":true}""")
+            ?.AsObject());
+        if (parsed is not { Email: "person@example.com", PlanType: "team" })
+        {
+            throw new InvalidOperationException("Codex account/read identity parsing self-test failed.");
+        }
+
+        foreach (var rejected in new[]
+                 {
+                     """{"account":{"type":"apiKey","email":"person@example.com","planType":null}}""",
+                     """{"account":{"type":"chatgpt","email":"Display <person@example.com>","planType":"team"}}""",
+                     """{"account":{"type":"chatgpt","email":"person@example.com\nforged","planType":"team"}}""",
+                     """{"account":null,"requiresOpenaiAuth":true}"""
+                 })
+        {
+            if (ParseAccountIdentity(JsonNode.Parse(rejected)?.AsObject()) != null)
+            {
+                throw new InvalidOperationException(
+                    "Codex account/read identity parser accepted an unsafe or non-ChatGPT response.");
+            }
+        }
+    }
+
     private static async Task<T> SelectThreadSectionCliCandidateAsync<T>(
         IReadOnlyList<string> candidates,
         Func<string, CancellationToken, Task<T>> tryCandidate,
@@ -435,6 +478,41 @@ internal sealed class CodexAppServerClient
             return null;
         }
         return new CodexThreadSection(id, name, ReadString(value, "appearance"));
+    }
+
+    private static CodexAccountIdentity? ParseAccountIdentity(JsonObject? result)
+    {
+        if (result?["account"] is not JsonObject account ||
+            !ReadString(account, "type").Equals("chatgpt", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var email = ReadString(account, "email").Trim();
+        if (email.Length is < 3 or > 320 ||
+            email.Any(character => char.IsControl(character) || char.IsWhiteSpace(character)))
+        {
+            return null;
+        }
+        try
+        {
+            var parsed = new System.Net.Mail.MailAddress(email);
+            if (!parsed.Address.Equals(email, StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+        }
+        catch (FormatException)
+        {
+            return null;
+        }
+
+        var planType = ReadString(account, "planType").Trim();
+        if (planType.Length > 64 || planType.Any(char.IsControl))
+        {
+            planType = string.Empty;
+        }
+        return new CodexAccountIdentity(email, planType);
     }
 
     private static string NormalizeThreadSectionName(string name)

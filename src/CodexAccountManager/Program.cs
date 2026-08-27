@@ -191,8 +191,13 @@ static class Program
             CodexCliService.ValidateLocalPatConfigMigration();
             LocalPatGatewayHost.ValidateRoutingAndCredentialClassification();
             LocalPatGatewayHost.ValidatePatRejectionMessaging();
+            PatAutoRotationPolicy.Validate();
+            AccountRotationConfiguration.Validate();
+            PatGatewayRotationStore.Validate();
+            CodexTaskBoundaryMonitor.Validate();
             CodexCliService.ValidateDesktopSidebarProjection();
             CodexCliService.ValidateSharedProfileProjection();
+            CodexCliService.ValidateExplicitChatGptFeatureProjection();
             CodexCliService.ValidateServiceTierAccountIsolation();
             CodexCliService.ValidateOfficialOAuthBrowserFlow();
             CodexCliService.ValidateOfficialOAuthProfileProjection();
@@ -255,6 +260,7 @@ static class Program
             }
             SharedHistoryService.ValidateReader();
             CodexCliService.ValidateThreadSectionMutationSafety();
+            CodexAppServerClient.ValidateAccountIdentityProtocol();
             CodexAppServerClient.ValidateThreadSectionProtocol();
             ThreadSectionNameDialog.ValidateValidation();
             ThreadSectionNameDialog.ValidateLayout();
@@ -278,6 +284,7 @@ static class Program
                 Console.WriteLine("Windows Codex desktop client self-test skipped by build environment.");
             }
             CodexCliService.ValidateOfficialCodexActivation();
+            CodexCliService.ValidateOfficialCodexLaunchRecovery();
             CodexDreamSkinService.ValidateBundledRuntime();
             CodexNativeFastBridge.ValidatePatchContract();
 

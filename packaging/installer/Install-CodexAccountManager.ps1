@@ -435,7 +435,13 @@ try {
 
     if (-not $NoLaunch) {
         Write-InstallerProgress -Status '正在启动 Codex Account Manager。' -Percent 96
-        Start-Process -FilePath $installedExe -WorkingDirectory $managerRoot | Out-Null
+        # An upgrade must not replace a gateway that may still be carrying the
+        # current Codex request. The new manager adopts it first and performs any
+        # protocol hand-off only after the request/task boundary is quiet.
+        Start-Process `
+            -FilePath $installedExe `
+            -WorkingDirectory $managerRoot `
+            -ArgumentList @('--preserve-existing-pat-gateway', '--refresh-native-fast-bridge-after-update') | Out-Null
     }
 
     Write-InstallerProgress -Status '安装完成。' -Percent 100

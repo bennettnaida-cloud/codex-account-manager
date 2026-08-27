@@ -107,6 +107,10 @@ $modernUiControlsSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAc
 $cliServiceSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\CodexCliService.cs') -Raw -Encoding UTF8
 $cliServiceModelsSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\CodexCliService.Models.cs') -Raw -Encoding UTF8
 $localPatGatewaySource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\LocalPatGateway.cs') -Raw -Encoding UTF8
+$localPatGatewayControlSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\LocalPatGatewayControl.cs') -Raw -Encoding UTF8
+$patAutoRotationSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\PatAutoRotation.cs') -Raw -Encoding UTF8
+$accountRotationSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\AccountRotationConfiguration.cs') -Raw -Encoding UTF8
+$patGatewayRotationStoreSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\PatGatewayRotationStore.cs') -Raw -Encoding UTF8
 $localProxyDetectorSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\LocalProxyDetector.cs') -Raw -Encoding UTF8
 $quotaSnapshotStoreSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\QuotaSnapshotStore.cs') -Raw -Encoding UTF8
 $dreamSkinServiceSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\CodexDreamSkinService.cs') -Raw -Encoding UTF8
@@ -129,6 +133,7 @@ $historyMergerSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccou
 $threadTranscriptSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\SharedThreadTranscriptService.cs') -Raw -Encoding UTF8
 $threadPreviewDialogSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\ThreadPreviewDialog.cs') -Raw -Encoding UTF8
 $buildScriptSource = Get-Content -LiteralPath (Join-Path $root 'Build-CodexAccountManager.ps1') -Raw -Encoding UTF8
+$oneClickPackageSource = Get-Content -LiteralPath (Join-Path $root 'Build-OneClickInstallerPackage.ps1') -Raw -Encoding UTF8
 $buildLatestWorkflowSource = Get-Content -LiteralPath (Join-Path $root '.github\workflows\build-latest.yml') -Raw -Encoding UTF8
 $selfContainedLauncherSource = Get-Content -LiteralPath $selfContainedLauncher -Raw -Encoding UTF8
 $installerDefaultsSource = Get-Content -LiteralPath (Join-Path $root 'packaging\defaults\appsettings.json') -Raw -Encoding UTF8
@@ -146,6 +151,8 @@ if ($appUpdateServiceSource -notmatch 'CodexAccountManager["'']\s*,\s*["'']versi
     $appUpdateServiceSource -notmatch [regex]::Escape('--refresh-native-fast-bridge-after-update') -or
     $appUpdateServiceSource -notmatch '\$_\.CommandLine\.IndexOf\(\$gatewayArgument,[^\r\n]+\)\s+-lt\s+0' -or
     $programSource -notmatch 'PreserveExistingGatewayArgument' -or
+    $windowsInstallerSource -notmatch [regex]::Escape('--preserve-existing-pat-gateway') -or
+    $windowsInstallerSource -notmatch [regex]::Escape('--refresh-native-fast-bridge-after-update') -or
     $formSource -notmatch 'restartOnProxyMismatch:\s*!_preserveExistingPatGatewayOnStartup' -or
     $formSource -notmatch 'if\s*\(_preserveExistingPatGatewayOnStartup\)[\s\S]{0,500}return;[\s\S]{0,500}ShutdownOwnedGatewayAsync' -or
     $formSource -notmatch 'TryRefreshNativeFastBridgeAfterUpdate') {
@@ -321,13 +328,15 @@ if ($formSource -notmatch 'AccountRowMinWidth' -or
     $formSource -notmatch 'WorkspaceView\.StatusCheck' -or
     $formSource -match 'WorkspaceView\.TokenManagement' -or
     $formSource -notmatch 'WorkspaceView\.QuotaUsage' -or
+    $formSource -notmatch 'WorkspaceView\.AccountRotation' -or
     $formSource -notmatch '_accountLayout\.ColumnCount\s*=\s*1' -or
     $formSource -notmatch 'CreateAccountSwitchRow\(account,\s*workspaceWidth\)' -or
     $formSource -notmatch 'CreateAccountCard\(selectedAccount,\s*workspaceWidth\)' -or
     $formSource -notmatch 'CreateStatusTokenRow\(account,\s*workspaceWidth\)' -or
     $formSource -match '_tokenManageNavButton' -or
-    $formSource -notmatch '"状态与凭据",\s*222,\s*WorkspaceView\.StatusCheck' -or
-    $formSource -notmatch '"额度显示",\s*274,\s*WorkspaceView\.QuotaUsage' -or
+    $formSource -notmatch '(?s)ConfigureSidebarNavButton\(\s*_statusCheckNavButton,\s*"状态与凭据",\s*\d+,\s*WorkspaceView\.StatusCheck\)' -or
+    $formSource -notmatch '(?s)ConfigureSidebarNavButton\(\s*_quotaUsageNavButton,\s*"额度显示",\s*\d+,\s*WorkspaceView\.QuotaUsage\)' -or
+    $formSource -notmatch '(?s)ConfigureSidebarNavButton\(\s*_accountRotationNavButton,\s*"账号轮换",\s*\d+,\s*WorkspaceView\.AccountRotation\)' -or
     $formSource -notmatch '_showAccountDetail\s*=\s*true' -or
     $formSource -notmatch 'MakeBackIconButton' -or
     $formSource -notmatch 'SelectAccount\(string accountName\)') {
@@ -412,7 +421,7 @@ if ($formSource -notmatch 'var headerTextWidth\s*=\s*Math\.Clamp\(' -or
 }
 if ($formSource -match 'NativeWindowTheme\.SuspendRedraw\(this\)' -or
     $formSource -match 'RecreateHandle\(' -or
-    $formSource -match 'ShowInTaskbar\s*=\s*false' -or
+    $formSource -notmatch 'ShowInTaskbar\s*=\s*true' -or
     $formSource -notmatch 'using var redraw = NativeWindowTheme\.SuspendRedraw\(_accountLayout\)' -or
     $formSource -notmatch 'private readonly BufferedFlowLayoutPanel _cardsPanel' -or
     $formSource -notmatch 'if \(_suppressSearchRender\)' -or
@@ -1254,15 +1263,45 @@ if ($formSource -notmatch 'MeasureActionButtonWidth\("查询重置次数", 184\)
     $formSource -notmatch 'queryResetCount\.UseMnemonic\s*=\s*false') {
     throw 'Usage reset controls must size from the rendered text so high-DPI Chinese labels are not clipped.'
 }
+$prepareWindowsClientMatch = [regex]::Match(
+    $cliServiceSource,
+    '(?s)public async Task<WindowsClientAccountProjection> PrepareWindowsClientAccountAsync\(.*?(?=\r?\n\s*public Task<WindowsClientAccountProjection> SwitchWindowsClientAccountAsync)')
+$directWindowsClientSwitchMatch = [regex]::Match(
+    $cliServiceSource,
+    '(?s)public async Task<WindowsClientAccountProjection> SwitchWindowsClientAccountAsync\(\s*AccountRecord account,\s*string projectPath,\s*WindowsClientMode mode,\s*bool useDreamSkin,\s*ThemeMode appearanceMode,\s*string appearancePresetId = "manager",\s*string\? appearanceLabel = null,\s*bool routeOfficialOAuthThroughGateway = false\s*\).*?(?=\r?\n\s*public async Task<WindowsClientAccountProjection> SwitchWindowsClientAccountWithChatGptFeaturesAsync\()')
+$featureWindowsClientSwitchMatch = [regex]::Match(
+    $cliServiceSource,
+    '(?s)public async Task<WindowsClientAccountProjection> SwitchWindowsClientAccountWithChatGptFeaturesAsync\(.*?(?=\r?\n\s*private async Task<WindowsClientAccountProjection> SwitchWindowsClientAccountCoreAsync\()')
 $switchWindowsClientMatch = [regex]::Match(
     $cliServiceSource,
-    '(?s)public async Task<WindowsClientAccountProjection> SwitchWindowsClientAccountAsync\(.*?(?=\r?\n\s*private async Task<LoginStatus> ValidateWindowsClientAccountAsync)')
+    '(?s)private async Task<WindowsClientAccountProjection> SwitchWindowsClientAccountCoreAsync\(.*?(?=\r?\n\s*private static bool RequiresWindowsClientShutdown\()')
 $launchWindowsClientMatch = [regex]::Match(
     $cliServiceSource,
     '(?s)public bool LaunchWindowsClient\(.*?(?=\r?\n\s*public void RepairCodexPlusPlusScheduledTask)')
 $launchOfficialCodexMatch = [regex]::Match(
     $cliServiceSource,
     '(?s)private static bool LaunchOfficialCodex\(.*?(?=\r?\n\s*internal static ProcessStartInfo BuildOfficialCodexActivationStartInfo)')
+$launchOfficialCodexEntryMatch = [regex]::Match(
+    $cliServiceSource,
+    '(?s)private static bool LaunchOfficialCodex\(.*?(?=\r?\n\s*private static OfficialCodexLaunchAttemptOutcome CompleteOfficialCodexLaunchAttempt)')
+$completeOfficialCodexLaunchAttemptMatch = [regex]::Match(
+    $cliServiceSource,
+    '(?s)private static OfficialCodexLaunchAttemptOutcome CompleteOfficialCodexLaunchAttempt\(.*?(?=\r?\n\s*private static OfficialCodexMainPageWaitOutcome WaitForOfficialCodexMainPageReady)')
+$nativeFastAttachMatch = [regex]::Match(
+    $cliServiceSource,
+    '(?s)private static Task<OfficialCodexNativeFastAttachOutcome> AttachNativeFastBridgeWhenOfficialCodexIsReady\(.*?(?=\r?\n\s*private static (?:bool|void) StopOwnedNativeFastBridgeProcess)')
+$rendererPatchOutcomeWaitMatch = [regex]::Match(
+    $nativeFastBridgeSource,
+    '(?s)internal static NativeFastPatchWaitOutcome WaitForRendererPatchOutcome\(.*?(?=\r?\n\s*internal static async Task<bool> TryApplyAccountDisplayAsync)')
+$recoverOfficialCodexLaunchMatch = [regex]::Match(
+    $cliServiceSource,
+    '(?s)private static bool TryRecoverOfficialCodexLaunchWithoutRendererPatch\(.*?(?=\r?\n\s*private static bool WaitForWindowsClientProcessAndPortRelease)')
+$updateNativeFastRefreshMatch = [regex]::Match(
+    $cliServiceSource,
+    '(?s)internal static bool TryRefreshNativeFastBridgeAfterUpdate\(\).*?(?=\r?\n\s*private static bool TryAttachNativeFastBridgeToExistingOfficialCodex\()')
+$programSelfTestMatch = [regex]::Match(
+    $programSource,
+    '(?s)private static int RunSelfTest\(\).*?(?=\r?\n\s*private static bool IsWindowsClientSelfTestSkipped)')
 $openWindowsClientThreadMatch = [regex]::Match(
     $cliServiceSource,
     '(?s)public Task OpenWindowsClientThreadAsync\(.*?(?=\r?\n\s*public void OpenWindowsClientThread)')
@@ -1271,21 +1310,71 @@ $taskLauncherScriptMatch = [regex]::Match(
     '(?s)private static string BuildCodexPlusPlusTaskLauncherScript\(\).*?(?=\r?\n\s*internal static void ValidateCodexPlusPlusTaskLauncherScript)')
 $launchAccountMatch = [regex]::Match(
     $formSource,
-    '(?s)private async Task LaunchAccountAsync\(.*?(?=\r?\n\s*private async Task LaunchCliAccountAsync)')
-if (-not $switchWindowsClientMatch.Success -or
+    '(?s)private async Task<bool> LaunchAccountAsync\(.*?(?=\r?\n\s*private async Task LaunchCliAccountAsync)')
+$accountBindingKeyMatch = [regex]::Match(
+    $cliServiceSource,
+    '(?s)public string\? GetChatGptFeatureIdentityBindingKey\(.*?(?=\r?\n\s*internal static string MinimalQuotaTestModelId)')
+$queueAccountDisplayMatch = [regex]::Match(
+    $cliServiceSource,
+    '(?s)private void QueueOfficialAccountDisplay\(.*?(?=\r?\n\s*private async Task TryApplyOfficialAccountDisplayAsync\()')
+$applyOfficialAccountDisplayMatch = [regex]::Match(
+    $cliServiceSource,
+    '(?s)private async Task TryApplyOfficialAccountDisplayAsync\(.*?(?=\r?\n\s*private static AccountRecord SnapshotAccountForDisplay\()')
+$readAccountIdentityMatch = [regex]::Match(
+    $appServerClientSource,
+    '(?s)public async Task<CodexAccountIdentity\?> ReadAccountIdentityAsync\(.*?(?=\r?\n\s*public async Task<IReadOnlyList<CodexThreadSummary>> ListThreadsAsync\()')
+$nativeAccountDisplayMatch = [regex]::Match(
+    $nativeFastBridgeSource,
+    '(?s)internal static async Task<bool> TryApplyAccountDisplayAsync\(.*?(?=\r?\n\s*private static ProcessStartInfo BuildStartInfo\()')
+$buildAccountDisplayScriptMatch = [regex]::Match(
+    $nativeFastBridgeSource,
+    '(?s)internal static string BuildAccountDisplayScript\(.*?(?=\r?\n\s*private static string\? NormalizeAccountDisplayText\()')
+if (-not $prepareWindowsClientMatch.Success -or
+    -not $directWindowsClientSwitchMatch.Success -or
+    -not $featureWindowsClientSwitchMatch.Success -or
+    -not $switchWindowsClientMatch.Success -or
     -not $launchWindowsClientMatch.Success -or
     -not $launchOfficialCodexMatch.Success -or
+    -not $launchOfficialCodexEntryMatch.Success -or
+    -not $completeOfficialCodexLaunchAttemptMatch.Success -or
+    -not $nativeFastAttachMatch.Success -or
+    -not $rendererPatchOutcomeWaitMatch.Success -or
+    -not $recoverOfficialCodexLaunchMatch.Success -or
+    -not $updateNativeFastRefreshMatch.Success -or
+    -not $programSelfTestMatch.Success -or
     -not $openWindowsClientThreadMatch.Success -or
     -not $taskLauncherScriptMatch.Success -or
-    -not $launchAccountMatch.Success) {
+    -not $launchAccountMatch.Success -or
+    -not $accountBindingKeyMatch.Success -or
+    -not $queueAccountDisplayMatch.Success -or
+    -not $applyOfficialAccountDisplayMatch.Success -or
+    -not $readAccountIdentityMatch.Success -or
+    -not $nativeAccountDisplayMatch.Success -or
+    -not $buildAccountDisplayScriptMatch.Success) {
     throw 'Could not isolate the desktop switch, launch, chat-open, and UI launch methods for safety assertions.'
 }
+$prepareWindowsClientMethod = $prepareWindowsClientMatch.Value
+$directWindowsClientSwitchMethod = $directWindowsClientSwitchMatch.Value
+$featureWindowsClientSwitchMethod = $featureWindowsClientSwitchMatch.Value
 $switchWindowsClientMethod = $switchWindowsClientMatch.Value
 $launchWindowsClientMethod = $launchWindowsClientMatch.Value
 $launchOfficialCodexMethod = $launchOfficialCodexMatch.Value
+$launchOfficialCodexEntryMethod = $launchOfficialCodexEntryMatch.Value
+$completeOfficialCodexLaunchAttemptMethod = $completeOfficialCodexLaunchAttemptMatch.Value
+$nativeFastAttachMethod = $nativeFastAttachMatch.Value
+$rendererPatchOutcomeWaitMethod = $rendererPatchOutcomeWaitMatch.Value
+$recoverOfficialCodexLaunchMethod = $recoverOfficialCodexLaunchMatch.Value
+$updateNativeFastRefreshMethod = $updateNativeFastRefreshMatch.Value
+$programSelfTestMethod = $programSelfTestMatch.Value
 $openWindowsClientThreadMethod = $openWindowsClientThreadMatch.Value
 $taskLauncherScriptMethod = $taskLauncherScriptMatch.Value
 $launchAccountMethod = $launchAccountMatch.Value
+$accountBindingKeyMethod = $accountBindingKeyMatch.Value
+$queueAccountDisplayMethod = $queueAccountDisplayMatch.Value
+$applyOfficialAccountDisplayMethod = $applyOfficialAccountDisplayMatch.Value
+$readAccountIdentityMethod = $readAccountIdentityMatch.Value
+$nativeAccountDisplayMethod = $nativeAccountDisplayMatch.Value
+$buildAccountDisplayScriptMethod = $buildAccountDisplayScriptMatch.Value
 
 if ($cliServiceSource -notmatch 'LaunchWindowsClient' -or
     $cliServiceSource -notmatch 'ResolveCodexPlusPlusLauncherPath' -or
@@ -1319,18 +1408,64 @@ if ($cliServiceSource -notmatch 'AccessTokenSwitchValidationCacheLifetime' -or
     $programSource -notmatch '--repair-codex-plus-plus-task') {
     throw 'Explicit status checks must retain validation caches, switching must stay off the UI thread, and legacy task repair must remain explicit only.'
 }
-if ($switchWindowsClientMethod -notmatch 'ValidateWindowsClientAccountAsync\(\s*account,\s*localOnly:\s*true,\s*accessTokenMode:\s*AccessTokenSharedProfileMode\.ApiCompatible\)' -or
+if (([regex]::Matches(
+        $directWindowsClientSwitchMethod,
+        'SwitchWindowsClientAccountCoreAsync\s*\(')).Count -ne 1 -or
+    $directWindowsClientSwitchMethod -notmatch '(?s)return await SwitchWindowsClientAccountCoreAsync\(\s*account,\s*projectPath,\s*mode,\s*useDreamSkin,\s*appearanceMode,\s*appearancePresetId,\s*appearanceLabel,\s*AccessTokenSharedProfileMode\.ApiCompatible,\s*chatGptFeatureAccount:\s*null,\s*routeOfficialOAuthThroughGateway\s*\);' -or
+    $directWindowsClientSwitchMethod -match 'AccessTokenSharedProfileMode\.ChatGptDesktop' -or
+    ([regex]::Matches(
+        $featureWindowsClientSwitchMethod,
+        'SwitchWindowsClientAccountCoreAsync\s*\(')).Count -ne 1 -or
+    $featureWindowsClientSwitchMethod -notmatch '(?s)return await SwitchWindowsClientAccountCoreAsync\(\s*account,\s*projectPath,\s*WindowsClientMode\.OfficialCodex,\s*useDreamSkin,\s*appearanceMode,\s*appearancePresetId,\s*appearanceLabel,\s*AccessTokenSharedProfileMode\.ChatGptDesktop,\s*chatGptFeatureAccount,\s*routeOfficialOAuthThroughGateway:\s*false\s*\);' -or
+    $featureWindowsClientSwitchMethod -match 'AccessTokenSharedProfileMode\.ApiCompatible') {
+    throw 'Normal PAT/API startup must pass ApiCompatible with no OAuth feature account, while the explicit dual-login entry must pass both the model and ChatGPT OAuth accounts.'
+}
+if ($switchWindowsClientMethod -notmatch 'ValidateWindowsClientAccountAsync\(\s*account,\s*localOnly:\s*true,\s*accessTokenMode:\s*accessTokenMode,\s*chatGptFeatureAccount:\s*chatGptFeatureAccount\)' -or
     $switchWindowsClientMethod -notmatch 'sharedProfileAlreadySelected' -or
     $switchWindowsClientMethod -notmatch 'CreateReusedSharedProfileProjection' -or
     $switchWindowsClientMethod -notmatch 'if\s*\(sharedProfileAlreadySelected\)' -or
     $switchWindowsClientMethod -notmatch 'RequiresWindowsClientShutdown\(sharedProfileAlreadySelected\)' -or
     $switchWindowsClientMethod -match 'if\s*\(sharedProfileAlreadySelected\)[\s\S]*?StopWindowsClientProcesses[\s\S]*?CreateReusedSharedProfileProjection' -or
     $switchWindowsClientMethod -notmatch 'else[\s\S]*?StopWindowsClientProcesses\(shutdownTargets\)' -or
+    $switchWindowsClientMethod -notmatch '(?s)StopWindowsClientProcesses\(shutdownTargets\);\s*if \(!WaitForWindowsClientProcessAndPortRelease\(\s*shutdownTargets,\s*shutdownNativeFastPorts,\s*launchGeneration,.*?\)\).*?throw new TimeoutException\(.*?ProjectWindowsClientAccount\(' -or
     $switchWindowsClientMethod -notmatch 'projection\.ClientLaunchStarted\s*=\s*LaunchWindowsClient\(' -or
+    $switchWindowsClientMethod -notmatch 'allowOfficialRendererPatch:\s*ShouldApplyOfficialRendererPatch\(' -or
     $switchWindowsClientMethod -notmatch 'projection\.ClientLaunchError' -or
     $switchWindowsClientMethod -notmatch 'must not silently restore the old account' -or
     $switchWindowsClientMethod -match 'SharedHistoryMerger\.Merge') {
     throw 'Switching must use a same-profile fast path, project only on a real account change, and never roll credentials back after a launcher failure.'
+}
+if ($prepareWindowsClientMethod -notmatch 'WindowsClientSwitchMutexName' -or
+    $prepareWindowsClientMethod -notmatch '(?s)WindowsClientSwitchMutexName.*?ValidateWindowsClientAccountAsync\(.*?CanReuseSharedProfileWithoutNetwork\(' -or
+    $prepareWindowsClientMethod -match 'localOnly:\s*true' -or
+    $prepareWindowsClientMethod -notmatch 'BeginWindowsClientLaunchGeneration\(\)' -or
+    $prepareWindowsClientMethod -notmatch 'CaptureWindowsClientProcessSnapshots\(\)' -or
+    $prepareWindowsClientMethod -notmatch 'WaitForOfficialCodexSwitchQuiescence\(' -or
+    $prepareWindowsClientMethod -notmatch '(?s)WaitForOfficialCodexSwitchQuiescence\(.*?ProjectWindowsClientAccount\(' -or
+    $switchWindowsClientMethod -notmatch 'WaitForOfficialCodexSwitchQuiescence\(' -or
+    $cliServiceSource -notmatch 'TryAreOfficialCodexProcessesAbsent' -or
+    $cliServiceSource -notmatch 'TryGetWindowsAppsPackageFamily' -or
+    $cliServiceSource -notmatch 'trustedPublisherId\.Equals\(candidatePublisherId') {
+    throw 'CLI and desktop credential projection must share the switch mutex and reject old/new same-family Codex processes before writing the shared profile.'
+}
+$updateTokenFlow = [regex]::Match(
+    $formSource,
+    '(?s)private async Task UpdateTokenAsync\(AccountRecord account\).*?(?=\r?\n\s*private async Task LoginWithChatGptAsync)')
+if (-not $updateTokenFlow.Success -or
+    $accountDialogSource -notmatch '_authKindBox\.Items\.AddRange\(\["Access Token",\s*"兼容 API",\s*"通过 ChatGPT 登录（官方）"\]\);' -or
+    $formSource -notmatch 'ConfigureSidebarCommandButton\(_addAccountNavButton,\s*"新增账号"' -or
+    $formSource -notmatch '_addAccountNavButton\.Click \+= \(_, _\) => AddAccount\(\);' -or
+    $addAccountFlow.Value -notmatch 'dialog\.ApiKeyValue' -or
+    $addAccountFlow.Value -notmatch '(?s)account\.IsAccessToken.*?dialog\.AccessTokenValue.*?LoginWithTokenAsync\(' -or
+    $formSource -notmatch '(?s)GetCredentialActionText\(AccountRecord account\).*?account\.IsCompatibleApi\s*\?\s*"编辑 API"\s*:\s*"更新 Token"' -or
+    $statusTokenRowLayout.Value -notmatch 'UpdateTokenAsync\(account\)' -or
+    $updateTokenFlow.Value -notmatch '(?s)if \(account\.IsCompatibleApi\)\s*\{\s*await EditAccountAsync\(account\);\s*return;\s*\}' -or
+    $updateTokenFlow.Value -notmatch '(?s)new TokenDialog\(account\.Name, account\.CodexHome, _palette\).*?LoginWithTokenAsync\(account, token,' -or
+    $accountSwitchRowLayout.Value -notmatch '(?s)"Codex 启动".*?LaunchAccountAsync\(account, WindowsClientMode\.OfficialCodex\)' -or
+    $launchAccountMethod -notmatch 'SwitchWindowsClientAccountAsync\(\s*account,\s*projectPath,\s*mode,' -or
+    $switchWindowsClientMethod -notmatch '(?s)if \(account\.IsCompatibleApi\).*?EnsureCompatibleApiLaunchPreflightAsync\(account\)' -or
+    $switchWindowsClientMethod -notmatch 'projection\.ClientLaunchStarted\s*=\s*LaunchWindowsClient\(\s*account,\s*projectPath,\s*projection\.DefaultCodexHome,\s*mode,') {
+    throw 'Access Token and compatible-API quick credential actions and their official Codex LaunchWindowsClient path must remain available.'
 }
 if ($launchWindowsClientMethod -notmatch 'TryLaunchCodexPlusPlusViaScheduledTask' -or
     $launchWindowsClientMethod -notmatch 'LaunchOfficialCodex' -or
@@ -1349,14 +1484,122 @@ if ($launchWindowsClientMethod -notmatch 'TryLaunchCodexPlusPlusViaScheduledTask
     $launchWindowsClientMethod -match 'StartCodexPlusPlusElevated|Verb\s*=\s*"runas"|new\s+ProcessStartInfo\("powershell\.exe"\)') {
     throw 'The normal Start path must accept Codex++ quickly, finish fresh-window/bridge readiness in the background, enable fast startup, capture launcher errors, and avoid an implicit elevated PowerShell fallback.'
 }
-if ($launchOfficialCodexMethod -notmatch 'BuildOfficialCodexActivationStartInfo\(projectPath\)' -or
+if ($launchWindowsClientMethod -notmatch '(?s)var sameAccountShutdownTargets = CaptureWindowsClientProcessSnapshots\(\);.*?WaitForWindowsClientProcessAndPortRelease\(\s*sameAccountShutdownTargets,.*?\)\s*\|\|\s*!WaitForOfficialCodexSwitchQuiescence\(\s*launchGeneration,') {
+    throw 'An unhealthy same-account official client must pass the global quiescence gate before replacement activation.'
+}
+$noRendererFastPathMatch = [regex]::Match(
+    $launchWindowsClientMethod,
+    '(?s)if \(ShouldPreserveExistingOfficialWindow\(.*?allowOfficialRendererPatch\)\)\s*\{.*?official-same-profile-window-preserved.*?return true;\s*\}.*?var existingOfficialClientHealthy\s*=\s*\r?\n?\s*IsWindowsClientRuntimeHealthySince\(DateTime\.MinValue\);')
+if (-not $noRendererFastPathMatch.Success -or
+    $noRendererFastPathMatch.Value -match 'StopWindowsClientProcesses' -or
+    $noRendererFastPathMatch.Value -match 'TryAttachNativeFastBridgeToExistingOfficialCodex.*?official-same-profile-window-preserved|IsWindowsClientRuntimeHealthySince.*?official-same-profile-window-preserved' -or
+    $noRendererFastPathMatch.Value -notmatch 'BuildNewThreadDeepLink\(projectPath\)') {
+    throw 'Dual-login and pure OAuth same-profile launches must preserve an existing official window even while runtime health is transient, without probing the renderer bridge or stopping Codex.'
+}
+if ($cliServiceSource -notmatch '(?s)private static bool ShouldPreserveExistingOfficialWindow\(.*?return !switchRequired &&.*?mode == WindowsClientMode\.OfficialCodex &&.*?!useDreamSkin &&.*?hasExistingOfficialWindow &&.*?!allowOfficialRendererPatch;') {
+    throw 'The existing dual-login/OAuth window-preservation decision must remain independent of transient runtime health.'
+}
+if ($updateNativeFastRefreshMethod -notmatch 'allowRendererReload:\s*false' -or
+    $updateNativeFastRefreshMethod -match 'allowRendererReload:\s*true') {
+    throw 'Post-update bridge maintenance must never reload a renderer without the routes and IPC readiness/recovery transaction.'
+}
+if ($launchOfficialCodexEntryMethod -notmatch 'ActivateOfficialCodexPackage\(' -or
     $cliServiceSource -notmatch 'new ProcessStartInfo\(BuildNewThreadDeepLink\(projectPath\)\)' -or
     $cliServiceSource -notmatch 'ValidateOfficialCodexActivation' -or
+    $launchOfficialCodexEntryMethod -match 'Process\.Start\(BuildOfficialCodexActivationStartInfo\(projectPath\)\)' -or
     $launchOfficialCodexMethod -match 'new ProcessStartInfo\(clientPath\)' -or
     $launchOfficialCodexMethod -match 'UseShellExecute\s*=\s*false' -or
     $launchOfficialCodexMethod -match 'startInfo\.Environment\[' -or
     $launchOfficialCodexMethod -match 'OpenNewTaskAfterWindowsClientLaunchInBackground') {
-    throw 'The official MSIX Codex client must be activated through codex:// and never started directly from the protected WindowsApps executable.'
+    throw 'The official MSIX Codex client must use identity-returning package activation; codex:// project delivery cannot bypass readiness, and the protected WindowsApps executable must never be started directly.'
+}
+if ($cliServiceSource -notmatch '_ = candidate\.Handle;' -or
+    $cliServiceSource -notmatch 'activationProcess\.Kill\(\);' -or
+    $cliServiceSource -match 'activationProcess\.Kill\(entireProcessTree:' -or
+    $cliServiceSource -match 'StartTimeUtcTicks:\s*null' -or
+    $cliServiceSource -notmatch '(?s)catch \(OfficialCodexActivationIdentityException\).*?a second package activation.*?throw;' -or
+    $cliServiceSource -notmatch '(?s)private static bool TryLaunchOfficialCodexFallback\(.*?catch \(OfficialCodexActivationIdentityException\)\s*\{.*?return false;\s*\}.*?Process\.Start\(BuildOfficialCodexActivationStartInfo\(projectPath\)\)' -or
+    $cliServiceSource -notmatch 'TryGetWindowsAppsPackageFamily' -or
+    $cliServiceSource -notmatch 'trustedIdentityName\.Equals\(candidateIdentityName' -or
+    $cliServiceSource -notmatch 'trustedPublisherId\.Equals\(candidatePublisherId') {
+    throw 'Official package activation must hold an immutable process handle, fail closed on unprovable identity, and trust only exact or same-family WindowsApps process paths.'
+}
+$initialReadinessIndex = $completeOfficialCodexLaunchAttemptMethod.IndexOf(
+    'var initialReadiness = WaitForOfficialCodexMainPageReady(')
+$initialReadyGateIndex = $completeOfficialCodexLaunchAttemptMethod.IndexOf(
+    'if (initialReadiness != OfficialCodexMainPageWaitOutcome.Ready)')
+$postPatchBaselineIndex = $completeOfficialCodexLaunchAttemptMethod.IndexOf(
+    'var postPatchBaseline = CaptureOfficialCodexLaunchLogBaseline();')
+$rendererPatchIndex = $completeOfficialCodexLaunchAttemptMethod.IndexOf(
+    'AttachNativeFastBridgeWhenOfficialCodexIsReady(')
+$postPatchReadinessIndex = $completeOfficialCodexLaunchAttemptMethod.IndexOf(
+    'var postPatchReadiness = WaitForOfficialCodexMainPageReady(')
+if ($initialReadinessIndex -lt 0 -or
+    $initialReadyGateIndex -le $initialReadinessIndex -or
+    $postPatchBaselineIndex -le $initialReadyGateIndex -or
+    $rendererPatchIndex -le $postPatchBaselineIndex -or
+    $completeOfficialCodexLaunchAttemptMethod -notmatch '(?s)var initialReadiness = WaitForOfficialCodexMainPageReady\(\s*launchLogBaseline,\s*activationIdentity,\s*OfficialCodexPrimaryPageReadyTimeout,\s*launchGeneration,\s*OfficialCodexLogReadinessStage\.InitialLaunch,\s*observedProcessTree\)' -or
+    $completeOfficialCodexLaunchAttemptMethod -match 'WaitForWindowsClientRuntimeHealthy\(' -or
+    $completeOfficialCodexLaunchAttemptMethod.Substring(
+        $initialReadyGateIndex,
+        $postPatchBaselineIndex - $initialReadyGateIndex) -notmatch
+        'return OfficialCodexLaunchAttemptOutcome\.RecoverableFailure;') {
+    throw 'Official Codex must observe the initial primary routes and IPC-ready handshake before attaching the renderer patch.'
+}
+if ($postPatchReadinessIndex -le $rendererPatchIndex -or
+    $completeOfficialCodexLaunchAttemptMethod -notmatch '(?s)var postPatchBaseline = CaptureOfficialCodexLaunchLogBaseline\(\);\s*if \(!postPatchBaseline\.IsUsable\).*?return OfficialCodexLaunchAttemptOutcome\.ReadyWithoutRendererPatch;\s*\}.*?AttachNativeFastBridgeWhenOfficialCodexIsReady' -or
+    $completeOfficialCodexLaunchAttemptMethod -notmatch '(?s)var postPatchReadiness = WaitForOfficialCodexMainPageReady\(\s*postPatchBaseline,\s*activationIdentity,\s*OfficialCodexPostPatchPageReadyTimeout,\s*launchGeneration,\s*OfficialCodexLogReadinessStage\.RendererReload,\s*observedProcessTree\)' -or
+    $completeOfficialCodexLaunchAttemptMethod -notmatch '(?s)if \(postPatchReadiness != OfficialCodexMainPageWaitOutcome\.Ready\).*?return OfficialCodexLaunchAttemptOutcome\.RecoverableFailure;') {
+    throw 'A successful official Codex renderer patch must produce a fresh primary routes and IPC-ready handshake.'
+}
+if ($completeOfficialCodexLaunchAttemptMethod -notmatch 'if \(!nativeFastPort\.HasValue \|\| !allowRendererPatch\)' -or
+    $completeOfficialCodexLaunchAttemptMethod -notmatch 'official-renderer-patch-not-required' -or
+    $cliServiceSource -notmatch '(?s)private static bool ShouldApplyOfficialRendererPatch\(.*?AccessTokenSharedProfileMode\.ApiCompatible.*?chatGptFeatureAccount == null.*?modelAccount\.IsAccessToken \|\| modelAccount\.IsCompatibleApi' -or
+    $nativeFastAttachMethod -notmatch 'WaitForRendererPatchOutcome' -or
+    $nativeFastAttachMethod -notmatch 'NativeFastPatchWaitOutcome\.SkippedWithoutReload' -or
+    $nativeFastAttachMethod -notmatch 'NativeFastPatchWaitOutcome\.TimedOutWithoutReload' -or
+    $nativeFastAttachMethod -notmatch 'NativeFastPatchWaitOutcome\.TimedOutAfterReloadAttempt' -or
+    $nativeFastAttachMethod -notmatch 'StopOwnedNativeFastBridgeProcess\(bridgeProcess\)' -or
+    $nativeFastAttachMethod -match 'bridgeStarted\s*\?\s*OfficialCodexNativeFastAttachOutcome\.ReloadMayHaveStarted' -or
+    $rendererPatchOutcomeWaitMethod -notmatch 'BuildRendererPatchSkippedEventName' -or
+    $rendererPatchOutcomeWaitMethod -notmatch 'BuildRendererReloadAttemptedEventName' -or
+    $rendererPatchOutcomeWaitMethod -notmatch 'reloadAttemptObserved' -or
+    $nativeFastBridgeSource -notmatch '(?s)notifyReloadAttempted\(\);\s*await _connection\.SendAsync\(\s*"Page\.reload"' -or
+    $nativeFastBridgeSource -notmatch 'renderer_patch_skipped') {
+    throw 'Dual-login must skip the optional renderer reload, and generic launch recovery must require an explicit owner-scoped reload-attempt signal before restarting Codex.'
+}
+$recoveryActivationCallCount = [regex]::Matches(
+    $recoverOfficialCodexLaunchMethod,
+    'ActivateOfficialCodexPackage\s*\(').Count
+$recoveryEntryCallCount = [regex]::Matches(
+    $launchOfficialCodexEntryMethod,
+    'TryRecoverOfficialCodexLaunchWithoutRendererPatch\s*\(').Count
+if ($recoveryActivationCallCount -ne 1 -or
+    $recoveryEntryCallCount -ne 1 -or
+    $launchOfficialCodexEntryMethod -notmatch '(?s)if \(firstAttempt is\s*OfficialCodexLaunchAttemptOutcome\.Ready or\s*OfficialCodexLaunchAttemptOutcome\.ReadyWithoutRendererPatch\)\s*\{\s*return true;\s*\}' -or
+    $launchOfficialCodexEntryMethod -notmatch '(?s)if \(firstAttempt == OfficialCodexLaunchAttemptOutcome\.Superseded\)\s*\{\s*return false;\s*\}' -or
+    $launchOfficialCodexEntryMethod -notmatch 'DecideOfficialCodexRecovery\(firstAttempt, recoveryAlreadyAttempted:\s*false\)' -or
+    $recoverOfficialCodexLaunchMethod -notmatch 'retryIdentity\s*=\s*ActivateOfficialCodexPackage\(\);' -or
+    $recoverOfficialCodexLaunchMethod -notmatch 'nativeFastPort:\s*null' -or
+    $recoverOfficialCodexLaunchMethod -notmatch '(?s)var succeeded = retryOutcome is\s*OfficialCodexLaunchAttemptOutcome\.Ready or\s*OfficialCodexLaunchAttemptOutcome\.ReadyWithoutRendererPatch;' -or
+    $recoverOfficialCodexLaunchMethod -notmatch 'RememberWindowsClientProcessTree\(retryIdentity, observedRetryProcessTree\)' -or
+    $recoverOfficialCodexLaunchMethod -notmatch 'WaitForOfficialCodexSwitchQuiescence\(' -or
+    $launchOfficialCodexEntryMethod -notmatch 'RememberWindowsClientProcessTree\(\s*activationIdentity,\s*observedFirstAttemptProcessTree\)' -or
+    $recoverOfficialCodexLaunchMethod -notmatch 'RememberWindowsClientProcessTree\(\s*failedActivationIdentity,\s*observedFailedProcessTree\)' -or
+    $recoverOfficialCodexLaunchMethod -notmatch '(?s)CleanupFailedOfficialCodexRetry\(\s*retryIdentity,\s*observedRetryProcessTree,\s*launchGeneration\)' -or
+    $recoverOfficialCodexLaunchMethod -notmatch 'CaptureWindowsClientProcessTreeSnapshots\(activationIdentity\)' -or
+    $recoverOfficialCodexLaunchMethod -notmatch 'WaitForWindowsClientProcessAndPortRelease\(' -or
+    $completeOfficialCodexLaunchAttemptMethod -notmatch '(?s)if \(!nativeFastPort\.HasValue \|\| !allowRendererPatch\)\s*\{.*?return OfficialCodexLaunchAttemptOutcome\.ReadyWithoutRendererPatch;\s*\}.*?AttachNativeFastBridgeWhenOfficialCodexIsReady' -or
+    $recoverOfficialCodexLaunchMethod -match 'SelectOfficialNativeFastCdpPort|AttachNativeFastBridgeWhenOfficialCodexIsReady|BuildOfficialNativeFastActivationArguments' -or
+    ([regex]::Matches(
+        $recoverOfficialCodexLaunchMethod,
+        'TryRecoverOfficialCodexLaunchWithoutRendererPatch\s*\(')).Count -ne 1) {
+    throw 'Official Codex recovery must perform one non-recursive package activation without CDP or a renderer patch.'
+}
+if ($programSource -notmatch '(?s)args\.Contains\("--self-test".*?return RunSelfTest\(\);' -or
+    $programSelfTestMethod -notmatch 'CodexCliService\.ValidateOfficialCodexLaunchRecovery\(\);' -or
+    $programSelfTestMethod -notmatch 'CodexCliService\.ValidateExplicitChatGptFeatureProjection\(\);') {
+    throw 'Program --self-test must execute the official Codex launch-recovery and explicit ChatGPT-feature projection validations.'
 }
 $reviewedOfficialCodexPageUrls = @(
     'app://codex/',
@@ -1847,7 +2090,7 @@ if ($programSource -notmatch 'CodexNativeFastBridge\.ProcessArgument' -or
     $nativeFastBridgeSource -notmatch 'workers\.Add\(target\.Id, worker\);\s*worker\.ActivateReadiness\(\)' -or
     $nativeFastBridgeSource -notmatch 'RequiresReconnect' -or
     $nativeFastBridgeSource -notmatch 'target_reconnect_scheduled' -or
-    $nativeFastBridgeSource -notmatch 'rendererReady\.Reset\(\);\s*return RunWatchAsync' -or
+     $nativeFastBridgeSource -notmatch '(?s)rendererReady\.Reset\(\);.*?rendererPatchSkipped\.Reset\(\);.*?rendererReloadAttempted\.Reset\(\);.*?return RunWatchAsync' -or
     $nativeFastBridgeSource -match 'internal static void ResetRendererPatchReadiness' -or
     $nativeFastBridgeSource -notmatch 'personalAccessToken' -or
     $nativeFastBridgeSource -notmatch 'apikey' -or
@@ -1865,8 +2108,99 @@ if ($programSource -notmatch 'CodexNativeFastBridge\.ProcessArgument' -or
     $nativeFastBridgeSource -notmatch 'UseShellExecute\s*=\s*false' -or
     $nativeFastBridgeSource -notmatch 'CreateNoWindow\s*=\s*true' -or
     $nativeFastBridgeSource -notmatch 'EventResetMode\.ManualReset' -or
-    $nativeFastBridgeSource -match 'Runtime\.evaluate|visibilitychange|new Event\(''focus''\)') {
+    $nativeFastBridgeSource -match 'visibilitychange|new Event\(''focus''\)') {
     throw 'Official Codex PAT/API Fast controls must use identity-scoped Fetch response interception, exact source verification, lifecycle-gated all-renderer readiness, a one-shot controlled reload, and no LiveEdit mutation or retry path.'
+}
+$accountReadCallCount = [regex]::Matches($readAccountIdentityMethod, '"account/read"').Count
+if ($accountReadCallCount -ne 1 -or
+    $readAccountIdentityMethod -notmatch '\["refreshToken"\]\s*=\s*false' -or
+    $readAccountIdentityMethod -match '\["refreshToken"\]\s*=\s*true' -or
+    $appServerClientSource -notmatch 'internal static void ValidateAccountIdentityProtocol\(\)' -or
+    $programSelfTestMethod -notmatch 'CodexAppServerClient\.ValidateAccountIdentityProtocol\(\);') {
+    throw 'The optional account identity must come from one non-refreshing account/read request and retain its protocol self-test.'
+}
+if ($accountBindingKeyMethod -notmatch 'TryReadChatGptAuthAccountId' -or
+    $accountBindingKeyMethod -notmatch 'SHA256\.HashData\(Encoding\.UTF8\.GetBytes\(accountId\)\)' -or
+    $accountBindingKeyMethod -match 'return\s+accountId\s*;') {
+    throw 'ChatGPT display identity binding must expose only a SHA-256 account_id fingerprint.'
+}
+if ($switchWindowsClientMethod -match 'await\s+TryApplyOfficialAccountDisplayAsync' -or
+    $switchWindowsClientMethod -notmatch '(?s)\}\);\s*if \(projectionResult\.ClientLaunchStarted.*?QueueOfficialAccountDisplay\(' -or
+    $switchWindowsClientMethod -notmatch 'successfulLaunchGeneration\s*=\s*launchGeneration' -or
+    $formSource -notmatch '_codex\.QueueCurrentOfficialAccountDisplay\(_accounts\);' -or
+    $queueAccountDisplayMethod -notmatch 'SnapshotAccountForDisplay\(modelAccount\)' -or
+    $queueAccountDisplayMethod -notmatch 'SnapshotAccountForDisplay\(chatGptAccount\)' -or
+    $queueAccountDisplayMethod -notmatch 'Task\.Run\(\(\)\s*=>\s*TryApplyOfficialAccountDisplayAsync' -or
+    $queueAccountDisplayMethod -notmatch 'dualSelections\.Count\s*==\s*1' -or
+    $queueAccountDisplayMethod -notmatch 'oauthSelections\.Length\s*==\s*1') {
+    throw 'Optional account display must run from immutable snapshots after the successful launch result leaves the critical path.'
+}
+$displayIdentityBeforeIndex = $applyOfficialAccountDisplayMethod.IndexOf('var identityBefore =')
+$displayAccountReadIndex = $applyOfficialAccountDisplayMethod.IndexOf('ReadAccountIdentityAsync(')
+$displayIdentityAfterIndex = $applyOfficialAccountDisplayMethod.IndexOf('var identityAfter =')
+$displayMutexIndex = $applyOfficialAccountDisplayMethod.IndexOf('switchMutex.WaitOne(TimeSpan.Zero)')
+$displayProjectionIndex = $applyOfficialAccountDisplayMethod.IndexOf('var selected =')
+$displayFinalIdentityIndex = $applyOfficialAccountDisplayMethod.IndexOf('var finalIdentityBinding =')
+$displayEndpointCountIndex = $applyOfficialAccountDisplayMethod.IndexOf('if (endpoints.Count != 1)')
+$displayInjectionIndex = $applyOfficialAccountDisplayMethod.IndexOf('TryApplyAccountDisplayAsync(')
+if ($displayIdentityBeforeIndex -lt 0 -or
+    $displayAccountReadIndex -le $displayIdentityBeforeIndex -or
+    $displayIdentityAfterIndex -le $displayAccountReadIndex -or
+    $displayMutexIndex -le $displayIdentityAfterIndex -or
+    $displayProjectionIndex -le $displayMutexIndex -or
+    $displayFinalIdentityIndex -le $displayProjectionIndex -or
+    $displayEndpointCountIndex -le $displayFinalIdentityIndex -or
+    $displayInjectionIndex -le $displayEndpointCountIndex -or
+    $applyOfficialAccountDisplayMethod -notmatch 'new CancellationTokenSource\(OfficialAccountDisplayTimeout\)' -or
+    $applyOfficialAccountDisplayMethod -notmatch 'ReadAccountIdentityAsync\([\s\S]*?timeout\.Token\)' -or
+    $applyOfficialAccountDisplayMethod -notmatch 'IsCurrentWindowsClientLaunchGeneration\(launchGeneration\)' -or
+    $applyOfficialAccountDisplayMethod -notmatch 'CanIdentifySharedChatGptFeatureProfileWithoutNetwork\(' -or
+    $applyOfficialAccountDisplayMethod -notmatch 'CanReuseOfficialOAuthSharedProfile\(' -or
+    $applyOfficialAccountDisplayMethod -notmatch 'catch \(OperationCanceledException\)' -or
+    $applyOfficialAccountDisplayMethod -notmatch 'switchMutex\.ReleaseMutex\(\)' -or
+    $applyOfficialAccountDisplayMethod -match '(?s)WriteCodexPlusPlusLaunchDiagnostic\([^;]*(identity\.Email|modelAccount\.Name|chatGptAccount\.Name|ex\.Message)') {
+    throw 'Account display must revalidate the OAuth hash and shared projection under a non-blocking switch mutex, require one owner, use a short timeout, and keep PII out of diagnostics.'
+}
+$accountDisplayRuntimeEvaluateCount = [regex]::Matches(
+    $nativeFastBridgeSource,
+    '"Runtime\.evaluate"').Count
+$accountDisplayMethodRuntimeEvaluateCount = [regex]::Matches(
+    $nativeAccountDisplayMethod,
+    '"Runtime\.evaluate"').Count
+$accountDisplayFrameTreeIndex = $nativeAccountDisplayMethod.IndexOf('"Page.getFrameTree"')
+$accountDisplaySourceIndex = $nativeAccountDisplayMethod.IndexOf('var source = BuildAccountDisplayScript(display);')
+$accountDisplayRuntimeIndex = $nativeAccountDisplayMethod.IndexOf('"Runtime.evaluate"')
+$accountDisplayFinalOwnerIndex = if ($accountDisplaySourceIndex -gt 0) {
+    $nativeAccountDisplayMethod.LastIndexOf('IsExpectedCdpOwner', $accountDisplaySourceIndex)
+}
+else {
+    -1
+}
+if ($accountDisplayRuntimeEvaluateCount -ne 1 -or
+    $accountDisplayMethodRuntimeEvaluateCount -ne 1 -or
+    $nativeFastBridgeSource -match 'Page\.addScriptToEvaluateOnNewDocument' -or
+    $nativeAccountDisplayMethod -notmatch 'IsPrimaryOfficialCodexPageUrl\(target\.PageUrl\)' -or
+    ([regex]::Matches($nativeAccountDisplayMethod, 'IsExpectedCdpOwner\(')).Count -lt 3 -or
+    ([regex]::Matches($nativeAccountDisplayMethod, 'BrowserId\.Equals\(expectedBrowserId')).Count -lt 2 -or
+    $nativeAccountDisplayMethod -notmatch 'targetsBeforeSend\[0\]\.Id\.Equals\(primaryTargets\[0\]\.Id' -or
+    $nativeAccountDisplayMethod -notmatch 'targetsBeforeSend\[0\]\.WebSocketUrl\.AbsoluteUri\.Equals' -or
+    $accountDisplayFrameTreeIndex -lt 0 -or
+    $accountDisplaySourceIndex -le $accountDisplayFrameTreeIndex -or
+    $accountDisplayFinalOwnerIndex -le $accountDisplayFrameTreeIndex -or
+    $accountDisplayRuntimeIndex -le $accountDisplaySourceIndex) {
+    throw 'The PII-bearing account display expression must be the sole Runtime.evaluate call and run only after unique primary-target, frame-tree, browser-id, and immutable owner revalidation.'
+}
+if ($buildAccountDisplayScriptMethod -notmatch 'MutationObserver' -or
+    $buildAccountDisplayScriptMethod -notmatch 'textContent' -or
+    $buildAccountDisplayScriptMethod -notmatch 'observerInstalled' -or
+    $buildAccountDisplayScriptMethod -notmatch 'shellReady' -or
+    $buildAccountDisplayScriptMethod -notmatch 'triggerReady' -or
+    $buildAccountDisplayScriptMethod -notmatch 'displayMounted' -or
+    $buildAccountDisplayScriptMethod -notmatch 'attributeFilter:\s*\["data-state",\s*"aria-labelledby"\]' -or
+    $buildAccountDisplayScriptMethod -notmatch 'classList\.contains\("rounded-full"\)' -or
+    $buildAccountDisplayScriptMethod -notmatch 'observer\.disconnect\(\)' -or
+    $buildAccountDisplayScriptMethod -match 'innerHTML|outerHTML|insertAdjacentHTML|document\.write') {
+    throw 'The account display decorator must remain text-only, idempotent, avatar-fallback aware, lifecycle-observed, and explicit about observer/shell/mount readiness.'
 }
 if ($cliServiceSource -notmatch 'public void CaptureActiveServiceTier\(\)' -or
     $formSource -notmatch '_codex\.CaptureActiveServiceTier\(\)' -or
@@ -2053,6 +2387,11 @@ if (-not $applyAndStartDreamSkinMethod.Success -or
     $applyAndStartDreamSkinMethod.Value -notmatch 'if\s*\(restoreError\s*!=\s*null\)' -or
     $applyAndStartDreamSkinMethod.Value -notmatch 'innerException:\s*applyError') {
     throw 'Applying a picture theme must install, configure, and start in order, then attempt official-appearance rollback without hiding the original failure.'
+}
+if ($cliServiceSource -notmatch '(?s)public Task<bool> ApplyCodexDreamSkinAsync\(.*?RunWithWindowsClientSwitchMutex\(launchGeneration =>.*?StopWindowsClientForAppearanceChange\(launchGeneration\)' -or
+    $cliServiceSource -notmatch '(?s)public Task<bool> RestoreOfficialCodexAppearanceAsync\(.*?RunWithWindowsClientSwitchMutex\(launchGeneration =>.*?StopWindowsClientForAppearanceChange\(launchGeneration\)' -or
+    $cliServiceSource -notmatch '(?s)private static void StopWindowsClientForAppearanceChange\(.*?WaitForOfficialCodexSwitchQuiescence\(') {
+    throw 'Codex appearance changes must share the account-switch mutex and global process-quiescence gate.'
 }
 $restoreOfficialAppearanceMethod = [regex]::Match(
     $dreamSkinServiceSource,
@@ -2451,7 +2790,7 @@ if ($accountStoreSource -notmatch 'OfficialOAuthProviderId\s*=\s*"codex_official
 if ($cliServiceSource -notmatch 'ApiKeyAuthMode\s*=\s*"apikey"' -or
     $cliServiceSource -notmatch '\["auth_mode"\]\s*=\s*ApiKeyAuthMode' -or
     $cliServiceSource -notmatch 'accessTokenMode:\s*AccessTokenSharedProfileMode\.ApiCompatible' -or
-    $cliServiceSource -notmatch 'IsSharedProfileAlreadySelected\(AccountRecord account\)[\s\S]*?AccessTokenSharedProfileMode\.ApiCompatible' -or
+    $cliServiceSource -notmatch 'IsSharedProfileAlreadySelected\(\s*AccountRecord account,\s*bool routeOfficialOAuthThroughGateway = false\s*\)[\s\S]*?AccessTokenSharedProfileMode\.ApiCompatible' -or
     $cliServiceSource -notmatch 'One-click Access Token projection did not write a reusable official-App API-key login' -or
     $cliServiceSource -notmatch 'One-click compatible-API projection did not write a reusable official-App API-key login' -or
     $formSource -match '请在打开的 Codex App 完成一次 ChatGPT 登录' -or
@@ -2486,6 +2825,221 @@ if ($localPatGatewaySource -notmatch 'ProviderBaseUrl\s*=\s*"http://127\.0\.0\.1
     $localPatGatewaySource -notmatch 'GetConfiguredProxyUri\(\)' -or
     $settingsSource -notmatch 'File\.Move\(temporaryPath, _settingsPath, overwrite:\s*true\)') {
     throw 'The local PAT gateway must resolve each token identity, inject the ChatGPT account id, and use the split address/port proxy settings with loopback detection.'
+}
+$preparePatRotationMatch = [regex]::Match(
+    $formSource,
+    '(?s)private async Task PreparePatAutoRotationAsync\(.*?(?=\r?\n\s*private async Task<PatRotationCandidateQuotaStatus> ConfirmPatRotationCandidateQuotaAsync)')
+$waitPatActivationMatch = [regex]::Match(
+    $formSource,
+    '(?s)private async Task<DateTimeOffset> WaitForPatGatewayRotationActivationAsync\(.*?(?=\r?\n\s*private void CompletePatGatewayRotation)')
+$completePatRotationMatch = [regex]::Match(
+    $formSource,
+    '(?s)private void CompletePatGatewayRotation\(.*?(?=\r?\n\s*private void PruneResetPatAutoRotationAccounts)')
+$gatewayHandleMatch = [regex]::Match(
+    $localPatGatewaySource,
+    '(?s)private async Task HandleAsync\(.*?(?=\r?\n\s*private async Task WriteHealthAsync)')
+$gatewayResolveRotationMatch = [regex]::Match(
+    $localPatGatewaySource,
+    '(?s)private GatewayCredential ResolveRotationCredential\(.*?(?=\r?\n\s*private static bool TokenHashesEqual)')
+$gatewayRewriteApiBodyMatch = [regex]::Match(
+    $localPatGatewaySource,
+    '(?s)private static byte\[\] RewriteCompatibleApiRequestBody\(.*?(?=\r?\n\s*private static HttpRequestMessage BuildUpstreamRequest)')
+$gatewayBuildUpstreamMatch = [regex]::Match(
+    $localPatGatewaySource,
+    '(?s)private static HttpRequestMessage BuildUpstreamRequest\(.*?(?=\r?\n\s*private static bool ShouldForwardRequestHeader)')
+$gatewayCompatibleUriMatch = [regex]::Match(
+    $localPatGatewaySource,
+    '(?s)private static bool TryBuildCompatibleApiUpstreamUri\(.*?(?=\r?\n\s*private static bool HasPathPrefix)')
+$initializeGatewayMatch = [regex]::Match(
+    $formSource,
+    '(?s)private async Task InitializePatGatewayOnStartupAsync\(.*?(?=\r?\n\s*private async Task UpgradePatGatewayAtSafeBoundaryAsync)')
+$upgradeGatewayMatch = [regex]::Match(
+    $formSource,
+    '(?s)private async Task UpgradePatGatewayAtSafeBoundaryAsync\(.*?(?=\r?\n\s*private async Task TryRecoverPatAutoRotationLaunchContextAsync)')
+$recoverRotationContextMatch = [regex]::Match(
+    $formSource,
+    '(?s)private async Task TryRecoverPatAutoRotationLaunchContextAsync\(.*?(?=\r?\n\s*private AccountRecord\? FindRotationAccount)')
+$findRotationAccountMatch = [regex]::Match(
+    $formSource,
+    '(?s)private AccountRecord\? FindRotationAccount\(.*?(?=\r?\n\s*private async Task ResumeRecoveredGatewayRotationAsync)')
+$resumeRecoveredRotationMatch = [regex]::Match(
+    $formSource,
+    '(?s)private async Task ResumeRecoveredGatewayRotationAsync\(.*?(?=\r?\n\s*private async Task TogglePatGatewayAsync)')
+$routeDocumentMatch = [regex]::Match(
+    $patGatewayRotationStoreSource,
+    '(?s)private sealed class RouteDocument.*?\r?\n\s*\}\r?\n\}')
+if (-not $preparePatRotationMatch.Success -or
+    -not $waitPatActivationMatch.Success -or
+    -not $completePatRotationMatch.Success -or
+    -not $gatewayHandleMatch.Success -or
+    -not $gatewayResolveRotationMatch.Success -or
+    -not $gatewayRewriteApiBodyMatch.Success -or
+    -not $gatewayBuildUpstreamMatch.Success -or
+    -not $gatewayCompatibleUriMatch.Success -or
+    -not $initializeGatewayMatch.Success -or
+    -not $upgradeGatewayMatch.Success -or
+    -not $recoverRotationContextMatch.Success -or
+    -not $findRotationAccountMatch.Success -or
+    -not $resumeRecoveredRotationMatch.Success -or
+    -not $routeDocumentMatch.Success) {
+    throw 'Could not isolate the PAT/API request-boundary rotation, gateway-upgrade, and running-takeover implementation.'
+}
+if ($settingsSource -notmatch 'PatAutoRotationEnabled\s*\{\s*get;\s*set;\s*\}\s*=\s*true' -or
+    $settingsSource -notmatch 'PatAutoRotationUsedPercentThreshold' -or
+    $patAutoRotationSource -notmatch 'RequiredConsecutiveOfficialObservations\s*=\s*2' -or
+    $patAutoRotationSource -notmatch 'MinimumOfficialObservationSpacing' -or
+    $patAutoRotationSource -notmatch 'ClassifyWindow\(info\.Primary\?\.WindowMinutes\)' -or
+    $patAutoRotationSource -notmatch 'ClassifyWindow\(info\.Secondary\?\.WindowMinutes\)' -or
+    $patAutoRotationSource -notmatch 'EvaluateQuotaSafety' -or
+    $patAutoRotationSource -notmatch 'RecentRequestSafetyMultiplier' -or
+    $patAutoRotationSource -notmatch 'official-100-percent' -or
+    $patAutoRotationSource -notmatch 'http-429' -or
+    $patAutoRotationSource -notmatch 'QuotaSafetyMarginTracker' -or
+    $accountRotationSource -notmatch 'PrimaryResetGracePeriod\s*=\s*TimeSpan\.FromMinutes\(1\)' -or
+    $accountRotationSource -notmatch 'AccountRotationPrimaryCursorAccountKey' -or
+    $accountRotationSource -notmatch 'AccountRotationBackupCursorAccountKey' -or
+    $accountRotationSource -notmatch 'Never expose backup candidates while any primary candidate is still eligible' -or
+    $programSource -notmatch 'PatAutoRotationPolicy\.Validate\(\)' -or
+    $programSource -notmatch 'AccountRotationConfiguration\.Validate\(\)' -or
+    $programSource -notmatch 'PatGatewayRotationStore\.Validate\(\)') {
+    throw 'Account rotation must use persistent primary/backup rings, reset grace, and a dynamic per-request quota safety margin.'
+}
+if ($installerDefaultsSource -notmatch '"PatGatewayEnabled"\s*:\s*true' -or
+    $installerDefaultsSource -notmatch '"PatAutoRotationEnabled"\s*:\s*true' -or
+    $installerDefaultsSource -notmatch '"PatAutoRotationUsedPercentThreshold"\s*:\s*98' -or
+    $oneClickPackageSource -notmatch "'PatAutoRotationEnabled'" -or
+    $oneClickPackageSource -notmatch "'PatAutoRotationUsedPercentThreshold'" -or
+    $oneClickPackageSource -notmatch 'patAutoRotationUsedPercentThreshold') {
+    throw 'The clean one-click package must enable the PAT gateway and 98% automatic request-boundary rotation by default and validate those fields.'
+}
+if ($localPatGatewaySource -notmatch 'RotationProtocolValue\s*=\s*"request-boundary-v3"' -or
+    $patGatewayRotationStoreSource -notmatch 'FileName\s*=\s*"account-auto-rotation-route-v2\.json"' -or
+    $patGatewayRotationStoreSource -notmatch 'LegacyFileName\s*=\s*"pat-auto-rotation-route-v1\.json"' -or
+    $patGatewayRotationStoreSource -notmatch 'SchemaVersion\s*=\s*2' -or
+    $patGatewayRotationStoreSource -notmatch 'LoadLegacyAndMigrate' -or
+    $patGatewayRotationStoreSource -notmatch '(?s)LoadLegacyAndMigrate.*?Save\(legacy\).*?File\.Delete\(_legacyPath\)' -or
+    $patGatewayRotationStoreSource -notmatch 'A corrupt v2 route must not revive a stale legacy route' -or
+    $patGatewayRotationStoreSource -notmatch 'TransportAccountKey' -or
+    $patGatewayRotationStoreSource -notmatch 'existing\.TargetAccountKey, source' -or
+    $patGatewayRotationStoreSource -notmatch 'transport\s*=\s*existing\.TransportAccountKey' -or
+    $routeDocumentMatch.Value -match '(?i)token|email|accountName|apiKey|apiBaseUrl|apiModel|provider' -or
+    $routeDocumentMatch.Value -notmatch 'TransportAccountKey' -or
+    $routeDocumentMatch.Value -notmatch 'SourceAccountKey' -or
+    $routeDocumentMatch.Value -notmatch 'TargetAccountKey' -or
+    $routeDocumentMatch.Value -notmatch 'ArmedAtUtc' -or
+    $routeDocumentMatch.Value -notmatch 'ActivatedAtUtc') {
+    throw 'The v2 route must migrate a live v1 chain atomically and persist only transport/source/target hashes and timestamps.'
+}
+if ($localPatGatewaySource -notmatch 'RotationArmPath\s*=\s*"__rotation/arm"' -or
+    $localPatGatewaySource -notmatch 'RotationClearPath\s*=\s*"__rotation/clear"' -or
+    $localPatGatewaySource -notmatch 'BuildRotationArmPurpose\(payload\)' -or
+    $localPatGatewaySource -notmatch 'LocalPatGatewayControl\.ValidateRequest' -or
+    $localPatGatewaySource -notmatch 'rotation\s*=\s*BuildRotationResponse\(rotation\)' -or
+    $localPatGatewaySource -notmatch 'ApplyRotationAtRequestBoundaryAsync' -or
+    $localPatGatewaySource -notmatch '_rotationActivationGate' -or
+    $localPatGatewaySource -notmatch 'GetActivitySnapshot\(\)\.ActiveModelRequests\s*==\s*0' -or
+    $gatewayHandleMatch.Value -notmatch '(?s)var isModelRequest = IsModelRequest\(.*?ApplyRotationAtRequestBoundaryAsync\(.*?BeginModelRequest\(credential\.AccountKey\).*?RewriteCompatibleApiRequestBodyAsync\(.*?BuildUpstreamRequest\(.*?client\.SendAsync\(' -or
+    $gatewayHandleMatch.Value -notmatch 'StatusCode\s*==\s*HttpStatusCode\.TooManyRequests' -or
+    ([regex]::Matches($gatewayHandleMatch.Value, 'client\.SendAsync\(')).Count -ne 1 -or
+    $gatewayHandleMatch.Value -match '(?i)replay|resend|retry\s*\(') {
+    throw 'The authenticated v3 gateway must activate only at a POST /responses boundary, count the full request lifetime, report state through healthz, send upstream once, and never replay a 429.'
+}
+if ($gatewayResolveRotationMatch.Value -notmatch 'CodexCliService\.ReadAccessTokenCredential' -or
+    $gatewayResolveRotationMatch.Value -notmatch 'ReadOfficialOAuthRotationCredential' -or
+    $gatewayResolveRotationMatch.Value -notmatch 'ChatGptAccountId\s*=\s*accountId' -or
+    $gatewayResolveRotationMatch.Value -notmatch 'AllowIncomingChatGptIdentity\s*=\s*false' -or
+    $gatewayResolveRotationMatch.Value -notmatch 'ApiWireApi\.Equals\("responses",\s*StringComparison\.OrdinalIgnoreCase\)' -or
+    $gatewayResolveRotationMatch.Value -notmatch '(?s)baseUri\.Scheme\.Equals\("http".*?!LocalProxyDetector\.IsLoopbackHost\(baseUri\.Host\)' -or
+    $gatewayResolveRotationMatch.Value -notmatch 'baseUri\.UserInfo' -or
+    $gatewayResolveRotationMatch.Value -notmatch 'baseUri\.Query' -or
+    $gatewayResolveRotationMatch.Value -notmatch 'baseUri\.Fragment' -or
+    $localPatGatewaySource -notmatch 'CompatibleApiRequestBodyMaxBytes' -or
+    $localPatGatewaySource -notmatch 'RewriteCompatibleApiRequestBodyAsync' -or
+    $gatewayRewriteApiBodyMatch.Value -notmatch 'modelCount\s*>\s*1' -or
+    $gatewayRewriteApiBodyMatch.Value -notmatch 'writer\.WriteString\("model",\s*model\.Trim\(\)\)' -or
+    $gatewayRewriteApiBodyMatch.Value -notmatch 'property\.WriteTo\(writer\)' -or
+    $gatewayCompatibleUriMatch.Value -notmatch 'suffix\.Equals\("/responses",\s*StringComparison\.OrdinalIgnoreCase\)' -or
+    $gatewayCompatibleUriMatch.Value -notmatch 'resolved\.Host\.Equals\(baseUri\.Host' -or
+    $gatewayCompatibleUriMatch.Value -notmatch 'resolved\.Port\s*!=\s*baseUri\.Port' -or
+    $gatewayBuildUpstreamMatch.Value -notmatch 'request\.Headers\.Remove\("chatgpt-account-id"\)' -or
+    $gatewayBuildUpstreamMatch.Value -notmatch 'request\.Headers\.Remove\("x-openai-fedramp"\)' -or
+    $gatewayBuildUpstreamMatch.Value -notmatch 'request\.Headers\.TryAddWithoutValidation\("Authorization",\s*"Bearer " \+ credential\.Token\)' -or
+    $gatewayBuildUpstreamMatch.Value -notmatch 'if \(credential\.IsCompatibleApi\)' -or
+    $gatewayBuildUpstreamMatch.Value -notmatch 'SelectChatGptAccountId' -or
+    $localPatGatewaySource -notmatch 'NeverForwardRequestHeaders' -or
+    $localPatGatewaySource -notmatch 'completedModelRequests' -or
+    $localPatGatewaySource -notmatch 'lastQuotaLimitedAccountKey') {
+    throw 'A v3 route must resolve PAT/API/OAuth credentials inside the gateway, bind the target OAuth account id, and never inherit source identity headers.'
+}
+if (([regex]::Matches(
+        $preparePatRotationMatch.Value,
+        'LocalPatGateway\.ArmRotationAsync\(')).Count -ne 1 -or
+    ([regex]::Matches(
+        $preparePatRotationMatch.Value,
+        'WaitForPatGatewayRotationActivationAsync\(')).Count -ne 1 -or
+    ([regex]::Matches(
+        $preparePatRotationMatch.Value,
+        'CompletePatGatewayRotation\(')).Count -ne 1 -or
+    $preparePatRotationMatch.Value -notmatch 'AccountRotationConfiguration\.BuildCandidates' -or
+    $preparePatRotationMatch.Value -notmatch '(?s)if \(candidate\.IsCompatibleApi\).*?EnsureCompatibleApiRotationPreflightAsync.*?else.*?ConfirmPatRotationCandidateQuotaAsync.*?LocalPatGateway\.ArmRotationAsync.*?WaitForPatGatewayRotationActivationAsync.*?CompletePatGatewayRotation' -or
+    $preparePatRotationMatch.Value -notmatch '(?s)temporarilyUnavailable\.UnionWith\(attemptedPrimaryKeys\).*?AccountRotationConfiguration\.BuildCandidates.*?AccountRotationPool\.Backup.*?pendingCandidates\.Enqueue' -or
+    $cliServiceSource -notmatch '(?s)EnsureCompatibleApiRotationPreflightAsync\(.*?GetCompatibleApiRotationBaseUrlValidationError\(account\.ApiBaseUrl\).*?await EnsureCompatibleApiLaunchPreflightAsync\(account, cancellationToken\)' -or
+    $cliServiceSource -notmatch '(?s)GetCompatibleApiRotationBaseUrlValidationError\(.*?baseUri\.Scheme\.Equals\("http".*?!LocalProxyDetector\.IsLoopbackHost\(baseUri\.Host\)' -or
+    $cliServiceSource -notmatch '远程 API 轮换地址必须使用 HTTPS' -or
+    $preparePatRotationMatch.Value -match 'LaunchAccountAsync|OpenOfficialCodexThreadAsync|LocalPatGateway\.ClearRotationAsync|StopWindowsClientProcesses|LaunchWindowsClient' -or
+    $formSource -match 'private async Task WaitForPatAutoRotationBoundaryAsync|private async Task ExecutePatAutoRotationAsync' -or
+    $waitPatActivationMatch.Value -notmatch 'PatGatewayRotationStatus\.Active' -or
+    $waitPatActivationMatch.Value -notmatch 'rotation\.SourceAccountKey' -or
+    $waitPatActivationMatch.Value -notmatch 'rotation\.TargetAccountKey' -or
+    $waitPatActivationMatch.Value -notmatch 'rotation\.ActivatedAtUtc' -or
+    $completePatRotationMatch.Value -notmatch 'SetCurrentAccount\(target\.Name, false, persistSettings:\s*true\)' -or
+    $completePatRotationMatch.Value -notmatch '_usageTracker\.RecordSwitch\(target,\s*"pat-gateway-rotation",\s*activatedAtUtc\)' -or
+    $completePatRotationMatch.Value -notmatch '_launchedOfficialQuotaAccountKey\s*=\s*target\.IsCompatibleApi\s*\?\s*null\s*:\s*targetKey' -or
+    $completePatRotationMatch.Value -notmatch 'ResetPatAutoRotationObservationAfterSwitch\(fallbackApi:\s*enteredBackup\)' -or
+    $completePatRotationMatch.Value -notmatch 'QueueHotRotatedOfficialAccountDisplay\(target,\s*_accounts\)' -or
+    $completePatRotationMatch.Value -notmatch '(?s)if \(!target\.IsCompatibleApi\).*?StartOfficialQuotaRefresh\(target\)' -or
+    $completePatRotationMatch.Value -notmatch 'Codex 未关闭或重启' -or
+    $completePatRotationMatch.Value -match 'LaunchAccountAsync|OpenOfficialCodexThreadAsync|LocalPatGateway\.ClearRotationAsync|StopWindowsClientProcesses|LaunchWindowsClient') {
+    throw 'PAT/OAuth/API rotation must use one preflighted request-boundary state machine, enter backup immediately only after primary candidates fail, and never clear the route, reopen a task, restart Codex, replay a request, or expose an API key over remote HTTP.'
+}
+if ($initializeGatewayMatch.Value -notmatch '_preserveExistingPatGatewayOnStartup' -or
+    $initializeGatewayMatch.Value -notmatch 'restartOnProxyMismatch:\s*!_preserveExistingPatGatewayOnStartup' -or
+    $initializeGatewayMatch.Value -notmatch 'RequiresRotationProtocolUpgradeAsync' -or
+    $initializeGatewayMatch.Value -notmatch 'UpgradePatGatewayAtSafeBoundaryAsync' -or
+    ([regex]::Matches(
+        $upgradeGatewayMatch.Value,
+        'ReadOwnedActivitySnapshotAsync\(')).Count -lt 2 -or
+    ([regex]::Matches(
+        $upgradeGatewayMatch.Value,
+        '_codexTaskBoundaryMonitor\.Inspect\(')).Count -lt 2 -or
+    ([regex]::Matches(
+        $upgradeGatewayMatch.Value,
+        'PatAutoRotationPolicy\.IsGatewayQuiet\(')).Count -lt 2 -or
+    $upgradeGatewayMatch.Value -notmatch 'RequiredConsecutiveSafeBoundaryChecks' -or
+    $upgradeGatewayMatch.Value -notmatch '(?s)ReadOwnedActivitySnapshotAsync\(\).*?_codexTaskBoundaryMonitor\.Inspect\(pendingSinceUtc\).*?ReadOwnedActivitySnapshotAsync\(\).*?_codexTaskBoundaryMonitor\.Inspect\(pendingSinceUtc\).*?RequiresRotationProtocolUpgradeAsync\(\).*?ShutdownIfRunningAsync\(\).*?EnsureRunningAsync\(restartOnProxyMismatch:\s*true\)' -or
+    $upgradeGatewayMatch.Value -notmatch 'TryRecoverPatAutoRotationLaunchContextAsync' -or
+    $upgradeGatewayMatch.Value -match 'LaunchAccountAsync|OpenOfficialCodexThreadAsync|LocalPatGateway\.ClearRotationAsync|ClearPersistedRotationRoute|StopWindowsClientProcesses|LaunchWindowsClient|Application\.Exit') {
+    throw 'An installed v2 manager must preserve the owned v1 gateway until two task/request oracles are quiet, recheck them immediately, replace only the listener, and leave Codex running.'
+}
+if ($recoverRotationContextMatch.Value -notmatch 'IsOfficialWindowsClientRunning\(\)' -or
+    $recoverRotationContextMatch.Value -notmatch 'LocalPatGateway\.ReadActivitySnapshotAsync\(\)' -or
+    $recoverRotationContextMatch.Value -notmatch 'PatGatewayRotationStatus\.Armed' -or
+    $recoverRotationContextMatch.Value -notmatch 'PatGatewayRotationStatus\.Active' -or
+    $recoverRotationContextMatch.Value -notmatch 'FindRotationAccount\(rotation\.TransportAccountKey\)' -or
+    $recoverRotationContextMatch.Value -notmatch 'FindRotationAccount\(rotation\.SourceAccountKey\)' -or
+    $recoverRotationContextMatch.Value -notmatch 'FindRotationAccount\(rotation\.TargetAccountKey\)' -or
+    $recoverRotationContextMatch.Value -notmatch 'IsSharedChatGptFeatureProfileAlreadySelected' -or
+    $recoverRotationContextMatch.Value -notmatch 'IsSharedProfileAlreadySelected' -or
+    $recoverRotationContextMatch.Value -notmatch '(?s)if \(!profileMatches\).*?return;.*?SetCurrentAccount\(logical\.Name, false, persistSettings:\s*true\)' -or
+    $recoverRotationContextMatch.Value -notmatch 'new PatAutoRotationLaunchContext\(' -or
+    $recoverRotationContextMatch.Value -notmatch '_launchedOfficialQuotaAccountKey\s*=\s*!logical\.IsCompatibleApi' -or
+    $recoverRotationContextMatch.Value -notmatch 'ResumeRecoveredGatewayRotationAsync' -or
+    $findRotationAccountMatch.Value -notmatch 'PatGatewayRotationStore\.TryNormalizeAccountKey' -or
+    $findRotationAccountMatch.Value -notmatch '\(account\.IsAccessToken\s*\|\|\s*account\.IsCompatibleApi\s*\|\|\s*account\.IsOfficialOAuth\)' -or
+    $resumeRecoveredRotationMatch.Value -notmatch 'WaitForPatGatewayRotationActivationAsync' -or
+    $resumeRecoveredRotationMatch.Value -notmatch 'CompletePatGatewayRotation' -or
+    ($recoverRotationContextMatch.Value + $resumeRecoveredRotationMatch.Value) -match 'LaunchAccountAsync|OpenOfficialCodexThreadAsync|LocalPatGateway\.ClearRotationAsync|ShutdownIfRunningAsync|StopWindowsClientProcesses|LaunchWindowsClient|Application\.Exit') {
+    throw 'After a side-by-side gateway handoff, the manager must recover the hashed transport/logical route and resume an armed PAT/OAuth/API switch without projecting credentials or restarting Codex.'
 }
 if ($localProxyDetectorSource -notmatch 'DetectPortAsync' -or
     $localProxyDetectorSource -notmatch 'TcpListener\(IPAddress\.Loopback,\s*0\)' -or
@@ -3057,7 +3611,7 @@ if ($formSource -notmatch 'BuildAccountGroups\(\s*visible(?:Accounts)?(?:,\s*(?:
     $formSource -notmatch 'matchingProfiles' -or
     $formSource -notmatch '_codex\.IsSharedCredentialAlreadySelected\(account\)' -or
     $formSource -notmatch 'var remembered = _accounts\.FirstOrDefault' -or
-    $formSource -notmatch 'SetCurrentAccount\(remembered\?\.Name, false\)' -or
+    $formSource -notmatch 'SetCurrentAccount\(remembered\?\.Name, false(?:,\s*persistSettings:\s*persistSettings)?\)' -or
     $formSource -notmatch 'var collapseRows = _collapsedAccountGroups\.Add\(stateKey\)' -or
     $formSource -notmatch 'row\.Visible = !collapseRows' -or
     $formSource -notmatch 'NativeWindowTheme\.SuspendRedraw\(_cardsPanel\)' -or

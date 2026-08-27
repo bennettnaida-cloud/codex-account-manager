@@ -38,6 +38,9 @@ Codex Account Manager 是一个在本机运行的 Codex 多账号管理器。它
 - 通过管理器启动 PAT/API 账号时，在官方 Codex 内显示其原生 Standard/Fast 选择器并保留所选服务层级。
 - 聊天页先显示本地缓存，再通过当前 Codex app-server 在后台同步共享目录与短标题；支持打开、归档、取消归档和永久删除，Codex 暂不可用时仍可使用缓存。
 - 按账号读取官方额度窗口、重置时间、Credits 和可重置次数。
+- 提供使用池与备用池两级账号轮换；PAT、官方 ChatGPT OAuth 和兼容 API 可自定义参与状态与顺序，并在下一次模型请求边界热切换，不关闭 Codex 或重放请求。
+- 轮换位置与 5h 重置时间会持久化；使用池恢复后等待一分钟，再从下一次请求返回使用池。安全余量会根据最近请求消耗动态计算。
+- “状态与凭据”支持逐账号开启安全的客户端元数据透传；授权、Cookie、ChatGPT 账号、组织、项目和工作区身份头始终不会跨账号透传。
 - 从本地 JSONL 与 SQLite 日志统计 Token、缓存写入和逐模型 API 等值成本。
 - 提供 1h、5h、今天、本周、本月趋势、模型分布和 CSV 导出。
 - 在系统配置中管理项目目录、启动目录、HTTP/SOCKS5 上游代理和自动检测；本地 PAT 网关默认随软件启动，也可手动打开或关闭。
@@ -145,7 +148,7 @@ Windows：
 仓库使用 [Build and publish latest packages](https://github.com/bennettnaida-cloud/codex-account-manager/actions/workflows/build-latest.yml) 自动发布：
 
 1. 将经过测试的源码和 README 推送到 `main`。
-2. GitHub Actions 构建并验证 Windows 安装包；macOS 安装包作为独立发布资产维护，不阻塞 Windows CI。
+2. 发布前把根目录 `VERSION` 更新为目标版本；GitHub Actions 构建并验证 Windows 安装包，macOS 安装包作为独立发布资产维护，不阻塞 Windows CI。
 3. 工作流覆盖 `latest` Release 中固定名称的 ZIP、SHA-256 和 `update-manifest.json`。
 4. README 的下载链接始终指向 `latest`，以后无需修改下载地址，也不要把大型 ZIP 提交到 Git 仓库。
 

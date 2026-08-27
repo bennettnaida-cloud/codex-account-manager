@@ -21,6 +21,22 @@ public sealed class AppSettings
     public bool PatGatewayProxyAutoDetect { get; set; } = true;
     public string? PatGatewayProxyScheme { get; set; } = "http";
     public bool PatGatewayEnabled { get; set; } = true;
+    public bool PatAutoRotationEnabled { get; set; } = true;
+    public double PatAutoRotationUsedPercentThreshold { get; set; } =
+        PatAutoRotationPolicy.DefaultUsedPercentThreshold;
+    public bool? AccountRotationEnabled { get; set; }
+    public Dictionary<string, string> AccountRotationPools { get; set; } =
+        new(StringComparer.Ordinal);
+    public List<string> AccountRotationPrimaryOrder { get; set; } = [];
+    public List<string> AccountRotationBackupOrder { get; set; } = [];
+    public string? AccountRotationPrimaryCursorAccountKey { get; set; }
+    public string? AccountRotationBackupCursorAccountKey { get; set; }
+    public Dictionary<string, DateTimeOffset> AccountRotationResetAtUtc { get; set; } =
+        new(StringComparer.Ordinal);
+    public Dictionary<string, bool> CodexFingerprintForwarding { get; set; } =
+        new(StringComparer.Ordinal);
+    public Dictionary<string, string> ChatGptFeatureAccountBindings { get; set; } =
+        new(StringComparer.OrdinalIgnoreCase);
     public int? WindowLeft { get; set; }
     public int? WindowTop { get; set; }
     public int? WindowWidth { get; set; }

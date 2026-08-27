@@ -11,6 +11,19 @@ using System.Text.RegularExpressions;
 
 namespace CodexAccountManager;
 
+internal sealed record CodexAccountDisplay(string? ModelAccountLabel, string ChatGptEmail)
+{
+    internal string? ModelAccountTypeLabel { get; init; }
+}
+
+internal enum NativeFastPatchWaitOutcome
+{
+    Patched,
+    SkippedWithoutReload,
+    TimedOutWithoutReload,
+    TimedOutAfterReloadAttempt
+}
+
 /// <summary>
 /// Applies a fail-closed, in-memory response substitution to the official Codex renderer so
 /// the built-in Standard/Fast picker is available for PAT and API-key authentication.
@@ -403,6 +416,22 @@ internal static class CodexNativeFastBridge
                     expectedBrowserId,
                     ownerPid,
                     ownerStartTicks));
+            using var rendererPatchSkipped = new EventWaitHandle(
+                initialState: false,
+                mode: EventResetMode.ManualReset,
+                name: BuildRendererPatchSkippedEventName(
+                    port,
+                    expectedBrowserId,
+                    ownerPid,
+                    ownerStartTicks));
+            using var rendererReloadAttempted = new EventWaitHandle(
+                initialState: false,
+                mode: EventResetMode.ManualReset,
+                name: BuildRendererReloadAttemptedEventName(
+                    port,
+                    expectedBrowserId,
+                    ownerPid,
+                    ownerStartTicks));
             var ownsSingleton = false;
             try
             {
@@ -423,6 +452,8 @@ internal static class CodexNativeFastBridge
                 // Only the process that acquired the singleton may clear a previous state.
                 // A duplicate launcher must not erase readiness published by the live owner.
                 rendererReady.Reset();
+                rendererPatchSkipped.Reset();
+                rendererReloadAttempted.Reset();
                 return RunWatchAsync(
                         port,
                         expectedBrowserId,
@@ -431,6 +462,8 @@ internal static class CodexNativeFastBridge
                         ownerRoot,
                         allowRendererReload,
                         rendererReady,
+                        rendererPatchSkipped,
+                        rendererReloadAttempted,
                         cancellation.Token)
                     .GetAwaiter()
                     .GetResult();
@@ -528,6 +561,239 @@ internal static class CodexNativeFastBridge
         return rendererReady.WaitOne(timeout);
     }
 
+    internal static NativeFastPatchWaitOutcome WaitForRendererPatchOutcome(
+        int port,
+        string expectedBrowserId,
+        int ownerPid,
+        long ownerStartTicks,
+        TimeSpan timeout)
+    {
+        ValidatePort(port);
+        if (string.IsNullOrWhiteSpace(expectedBrowserId) ||
+            !BrowserIdentityPattern.IsMatch(expectedBrowserId))
+        {
+            throw new ArgumentException("The supplied Codex CDP browser identity is invalid.", nameof(expectedBrowserId));
+        }
+        if (ownerPid <= 0 || ownerStartTicks <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(ownerPid));
+        }
+        if (timeout < TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(timeout));
+        }
+
+        using var rendererReady = new EventWaitHandle(
+            initialState: false,
+            mode: EventResetMode.ManualReset,
+            name: BuildRendererReadyEventName(
+                port,
+                expectedBrowserId,
+                ownerPid,
+                ownerStartTicks));
+        using var rendererPatchSkipped = new EventWaitHandle(
+            initialState: false,
+            mode: EventResetMode.ManualReset,
+            name: BuildRendererPatchSkippedEventName(
+                port,
+                expectedBrowserId,
+                ownerPid,
+                ownerStartTicks));
+        using var rendererReloadAttempted = new EventWaitHandle(
+            initialState: false,
+            mode: EventResetMode.ManualReset,
+            name: BuildRendererReloadAttemptedEventName(
+                port,
+                expectedBrowserId,
+                ownerPid,
+                ownerStartTicks));
+
+        var deadline = DateTime.UtcNow + timeout;
+        var reloadAttemptObserved = false;
+        while (true)
+        {
+            if (rendererReady.WaitOne(TimeSpan.Zero))
+            {
+                return NativeFastPatchWaitOutcome.Patched;
+            }
+            if (!reloadAttemptObserved &&
+                rendererReloadAttempted.WaitOne(TimeSpan.Zero))
+            {
+                reloadAttemptObserved = true;
+            }
+            if (!reloadAttemptObserved &&
+                rendererPatchSkipped.WaitOne(TimeSpan.Zero))
+            {
+                // Manual-reset events can become signaled together at a target boundary.
+                // Re-sample the higher-priority facts before accepting the terminal no-reload
+                // outcome so a real Page.reload can never be hidden by another target's skip.
+                if (rendererReady.WaitOne(TimeSpan.Zero))
+                {
+                    return NativeFastPatchWaitOutcome.Patched;
+                }
+                if (rendererReloadAttempted.WaitOne(TimeSpan.Zero))
+                {
+                    reloadAttemptObserved = true;
+                }
+                else
+                {
+                    return NativeFastPatchWaitOutcome.SkippedWithoutReload;
+                }
+            }
+
+            var remaining = deadline - DateTime.UtcNow;
+            if (remaining <= TimeSpan.Zero)
+            {
+                // One final ordered snapshot closes the timeout-boundary race. Once reload is
+                // observed it is sticky and no WithoutReload outcome is permitted.
+                if (rendererReady.WaitOne(TimeSpan.Zero))
+                {
+                    return NativeFastPatchWaitOutcome.Patched;
+                }
+                if (!reloadAttemptObserved &&
+                    rendererReloadAttempted.WaitOne(TimeSpan.Zero))
+                {
+                    reloadAttemptObserved = true;
+                }
+                if (!reloadAttemptObserved &&
+                    rendererPatchSkipped.WaitOne(TimeSpan.Zero))
+                {
+                    if (rendererReady.WaitOne(TimeSpan.Zero))
+                    {
+                        return NativeFastPatchWaitOutcome.Patched;
+                    }
+                    if (rendererReloadAttempted.WaitOne(TimeSpan.Zero))
+                    {
+                        reloadAttemptObserved = true;
+                    }
+                    else
+                    {
+                        return NativeFastPatchWaitOutcome.SkippedWithoutReload;
+                    }
+                }
+                return reloadAttemptObserved
+                    ? NativeFastPatchWaitOutcome.TimedOutAfterReloadAttempt
+                    : NativeFastPatchWaitOutcome.TimedOutWithoutReload;
+            }
+
+            if (reloadAttemptObserved)
+            {
+                _ = rendererReady.WaitOne(remaining);
+                continue;
+            }
+
+            _ = WaitHandle.WaitAny(
+                [rendererReady, rendererReloadAttempted, rendererPatchSkipped],
+                remaining);
+            if (rendererReloadAttempted.WaitOne(TimeSpan.Zero))
+            {
+                reloadAttemptObserved = true;
+            }
+        }
+    }
+
+    internal static async Task<bool> TryApplyAccountDisplayAsync(
+        int port,
+        string expectedBrowserId,
+        int ownerPid,
+        long ownerStartTicks,
+        string ownerRoot,
+        CodexAccountDisplay display,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(display);
+        ValidatePort(port);
+        if (string.IsNullOrWhiteSpace(expectedBrowserId) ||
+            !BrowserIdentityPattern.IsMatch(expectedBrowserId))
+        {
+            throw new ArgumentException("The supplied Codex CDP browser identity is invalid.", nameof(expectedBrowserId));
+        }
+        if (ownerPid <= 0 || ownerStartTicks <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(ownerPid));
+        }
+        ownerRoot = ValidateOwnerRoot(ownerRoot);
+        if (!IsExpectedCdpOwner(port, ownerPid, ownerStartTicks, ownerRoot))
+        {
+            return false;
+        }
+
+        using var httpClient = CreateLoopbackClient();
+        var version = await ReadBrowserVersionAsync(httpClient, port, cancellationToken);
+        if (!version.BrowserId.Equals(expectedBrowserId, StringComparison.Ordinal))
+        {
+            return false;
+        }
+        var primaryTargets = (await ReadAppTargetsAsync(httpClient, port, cancellationToken))
+            .Where(target => IsPrimaryOfficialCodexPageUrl(target.PageUrl))
+            .ToArray();
+        if (primaryTargets.Length != 1)
+        {
+            Log("account_display_skipped", $"port={port}; primary_targets={primaryTargets.Length}");
+            return false;
+        }
+
+        await using var connection = await CdpConnection.ConnectAsync(
+            primaryTargets[0].WebSocketUrl,
+            cancellationToken);
+        await connection.SendAsync(
+            "Runtime.enable",
+            new { },
+            CommandTimeout,
+            cancellationToken);
+        var versionBeforeSend = await ReadBrowserVersionAsync(httpClient, port, cancellationToken);
+        var targetsBeforeSend = (await ReadAppTargetsAsync(httpClient, port, cancellationToken))
+            .Where(target => IsPrimaryOfficialCodexPageUrl(target.PageUrl))
+            .ToArray();
+        if (!versionBeforeSend.BrowserId.Equals(expectedBrowserId, StringComparison.Ordinal) ||
+            targetsBeforeSend.Length != 1 ||
+            !targetsBeforeSend[0].Id.Equals(primaryTargets[0].Id, StringComparison.Ordinal) ||
+            !targetsBeforeSend[0].WebSocketUrl.AbsoluteUri.Equals(
+                primaryTargets[0].WebSocketUrl.AbsoluteUri,
+                StringComparison.Ordinal) ||
+            !IsExpectedCdpOwner(port, ownerPid, ownerStartTicks, ownerRoot))
+        {
+            return false;
+        }
+        var frameTreeBeforeSend = await connection.SendAsync(
+            "Page.getFrameTree",
+            new { },
+            CommandTimeout,
+            cancellationToken);
+        if (!IsExpectedPrimaryOfficialCodexFrameTree(
+                frameTreeBeforeSend,
+                primaryTargets[0].PageUrl) ||
+            !IsExpectedCdpOwner(port, ownerPid, ownerStartTicks, ownerRoot))
+        {
+            return false;
+        }
+
+        // Build and send the PII-bearing expression only after the connected target, browser
+        // identity and immutable listener owner have all been revalidated.
+        var source = BuildAccountDisplayScript(display);
+        var evaluation = await connection.SendAsync(
+            "Runtime.evaluate",
+            new
+            {
+                expression = source,
+                returnByValue = true,
+                awaitPromise = false,
+                userGesture = false
+            },
+            CommandTimeout,
+            cancellationToken);
+        if (!IsSuccessfulAccountDisplayEvaluation(evaluation) ||
+            !IsExpectedCdpOwner(port, ownerPid, ownerStartTicks, ownerRoot))
+        {
+            return false;
+        }
+
+        Log(
+            "account_display_observer_installed",
+            $"port={port}; target={primaryTargets[0].Id}; dual_login={display.ModelAccountLabel != null}");
+        return true;
+    }
+
     private static ProcessStartInfo BuildStartInfo(
         int port,
         string expectedBrowserId,
@@ -610,6 +876,24 @@ internal static class CodexNativeFastBridge
         return $"Local\\CodexAccountManager.NativeFast.Ready.{port}.{BuildBrowserIdentityHash(browserId, ownerPid, ownerStartTicks)}";
     }
 
+    private static string BuildRendererPatchSkippedEventName(
+        int port,
+        string browserId,
+        int ownerPid = 0,
+        long ownerStartTicks = 0)
+    {
+        return $"Local\\CodexAccountManager.NativeFast.Skipped.{port}.{BuildBrowserIdentityHash(browserId, ownerPid, ownerStartTicks)}";
+    }
+
+    private static string BuildRendererReloadAttemptedEventName(
+        int port,
+        string browserId,
+        int ownerPid = 0,
+        long ownerStartTicks = 0)
+    {
+        return $"Local\\CodexAccountManager.NativeFast.ReloadAttempted.{port}.{BuildBrowserIdentityHash(browserId, ownerPid, ownerStartTicks)}";
+    }
+
     private static string BuildBrowserIdentityHash(
         string browserId,
         int ownerPid = 0,
@@ -629,6 +913,8 @@ internal static class CodexNativeFastBridge
         string ownerRoot,
         bool allowRendererReload,
         EventWaitHandle rendererReady,
+        EventWaitHandle rendererPatchSkipped,
+        EventWaitHandle rendererReloadAttempted,
         CancellationToken cancellationToken)
     {
         ValidatePort(port);
@@ -755,7 +1041,32 @@ internal static class CodexNativeFastBridge
                         await workers[target.Id].StartControlledReloadAsync(
                             reloadGates[target.Id],
                             allowRendererReload,
+                            () => rendererReloadAttempted.Set(),
                             cancellationToken);
+                    }
+                }
+                else if (allowRendererReload &&
+                         targets.Count != 0 &&
+                         targets.All(target => workers.TryGetValue(target.Id, out var worker) &&
+                                               !worker.IsClosed))
+                {
+                    // Every current target completed preflight, but at least one renderer was
+                    // rejected.  No Page.reload command can run in this state. Publish that
+                    // terminal fact and exit so the parent preserves the already-ready client
+                    // instead of mistaking a started helper process for a started reload.
+                    if (rendererReloadAttempted.WaitOne(TimeSpan.Zero))
+                    {
+                        Log(
+                            "renderer_patch_skip_suppressed",
+                            $"target_count={targets.Count}; reload_attempted=true; reason=preflight-rejected-after-reload");
+                    }
+                    else
+                    {
+                        rendererPatchSkipped.Set();
+                        Log(
+                            "renderer_patch_skipped",
+                            $"target_count={targets.Count}; reload_attempted=false; reason=preflight-rejected");
+                        return 0;
                     }
                 }
 
@@ -887,6 +1198,251 @@ internal static class CodexNativeFastBridge
                    value,
                    "app://-/index.html?initialRoute=%2Favatar-overlay",
                    StringComparison.Ordinal);
+    }
+
+    private static bool IsPrimaryOfficialCodexPageUrl(string? value) =>
+        string.Equals(value, "app://codex/", StringComparison.Ordinal) ||
+        string.Equals(value, "app://-/index.html", StringComparison.Ordinal);
+
+    private static bool IsExpectedPrimaryOfficialCodexFrameTree(
+        JsonElement result,
+        string expectedPageUrl)
+    {
+        if (!IsPrimaryOfficialCodexPageUrl(expectedPageUrl) ||
+            !result.TryGetProperty("frameTree", out var frameTree) ||
+            frameTree.ValueKind != JsonValueKind.Object ||
+            !frameTree.TryGetProperty("frame", out var frame) ||
+            frame.ValueKind != JsonValueKind.Object ||
+            !frame.TryGetProperty("url", out var url) ||
+            url.ValueKind != JsonValueKind.String ||
+            !string.Equals(url.GetString(), expectedPageUrl, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return !frame.TryGetProperty("parentId", out var parentId) ||
+               parentId.ValueKind == JsonValueKind.Null ||
+               parentId.ValueKind == JsonValueKind.String &&
+               string.IsNullOrWhiteSpace(parentId.GetString());
+    }
+
+    internal static string BuildAccountDisplayScript(CodexAccountDisplay display)
+    {
+        ArgumentNullException.ThrowIfNull(display);
+        var modelAccountLabel = NormalizeAccountDisplayText(
+            display.ModelAccountLabel,
+            maximumLength: 180,
+            required: false);
+        var modelAccountTypeLabel = modelAccountLabel == null
+            ? null
+            : NormalizeAccountDisplayText(
+                display.ModelAccountTypeLabel ?? "模型账号（本地）",
+                maximumLength: 40,
+                required: true);
+        var chatGptEmail = NormalizeAccountDisplayText(
+            display.ChatGptEmail,
+            maximumLength: 320,
+            required: true)!;
+        try
+        {
+            var parsed = new System.Net.Mail.MailAddress(chatGptEmail);
+            if (!parsed.Address.Equals(chatGptEmail, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new ArgumentException("The ChatGPT account email is not canonical.", nameof(display));
+            }
+        }
+        catch (FormatException ex)
+        {
+            throw new ArgumentException("The ChatGPT account email is invalid.", nameof(display), ex);
+        }
+
+        var payloadJson = JsonSerializer.Serialize(new
+        {
+            modelAccountLabel,
+            modelAccountTypeLabel,
+            chatGptEmail
+        });
+        return $$"""
+            (() => {
+              const STATE_KEY = "__CODEX_ACCOUNT_MANAGER_ACCOUNT_DISPLAY_V1__";
+              const ATTRIBUTE = "data-cam-account-display";
+              const VERSION = "1.2.0";
+              const payload = {{payloadJson}};
+              const previous = window[STATE_KEY];
+              if (previous && typeof previous.cleanup === "function") previous.cleanup();
+
+              let scheduled = null;
+              const removeAll = () => {
+                document.querySelectorAll(`[${ATTRIBUTE}]`).forEach((node) => node.remove());
+              };
+              const ensure = () => {
+                const shell = document.querySelector("aside.app-shell-left-panel");
+                if (!shell) {
+                  removeAll();
+                  return { shellReady: false, triggerReady: false, displayMounted: false };
+                }
+                const triggers = [...shell.querySelectorAll('button.sidebar-item[aria-haspopup="menu"]')]
+                  .filter((button) => {
+                    const avatar = [...button.querySelectorAll("span")]
+                      .some((node) => node.classList.contains("rounded-full"));
+                    const name = [...button.querySelectorAll("span")]
+                      .some((node) => node.classList.contains("truncate") &&
+                        node.classList.contains("flex-1") && node.classList.contains("min-w-0"));
+                    return avatar && name && Boolean(button.id);
+                  });
+                if (triggers.length !== 1) {
+                  removeAll();
+                  return { shellReady: true, triggerReady: false, displayMounted: false };
+                }
+
+                const trigger = triggers[0];
+                const menus = [...document.querySelectorAll('[role="menu"][aria-labelledby]')]
+                  .filter((menu) => menu.getAttribute("aria-labelledby") === trigger.id &&
+                    menu.getAttribute("data-state") === "open");
+                if (menus.length !== 1) {
+                  removeAll();
+                  return { shellReady: true, triggerReady: true, displayMounted: false };
+                }
+                const menu = menus[0];
+                const items = [...menu.querySelectorAll('[role="menuitem"]')]
+                  .filter((item) => item.closest('[role="menu"]') === menu);
+                if (items.length < 1) {
+                  removeAll();
+                  return { shellReady: true, triggerReady: true, displayMounted: false };
+                }
+                const host = items[0];
+                const contentRows = [...host.children]
+                  .filter((node) => !node.hasAttribute(ATTRIBUTE));
+                if (contentRows.length !== 1) {
+                  removeAll();
+                  return { shellReady: true, triggerReady: true, displayMounted: false };
+                }
+                const profileRow = contentRows[0];
+                const profileNames = [...contentRows[0].querySelectorAll("span")]
+                  .filter((node) => node.classList.contains("truncate") &&
+                    node.classList.contains("flex-1") && node.classList.contains("min-w-0"));
+                const hasReviewedAvatar = Boolean(profileRow.querySelector("img")) ||
+                  [...profileRow.querySelectorAll("span")]
+                    .some((node) => node.classList.contains("rounded-full"));
+                if (profileNames.length !== 1 || !hasReviewedAvatar) {
+                  removeAll();
+                  return { shellReady: true, triggerReady: true, displayMounted: false };
+                }
+
+                let block = [...host.children]
+                  .find((node) => node.getAttribute(ATTRIBUTE) === VERSION);
+                if (!block) {
+                  [...host.querySelectorAll(`[${ATTRIBUTE}]`)].forEach((node) => node.remove());
+                  block = document.createElement("div");
+                  block.setAttribute(ATTRIBUTE, VERSION);
+                  block.setAttribute("role", "note");
+                  block.style.cssText =
+                    "display:grid;gap:2px;min-width:0;margin-top:4px;padding-left:26px;" +
+                    "font-size:11px;line-height:1.35;opacity:.78;pointer-events:none;";
+                  host.appendChild(block);
+                }
+
+                const entries = payload.modelAccountLabel
+                  ? [[payload.modelAccountTypeLabel, payload.modelAccountLabel], ["ChatGPT", payload.chatGptEmail]]
+                  : [["ChatGPT", payload.chatGptEmail]];
+                const signature = JSON.stringify(entries);
+                if (block.dataset.signature !== signature) {
+                  block.replaceChildren();
+                  block.dataset.signature = signature;
+                  for (const [labelText, valueText] of entries) {
+                    const line = document.createElement("div");
+                    line.style.cssText = "display:flex;gap:5px;min-width:0;white-space:nowrap;";
+                    line.title = `${labelText}：${valueText}`;
+                    const label = document.createElement("span");
+                    label.textContent = `${labelText}：`;
+                    label.style.flex = "0 0 auto";
+                    const value = document.createElement("span");
+                    value.textContent = valueText;
+                    value.style.cssText =
+                      "min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+                    line.append(label, value);
+                    block.appendChild(line);
+                  }
+                  block.setAttribute(
+                    "aria-label",
+                    entries.map(([label, value]) => `${label}：${value}`).join("；"));
+                }
+                return { shellReady: true, triggerReady: true, displayMounted: true };
+              };
+              const schedule = () => {
+                if (scheduled !== null) return;
+                scheduled = setTimeout(() => {
+                  scheduled = null;
+                  ensure();
+                }, 60);
+              };
+              const observer = new MutationObserver(schedule);
+              observer.observe(document.documentElement, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ["data-state", "aria-labelledby"]
+              });
+              const cleanup = () => {
+                observer.disconnect();
+                if (scheduled !== null) clearTimeout(scheduled);
+                scheduled = null;
+                removeAll();
+                if (window[STATE_KEY]?.cleanup === cleanup) delete window[STATE_KEY];
+              };
+              window[STATE_KEY] = { cleanup, ensure, observer, version: VERSION };
+              const initial = ensure();
+              return {
+                observerInstalled: true,
+                shellReady: initial.shellReady,
+                triggerReady: initial.triggerReady,
+                displayMounted: initial.displayMounted,
+                version: VERSION
+              };
+            })()
+            """;
+    }
+
+    private static string? NormalizeAccountDisplayText(
+        string? value,
+        int maximumLength,
+        bool required)
+    {
+        var normalized = value?.Trim();
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            if (required)
+            {
+                throw new ArgumentException("A required account display value is missing.", nameof(value));
+            }
+            return null;
+        }
+        if (normalized.Length > maximumLength ||
+            normalized.Any(character => char.IsControl(character) || character is '\u2028' or '\u2029'))
+        {
+            throw new ArgumentException("An account display value is unsafe or too long.", nameof(value));
+        }
+        return normalized;
+    }
+
+    private static bool IsSuccessfulAccountDisplayEvaluation(JsonElement evaluation)
+    {
+        if (evaluation.TryGetProperty("exceptionDetails", out _ ) ||
+            !evaluation.TryGetProperty("result", out var remoteObject) ||
+            !remoteObject.TryGetProperty("value", out var value) ||
+            value.ValueKind != JsonValueKind.Object ||
+            !value.TryGetProperty("observerInstalled", out var observerInstalled) ||
+            observerInstalled.ValueKind != JsonValueKind.True ||
+            !value.TryGetProperty("shellReady", out var shellReady) ||
+            shellReady.ValueKind != JsonValueKind.True ||
+            !value.TryGetProperty("triggerReady", out var triggerReady) ||
+            triggerReady.ValueKind != JsonValueKind.True ||
+            !value.TryGetProperty("version", out var version) ||
+            version.ValueKind != JsonValueKind.String)
+        {
+            return false;
+        }
+        return version.GetString()?.Equals("1.2.0", StringComparison.Ordinal) == true;
     }
 
     private static bool IsReviewedModernCodexPageUrl(string? value)
@@ -3586,6 +4142,52 @@ internal static class CodexNativeFastBridge
                 "Native Fast bridge shared a controlled reload gate across different targets.");
         }
 
+        var accountDisplayScript = BuildAccountDisplayScript(
+            new CodexAccountDisplay("model\"${notCode}@example.test", "chatgpt@example.com")
+            {
+                ModelAccountTypeLabel = "PAT 模型账号"
+            });
+        using var accountDisplayResult = JsonDocument.Parse(
+            """{"result":{"type":"object","value":{"observerInstalled":true,"shellReady":true,"triggerReady":true,"displayMounted":false,"version":"1.2.0"}}}""");
+        using var accountDisplayFrameTree = JsonDocument.Parse(
+            """{"frameTree":{"frame":{"id":"frame-1","url":"app://-/index.html"}}}""");
+        using var rejectedAccountDisplayFrameTree = JsonDocument.Parse(
+            """{"frameTree":{"frame":{"id":"frame-1","url":"app://-/index.html?initialRoute=%2Favatar-overlay"}}}""");
+        if (!accountDisplayScript.Contains("data-cam-account-display", StringComparison.Ordinal) ||
+            !accountDisplayScript.Contains("MutationObserver", StringComparison.Ordinal) ||
+            !accountDisplayScript.Contains("textContent", StringComparison.Ordinal) ||
+            accountDisplayScript.Contains("innerHTML", StringComparison.Ordinal) ||
+            !accountDisplayScript.Contains(
+                JsonSerializer.Serialize("PAT 模型账号"),
+                StringComparison.Ordinal) ||
+            !accountDisplayScript.Contains("chatgpt@example.com", StringComparison.Ordinal) ||
+            !IsSuccessfulAccountDisplayEvaluation(accountDisplayResult.RootElement) ||
+            !IsExpectedPrimaryOfficialCodexFrameTree(
+                accountDisplayFrameTree.RootElement,
+                "app://-/index.html") ||
+            IsExpectedPrimaryOfficialCodexFrameTree(
+                rejectedAccountDisplayFrameTree.RootElement,
+                "app://-/index.html"))
+        {
+            throw new InvalidOperationException(
+                "Codex account identity display injection is not bounded, idempotent, and text-only.");
+        }
+        var invalidAccountDisplayRejected = false;
+        try
+        {
+            _ = BuildAccountDisplayScript(
+                new CodexAccountDisplay("model", "Display <chatgpt@example.com>"));
+        }
+        catch (ArgumentException)
+        {
+            invalidAccountDisplayRejected = true;
+        }
+        if (!invalidAccountDisplayRejected)
+        {
+            throw new InvalidOperationException(
+                "Codex account identity display accepted a non-canonical email address.");
+        }
+
         if (WaitForRendererPatch(19335, "test-browser", TimeSpan.Zero))
         {
             throw new InvalidOperationException("Native Fast bridge readiness started in a stale signaled state.");
@@ -3594,6 +4196,110 @@ internal static class CodexNativeFastBridge
         if (!WaitForRendererPatch(19335, "test-browser", TimeSpan.Zero))
         {
             throw new InvalidOperationException("Native Fast bridge readiness handshake did not cross process handles.");
+        }
+
+        const int outcomePort = 19366;
+        const string outcomeBrowser = "test-outcome-browser";
+        const int outcomeOwnerPid = 424242;
+        const long outcomeOwnerStartTicks = 434343;
+        var outcomeReadyName = BuildRendererReadyEventName(
+            outcomePort,
+            outcomeBrowser,
+            outcomeOwnerPid,
+            outcomeOwnerStartTicks);
+        var outcomeSkippedName = BuildRendererPatchSkippedEventName(
+            outcomePort,
+            outcomeBrowser,
+            outcomeOwnerPid,
+            outcomeOwnerStartTicks);
+        var outcomeReloadName = BuildRendererReloadAttemptedEventName(
+            outcomePort,
+            outcomeBrowser,
+            outcomeOwnerPid,
+            outcomeOwnerStartTicks);
+        if (new[] { outcomeReadyName, outcomeSkippedName, outcomeReloadName }
+                .Distinct(StringComparer.Ordinal)
+                .Count() != 3 ||
+            outcomeReloadName.Equals(
+                BuildRendererReloadAttemptedEventName(
+                    outcomePort,
+                    outcomeBrowser,
+                    outcomeOwnerPid + 1,
+                    outcomeOwnerStartTicks),
+                StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "Native Fast patch outcomes were not independently scoped to one immutable renderer owner.");
+        }
+        using var outcomeReady = new EventWaitHandle(
+            initialState: false,
+            mode: EventResetMode.ManualReset,
+            name: outcomeReadyName);
+        using var outcomeSkipped = new EventWaitHandle(
+            initialState: false,
+            mode: EventResetMode.ManualReset,
+            name: outcomeSkippedName);
+        using var outcomeReload = new EventWaitHandle(
+            initialState: false,
+            mode: EventResetMode.ManualReset,
+            name: outcomeReloadName);
+        outcomeReady.Reset();
+        outcomeSkipped.Reset();
+        outcomeReload.Reset();
+        if (WaitForRendererPatchOutcome(
+                outcomePort,
+                outcomeBrowser,
+                outcomeOwnerPid,
+                outcomeOwnerStartTicks,
+                TimeSpan.Zero) != NativeFastPatchWaitOutcome.TimedOutWithoutReload)
+        {
+            throw new InvalidOperationException(
+                "Native Fast patch outcome inferred a reload without an explicit owner-scoped signal.");
+        }
+        outcomeSkipped.Set();
+        if (WaitForRendererPatchOutcome(
+                outcomePort,
+                outcomeBrowser,
+                outcomeOwnerPid,
+                outcomeOwnerStartTicks,
+                TimeSpan.Zero) != NativeFastPatchWaitOutcome.SkippedWithoutReload)
+        {
+            throw new InvalidOperationException(
+                "Native Fast preflight rejection did not terminate as a no-reload outcome.");
+        }
+        outcomeSkipped.Reset();
+        outcomeReload.Set();
+        if (WaitForRendererPatchOutcome(
+                outcomePort,
+                outcomeBrowser,
+                outcomeOwnerPid,
+                outcomeOwnerStartTicks,
+                TimeSpan.Zero) != NativeFastPatchWaitOutcome.TimedOutAfterReloadAttempt)
+        {
+            throw new InvalidOperationException(
+                "Native Fast reload recovery was enabled without its explicit reload-attempt signal.");
+        }
+        outcomeSkipped.Set();
+        if (WaitForRendererPatchOutcome(
+                outcomePort,
+                outcomeBrowser,
+                outcomeOwnerPid,
+                outcomeOwnerStartTicks,
+                TimeSpan.Zero) != NativeFastPatchWaitOutcome.TimedOutAfterReloadAttempt)
+        {
+            throw new InvalidOperationException(
+                "Native Fast skipped state overrode an owner-scoped reload-attempt signal.");
+        }
+        outcomeReady.Set();
+        if (WaitForRendererPatchOutcome(
+                outcomePort,
+                outcomeBrowser,
+                outcomeOwnerPid,
+                outcomeOwnerStartTicks,
+                TimeSpan.Zero) != NativeFastPatchWaitOutcome.Patched)
+        {
+            throw new InvalidOperationException(
+                "Native Fast patched readiness did not take precedence over simultaneous reload and skipped state.");
         }
     }
 
@@ -3770,8 +4476,10 @@ internal static class CodexNativeFastBridge
         internal async Task StartControlledReloadAsync(
             ControlledReloadGate reloadGate,
             bool allowRendererReload,
+            Action notifyReloadAttempted,
             CancellationToken cancellationToken)
         {
+            ArgumentNullException.ThrowIfNull(notifyReloadAttempted);
             if (!allowRendererReload || !_preflightAllowed || !reloadGate.TryConsume())
             {
                 return;
@@ -3789,6 +4497,10 @@ internal static class CodexNativeFastBridge
 
             try
             {
+                // Signal before issuing Page.reload. If the CDP command begins navigation and
+                // its acknowledgement is then lost, the parent must conservatively treat the
+                // renderer as having reloaded and retain the clean-recovery path.
+                notifyReloadAttempted();
                 await _connection.SendAsync(
                     "Page.reload",
                     new

@@ -15,6 +15,7 @@ public partial class Form1 : Form
         UnifiedHistory,
         StatusCheck,
         QuotaUsage,
+        AccountRotation,
         ThemeSettings,
         SystemConfig
     }
@@ -245,6 +246,7 @@ public partial class Form1 : Form
     // Only the account launched during this manager session is eligible for an automatic
     // official read. Opening the quota workspace and loading an account never opt it in.
     private static readonly TimeSpan OfficialQuotaActiveRefreshInterval = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan UnknownQuotaResetRetryDelay = TimeSpan.FromMinutes(2);
     private static readonly TimeSpan ResetCreditUnavailableRetryDelay = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan MinimalQuotaPostRefreshTimeout = TimeSpan.FromSeconds(30);
     private readonly AccountStore _store = new();
@@ -262,6 +264,9 @@ public partial class Form1 : Form
     private readonly Label _patGatewayProxyDetectionLabel = new();
     private readonly Label _patGatewayRuntimeStatusLabel = new();
     private readonly ModernButton _patGatewayToggleButton = new();
+    private readonly Label _patAutoRotationStatusLabel = new();
+    private readonly ModernButton _patAutoRotationToggleButton = new();
+    private readonly ModernButton _patAutoRotationThresholdButton = new();
     private readonly Label _statusBox = new();
     private readonly ThemePicker _themeModePicker = new();
     private readonly ModernButton _updateAvailableButton = new();
@@ -271,6 +276,7 @@ public partial class Form1 : Form
     private readonly ModernButton _unifiedHistoryNavButton = new();
     private readonly ModernButton _statusCheckNavButton = new();
     private readonly ModernButton _quotaUsageNavButton = new();
+    private readonly ModernButton _accountRotationNavButton = new();
     private readonly ModernButton _themeSettingsNavButton = new();
     private readonly ModernButton _systemConfigNavButton = new();
     private readonly AppUpdateService _updateService = new();
@@ -293,6 +299,9 @@ public partial class Form1 : Form
     private readonly PassiveQuotaMonitoringService _passiveQuotaMonitoring;
     private readonly QuotaSnapshotStore _quotaSnapshotStore;
     private readonly AppSettings _appSettings;
+    private readonly CodexTaskBoundaryMonitor _codexTaskBoundaryMonitor =
+        new(CodexCliService.GetDefaultCodexHome());
+    private readonly QuotaSafetyMarginTracker _quotaSafetyMarginTracker = new();
     private readonly bool _preserveExistingPatGatewayOnStartup;
     private readonly bool _refreshNativeFastBridgeOnStartup;
     private readonly Dictionary<string, ResetCreditViewState> _resetCreditState =
@@ -373,6 +382,22 @@ public partial class Form1 : Form
     private bool _deletedThreadCleanupStarted;
     private bool _patGatewayRuntimeRunning;
     private bool _patGatewayActionRunning;
+    private readonly HashSet<string> _patAutoRotationUnavailableAccountKeys =
+        new(StringComparer.Ordinal);
+    private readonly Dictionary<string, DateTimeOffset> _patAutoRotationUnknownResetRetryAtUtc =
+        new(StringComparer.Ordinal);
+    private PatAutoRotationState _patAutoRotationState = PatAutoRotationState.Idle;
+    private PatAutoRotationLaunchContext? _patAutoRotationLaunchContext;
+    private CancellationTokenSource? _patAutoRotationBoundaryCancellation;
+    private string? _patAutoRotationObservedAccountKey;
+    private DateTimeOffset? _patAutoRotationObservedResetAtUtc;
+    private DateTimeOffset? _patAutoRotationLastObservationAtUtc;
+    private int _patAutoRotationConsecutiveObservations;
+    private DateTimeOffset? _patAutoRotationCooldownUntilUtc;
+    private bool _patAutoRotationGatewayTransportActive;
+    private DateTimeOffset? _accountRotationPrimaryReturnCheckedAtUtc;
+    private CancellationTokenSource? _accountRotationPrimaryReturnCancellation;
+    private QuotaRotationDecision? _patAutoRotationLastDecision;
     private readonly HashSet<string> _minimalQuotaTestsInProgress = new(StringComparer.Ordinal);
     private string _patGatewayRuntimeStatus = "等待启动";
     private CancellationTokenSource? _proxyDetectionCancellation;
@@ -399,6 +424,15 @@ public partial class Form1 : Form
         _quotaSnapshotStore = new QuotaSnapshotStore(_store.RootPath);
         _appSettings = _themeService.LoadSettings();
         _appSettings.CustomCodexTheme ??= new CustomCodexTheme();
+        if (!double.IsFinite(_appSettings.PatAutoRotationUsedPercentThreshold))
+        {
+            _appSettings.PatAutoRotationUsedPercentThreshold =
+                PatAutoRotationPolicy.DefaultUsedPercentThreshold;
+        }
+        _appSettings.PatAutoRotationUsedPercentThreshold = Math.Clamp(
+            _appSettings.PatAutoRotationUsedPercentThreshold,
+            95D,
+            99D);
         if (string.Equals(_appSettings.CodexAppearancePresetId, "manager", StringComparison.OrdinalIgnoreCase))
         {
             _appSettings.CodexAppearancePresetId = _appSettings.ThemeMode switch
@@ -438,6 +472,7 @@ public partial class Form1 : Form
                 _ = RefreshQuotaUsageAsync(force: false, _workspaceLoadGeneration);
             }
             _ = InitializePatGatewayOnStartupAsync();
+            _codex.QueueCurrentOfficialAccountDisplay(_accounts);
             if (_refreshNativeFastBridgeOnStartup)
             {
                 _ = Task.Run(CodexCliService.TryRefreshNativeFastBridgeAfterUpdate);
@@ -628,17 +663,19 @@ public partial class Form1 : Form
 
         ConfigureSidebarCommandButton(_addAccountNavButton, "新增账号", 58);
         _addAccountNavButton.Click += (_, _) => AddAccount();
-        ConfigureSidebarNavButton(_accountSwitchNavButton, "账号切换", 118, WorkspaceView.AccountSwitch);
-        ConfigureSidebarNavButton(_unifiedHistoryNavButton, "聊天记录", 170, WorkspaceView.UnifiedHistory);
-        ConfigureSidebarNavButton(_statusCheckNavButton, "状态与凭据", 222, WorkspaceView.StatusCheck);
-        ConfigureSidebarNavButton(_quotaUsageNavButton, "额度显示", 274, WorkspaceView.QuotaUsage);
-        ConfigureSidebarNavButton(_themeSettingsNavButton, "Codex 主题", 326, WorkspaceView.ThemeSettings);
-        ConfigureSidebarNavButton(_systemConfigNavButton, "系统配置", 378, WorkspaceView.SystemConfig);
+        ConfigureSidebarNavButton(_accountSwitchNavButton, "账号切换", 102, WorkspaceView.AccountSwitch);
+        ConfigureSidebarNavButton(_unifiedHistoryNavButton, "聊天记录", 146, WorkspaceView.UnifiedHistory);
+        ConfigureSidebarNavButton(_statusCheckNavButton, "状态与凭据", 190, WorkspaceView.StatusCheck);
+        ConfigureSidebarNavButton(_quotaUsageNavButton, "额度显示", 234, WorkspaceView.QuotaUsage);
+        ConfigureSidebarNavButton(_accountRotationNavButton, "账号轮换", 278, WorkspaceView.AccountRotation);
+        ConfigureSidebarNavButton(_themeSettingsNavButton, "Codex 主题", 322, WorkspaceView.ThemeSettings);
+        ConfigureSidebarNavButton(_systemConfigNavButton, "系统配置", 366, WorkspaceView.SystemConfig);
         sidebar.Controls.Add(_addAccountNavButton);
         sidebar.Controls.Add(_accountSwitchNavButton);
         sidebar.Controls.Add(_unifiedHistoryNavButton);
         sidebar.Controls.Add(_statusCheckNavButton);
         sidebar.Controls.Add(_quotaUsageNavButton);
+        sidebar.Controls.Add(_accountRotationNavButton);
         sidebar.Controls.Add(_themeSettingsNavButton);
         sidebar.Controls.Add(_systemConfigNavButton);
 
@@ -859,6 +896,8 @@ public partial class Form1 : Form
         };
         InitializePatGatewayProxyEditors();
         _patGatewayToggleButton.Click += async (_, _) => await TogglePatGatewayAsync();
+        _patAutoRotationToggleButton.Click += async (_, _) =>
+            await TogglePatAutoRotationAsync();
         _patGatewayProxyAddressBox.Validated += (_, _) => SaveEditedPatGatewayProxy();
         _patGatewayProxyAddressBox.KeyDown += (_, eventArgs) =>
         {
@@ -894,6 +933,10 @@ public partial class Form1 : Form
             _proxyDetectionCancellation?.Cancel();
             _proxyDetectionCancellation?.Dispose();
             _proxyDetectionCancellation = null;
+            _patAutoRotationBoundaryCancellation?.Cancel();
+            _patAutoRotationBoundaryCancellation = null;
+            _accountRotationPrimaryReturnCancellation?.Cancel();
+            _accountRotationPrimaryReturnCancellation = null;
             _unifiedHistoryContentIndexCancellation?.Cancel();
             _quotaRefreshTimer.Dispose();
             _layoutRefreshTimer.Dispose();
@@ -1362,7 +1405,7 @@ public partial class Form1 : Form
         button.Left = 16;
         button.Top = top;
         button.Width = 228;
-        button.Height = 44;
+        button.Height = 40;
         button.TextAlign = ContentAlignment.MiddleLeft;
         button.Padding = new Padding(12, 0, 10, 0);
         button.FlatStyle = FlatStyle.Flat;
@@ -1376,6 +1419,7 @@ public partial class Form1 : Form
                 WorkspaceView.UnifiedHistory => "◷",
                 WorkspaceView.StatusCheck => "✓",
                 WorkspaceView.QuotaUsage => "▥",
+                WorkspaceView.AccountRotation => "↻",
                 WorkspaceView.ThemeSettings => "◐",
                 WorkspaceView.SystemConfig => "⚙",
                 _ => "•"
@@ -1394,7 +1438,7 @@ public partial class Form1 : Form
         button.Left = 16;
         button.Top = top;
         button.Width = 228;
-        button.Height = 44;
+        button.Height = 40;
         button.TextAlign = ContentAlignment.MiddleLeft;
         button.Padding = new Padding(12, 0, 10, 0);
         button.FlatStyle = FlatStyle.Flat;
@@ -1640,6 +1684,7 @@ public partial class Form1 : Form
         {
             RefreshQuotaUsageIfNeeded();
             RefreshOfficialQuotaIfNeeded();
+            RefreshAccountRotationPrimaryReturnIfNeeded();
         };
         _quotaRefreshTimer.Start();
     }
@@ -1668,6 +1713,157 @@ public partial class Form1 : Form
         }
 
         StartOfficialQuotaRefresh(account);
+    }
+
+    private void RefreshAccountRotationPrimaryReturnIfNeeded()
+    {
+        if (_formClosed || IsDisposed ||
+            !AccountRotationConfiguration.IsEnabled(_appSettings) ||
+            !_patAutoRotationGatewayTransportActive ||
+            _patAutoRotationLaunchContext?.ClientMode != WindowsClientMode.OfficialCodex ||
+            _patAutoRotationBoundaryCancellation != null ||
+            GetCurrentAccountRecord() is not { } current ||
+            AccountRotationConfiguration.GetPool(_appSettings, current) !=
+                AccountRotationPool.Backup)
+        {
+            return;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        if (_accountRotationPrimaryReturnCheckedAtUtc is { } lastChecked &&
+            now - lastChecked < OfficialQuotaActiveRefreshInterval)
+        {
+            return;
+        }
+        _accountRotationPrimaryReturnCheckedAtUtc = now;
+
+        PruneResetPatAutoRotationAccounts();
+
+        // Re-enter the primary pool at the position after its persisted cursor. The
+        // backup account is deliberately used only as the current-key exclusion; it must
+        // not reset the independent primary ring to item 1.
+        var primaryCandidates = AccountRotationConfiguration
+            .BuildCandidates(
+                _appSettings,
+                _accounts,
+                current,
+                _patAutoRotationUnavailableAccountKeys,
+                now,
+                HasUsableAccountCredential)
+            .Where(account =>
+                AccountRotationConfiguration.GetPool(_appSettings, account) ==
+                AccountRotationPool.Primary)
+            .ToList();
+        if (primaryCandidates.Count == 0)
+        {
+            return;
+        }
+
+        var cancellation = new CancellationTokenSource();
+        _accountRotationPrimaryReturnCancellation = cancellation;
+        _patAutoRotationBoundaryCancellation = cancellation;
+        _ = PreparePrimaryPoolReturnAsync(current, primaryCandidates, cancellation);
+    }
+
+    private async Task PreparePrimaryPoolReturnAsync(
+        AccountRecord source,
+        IReadOnlyList<AccountRecord> candidates,
+        CancellationTokenSource cancellation)
+    {
+        var sourceKey = QuotaAccountIdentity.CreateKey(source);
+        try
+        {
+            foreach (var candidate in candidates)
+            {
+                cancellation.Token.ThrowIfCancellationRequested();
+                if (!IsPatAutoRotationContextCurrent(sourceKey))
+                {
+                    return;
+                }
+
+                if (candidate.IsCompatibleApi)
+                {
+                    try
+                    {
+                        await CodexCliService.EnsureCompatibleApiRotationPreflightAsync(
+                            candidate,
+                            cancellation.Token);
+                    }
+                    catch (Exception ex) when (
+                        ex is IOException or HttpRequestException or InvalidOperationException or
+                        UnauthorizedAccessException or System.Text.Json.JsonException)
+                    {
+                        continue;
+                    }
+                }
+                else
+                {
+                    var quotaStatus = await ConfirmPatRotationCandidateQuotaAsync(
+                        candidate,
+                        cancellation.Token);
+                    if (quotaStatus != PatRotationCandidateQuotaStatus.Available)
+                    {
+                        if (quotaStatus == PatRotationCandidateQuotaStatus.Exhausted)
+                        {
+                            _patAutoRotationUnavailableAccountKeys.Add(
+                                QuotaAccountIdentity.CreateKey(candidate));
+                        }
+                        continue;
+                    }
+                }
+
+                var targetKey = QuotaAccountIdentity.CreateKey(candidate);
+                var armed = await LocalPatGateway.ArmRotationAsync(
+                    sourceKey,
+                    targetKey,
+                    cancellation.Token);
+                if (armed.Status != PatGatewayRotationStatus.Armed ||
+                    !string.Equals(armed.SourceAccountKey, sourceKey, StringComparison.Ordinal) ||
+                    !string.Equals(armed.TargetAccountKey, targetKey, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                _patAutoRotationState = PatAutoRotationState.WaitingForRequestBoundary;
+                _statusBox.Text =
+                    $"使用轮换池账号 {candidate.Name} 已在额度重置后等待满 1 分钟；" +
+                    "当前响应继续，下一次模型请求自动返回使用轮换池。";
+                UpdatePatAutoRotationControls();
+                var activatedAtUtc = await WaitForPatGatewayRotationActivationAsync(
+                    sourceKey,
+                    targetKey,
+                    cancellation.Token);
+                CompletePatGatewayRotation(candidate, activatedAtUtc);
+                return;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // A manual launch or another rotation superseded this return route.
+        }
+        catch (Exception ex) when (
+            ex is IOException or HttpRequestException or InvalidOperationException or
+            InvalidDataException or UnauthorizedAccessException or
+            System.Text.Json.JsonException)
+        {
+            if (!_formClosed && !IsDisposed)
+            {
+                _statusBox.Text = "返回使用轮换池暂缓：" + ex.Message;
+            }
+        }
+        finally
+        {
+            if (ReferenceEquals(_accountRotationPrimaryReturnCancellation, cancellation))
+            {
+                _accountRotationPrimaryReturnCancellation = null;
+            }
+            if (ReferenceEquals(_patAutoRotationBoundaryCancellation, cancellation))
+            {
+                _patAutoRotationBoundaryCancellation = null;
+            }
+            cancellation.Dispose();
+            UpdatePatAutoRotationControls();
+        }
     }
 
     private void RefreshQuotaUsageIfNeeded()
@@ -2889,6 +3085,7 @@ public partial class Form1 : Form
             WorkspaceView.UnifiedHistory => "查看、全文搜索和管理本地聊天。",
             WorkspaceView.StatusCheck => "检查登录状态并管理账号凭据。",
             WorkspaceView.QuotaUsage => "本地用量估算与额度窗口。",
+            WorkspaceView.AccountRotation => "配置账号参与范围与轮换顺序。",
             WorkspaceView.ThemeSettings => "选择、预览并应用 Codex 外观。",
             WorkspaceView.SystemConfig => "启动目录与项目设置。",
             _ => ""
@@ -2900,6 +3097,7 @@ public partial class Form1 : Form
                 "阅读本地聊天；分类经 Codex 官方目录接口并自动备份，不启动或登录 Codex++。",
             WorkspaceView.StatusCheck => "状态检查按账号单独执行；ChatGPT 登录、Access Token 与 API Key 均按账号目录隔离。",
             WorkspaceView.QuotaUsage => "按官方返回显示 5h、周或月额度窗口；不会在后台轮流登录账号。",
+            WorkspaceView.AccountRotation => "使用池优先；全部不可用时进入备用池，并从上次使用位置继续。",
             WorkspaceView.ThemeSettings => "Codex 主题可以独立启用、应用或恢复，不影响账号与聊天记录。",
             WorkspaceView.SystemConfig => "项目根目录保存本地配置，启动目录用于打开 Codex。",
             _ => _headerSubtitle.Text
@@ -2936,6 +3134,7 @@ public partial class Form1 : Form
             WorkspaceView.UnifiedHistory => "聊天记录",
             WorkspaceView.StatusCheck => "状态与凭据",
             WorkspaceView.QuotaUsage => "额度显示",
+            WorkspaceView.AccountRotation => "账号轮换",
             WorkspaceView.ThemeSettings => "Codex 主题",
             WorkspaceView.SystemConfig => "系统配置",
             _ => "账号工作台"
@@ -2948,6 +3147,7 @@ public partial class Form1 : Form
         ApplySidebarNavButton(_unifiedHistoryNavButton, _activeView == WorkspaceView.UnifiedHistory);
         ApplySidebarNavButton(_statusCheckNavButton, _activeView == WorkspaceView.StatusCheck);
         ApplySidebarNavButton(_quotaUsageNavButton, _activeView == WorkspaceView.QuotaUsage);
+        ApplySidebarNavButton(_accountRotationNavButton, _activeView == WorkspaceView.AccountRotation);
         ApplySidebarNavButton(_themeSettingsNavButton, _activeView == WorkspaceView.ThemeSettings);
         ApplySidebarNavButton(_systemConfigNavButton, _activeView == WorkspaceView.SystemConfig);
     }
@@ -2958,6 +3158,7 @@ public partial class Form1 : Form
         {
             _ when ReferenceEquals(button, _unifiedHistoryNavButton) => _palette.SecondaryAccentColor,
             _ when ReferenceEquals(button, _statusCheckNavButton) => _palette.SuccessColor,
+            _ when ReferenceEquals(button, _accountRotationNavButton) => _palette.TertiaryAccentColor,
             _ when ReferenceEquals(button, _themeSettingsNavButton) => _palette.AccentColor,
             _ when ReferenceEquals(button, _systemConfigNavButton) => _palette.SecondaryAccentColor,
             _ => _palette.AccentColor
@@ -3473,10 +3674,14 @@ public partial class Form1 : Form
         _ => "Codex++"
     };
 
-    private void LoadAccounts()
+    private void LoadAccounts(bool persistCurrentAccountSelection = true)
     {
         ClearWorkspaceViewCache();
         _accounts = _store.LoadAccounts();
+        if (AccountRotationConfiguration.Normalize(_appSettings, _accounts))
+        {
+            _themeService.SaveSettings(_appSettings);
+        }
         var accountConfigFailures = new List<string>();
         foreach (var account in _accounts.Where(candidate => candidate.IsAccessToken))
         {
@@ -3520,7 +3725,7 @@ public partial class Form1 : Form
             // A damaged/stale index is repaired by the normal background scan.
             _quotaUsageCache = null;
         }
-        SyncCurrentAccountSelection();
+        SyncCurrentAccountSelection(persistCurrentAccountSelection);
         _usageTracker.EnsureCurrentAccountTracking(GetCurrentAccountRecord());
         RenderCards();
         if (_activeView == WorkspaceView.QuotaUsage)
@@ -3604,7 +3809,7 @@ public partial class Form1 : Form
         }
     }
 
-    private void SyncCurrentAccountSelection()
+    private void SyncCurrentAccountSelection(bool persistSettings = true)
     {
         // appsettings is only a hint after a reboot or an external login. The shared
         // profile on disk is authoritative and can be compared without any network call.
@@ -3626,7 +3831,7 @@ public partial class Form1 : Form
                        matchingProfiles.FirstOrDefault();
         if (resolved != null)
         {
-            SetCurrentAccount(resolved.Name, false);
+            SetCurrentAccount(resolved.Name, false, persistSettings: persistSettings);
             return;
         }
 
@@ -3636,7 +3841,7 @@ public partial class Form1 : Form
         // account marker and current-first ordering stable without any network request.
         var remembered = _accounts.FirstOrDefault(account =>
             account.Name.Equals(_currentAccountName, StringComparison.OrdinalIgnoreCase));
-        SetCurrentAccount(remembered?.Name, false);
+        SetCurrentAccount(remembered?.Name, false, persistSettings: persistSettings);
     }
 
     private void RenderCards()
@@ -3688,6 +3893,13 @@ public partial class Form1 : Form
         }
 
         var query = _searchBox.Text.Trim();
+        if (_activeView == WorkspaceView.AccountRotation)
+        {
+            RenderAccountRotationWorkspace(query, workspaceWidth);
+            _cardsPanel.ResumeLayout();
+            return;
+        }
+
         if (_activeView == WorkspaceView.UnifiedHistory)
         {
             if (_unifiedHistoryCache == null)
@@ -3807,6 +4019,9 @@ public partial class Form1 : Form
         DetachPersistentControl(_patGatewayProxyDetectionLabel);
         DetachPersistentControl(_patGatewayRuntimeStatusLabel);
         DetachPersistentControl(_patGatewayToggleButton);
+        DetachPersistentControl(_patAutoRotationStatusLabel);
+        DetachPersistentControl(_patAutoRotationToggleButton);
+        DetachPersistentControl(_patAutoRotationThresholdButton);
     }
 
     private static void DetachPersistentControl(Control? control)
@@ -5720,7 +5935,8 @@ public partial class Form1 : Form
                 168);
             var quotaActions = new Rectangle(width - 316, 186, 290, 34);
 
-            const int compactActionTotalWidth = 210 + 180 + 74 + 86 + (10 * 3);
+            // PAT/API rows add the optional Voice/Mobile launch between Codex and CLI.
+            const int compactActionTotalWidth = 210 + 180 + 160 + 74 + 86 + (10 * 4);
             var compactActionLeft = Math.Max(18, (width - compactActionTotalWidth) / 2);
             var switchName = new Rectangle(18, 4, width - 120 - 20 - 36, 30);
             var switchState = new Rectangle(width - 120 - 20, 10, 120, 36);
@@ -7044,7 +7260,7 @@ public partial class Form1 : Form
         var panel = new RoundedPanel
         {
             Width = width,
-            Height = 536,
+            Height = 648,
             Radius = 16,
             BorderColor = _palette.BorderColor,
             BackColor = _palette.CardColor,
@@ -7261,13 +7477,67 @@ public partial class Form1 : Form
         panel.Controls.Add(_patGatewayToggleButton);
         UpdatePatGatewayControls();
 
-        var note = new Label
+        var autoRotationLabel = new Label
         {
-            Text = "自动检测只探测本机回环地址；地址默认 127.0.0.1，端口会显示并回填检测结果。手动编辑任一项后使用手动设置。",
+            Text = "额度轮换",
             Left = innerLeft,
             Top = 414,
-            Width = Math.Max(260, innerWidth - configActionWidth - 18),
-            Height = 60,
+            Width = 150,
+            Height = 42,
+            Font = new Font(Font.FontFamily, 9F, FontStyle.Bold),
+            TextAlign = ContentAlignment.MiddleLeft,
+            UseMnemonic = false
+        };
+        ThemeStyler.ApplyLabel(autoRotationLabel, _palette, true);
+        panel.Controls.Add(autoRotationLabel);
+
+        _patAutoRotationStatusLabel.Parent?.Controls.Remove(_patAutoRotationStatusLabel);
+        _patAutoRotationStatusLabel.SetBounds(innerLeft + 164, 414, configFieldWidth, 42);
+        _patAutoRotationStatusLabel.Font = new Font(Font.FontFamily, 8.8F);
+        _patAutoRotationStatusLabel.TextAlign = ContentAlignment.MiddleLeft;
+        _patAutoRotationStatusLabel.AutoEllipsis = true;
+        _patAutoRotationStatusLabel.UseMnemonic = false;
+        ThemeStyler.ApplyLabel(_patAutoRotationStatusLabel, _palette);
+        panel.Controls.Add(_patAutoRotationStatusLabel);
+
+        var rotationActionGap = 8;
+        var rotationActionWidth = (configActionWidth - rotationActionGap) / 2;
+        _patAutoRotationThresholdButton.Parent?.Controls.Remove(_patAutoRotationThresholdButton);
+        _patAutoRotationThresholdButton.SetBounds(
+            configActionLeft,
+            411,
+            rotationActionWidth,
+            42);
+        _patAutoRotationThresholdButton.Tag = "soft";
+        _patAutoRotationThresholdButton.Radius = 12;
+        _patAutoRotationThresholdButton.Font = new Font(Font.FontFamily, 8.6F);
+        _patAutoRotationThresholdButton.MinimumFontSize = 7.8F;
+        _patAutoRotationThresholdButton.AccessibleName = "自动计算的账号轮换动态安全余量";
+        ThemeStyler.ApplySoftButton(_patAutoRotationThresholdButton, _palette);
+        panel.Controls.Add(_patAutoRotationThresholdButton);
+
+        _patAutoRotationToggleButton.Parent?.Controls.Remove(_patAutoRotationToggleButton);
+        _patAutoRotationToggleButton.SetBounds(
+            configActionLeft + rotationActionWidth + rotationActionGap,
+            411,
+            rotationActionWidth,
+            42);
+        _patAutoRotationToggleButton.Tag = "soft";
+        _patAutoRotationToggleButton.Radius = 12;
+        _patAutoRotationToggleButton.Font = new Font(Font.FontFamily, 8.6F);
+        _patAutoRotationToggleButton.MinimumFontSize = 7.8F;
+        _patAutoRotationToggleButton.AccessibleName = "打开或关闭账号轮换";
+        ThemeStyler.ApplySoftButton(_patAutoRotationToggleButton, _palette);
+        panel.Controls.Add(_patAutoRotationToggleButton);
+        UpdatePatAutoRotationControls();
+
+        var note = new Label
+        {
+            Text = "5h 剩余额度进入动态安全余量并经官方只读监控确认后，仅标记待轮换；当前响应会继续，下一次模型请求按使用池、备用池顺序切换。不会关闭 Codex，也不会自动重发上一条消息。",
+            Left = innerLeft,
+            Top = 478,
+            Width = innerWidth,
+            Height = 72,
             Font = new Font(Font.FontFamily, 8.5F),
             AutoEllipsis = false,
             UseMnemonic = false
@@ -7275,10 +7545,10 @@ public partial class Form1 : Form
         ThemeStyler.ApplyLabel(note, _palette, true);
         _toolTip.SetToolTip(
             note,
-            "检测只连接 127.0.0.1 的本地监听端口并执行 HTTP 代理握手，不访问外网；本地 PAT 网关端口 8317 会被排除。");
+            "安全余量会结合最近请求消耗、剩余额度和网关额度拒绝信号自动计算；流式请求执行中不会更换该请求的账号。");
         panel.Controls.Add(note);
 
-        var manualUpdate = MakeActionButton("检查更新", configActionLeft, 476, configActionWidth, false);
+        var manualUpdate = MakeActionButton("检查更新", configActionLeft, 574, configActionWidth, false);
         manualUpdate.AccessibleName = "手动检查应用更新";
         manualUpdate.Click += async (_, _) => await CheckForUpdatesAsync(manual: true);
         panel.Controls.Add(manualUpdate);
@@ -7295,17 +7565,32 @@ public partial class Form1 : Form
         const int compactBadgeWidth = 120;
         var horizontal = UsesHorizontalAccountSwitchLayout(width);
         var roomyHorizontal = width >= 1280;
+        var hasChatGptFeatureLaunch = !account.IsOfficialOAuth;
         var measuredCodexPlusPlusWidth = MeasureActionButtonWidth("Codex++ 启动", 210);
         var measuredCodexWidth = MeasureActionButtonWidth("Codex 启动", 180);
+        var measuredFeatureWidth = hasChatGptFeatureLaunch
+            ? MeasureActionButtonWidth("语音 / 手机", 160)
+            : 0;
         var splitActionWidth = Math.Max(160, (width - 46) / 2);
+        var primaryActionCount = hasChatGptFeatureLaunch ? 3 : 2;
+        var stackedPrimaryWidth = Math.Max(
+            108,
+            (width - 36 - (actionGap * (primaryActionCount - 1))) / primaryActionCount);
+        var singleRowGapCount = hasChatGptFeatureLaunch ? 4 : 3;
+        var featureActionSpace = hasChatGptFeatureLaunch
+            ? measuredFeatureWidth
+            : 0;
         var singleRowActionsFit = width - 36 >=
                                   measuredCodexPlusPlusWidth + measuredCodexWidth +
-                                  cliButtonWidth + detailButtonWidth + (actionGap * 3);
+                                  featureActionSpace + cliButtonWidth + detailButtonWidth +
+                                  (actionGap * singleRowGapCount);
         var twoActionRows = !singleRowActionsFit;
-        var codexPlusPlusButtonWidth = twoActionRows ? splitActionWidth : measuredCodexPlusPlusWidth;
-        var codexButtonWidth = twoActionRows ? splitActionWidth : measuredCodexWidth;
+        var codexPlusPlusButtonWidth = twoActionRows ? stackedPrimaryWidth : measuredCodexPlusPlusWidth;
+        var codexButtonWidth = twoActionRows ? stackedPrimaryWidth : measuredCodexWidth;
+        var featureButtonWidth = twoActionRows ? stackedPrimaryWidth : measuredFeatureWidth;
         var actionTotalWidth = measuredCodexPlusPlusWidth + measuredCodexWidth +
-                               cliButtonWidth + detailButtonWidth + (actionGap * 3);
+                               featureActionSpace + cliButtonWidth + detailButtonWidth +
+                               (actionGap * singleRowGapCount);
         var row = new RoundedPanel
         {
             Width = width,
@@ -7410,11 +7695,34 @@ public partial class Form1 : Form
             actionTop,
             codexButtonWidth);
         codex.Click += async (_, _) => await LaunchAccountAsync(account, WindowsClientMode.OfficialCodex);
-        _toolTip.SetToolTip(codex, "使用官方 Codex 启动此账号");
+        _toolTip.SetToolTip(
+            codex,
+            account.IsOfficialOAuth
+                ? "使用该 ChatGPT 官方登录启动 Codex。"
+                : "使用纯 PAT/API 登录启动官方 Codex；语音和手机连接不可用。");
         row.Controls.Add(codex);
 
+        var featureRight = codexLeft + codexButtonWidth;
+        if (hasChatGptFeatureLaunch)
+        {
+            var featureLeft = featureRight + actionGap;
+            var feature = MakeLaunchActionButton(
+                "语音 / 手机",
+                featureLeft,
+                actionTop,
+                featureButtonWidth);
+            feature.Click += async (_, _) => await LaunchChatGptFeatureAccountAsync(account);
+            _toolTip.SetToolTip(
+                feature,
+                "普通模型请求继续走此 PAT/API；语音、手机连接和设备配对使用已保存的 ChatGPT 官方登录。\n" +
+                "官方 OAuth 只是必要条件，不保证功能一定开放；语音仍受套餐、工作区策略和灰度限制，" +
+                "手机端必须登录同一 ChatGPT 账号与工作区。");
+            row.Controls.Add(feature);
+            featureRight = featureLeft + featureButtonWidth;
+        }
+
         var secondaryActionTop = twoActionRows ? actionTop + 50 : actionTop;
-        var cliLeft = twoActionRows ? 18 : codexLeft + codexButtonWidth + actionGap;
+        var cliLeft = twoActionRows ? 18 : featureRight + actionGap;
         var effectiveCliWidth = twoActionRows ? splitActionWidth : cliButtonWidth;
         var cli = MakeLaunchTonalButton("CLI", cliLeft, secondaryActionTop, effectiveCliWidth);
         cli.Click += async (_, _) => await LaunchCliAccountAsync(account);
@@ -7655,7 +7963,11 @@ public partial class Form1 : Form
                 StringComparison.OrdinalIgnoreCase));
     }
 
-    private void SetCurrentAccount(string? accountName, bool render = true, bool recordUsageSwitch = false)
+    private void SetCurrentAccount(
+        string? accountName,
+        bool render = true,
+        bool recordUsageSwitch = false,
+        bool persistSettings = true)
     {
         var normalizedAccountName = string.IsNullOrWhiteSpace(accountName) ? null : accountName;
         var accountChanged = !string.Equals(
@@ -7668,7 +7980,10 @@ public partial class Form1 : Form
         }
         _currentAccountName = normalizedAccountName;
         _appSettings.CurrentAccountName = _currentAccountName;
-        _themeService.SaveSettings(_appSettings);
+        if (persistSettings)
+        {
+            _themeService.SaveSettings(_appSettings);
+        }
         if (recordUsageSwitch && accountChanged)
         {
             _usageTracker.RecordSwitch(GetCurrentAccountRecord());
@@ -7763,7 +8078,10 @@ public partial class Form1 : Form
             metricWidth));
 
         var actionGap = 6;
-        var launchActionWidth = (innerWidth - actionGap) / 2;
+        var hasChatGptFeatureLaunch = !account.IsOfficialOAuth;
+        var launchActionCount = hasChatGptFeatureLaunch ? 3 : 2;
+        var launchActionWidth =
+            (innerWidth - (actionGap * (launchActionCount - 1))) / launchActionCount;
         var actionTop = 532;
         var codexPlusPlus = MakeLaunchActionButton(
             "Codex++ 启动",
@@ -7780,11 +8098,33 @@ public partial class Form1 : Form
             actionTop,
             launchActionWidth);
         codex.Click += async (_, _) => await LaunchAccountAsync(account, WindowsClientMode.OfficialCodex);
-        _toolTip.SetToolTip(codex, "使用官方 Codex 启动此账号");
+        _toolTip.SetToolTip(
+            codex,
+            account.IsOfficialOAuth
+                ? "使用该 ChatGPT 官方登录启动 Codex。"
+                : "使用纯 PAT/API 登录启动官方 Codex；语音和手机连接不可用。");
         card.Controls.Add(codex);
 
+        if (hasChatGptFeatureLaunch)
+        {
+            var feature = MakeLaunchActionButton(
+                "语音 / 手机",
+                innerLeft + ((launchActionWidth + actionGap) * 2),
+                actionTop,
+                launchActionWidth);
+            feature.Click += async (_, _) => await LaunchChatGptFeatureAccountAsync(account);
+            _toolTip.SetToolTip(
+                feature,
+                "普通模型请求继续走此 PAT/API；语音、手机连接和设备配对使用已保存的 ChatGPT 官方登录。\n" +
+                "官方 OAuth 只是必要条件，不保证功能一定开放；语音仍受套餐、工作区策略和灰度限制，" +
+                "手机端必须登录同一 ChatGPT 账号与工作区。");
+            card.Controls.Add(feature);
+        }
+
         var utilityActionTop = actionTop + 46;
-        var utilityActionWidth = (innerWidth - actionGap) / 2;
+        var utilityActionCount = hasChatGptFeatureLaunch ? 3 : 2;
+        var utilityActionWidth =
+            (innerWidth - (actionGap * (utilityActionCount - 1))) / utilityActionCount;
         var cli = MakeActionButton(
             "CLI",
             innerLeft,
@@ -7802,6 +8142,22 @@ public partial class Form1 : Form
             false);
         statusButton.Click += async (_, _) => await CheckStatusAsync(account);
         card.Controls.Add(statusButton);
+
+        if (hasChatGptFeatureLaunch)
+        {
+            var binding = MakeActionButton(
+                "ChatGPT 绑定",
+                innerLeft + ((utilityActionWidth + actionGap) * 2),
+                utilityActionTop,
+                utilityActionWidth,
+                false);
+            binding.Click += (_, _) => ConfigureChatGptFeatureBinding(account);
+            _toolTip.SetToolTip(
+                binding,
+                "选择或解除语音、手机连接、MFA 和设备配对所使用的 ChatGPT 官方账号；" +
+                "这不会立即切换正在运行的 Codex，也不改变 PAT/API 模型账号。");
+            card.Controls.Add(binding);
+        }
 
         var secondActionTop = actionTop + 92;
         var secondaryActionWidth = (innerWidth - (actionGap * 2)) / 3;
@@ -8128,17 +8484,11 @@ public partial class Form1 : Form
         _toolTip.SetToolTip(statusBadge, status == null ? "尚未检查登录状态" : status.Text);
         row.Controls.Add(statusBadge);
 
-        var tokenBadge = MakeBadge(
-            GetCredentialBadgeText(account),
-            geometry.TokenBadge.Left,
-            geometry.TokenBadge.Top,
-            authReady || account.IsAccessToken
-                ? Color.FromArgb(48, _palette.SuccessColor)
-                : Color.FromArgb(40, _palette.WarningColor),
-            authReady || account.IsAccessToken ? _palette.SuccessColor : _palette.WarningColor);
-        tokenBadge.Size = geometry.TokenBadge.Size;
-        tokenBadge.UseMnemonic = false;
-        row.Controls.Add(tokenBadge);
+        var fingerprintToggle = MakeFingerprintForwardingToggle(
+            account,
+            geometry.TokenBadge,
+            row.BackColor);
+        row.Controls.Add(fingerprintToggle);
 
         var check = MakeStatusCheckButton(
             geometry.Check.Left,
@@ -8158,6 +8508,81 @@ public partial class Form1 : Form
         row.Controls.Add(update);
 
         return row;
+    }
+
+    private ModernToggleSwitch MakeFingerprintForwardingToggle(
+        AccountRecord account,
+        Rectangle bounds,
+        Color backgroundColor)
+    {
+        _appSettings.CodexFingerprintForwarding ??= new Dictionary<string, bool>(
+            StringComparer.Ordinal);
+        var enabled = AccountRotationConfiguration.IsFingerprintForwardingEnabled(
+            _appSettings,
+            account);
+        var toggle = new ModernToggleSwitch
+        {
+            Bounds = bounds,
+            Text = "指纹透传",
+            Checked = enabled,
+            BackColor = backgroundColor,
+            Font = new Font(Font.FontFamily, 8.1F, FontStyle.Bold),
+            AccessibleName = $"{account.Name} Codex 指纹透传"
+        };
+        ApplyFingerprintForwardingToggleStyle(toggle);
+        _toolTip.SetToolTip(
+            toggle,
+            "仅在该账号经本地网关转发时，透传明确白名单内的 Codex 客户端元数据。" +
+            "Authorization、Cookie、ChatGPT 账号和工作区身份头始终不会跨账号透传；" +
+            "兼容 API 还会移除 attestation 与内部身份元数据。官方 OAuth 原生直连时不受此设置影响。");
+
+        toggle.Click += (_, _) =>
+        {
+            var previous = AccountRotationConfiguration.IsFingerprintForwardingEnabled(
+                _appSettings,
+                account);
+            if (toggle.Checked == previous)
+            {
+                return;
+            }
+
+            AccountRotationConfiguration.ToggleFingerprintForwarding(_appSettings, account);
+            if (!TrySaveAppSettings(out var error))
+            {
+                AccountRotationConfiguration.ToggleFingerprintForwarding(_appSettings, account);
+                toggle.Checked = previous;
+                ApplyFingerprintForwardingToggleStyle(toggle);
+                _statusBox.Text = "指纹透传设置未保存：" + error;
+                return;
+            }
+
+            ApplyFingerprintForwardingToggleStyle(toggle);
+            _statusBox.Text = toggle.Checked
+                ? $"已为 {account.Name} 开启安全指纹透传；仅使用客户端元数据白名单。"
+                : $"已为 {account.Name} 关闭指纹透传；后续请求使用网关默认客户端元数据。";
+        };
+        return toggle;
+    }
+
+    private void ApplyFingerprintForwardingToggleStyle(ModernToggleSwitch toggle)
+    {
+        var dark = ThemeStyler.IsDark(_palette);
+        toggle.OnTrackColor = _palette.SuccessColor;
+        toggle.OffTrackColor = UiDesign.Blend(
+            _palette.BorderColor,
+            _palette.MutedTextColor,
+            dark ? 0.38F : 0.24F);
+        toggle.KnobColor = dark
+            ? UiDesign.Blend(_palette.TextColor, Color.White, 0.12F)
+            : Color.White;
+        toggle.TextColor = toggle.Enabled
+            ? toggle.Checked ? _palette.SuccessColor : _palette.MutedTextColor
+            : _palette.MutedTextColor;
+        toggle.BorderColor = UiDesign.Blend(
+            _palette.BorderColor,
+            toggle.Checked ? _palette.SuccessColor : _palette.MutedTextColor,
+            0.32F);
+        toggle.Invalidate();
     }
 
     private StatusTokenRowGeometry CalculateStatusTokenRowGeometry(int width) =>
@@ -14027,6 +14452,11 @@ public partial class Form1 : Form
                                     authKindChanged ||
                                     !string.IsNullOrWhiteSpace(token) ||
                                     !string.IsNullOrWhiteSpace(dialog.ApiKeyValue);
+            string? postOperationSettingsError = null;
+            if (authKindChanged || !PathsEqual(account.CodexHome, updatedAccount.CodexHome))
+            {
+                TryRemoveChatGptFeatureBindings(account, out postOperationSettingsError);
+            }
             if (credentialChanged)
             {
                 // A display-name-only edit keeps the identity key and therefore keeps every
@@ -14055,9 +14485,9 @@ public partial class Form1 : Form
             }
             if (account.Name.Equals(_currentAccountName, StringComparison.OrdinalIgnoreCase))
             {
-                SetCurrentAccount(updatedAccount.Name, false);
+                SetCurrentAccount(updatedAccount.Name, false, persistSettings: false);
             }
-            LoadAccounts();
+            LoadAccounts(persistCurrentAccountSelection: false);
             _statusBox.Text = $"已更新账号：{updatedAccount.Name}";
 
             if (updatedAccount.IsOfficialOAuth && authKindChanged)
@@ -14067,6 +14497,20 @@ public partial class Form1 : Form
             else if (updatedAccount.IsAccessToken && !string.IsNullOrWhiteSpace(token))
             {
                 await LoginWithTokenAsync(updatedAccount, token, "密钥已更新。");
+            }
+
+            if (!TrySaveAppSettings(out var finalSettingsError))
+            {
+                postOperationSettingsError = CombineSettingsErrors(
+                    postOperationSettingsError,
+                    finalSettingsError);
+            }
+            if (!string.IsNullOrWhiteSpace(postOperationSettingsError))
+            {
+                _statusBox.Text += "；Account Manager 设置未能完整保存。";
+                ShowCompletedAccountOperationSettingsWarning(
+                    $"账号 {updatedAccount.Name} 已更新",
+                    postOperationSettingsError);
             }
 
             return;
@@ -14079,6 +14523,22 @@ public partial class Form1 : Form
             this,
             error.Message,
             "无法保存账号",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Warning);
+    }
+
+    private void ShowCompletedAccountOperationSettingsWarning(
+        string completedAction,
+        string settingsError)
+    {
+        MessageBox.Show(
+            this,
+            $"{completedAction}，账号列表也已刷新，但 Account Manager 设置未能完整写回。" +
+            "旧的 ChatGPT 功能绑定或当前账号选择可能仍保留在磁盘中。\n\n" +
+            $"设置错误：{settingsError}\n\n" +
+            "这不会撤销已经完成的账号操作；请检查 Account Manager 数据目录的写入权限或磁盘空间，" +
+            "然后重新配置一次 ChatGPT 绑定。",
+            "账号操作已完成，设置未完整保存",
             MessageBoxButtons.OK,
             MessageBoxIcon.Warning);
     }
@@ -14112,15 +14572,6 @@ public partial class Form1 : Form
         {
             _codex.DeleteSharedCredentialIfSelected(account);
             _store.DeleteAccount(account);
-            try
-            {
-                _quotaSnapshotStore.Remove(account);
-            }
-            catch
-            {
-                // Deleting an optional quota cache must not turn a completed account
-                // deletion into a reported failure.
-            }
         }
         catch (Exception ex)
         {
@@ -14128,25 +14579,564 @@ public partial class Form1 : Form
             return;
         }
 
+        TryRemoveChatGptFeatureBindings(account, out var postOperationSettingsError);
+        try
+        {
+            _quotaSnapshotStore.Remove(account);
+        }
+        catch
+        {
+            // Deleting an optional quota cache must not turn a completed account
+            // deletion into a reported failure.
+        }
+
         _statusCache.Remove(account.Name);
         InvalidateQuotaRuntimeState(account);
         if (account.Name.Equals(_currentAccountName, StringComparison.OrdinalIgnoreCase))
         {
-            SetCurrentAccount(null, false);
+            SetCurrentAccount(null, false, persistSettings: false);
         }
         if (account.Name.Equals(_selectedAccountName, StringComparison.OrdinalIgnoreCase))
         {
             _selectedAccountName = null;
         }
-        LoadAccounts();
+        LoadAccounts(persistCurrentAccountSelection: false);
         _statusBox.Text = $"已永久删除账号及本地凭据：{account.Name}";
+        if (!TrySaveAppSettings(out var finalSettingsError))
+        {
+            postOperationSettingsError = CombineSettingsErrors(
+                postOperationSettingsError,
+                finalSettingsError);
+        }
+        if (!string.IsNullOrWhiteSpace(postOperationSettingsError))
+        {
+            _statusBox.Text += "；Account Manager 设置未能完整保存。";
+            ShowCompletedAccountOperationSettingsWarning(
+                $"账号 {account.Name} 已永久删除",
+                postOperationSettingsError);
+        }
     }
 
-    private async Task LaunchAccountAsync(AccountRecord account, WindowsClientMode mode)
+    private async Task LaunchChatGptFeatureAccountAsync(AccountRecord account)
+    {
+        if (account.IsOfficialOAuth)
+        {
+            await LaunchAccountAsync(account, WindowsClientMode.OfficialCodex);
+            return;
+        }
+
+        var candidates = _accounts
+            .Where(candidate => candidate.IsOfficialOAuth &&
+                                _codex.HasVerifiableChatGptFeatureLogin(candidate))
+            .OrderBy(candidate => candidate.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var hasSavedBinding = HasSavedChatGptFeatureBinding(account);
+        if (candidates.Count == 0 && !hasSavedBinding)
+        {
+            MessageBox.Show(
+                this,
+                "语音和手机连接不能只用 PAT 或 API Key 授权。\n\n" +
+                "请先添加一个“通过 ChatGPT 登录（官方）”账号并完成网页登录。" +
+                "官方 OAuth 只是必要条件，不保证功能一定开放：语音仍受套餐、工作区策略和灰度限制，" +
+                "手机端还必须登录同一 ChatGPT 账号与工作区。\n\n" +
+                "本次不会切换或启动 Codex；当前运行中的登录态保持不变。",
+                "需要 ChatGPT 官方登录",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        var featureAccount = ResolveBoundChatGptFeatureAccount(account, candidates);
+        var bindingChanged = false;
+        if (featureAccount == null)
+        {
+            featureAccount = SelectChatGptFeatureAccount(
+                candidates,
+                currentBinding: null,
+                hasSavedBinding,
+                out var unbindRequested);
+            if (unbindRequested)
+            {
+                if (!TryRemoveChatGptFeatureBindings(account, out var removeError))
+                {
+                    ShowError($"无法解除 ChatGPT 功能绑定：{removeError}");
+                    return;
+                }
+
+                _statusBox.Text =
+                    $"已解除 {account.Name} 的 ChatGPT 功能绑定；本次未启动 Codex，当前运行中的登录态未改变。";
+                return;
+            }
+            bindingChanged = featureAccount != null;
+        }
+        if (featureAccount == null)
+        {
+            return;
+        }
+        if (bindingChanged)
+        {
+            try
+            {
+                SaveChatGptFeatureBinding(account, featureAccount);
+            }
+            catch (Exception ex)
+            {
+                ShowError($"无法保存 ChatGPT 功能绑定：{ex.Message}");
+                return;
+            }
+        }
+
+        await LaunchAccountAsync(
+            account,
+            WindowsClientMode.OfficialCodex,
+            featureAccount);
+    }
+
+    private AccountRecord? ResolveBoundChatGptFeatureAccount(
+        AccountRecord modelAccount,
+        IReadOnlyList<AccountRecord> candidates)
+    {
+        _appSettings.ChatGptFeatureAccountBindings ??=
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var modelKey = _codex.GetDesktopAccountBindingKey(modelAccount);
+        if (!_appSettings.ChatGptFeatureAccountBindings.TryGetValue(
+                modelKey,
+                out var boundAuthKey))
+        {
+            return null;
+        }
+
+        return candidates.FirstOrDefault(candidate =>
+        {
+            var identityKey = _codex.GetChatGptFeatureIdentityBindingKey(candidate);
+            var candidateBinding = identityKey == null
+                ? ""
+                : _codex.GetDesktopAccountBindingKey(candidate) + ":" + identityKey;
+            return candidateBinding.Equals(
+                boundAuthKey,
+                StringComparison.OrdinalIgnoreCase);
+        });
+    }
+
+    private void SaveChatGptFeatureBinding(
+        AccountRecord modelAccount,
+        AccountRecord chatGptFeatureAccount)
+    {
+        _appSettings.ChatGptFeatureAccountBindings ??=
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var identityKey = _codex.GetChatGptFeatureIdentityBindingKey(chatGptFeatureAccount);
+        if (identityKey == null)
+        {
+            throw new InvalidOperationException(
+                $"账号 {chatGptFeatureAccount.Name} 没有可验证身份的 ChatGPT 官方登录态，无法保存绑定。");
+        }
+
+        var modelKey = _codex.GetDesktopAccountBindingKey(modelAccount);
+        var hadPreviousBinding = _appSettings.ChatGptFeatureAccountBindings.TryGetValue(
+            modelKey,
+            out var previousBinding);
+        _appSettings.ChatGptFeatureAccountBindings[modelKey] =
+            _codex.GetDesktopAccountBindingKey(chatGptFeatureAccount) + ":" + identityKey;
+        try
+        {
+            _themeService.SaveSettings(_appSettings);
+        }
+        catch
+        {
+            if (hadPreviousBinding)
+            {
+                _appSettings.ChatGptFeatureAccountBindings[modelKey] = previousBinding!;
+            }
+            else
+            {
+                _appSettings.ChatGptFeatureAccountBindings.Remove(modelKey);
+            }
+            throw;
+        }
+    }
+
+    private bool HasSavedChatGptFeatureBinding(AccountRecord modelAccount)
+    {
+        var bindings = _appSettings.ChatGptFeatureAccountBindings;
+        return bindings != null &&
+               bindings.ContainsKey(_codex.GetDesktopAccountBindingKey(modelAccount));
+    }
+
+    private void RemoveChatGptFeatureBindings(AccountRecord account)
+    {
+        var bindings = _appSettings.ChatGptFeatureAccountBindings;
+        if (bindings == null || bindings.Count == 0)
+        {
+            return;
+        }
+
+        var accountKey = _codex.GetDesktopAccountBindingKey(account);
+        var keysToRemove = bindings
+            .Where(binding =>
+                binding.Key.Equals(accountKey, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(binding.Value, accountKey, StringComparison.OrdinalIgnoreCase) ||
+                (binding.Value?.StartsWith(
+                     accountKey + ":",
+                     StringComparison.OrdinalIgnoreCase) ?? false))
+            .Select(binding => binding.Key)
+            .ToList();
+        var removedBindings = keysToRemove
+            .Select(key => new KeyValuePair<string, string>(key, bindings[key]))
+            .ToList();
+        foreach (var key in keysToRemove)
+        {
+            bindings.Remove(key);
+        }
+        if (keysToRemove.Count > 0)
+        {
+            try
+            {
+                _themeService.SaveSettings(_appSettings);
+            }
+            catch
+            {
+                foreach (var removedBinding in removedBindings)
+                {
+                    bindings[removedBinding.Key] = removedBinding.Value;
+                }
+                throw;
+            }
+        }
+    }
+
+    private bool TryRemoveChatGptFeatureBindings(AccountRecord account, out string? error)
+    {
+        try
+        {
+            RemoveChatGptFeatureBindings(account);
+            error = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return false;
+        }
+    }
+
+    private bool TrySaveAppSettings(out string? error)
+    {
+        try
+        {
+            _themeService.SaveSettings(_appSettings);
+            error = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return false;
+        }
+    }
+
+    private static string? CombineSettingsErrors(string? first, string? second)
+    {
+        if (string.IsNullOrWhiteSpace(first))
+        {
+            return second;
+        }
+        if (string.IsNullOrWhiteSpace(second) ||
+            first.Contains(second, StringComparison.Ordinal))
+        {
+            return first;
+        }
+        return first + "\n" + second;
+    }
+
+    private void ConfigureChatGptFeatureBinding(AccountRecord account)
+    {
+        var candidates = _accounts
+            .Where(candidate => candidate.IsOfficialOAuth &&
+                                _codex.HasVerifiableChatGptFeatureLogin(candidate))
+            .OrderBy(candidate => candidate.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var hasSavedBinding = HasSavedChatGptFeatureBinding(account);
+        if (candidates.Count == 0 && !hasSavedBinding)
+        {
+            MessageBox.Show(
+                this,
+                "没有可绑定的 ChatGPT 官方登录账号。请先添加并完成网页登录。\n\n" +
+                "官方 OAuth 只是语音和手机连接的必要条件，不保证功能一定开放；" +
+                "实际可用性仍以 Codex 页面、ChatGPT 套餐和工作区策略为准。",
+                "无法绑定 ChatGPT 功能账号",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
+        var currentBinding = ResolveBoundChatGptFeatureAccount(account, candidates);
+        var selected = SelectChatGptFeatureAccount(
+            candidates,
+            currentBinding,
+            hasSavedBinding,
+            out var unbindRequested);
+        if (unbindRequested)
+        {
+            if (!TryRemoveChatGptFeatureBindings(account, out var removeError))
+            {
+                ShowError($"无法解除 ChatGPT 功能绑定：{removeError}");
+                return;
+            }
+
+            _statusBox.Text =
+                $"已解除 {account.Name} 的 ChatGPT 功能绑定；当前运行中的 Codex 登录态未改变。";
+            return;
+        }
+        if (selected == null)
+        {
+            return;
+        }
+
+        try
+        {
+            SaveChatGptFeatureBinding(account, selected);
+        }
+        catch (Exception ex)
+        {
+            ShowError($"无法保存 ChatGPT 功能绑定：{ex.Message}");
+            return;
+        }
+        _statusBox.Text =
+            $"已将 {account.Name} 的语音/手机功能绑定到 ChatGPT 账号 {selected.Name}；" +
+            "下次从“语音 / 手机”启动时，普通模型请求将使用此 PAT/API。";
+    }
+
+    private AccountRecord? SelectChatGptFeatureAccount(
+        IReadOnlyList<AccountRecord> candidates,
+        AccountRecord? currentBinding,
+        bool hasSavedBinding,
+        out bool unbindRequested)
+    {
+        unbindRequested = false;
+        using var dialog = new Form
+        {
+            Text = "选择 ChatGPT 功能账号",
+            ClientSize = new Size(640, 350),
+            MinimumSize = new Size(560, 320),
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MaximizeBox = false,
+            MinimizeBox = false,
+            ShowInTaskbar = false,
+            AutoScaleMode = AutoScaleMode.Dpi,
+            AutoScaleDimensions = new SizeF(96F, 96F),
+            Font = new Font(Font.FontFamily, 9.25F)
+        };
+        ThemeStyler.ApplyDialog(dialog, _palette);
+
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            Padding = new Padding(24, 22, 24, 20),
+            ColumnCount = 1,
+            RowCount = 6,
+            BackColor = _palette.SurfaceColor
+        };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        dialog.Controls.Add(layout);
+
+        var explanation = new Label
+        {
+            Text = "ChatGPT 官方登录只提供语音、手机连接、MFA 与设备配对所需的身份和权益；" +
+                   "它是必要条件，不保证功能一定开放。语音仍受套餐、工作区策略和灰度限制，" +
+                   "手机端必须登录同一 ChatGPT 账号与工作区。",
+            AutoSize = true,
+            MaximumSize = new Size(572, 0),
+            Dock = DockStyle.Fill,
+            Margin = new Padding(0, 0, 0, 12),
+            UseMnemonic = false
+        };
+        ThemeStyler.ApplyLabel(explanation, _palette);
+        layout.Controls.Add(explanation, 0, 0);
+
+        var currentBindingText = currentBinding != null
+            ? $"当前绑定：{currentBinding.Name}（已在下拉列表中标注）"
+            : hasSavedBinding
+                ? "当前绑定已失效：原 ChatGPT 登录态已更换或不可用。请选择新账号，或解除旧绑定。"
+                : "当前未绑定 ChatGPT 功能账号。";
+        var currentBindingLabel = new Label
+        {
+            Text = currentBindingText,
+            AutoSize = true,
+            MaximumSize = new Size(572, 0),
+            Dock = DockStyle.Fill,
+            Margin = new Padding(0, 0, 0, 8),
+            Font = new Font(dialog.Font.FontFamily, 9F, FontStyle.Bold),
+            UseMnemonic = false
+        };
+        ThemeStyler.ApplyLabel(currentBindingLabel, _palette);
+        currentBindingLabel.ForeColor = currentBinding != null
+            ? _palette.SuccessColor
+            : hasSavedBinding
+                ? _palette.WarningColor
+                : _palette.MutedTextColor;
+        layout.Controls.Add(currentBindingLabel, 0, 1);
+
+        var picker = new ComboBox
+        {
+            Dock = DockStyle.Top,
+            MinimumSize = new Size(0, 34),
+            Margin = new Padding(0, 0, 0, 10),
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            AccessibleName = "ChatGPT 功能账号"
+        };
+        var currentBindingIndex = -1;
+        var currentBindingKey = currentBinding == null
+            ? null
+            : _codex.GetDesktopAccountBindingKey(currentBinding);
+        for (var index = 0; index < candidates.Count; index++)
+        {
+            var candidate = candidates[index];
+            var isCurrent = currentBindingKey != null &&
+                            _codex.GetDesktopAccountBindingKey(candidate).Equals(
+                                currentBindingKey,
+                                StringComparison.OrdinalIgnoreCase);
+            picker.Items.Add(isCurrent
+                ? $"{candidate.Name}（当前绑定）"
+                : candidate.Name);
+            if (isCurrent)
+            {
+                currentBindingIndex = index;
+            }
+        }
+        if (candidates.Count == 0)
+        {
+            picker.Items.Add("没有可用的 ChatGPT 官方登录账号");
+            picker.Enabled = false;
+            picker.SelectedIndex = 0;
+        }
+        else
+        {
+            picker.SelectedIndex = currentBindingIndex >= 0 ? currentBindingIndex : 0;
+        }
+        ThemeStyler.ApplyComboBox(picker, _palette);
+        layout.Controls.Add(picker, 0, 2);
+
+        var routingNote = new Label
+        {
+            Text = "下次从“语音 / 手机”启动时，普通模型请求将使用当前 PAT/API；" +
+                   "语音实时会话可能使用所选 ChatGPT 账号的权益。当前运行中的 Codex 不会因绑定操作立即切换。",
+            AutoSize = true,
+            MaximumSize = new Size(572, 0),
+            Dock = DockStyle.Fill,
+            Margin = new Padding(0, 0, 0, 10),
+            UseMnemonic = false
+        };
+        ThemeStyler.ApplyLabel(routingNote, _palette, true);
+        layout.Controls.Add(routingNote, 0, 3);
+
+        var spacer = new Panel
+        {
+            Dock = DockStyle.Fill,
+            Margin = Padding.Empty,
+            BackColor = Color.Transparent
+        };
+        layout.Controls.Add(spacer, 0, 4);
+
+        var actions = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            WrapContents = false,
+            FlowDirection = FlowDirection.RightToLeft,
+            Margin = Padding.Empty,
+            BackColor = Color.Transparent
+        };
+
+        var cancel = new Button
+        {
+            Text = "取消",
+            Width = 96,
+            Height = 40,
+            Margin = new Padding(8, 0, 0, 0),
+            DialogResult = DialogResult.Cancel
+        };
+        ThemeStyler.ApplySoftButton(cancel, _palette);
+
+        var confirm = new Button
+        {
+            Text = "使用此账号",
+            Width = 112,
+            Height = 40,
+            Margin = Padding.Empty,
+            DialogResult = DialogResult.OK,
+            Enabled = candidates.Count > 0
+        };
+        ThemeStyler.ApplyPrimaryButton(confirm, _palette);
+
+        var removeRequested = false;
+        var unbind = new Button
+        {
+            Text = "解除当前绑定",
+            Width = 126,
+            Height = 40,
+            Margin = new Padding(8, 0, 0, 0),
+            Enabled = hasSavedBinding
+        };
+        ThemeStyler.ApplySoftButton(unbind, _palette);
+        unbind.Click += (_, _) =>
+        {
+            removeRequested = true;
+            dialog.DialogResult = DialogResult.OK;
+            dialog.Close();
+        };
+
+        actions.Controls.Add(confirm);
+        actions.Controls.Add(cancel);
+        actions.Controls.Add(unbind);
+        layout.Controls.Add(actions, 0, 5);
+        dialog.AcceptButton = confirm;
+        dialog.CancelButton = cancel;
+
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return null;
+        }
+        if (removeRequested)
+        {
+            unbindRequested = true;
+            return null;
+        }
+
+        return picker.SelectedIndex >= 0 && picker.SelectedIndex < candidates.Count
+            ? candidates[picker.SelectedIndex]
+            : null;
+    }
+
+    private async Task<bool> LaunchAccountAsync(
+        AccountRecord account,
+        WindowsClientMode mode,
+        AccountRecord? chatGptFeatureAccount = null,
+        bool automaticRotation = false)
     {
         if (!TryGetProjectPathForLaunch(out var projectPath))
         {
-            return;
+            return false;
+        }
+
+        if (!automaticRotation)
+        {
+            CancelPendingPatAutoRotation(resetState: true);
+            _patAutoRotationLaunchContext = null;
+            _patAutoRotationGatewayTransportActive = false;
+            _accountRotationPrimaryReturnCancellation?.Cancel();
+            _accountRotationPrimaryReturnCancellation = null;
+            _patAutoRotationUnavailableAccountKeys.Clear();
+            _patAutoRotationUnknownResetRetryAtUtc.Clear();
+            _ = await LocalPatGateway.ClearRotationAsync();
+            UpdatePatAutoRotationControls();
         }
 
         var modelSummary = account.IsOfficialOAuth
@@ -14154,6 +15144,10 @@ public partial class Form1 : Form
             : account.IsCompatibleApi
                 ? $"{account.ApiModel} / 极高"
                 : $"{ModelCatalogService.DefaultModel} / 中等";
+        if (chatGptFeatureAccount != null)
+        {
+            modelSummary += $"；功能身份：{chatGptFeatureAccount.Name}";
+        }
         if (_appSettings.WindowsClientMode != mode)
         {
             // Remember the last explicit button for future defaults without hiding either
@@ -14161,11 +15155,27 @@ public partial class Form1 : Form
             _appSettings.WindowsClientMode = mode;
             _themeService.SaveSettings(_appSettings);
         }
-        var clientName = GetWindowsClientDisplayName(mode);
-        var profileAlreadySelected = _codex.IsSharedProfileAlreadySelected(account);
+        var clientName = chatGptFeatureAccount == null
+            ? GetWindowsClientDisplayName(mode)
+            : "官方 Codex（PAT/API + ChatGPT 双登录）";
+        var routeOfficialOAuthThroughGateway =
+            mode == WindowsClientMode.OfficialCodex &&
+            account.IsOfficialOAuth &&
+            AccountRotationConfiguration.IsEnabled(_appSettings) &&
+            AccountRotationConfiguration.GetPool(_appSettings, account) !=
+                AccountRotationPool.None;
+        var profileAlreadySelected = chatGptFeatureAccount == null
+            ? _codex.IsSharedProfileAlreadySelected(
+                account,
+                routeOfficialOAuthThroughGateway)
+            : _codex.IsSharedChatGptFeatureProfileAlreadySelected(
+                account,
+                chatGptFeatureAccount);
         _statusBox.Text = profileAlreadySelected
             ? $"正在使用现有凭据启动 {clientName}…"
-            : $"正在切换到 {account.Name} 并启动 {clientName}…";
+            : chatGptFeatureAccount == null
+                ? $"正在切换到 {account.Name} 并启动 {clientName}…"
+                : $"正在用 {account.Name} 的模型凭据和 {chatGptFeatureAccount.Name} 的 ChatGPT 功能身份启动…";
         _toolTip.SetToolTip(
             _statusBox,
             profileAlreadySelected
@@ -14175,17 +15185,42 @@ public partial class Form1 : Form
         WindowsClientAccountProjection? projection = null;
         await RunBusyAsync(async () =>
         {
+            if (routeOfficialOAuthThroughGateway)
+            {
+                await LocalPatGateway.EnsureRunningAsync(
+                    restartOnProxyMismatch: false);
+                if (await LocalPatGateway.RequiresRotationProtocolUpgradeAsync())
+                {
+                    throw new InvalidOperationException(
+                        "账号轮换网关正在等待当前任务的安全边界完成升级；" +
+                        "为避免中断任务，本次没有切换账号，请稍后再试。");
+                }
+                _patGatewayRuntimeRunning = true;
+                _patGatewayRuntimeStatus =
+                    $"已开启 · 127.0.0.1:{LocalPatGateway.Port}";
+                UpdatePatGatewayControls();
+            }
             var startupAppearance = GetCodexAppearanceOptionById(_appSettings.CodexAppearancePresetId);
             var useDreamSkinAtStartup = _appSettings.UseCodexDreamSkin &&
                                         !IsOfficialCodexAppearance(startupAppearance);
-            projection = await _codex.SwitchWindowsClientAccountAsync(
-                account,
-                projectPath,
-                mode,
-                useDreamSkinAtStartup,
-                GetCodexAppearanceRuntimeMode(startupAppearance),
-                GetCodexAppearanceRuntimePresetId(startupAppearance),
-                GetCodexAppearanceLabelById(_appSettings.CodexAppearancePresetId));
+            projection = chatGptFeatureAccount == null
+                ? await _codex.SwitchWindowsClientAccountAsync(
+                    account,
+                    projectPath,
+                    mode,
+                    useDreamSkinAtStartup,
+                    GetCodexAppearanceRuntimeMode(startupAppearance),
+                    GetCodexAppearanceRuntimePresetId(startupAppearance),
+                    GetCodexAppearanceLabelById(_appSettings.CodexAppearancePresetId),
+                    routeOfficialOAuthThroughGateway)
+                : await _codex.SwitchWindowsClientAccountWithChatGptFeaturesAsync(
+                    account,
+                    chatGptFeatureAccount,
+                    projectPath,
+                    useDreamSkinAtStartup,
+                    GetCodexAppearanceRuntimeMode(startupAppearance),
+                    GetCodexAppearanceRuntimePresetId(startupAppearance),
+                    GetCodexAppearanceLabelById(_appSettings.CodexAppearancePresetId));
             _statusCache[account.Name] = projection.Status;
             SetCurrentAccount(account.Name, false, recordUsageSwitch: true);
             if (projection.CodexDreamSkinFailed)
@@ -14209,10 +15244,25 @@ public partial class Form1 : Form
                         ? $"已切换到 {account.Name}；凭据已自动写入，{clientName} 已开始启动。"
                         : $"已复用 {account.Name} 的现有凭据；{clientName} 已开始启动。"
                     : $"{account.Name} 的凭据已生效，但 {clientName} 启动失败。";
+            if (chatGptFeatureAccount != null &&
+                projection.ClientLaunchStarted &&
+                !projection.CodexDreamSkinFailed)
+            {
+                _statusBox.Text = projection.ProfileChanged
+                    ? $"已用 {account.Name} 的模型凭据和 {chatGptFeatureAccount.Name} 的 ChatGPT 身份启动双登录模式；" +
+                      "语音/手机是否开放以 Codex 页面、ChatGPT 套餐和工作区策略为准。"
+                    : $"已复用 {account.Name} + {chatGptFeatureAccount.Name} 的双登录并启动；" +
+                      "语音/手机是否开放以 Codex 页面、ChatGPT 套餐和工作区策略为准。";
+            }
             var launchDiagnostic = string.IsNullOrWhiteSpace(projection.ClientLaunchError)
                 ? string.Empty
                 : $"\n启动诊断：{projection.ClientLaunchError}";
-            var accessTokenDesktopHint = account.IsOfficialOAuth
+            var accessTokenDesktopHint = chatGptFeatureAccount != null
+                ? $"\n双登录：普通模型请求使用 {account.Name} 的 PAT/API；" +
+                  $"语音、手机连接、MFA 与设备配对使用 {chatGptFeatureAccount.Name} 的 ChatGPT 登录。" +
+                  "官方 OAuth 只是必要条件，不保证功能开放；语音实时会话可能使用该 ChatGPT 账号的权益，" +
+                  "手机端必须登录同一 ChatGPT 账号与工作区。"
+                : account.IsOfficialOAuth
                 ? "\n一键凭据：已投放该账号独立保存的 ChatGPT 官方登录态；Codex 使用中会自动续期。"
                 : account.IsCompatibleApi
                     ? "\n一键凭据：Codex App 的 API Key 登录由管理器自动写入，无需在客户端重复输入。"
@@ -14224,6 +15274,11 @@ public partial class Form1 : Form
             ResetCardsScrollPosition();
             if (projection.ClientLaunchStarted)
             {
+                ConfigurePatAutoRotationLaunchContext(
+                    account,
+                    mode,
+                    chatGptFeatureAccount,
+                    automaticRotation);
                 StartOfficialQuotaRefreshAfterLaunch(account);
                 return;
             }
@@ -14231,7 +15286,674 @@ public partial class Form1 : Form
             throw new InvalidOperationException(
                 $"账号凭据已经切换并保留为 {account.Name}，不会回滚旧账号；" +
                 $"但 {clientName} 启动失败：{projection.ClientLaunchError ?? "未返回启动结果"}");
-        });
+        }, showErrors: !automaticRotation);
+        return projection?.ClientLaunchStarted == true;
+    }
+
+    private void ConfigurePatAutoRotationLaunchContext(
+        AccountRecord account,
+        WindowsClientMode mode,
+        AccountRecord? chatGptFeatureAccount,
+        bool automaticRotation)
+    {
+        if (mode != WindowsClientMode.OfficialCodex)
+        {
+            _patAutoRotationLaunchContext = null;
+            _patAutoRotationGatewayTransportActive = false;
+            CancelPendingPatAutoRotation(resetState: true);
+            UpdatePatAutoRotationControls();
+            return;
+        }
+
+        _patAutoRotationLaunchContext = new PatAutoRotationLaunchContext(
+            mode,
+            chatGptFeatureAccount?.Name,
+            DateTimeOffset.UtcNow);
+        // The desktop's initial PAT is the stable transport credential for the entire
+        // request-boundary chain. Direct OAuth/API launches do not pass model requests through
+        // the local gateway, so they remain ordinary single-account launches until the user
+        // starts a PAT profile.
+        var participatesInRotation =
+            AccountRotationConfiguration.GetPool(_appSettings, account) !=
+            AccountRotationPool.None;
+        _patAutoRotationGatewayTransportActive = participatesInRotation &&
+            (account.IsAccessToken ||
+             account.IsOfficialOAuth &&
+             AccountRotationConfiguration.IsEnabled(_appSettings));
+        AccountRotationConfiguration.MarkUsed(_appSettings, account);
+        _themeService.SaveSettings(_appSettings);
+        if (!automaticRotation)
+        {
+            _patAutoRotationObservedAccountKey = null;
+            _patAutoRotationObservedResetAtUtc = null;
+            _patAutoRotationLastObservationAtUtc = null;
+            _patAutoRotationConsecutiveObservations = 0;
+            _patAutoRotationCooldownUntilUtc = null;
+            _patAutoRotationState = account.IsCompatibleApi
+                ? PatAutoRotationState.FallbackApi
+                : PatAutoRotationState.Idle;
+        }
+        UpdatePatAutoRotationControls();
+    }
+
+    private async Task ObservePatAutoRotationQuotaAsync(
+        AccountRecord account,
+        UsageLimitResetInfo info)
+    {
+        if (!AccountRotationConfiguration.IsEnabled(_appSettings) ||
+            !_patAutoRotationGatewayTransportActive ||
+            account.IsCompatibleApi ||
+            AccountRotationConfiguration.GetPool(_appSettings, account) ==
+                AccountRotationPool.None ||
+            _patAutoRotationLaunchContext?.ClientMode != WindowsClientMode.OfficialCodex ||
+            !account.Name.Equals(_currentAccountName, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        if (_patAutoRotationCooldownUntilUtc is { } cooldownUntil && cooldownUntil > now)
+        {
+            return;
+        }
+
+        var accountKey = QuotaAccountIdentity.CreateKey(account);
+        var fiveHourWindow = PatAutoRotationPolicy.SelectFiveHourWindow(info);
+        LocalPatGatewayActivitySnapshot? activity = null;
+        try
+        {
+            activity = await LocalPatGateway.ReadActivitySnapshotAsync();
+        }
+        catch (Exception ex) when (
+            ex is IOException or HttpRequestException or InvalidOperationException or
+            System.Text.Json.JsonException or UnauthorizedAccessException)
+        {
+            // Official quota is still authoritative when the local activity probe is
+            // temporarily unavailable; the policy falls back to its conservative reserve.
+        }
+        var activityMatchesAccount = activity != null && string.Equals(
+            activity.LastModelRequestAccountKey,
+            accountKey,
+            StringComparison.Ordinal);
+        var quotaLimitMatchesAccount = activity != null && string.Equals(
+            activity.LastQuotaLimitedAccountKey,
+            accountKey,
+            StringComparison.Ordinal);
+        var recentRequestEstimate = _quotaSafetyMarginTracker.Observe(
+            accountKey,
+            fiveHourWindow,
+            activityMatchesAccount
+                ? activity!.CompletedModelRequests
+                : null,
+            now);
+        var decision = PatAutoRotationPolicy.EvaluateQuotaSafety(
+            fiveHourWindow,
+            recentRequestEstimate,
+            quotaLimitMatchesAccount
+                ? activity!.LastQuotaLimitedAtUtc
+                : null,
+            now);
+        _patAutoRotationLastDecision = decision;
+        if (!decision.ShouldRotate)
+        {
+            if (string.Equals(
+                    _patAutoRotationObservedAccountKey,
+                    accountKey,
+                    StringComparison.Ordinal))
+            {
+                _patAutoRotationObservedAccountKey = null;
+                _patAutoRotationObservedResetAtUtc = null;
+                _patAutoRotationLastObservationAtUtc = null;
+                _patAutoRotationConsecutiveObservations = 0;
+                _patAutoRotationUnavailableAccountKeys.Remove(accountKey);
+                CancelPendingPatAutoRotation(resetState: true);
+            }
+            return;
+        }
+
+        var sameObservationSeries = string.Equals(
+                                        _patAutoRotationObservedAccountKey,
+                                        accountKey,
+                                        StringComparison.Ordinal) &&
+                                    AreSameQuotaResetObservation(
+                                        _patAutoRotationObservedResetAtUtc,
+                                        fiveHourWindow?.ResetsAtUtc);
+        var sufficientlySeparated = _patAutoRotationLastObservationAtUtc is not { } lastObserved ||
+                                    now - lastObserved >=
+                                    PatAutoRotationPolicy.MinimumOfficialObservationSpacing;
+        _patAutoRotationObservedAccountKey = accountKey;
+        _patAutoRotationObservedResetAtUtc = fiveHourWindow?.ResetsAtUtc;
+        if (!sameObservationSeries)
+        {
+            _patAutoRotationConsecutiveObservations = 1;
+            _patAutoRotationLastObservationAtUtc = now;
+        }
+        else if (sufficientlySeparated)
+        {
+            _patAutoRotationConsecutiveObservations++;
+            _patAutoRotationLastObservationAtUtc = now;
+        }
+        var requiredObservations = decision.IsImmediatelyExhausted
+            ? 1
+            : PatAutoRotationPolicy.RequiredConsecutiveOfficialObservations;
+        if (_patAutoRotationConsecutiveObservations < requiredObservations ||
+            _patAutoRotationBoundaryCancellation != null)
+        {
+            return;
+        }
+
+        RecordPatRotationAccountExhausted(account, fiveHourWindow?.ResetsAtUtc, now);
+        _patAutoRotationState = PatAutoRotationState.PendingQuotaExhaustion;
+        var cancellation = new CancellationTokenSource();
+        _patAutoRotationBoundaryCancellation = cancellation;
+        _statusBox.Text =
+            $"{account.Name} 的 5h 剩余额度 " +
+            $"{decision.RemainingPercent?.ToString("0.#") ?? "未知"}% 已进入 " +
+            $"{decision.SafetyMarginPercent:0.#}% 动态安全余量；" +
+            "正在校验下一个轮换账号，当前响应不会被关闭或重放。";
+        UpdatePatAutoRotationControls();
+        _ = PreparePatAutoRotationAsync(accountKey, now, cancellation);
+    }
+
+    private static bool AreSameQuotaResetObservation(
+        DateTimeOffset? previous,
+        DateTimeOffset? current)
+    {
+        if (!previous.HasValue || !current.HasValue)
+        {
+            return previous.HasValue == current.HasValue;
+        }
+        return (previous.Value - current.Value).Duration() <= TimeSpan.FromMinutes(2);
+    }
+
+    private async Task PreparePatAutoRotationAsync(
+        string accountKey,
+        DateTimeOffset pendingSinceUtc,
+        CancellationTokenSource cancellation)
+    {
+        _ = pendingSinceUtc;
+        try
+        {
+            if (!IsPatAutoRotationContextCurrent(accountKey) ||
+                GetCurrentAccountRecord() is not { } current)
+            {
+                return;
+            }
+
+            PruneResetPatAutoRotationAccounts();
+            var candidates = AccountRotationConfiguration.BuildCandidates(
+                _appSettings,
+                _accounts,
+                current,
+                _patAutoRotationUnavailableAccountKeys,
+                DateTimeOffset.UtcNow,
+                HasUsableAccountCredential);
+            var hadUnknownQuotaCandidate = false;
+            string? lastCandidateFailure = null;
+            var pendingCandidates = new Queue<AccountRecord>(candidates);
+            var attemptedPrimaryKeys = candidates
+                .Where(candidate => AccountRotationConfiguration.GetPool(_appSettings, candidate) ==
+                                    AccountRotationPool.Primary)
+                .Select(QuotaAccountIdentity.CreateKey)
+                .ToHashSet(StringComparer.Ordinal);
+            var backupBatchAdded = candidates.Any(candidate =>
+                AccountRotationConfiguration.GetPool(_appSettings, candidate) ==
+                AccountRotationPool.Backup);
+            while (true)
+            {
+                while (pendingCandidates.TryDequeue(out var candidate))
+                {
+                    cancellation.Token.ThrowIfCancellationRequested();
+                    _patAutoRotationState = PatAutoRotationState.Switching;
+                    _statusBox.Text = candidate.IsCompatibleApi
+                        ? $"正在校验 API 轮换账号 {candidate.Name}…"
+                        : $"正在只读确认账号 {candidate.Name} 的最新 5h 额度…";
+                    UpdatePatAutoRotationControls();
+
+                    if (candidate.IsCompatibleApi)
+                    {
+                        try
+                        {
+                            await CodexCliService.EnsureCompatibleApiRotationPreflightAsync(
+                                candidate,
+                                cancellation.Token);
+                        }
+                        catch (Exception ex) when (
+                            ex is IOException or HttpRequestException or InvalidOperationException or
+                            UnauthorizedAccessException or System.Text.Json.JsonException)
+                        {
+                            lastCandidateFailure = ex.Message;
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        var quotaStatus = await ConfirmPatRotationCandidateQuotaAsync(
+                            candidate,
+                            cancellation.Token);
+                        if (quotaStatus == PatRotationCandidateQuotaStatus.Unknown)
+                        {
+                            hadUnknownQuotaCandidate = true;
+                            continue;
+                        }
+                        if (quotaStatus == PatRotationCandidateQuotaStatus.Exhausted)
+                        {
+                            continue;
+                        }
+                    }
+
+                    var targetKey = QuotaAccountIdentity.CreateKey(candidate);
+                    PatGatewayRotationSnapshot armed;
+                    try
+                    {
+                        armed = await LocalPatGateway.ArmRotationAsync(
+                            accountKey,
+                            targetKey,
+                            cancellation.Token);
+                    }
+                    catch (Exception ex) when (
+                        ex is IOException or HttpRequestException or InvalidOperationException or
+                        InvalidDataException or UnauthorizedAccessException or
+                        System.Text.Json.JsonException)
+                    {
+                        lastCandidateFailure = ex.Message;
+                        continue;
+                    }
+                    if (armed.Status != PatGatewayRotationStatus.Armed ||
+                        !string.Equals(armed.SourceAccountKey, accountKey, StringComparison.Ordinal) ||
+                        !string.Equals(armed.TargetAccountKey, targetKey, StringComparison.Ordinal))
+                    {
+                        throw new InvalidDataException("本地 PAT 网关返回了不一致的轮换路由。");
+                    }
+
+                    _patAutoRotationState = PatAutoRotationState.WaitingForRequestBoundary;
+                    _statusBox.Text =
+                        $"已准备从 {current.Name} 轮换到 {candidate.Name}；" +
+                        "当前响应继续运行，下一次模型请求会直接使用新账号。";
+                    UpdatePatAutoRotationControls();
+                    var activated = await WaitForPatGatewayRotationActivationAsync(
+                        accountKey,
+                        targetKey,
+                        cancellation.Token);
+                    CompletePatGatewayRotation(candidate, activated);
+                    return;
+                }
+
+                if (backupBatchAdded || attemptedPrimaryKeys.Count == 0)
+                {
+                    break;
+                }
+
+                // A primary account can become unavailable only after its fresh quota check.
+                // Rebuild once with those just-attempted accounts excluded so the same
+                // preparation cycle can enter the backup pool without a one-minute gap.
+                var temporarilyUnavailable = new HashSet<string>(
+                    _patAutoRotationUnavailableAccountKeys,
+                    StringComparer.Ordinal);
+                temporarilyUnavailable.UnionWith(attemptedPrimaryKeys);
+                var fallbackCandidates = AccountRotationConfiguration.BuildCandidates(
+                    _appSettings,
+                    _accounts,
+                    current,
+                    temporarilyUnavailable,
+                    DateTimeOffset.UtcNow,
+                    HasUsableAccountCredential)
+                    .Where(candidate =>
+                        AccountRotationConfiguration.GetPool(_appSettings, candidate) ==
+                        AccountRotationPool.Backup)
+                    .ToList();
+                backupBatchAdded = true;
+                foreach (var fallback in fallbackCandidates)
+                {
+                    pendingCandidates.Enqueue(fallback);
+                }
+            }
+
+            _patAutoRotationState = PatAutoRotationState.Cooldown;
+            _patAutoRotationCooldownUntilUtc = DateTimeOffset.UtcNow.AddMinutes(1);
+            _themeService.SaveSettings(_appSettings);
+            _statusBox.Text = hadUnknownQuotaCandidate
+                ? "候选账号的最新额度暂时无法确认；已跳过未知账号，一分钟后重新检查，不会重放请求。"
+                : string.IsNullOrWhiteSpace(lastCandidateFailure)
+                    ? "两个轮换池都没有可用账号；一分钟后重新检查，不会重放请求。"
+                    : "候选账号预检未通过；一分钟后重新检查，不会重放请求：" +
+                      lastCandidateFailure;
+        }
+        catch (OperationCanceledException)
+        {
+            // A manual launch, quota reset, or form shutdown superseded this route.
+        }
+        catch (Exception ex)
+        {
+            if (!_formClosed && !IsDisposed)
+            {
+                _patAutoRotationState = PatAutoRotationState.Cooldown;
+                _patAutoRotationCooldownUntilUtc = DateTimeOffset.UtcNow.AddMinutes(1);
+                _statusBox.Text = "自动轮换暂缓：" + ex.Message;
+            }
+        }
+        finally
+        {
+            if (ReferenceEquals(_patAutoRotationBoundaryCancellation, cancellation))
+            {
+                _patAutoRotationBoundaryCancellation = null;
+            }
+            cancellation.Dispose();
+            UpdatePatAutoRotationControls();
+        }
+    }
+
+    private async Task<PatRotationCandidateQuotaStatus> ConfirmPatRotationCandidateQuotaAsync(
+        AccountRecord candidate,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(15));
+            var info = await ReadUsageLimitResetInfoAsync(
+                candidate,
+                fastFail: true,
+                preserveRunningGateway: true,
+                cancellationToken: timeout.Token);
+            CacheUsageLimitResetInfo(candidate, info);
+
+            var fiveHour = PatAutoRotationPolicy.SelectFiveHourWindow(info);
+            if (fiveHour != null)
+            {
+                if (!fiveHour.UsedPercent.HasValue)
+                {
+                    return PatRotationCandidateQuotaStatus.Unknown;
+                }
+                if (fiveHour.ResetsAtUtc is { } resetAtUtc &&
+                    resetAtUtc <= DateTimeOffset.UtcNow)
+                {
+                    RecordPatRotationAccountAvailable(candidate);
+                    return PatRotationCandidateQuotaStatus.Available;
+                }
+                var candidateKey = QuotaAccountIdentity.CreateKey(candidate);
+                var estimate = _quotaSafetyMarginTracker.Observe(
+                    candidateKey,
+                    fiveHour,
+                    completedModelRequests: null,
+                    DateTimeOffset.UtcNow);
+                var decision = PatAutoRotationPolicy.EvaluateQuotaSafety(
+                    fiveHour,
+                    estimate,
+                    lastQuotaLimitedAtUtc: null,
+                    DateTimeOffset.UtcNow);
+                if (decision.ShouldRotate)
+                {
+                    RecordPatRotationAccountExhausted(
+                        candidate,
+                        fiveHour.ResetsAtUtc,
+                        DateTimeOffset.UtcNow);
+                    return PatRotationCandidateQuotaStatus.Exhausted;
+                }
+
+                RecordPatRotationAccountAvailable(candidate);
+                return PatRotationCandidateQuotaStatus.Available;
+            }
+
+            // A weekly/monthly-only PAT is a valid fallback when the official response has
+            // a concrete usage window. A completely missing window remains unknown.
+            return new[] { info.Primary, info.Secondary }
+                .Where(window => window != null)
+                .Any(window => window!.UsedPercent.HasValue)
+                ? PatRotationCandidateQuotaStatus.Available
+                : PatRotationCandidateQuotaStatus.Unknown;
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return PatRotationCandidateQuotaStatus.Unknown;
+        }
+        catch (Exception ex) when (
+            ex is IOException or HttpRequestException or InvalidOperationException or
+            System.Text.Json.JsonException or UnauthorizedAccessException)
+        {
+            return PatRotationCandidateQuotaStatus.Unknown;
+        }
+    }
+
+    private async Task<DateTimeOffset> WaitForPatGatewayRotationActivationAsync(
+        string sourceAccountKey,
+        string targetAccountKey,
+        CancellationToken cancellationToken)
+    {
+        var inconsistentSnapshots = 0;
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (_formClosed || IsDisposed ||
+                !IsPatAutoRotationContextCurrent(sourceAccountKey))
+            {
+                throw new OperationCanceledException(cancellationToken);
+            }
+
+            var activity = await LocalPatGateway.ReadActivitySnapshotAsync(cancellationToken);
+            var rotation = activity?.Rotation;
+            if (rotation?.Status == PatGatewayRotationStatus.Active &&
+                string.Equals(rotation.SourceAccountKey, sourceAccountKey, StringComparison.Ordinal) &&
+                string.Equals(rotation.TargetAccountKey, targetAccountKey, StringComparison.Ordinal) &&
+                rotation.ActivatedAtUtc is { } activatedAtUtc)
+            {
+                return activatedAtUtc;
+            }
+
+            var routeStillArmed = rotation?.Status == PatGatewayRotationStatus.Armed &&
+                                  string.Equals(
+                                      rotation.SourceAccountKey,
+                                      sourceAccountKey,
+                                      StringComparison.Ordinal) &&
+                                  string.Equals(
+                                      rotation.TargetAccountKey,
+                                      targetAccountKey,
+                                      StringComparison.Ordinal);
+            inconsistentSnapshots = activity == null || routeStillArmed
+                ? 0
+                : inconsistentSnapshots + 1;
+            if (inconsistentSnapshots >= 3)
+            {
+                throw new InvalidOperationException("本地 PAT 网关的待轮换路由意外消失。");
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken);
+        }
+    }
+
+    private void CompletePatGatewayRotation(
+        AccountRecord target,
+        DateTimeOffset activatedAtUtc)
+    {
+        var targetKey = QuotaAccountIdentity.CreateKey(target);
+        SetCurrentAccount(target.Name, false, persistSettings: true);
+        _codex.QueueHotRotatedOfficialAccountDisplay(target, _accounts);
+        _quotaSafetyMarginTracker.Reset(targetKey);
+        _usageTracker.RecordSwitch(target, "pat-gateway-rotation", activatedAtUtc);
+        InvalidateQuotaUsageCache(clearCachedData: false);
+        _launchedOfficialQuotaAccountKey = target.IsCompatibleApi ? null : targetKey;
+        if (!target.IsCompatibleApi)
+        {
+            _officialQuotaRefreshAttemptedAt.Remove(targetKey);
+        }
+        _patAutoRotationUnavailableAccountKeys.Remove(targetKey);
+        _patAutoRotationUnknownResetRetryAtUtc.Remove(targetKey);
+        AccountRotationConfiguration.RecordExhaustedReset(
+            _appSettings,
+            target,
+            resetAtUtc: null);
+        AccountRotationConfiguration.MarkUsed(_appSettings, target);
+        _themeService.SaveSettings(_appSettings);
+        var enteredBackup = AccountRotationConfiguration.GetPool(_appSettings, target) ==
+                            AccountRotationPool.Backup;
+        ResetPatAutoRotationObservationAfterSwitch(fallbackApi: enteredBackup);
+        var kind = target.IsCompatibleApi
+            ? "API"
+            : target.IsOfficialOAuth
+                ? "官方 ChatGPT"
+                : "PAT";
+        _statusBox.Text =
+            $"已在模型请求边界无缝轮换到{(enteredBackup ? "备用池" : "使用池")}的" +
+            $" {kind} 账号 {target.Name}；Codex 未关闭或重启，上一条请求没有重放。";
+        RenderCards();
+        ResetCardsScrollPosition();
+        if (!target.IsCompatibleApi)
+        {
+            StartOfficialQuotaRefresh(target);
+        }
+    }
+
+    private void PruneResetPatAutoRotationAccounts()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var settingsChanged = false;
+        foreach (var retry in _patAutoRotationUnknownResetRetryAtUtc
+                     .Where(pair => pair.Value <= now)
+                     .ToList())
+        {
+            _patAutoRotationUnknownResetRetryAtUtc.Remove(retry.Key);
+            _patAutoRotationUnavailableAccountKeys.Remove(retry.Key);
+        }
+        foreach (var account in _accounts.Where(account => !account.IsCompatibleApi))
+        {
+            var accountKey = QuotaAccountIdentity.CreateKey(account);
+            var usage = _quotaUsageCache?.Accounts.FirstOrDefault(summary =>
+                summary.AccountName.Equals(account.Name, StringComparison.OrdinalIgnoreCase));
+            var resetAtUtc = usage?.GetQuotaWindow(AccountQuotaWindowKind.FiveHour)?.ResetAtUtc;
+            if (!resetAtUtc.HasValue &&
+                _appSettings.AccountRotationResetAtUtc.TryGetValue(accountKey, out var persistedReset))
+            {
+                resetAtUtc = persistedReset;
+            }
+            if (resetAtUtc is { } reset &&
+                reset <= now)
+            {
+                _patAutoRotationUnavailableAccountKeys.Remove(accountKey);
+                if (reset + AccountRotationConfiguration.PrimaryResetGracePeriod <= now)
+                {
+                    AccountRotationConfiguration.RecordExhaustedReset(
+                        _appSettings,
+                        account,
+                        resetAtUtc: null);
+                    _quotaSafetyMarginTracker.Reset(accountKey);
+                    settingsChanged = true;
+                }
+            }
+        }
+        if (settingsChanged)
+        {
+            _themeService.SaveSettings(_appSettings);
+        }
+    }
+
+    private void RecordPatRotationAccountExhausted(
+        AccountRecord account,
+        DateTimeOffset? resetAtUtc,
+        DateTimeOffset observedAtUtc)
+    {
+        var accountKey = QuotaAccountIdentity.CreateKey(account);
+        if (!resetAtUtc.HasValue &&
+            _appSettings.AccountRotationResetAtUtc.TryGetValue(accountKey, out var knownReset))
+        {
+            resetAtUtc = knownReset;
+        }
+
+        _patAutoRotationUnavailableAccountKeys.Add(accountKey);
+        AccountRotationConfiguration.RecordExhaustedReset(
+            _appSettings,
+            account,
+            resetAtUtc);
+        if (resetAtUtc.HasValue)
+        {
+            _patAutoRotationUnknownResetRetryAtUtc.Remove(accountKey);
+        }
+        else
+        {
+            // Some quota/429 responses omit reset_at. Keep the account unavailable, but
+            // schedule a bounded read-only re-probe so it cannot remain locked out for the
+            // lifetime of the Manager process.
+            _patAutoRotationUnknownResetRetryAtUtc[accountKey] =
+                observedAtUtc + UnknownQuotaResetRetryDelay;
+        }
+        _themeService.SaveSettings(_appSettings);
+    }
+
+    private void RecordPatRotationAccountAvailable(AccountRecord account)
+    {
+        var accountKey = QuotaAccountIdentity.CreateKey(account);
+        var changed = _patAutoRotationUnavailableAccountKeys.Remove(accountKey) |
+                      _patAutoRotationUnknownResetRetryAtUtc.Remove(accountKey) |
+                      _appSettings.AccountRotationResetAtUtc.Remove(accountKey);
+        if (changed)
+        {
+            _themeService.SaveSettings(_appSettings);
+        }
+    }
+
+    private bool IsPatAutoRotationContextCurrent(string accountKey)
+    {
+        return AccountRotationConfiguration.IsEnabled(_appSettings) &&
+               _patAutoRotationGatewayTransportActive &&
+               _patAutoRotationLaunchContext?.ClientMode == WindowsClientMode.OfficialCodex &&
+               GetCurrentAccountRecord() is { } current &&
+               AccountRotationConfiguration.GetPool(_appSettings, current) !=
+                   AccountRotationPool.None &&
+               string.Equals(
+                   QuotaAccountIdentity.CreateKey(current),
+                   accountKey,
+                   StringComparison.Ordinal);
+    }
+
+    private void ResetPatAutoRotationObservationAfterSwitch(bool fallbackApi)
+    {
+        _patAutoRotationObservedAccountKey = null;
+        _patAutoRotationObservedResetAtUtc = null;
+        _patAutoRotationLastObservationAtUtc = null;
+        _patAutoRotationConsecutiveObservations = 0;
+        _patAutoRotationCooldownUntilUtc = null;
+        _patAutoRotationState = fallbackApi
+            ? PatAutoRotationState.FallbackApi
+            : PatAutoRotationState.Idle;
+        UpdatePatAutoRotationControls();
+    }
+
+    private void CancelPendingPatAutoRotation(bool resetState)
+    {
+        var cancellation = _patAutoRotationBoundaryCancellation;
+        _patAutoRotationBoundaryCancellation = null;
+        if (cancellation != null)
+        {
+            cancellation.Cancel();
+        }
+        if (resetState)
+        {
+            _patAutoRotationObservedAccountKey = null;
+            _patAutoRotationObservedResetAtUtc = null;
+            _patAutoRotationLastObservationAtUtc = null;
+            _patAutoRotationConsecutiveObservations = 0;
+            _patAutoRotationState = PatAutoRotationState.Idle;
+        }
+        UpdatePatAutoRotationControls();
+    }
+
+    private async Task CancelArmedPatGatewayRotationAsync()
+    {
+        try
+        {
+            var activity = await LocalPatGateway.ReadActivitySnapshotAsync();
+            if (activity?.Rotation?.Status == PatGatewayRotationStatus.Armed)
+            {
+                _ = await LocalPatGateway.ClearRotationAsync();
+            }
+        }
+        catch (Exception ex) when (
+            ex is IOException or HttpRequestException or InvalidOperationException or
+            System.Text.Json.JsonException or UnauthorizedAccessException)
+        {
+            // The local cancellation already prevents another manager-side route from being
+            // armed. Keep an active route intact; a temporarily unavailable gateway will be
+            // reconciled without restarting Codex when it becomes reachable again.
+        }
     }
 
     private async Task LaunchCliAccountAsync(AccountRecord account)
@@ -14240,6 +15962,14 @@ public partial class Form1 : Form
         {
             return;
         }
+
+        CancelPendingPatAutoRotation(resetState: true);
+        _patAutoRotationLaunchContext = null;
+        _patAutoRotationGatewayTransportActive = false;
+        _patAutoRotationUnavailableAccountKeys.Clear();
+        _patAutoRotationUnknownResetRetryAtUtc.Clear();
+        _ = await LocalPatGateway.ClearRotationAsync();
+        UpdatePatAutoRotationControls();
 
         WindowsClientAccountProjection? projection = null;
 
@@ -14343,6 +16073,7 @@ public partial class Form1 : Form
 
             CacheUsageLimitResetInfo(account, info);
             _officialQuotaRefreshedAt[accountKey] = DateTimeOffset.UtcNow;
+            await ObservePatAutoRotationQuotaAsync(account, info);
 
             if (_quotaUsageCache == null && !_formClosed && !IsDisposed)
             {
@@ -15150,7 +16881,7 @@ public partial class Form1 : Form
         };
     }
 
-    private async Task RunBusyAsync(Func<Task> action)
+    private async Task RunBusyAsync(Func<Task> action, bool showErrors = true)
     {
         try
         {
@@ -15160,7 +16891,14 @@ public partial class Form1 : Form
         }
         catch (Exception ex)
         {
-            ShowError(ex.Message);
+            if (showErrors)
+            {
+                ShowError(ex.Message);
+            }
+            else
+            {
+                _statusBox.Text = ex.Message;
+            }
         }
         finally
         {
@@ -15422,7 +17160,15 @@ public partial class Form1 : Form
             await LocalPatGateway.EnsureRunningAsync(
                 restartOnProxyMismatch: !_preserveExistingPatGatewayOnStartup);
             _patGatewayRuntimeRunning = true;
+            if (await LocalPatGateway.RequiresRotationProtocolUpgradeAsync())
+            {
+                _patGatewayRuntimeStatus = "旧网关仍在服务 · 当前任务结束后无缝升级";
+                UpdatePatGatewayControls();
+                await UpgradePatGatewayAtSafeBoundaryAsync();
+                return;
+            }
             _patGatewayRuntimeStatus = $"已开启 · 127.0.0.1:{LocalPatGateway.Port}";
+            await TryRecoverPatAutoRotationLaunchContextAsync();
         }
         catch (Exception ex)
         {
@@ -15437,6 +17183,223 @@ public partial class Form1 : Form
         {
             _patGatewayActionRunning = false;
             UpdatePatGatewayControls();
+        }
+    }
+
+    private async Task UpgradePatGatewayAtSafeBoundaryAsync()
+    {
+        var pendingSinceUtc = DateTimeOffset.UtcNow;
+        var consecutiveSafeChecks = 0;
+        while (!_formClosed && !IsDisposed)
+        {
+            if (!await LocalPatGateway.RequiresRotationProtocolUpgradeAsync())
+            {
+                _patGatewayRuntimeRunning = true;
+                _patGatewayRuntimeStatus = $"已开启 · 127.0.0.1:{LocalPatGateway.Port}";
+                await TryRecoverPatAutoRotationLaunchContextAsync();
+                return;
+            }
+
+            var activity = await LocalPatGateway.ReadOwnedActivitySnapshotAsync();
+            var taskBoundary = await Task.Run(
+                () => _codexTaskBoundaryMonitor.Inspect(pendingSinceUtc));
+            var safe = activity != null &&
+                       PatAutoRotationPolicy.IsGatewayQuiet(activity, DateTimeOffset.UtcNow) &&
+                       !taskBoundary.HasActiveTask;
+            consecutiveSafeChecks = safe ? consecutiveSafeChecks + 1 : 0;
+            if (consecutiveSafeChecks >=
+                PatAutoRotationPolicy.RequiredConsecutiveSafeBoundaryChecks)
+            {
+                // Close only the owned gateway, never ChatGPT.exe. Re-read both oracles
+                // immediately before the short listener hand-off so a new request cancels it.
+                activity = await LocalPatGateway.ReadOwnedActivitySnapshotAsync();
+                taskBoundary = await Task.Run(
+                    () => _codexTaskBoundaryMonitor.Inspect(pendingSinceUtc));
+                if (activity != null &&
+                    PatAutoRotationPolicy.IsGatewayQuiet(activity, DateTimeOffset.UtcNow) &&
+                    !taskBoundary.HasActiveTask &&
+                    await LocalPatGateway.RequiresRotationProtocolUpgradeAsync())
+                {
+                    _patGatewayRuntimeStatus = "正在无缝升级网关 · Codex 保持运行";
+                    UpdatePatGatewayControls();
+                    if (!await LocalPatGateway.ShutdownIfRunningAsync())
+                    {
+                        throw new InvalidOperationException("旧网关未能在安全边界释放监听端口。");
+                    }
+                    await Task.Delay(120);
+                    await LocalPatGateway.EnsureRunningAsync(restartOnProxyMismatch: true);
+                    _patGatewayRuntimeRunning = true;
+                    _patGatewayRuntimeStatus = $"已开启 · 127.0.0.1:{LocalPatGateway.Port}";
+                    await TryRecoverPatAutoRotationLaunchContextAsync();
+                    return;
+                }
+                consecutiveSafeChecks = 0;
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(1));
+        }
+    }
+
+    private async Task TryRecoverPatAutoRotationLaunchContextAsync()
+    {
+        if (!AccountRotationConfiguration.IsEnabled(_appSettings) ||
+            _formClosed ||
+            IsDisposed ||
+            !_codex.IsOfficialWindowsClientRunning())
+        {
+            return;
+        }
+
+        var activity = await LocalPatGateway.ReadActivitySnapshotAsync();
+        if (activity == null)
+        {
+            return;
+        }
+        var rotation = activity.Rotation;
+        var transport = rotation?.Status is PatGatewayRotationStatus.Armed or PatGatewayRotationStatus.Active
+            ? FindRotationAccount(rotation.TransportAccountKey)
+            : GetCurrentAccountRecord();
+        var logical = rotation?.Status switch
+        {
+            PatGatewayRotationStatus.Armed => FindRotationAccount(rotation.SourceAccountKey),
+            PatGatewayRotationStatus.Active => FindRotationAccount(rotation.TargetAccountKey),
+            _ => GetCurrentAccountRecord()
+        };
+        if (transport == null ||
+            (!transport.IsAccessToken && !transport.IsOfficialOAuth) ||
+            logical == null ||
+            (!logical.IsAccessToken && !logical.IsCompatibleApi && !logical.IsOfficialOAuth) ||
+            AccountRotationConfiguration.GetPool(_appSettings, logical) ==
+                AccountRotationPool.None)
+        {
+            return;
+        }
+
+        AccountRecord? featureAccount = null;
+        foreach (var candidate in _accounts.Where(account => account.IsOfficialOAuth))
+        {
+            try
+            {
+                if (_codex.IsSharedChatGptFeatureProfileAlreadySelected(transport, candidate))
+                {
+                    featureAccount = candidate;
+                    break;
+                }
+            }
+            catch
+            {
+                // A malformed unrelated OAuth profile must not weaken exact projection checks.
+            }
+        }
+        var profileMatches = featureAccount != null;
+        if (!profileMatches)
+        {
+            try
+            {
+                profileMatches = _codex.IsSharedProfileAlreadySelected(
+                    transport,
+                    routeOfficialOAuthThroughGateway: transport.IsOfficialOAuth);
+            }
+            catch
+            {
+                profileMatches = false;
+            }
+        }
+        if (!profileMatches)
+        {
+            return;
+        }
+
+        SetCurrentAccount(logical.Name, false, persistSettings: true);
+        _patAutoRotationLaunchContext = new PatAutoRotationLaunchContext(
+            WindowsClientMode.OfficialCodex,
+            featureAccount?.Name,
+            DateTimeOffset.UtcNow);
+        _patAutoRotationGatewayTransportActive = true;
+        _launchedOfficialQuotaAccountKey = !logical.IsCompatibleApi
+            ? QuotaAccountIdentity.CreateKey(logical)
+            : null;
+        _patAutoRotationState = AccountRotationConfiguration.GetPool(_appSettings, logical) ==
+                                AccountRotationPool.Backup
+            ? PatAutoRotationState.FallbackApi
+            : rotation?.Status == PatGatewayRotationStatus.Armed
+                ? PatAutoRotationState.WaitingForRequestBoundary
+                : PatAutoRotationState.Idle;
+
+        if (rotation?.Status == PatGatewayRotationStatus.Armed &&
+            FindRotationAccount(rotation.TargetAccountKey) is { } target &&
+            _patAutoRotationBoundaryCancellation == null)
+        {
+            var cancellation = new CancellationTokenSource();
+            _patAutoRotationBoundaryCancellation = cancellation;
+            _statusBox.Text =
+                $"已无重启接管运行中的轮换：当前响应继续，下一次请求切换到 {target.Name}。";
+            _ = ResumeRecoveredGatewayRotationAsync(
+                logical,
+                target,
+                rotation.TargetAccountKey!,
+                cancellation);
+        }
+        else
+        {
+            _statusBox.Text = logical.IsCompatibleApi
+                ? $"已无重启接管运行中的 API 兜底账号 {logical.Name}。"
+                : $"已无重启接管运行中的 PAT 账号 {logical.Name}，自动轮换正在监控。";
+        }
+        UpdatePatAutoRotationControls();
+        if (!logical.IsCompatibleApi)
+        {
+            _officialQuotaRefreshAttemptedAt.Remove(_launchedOfficialQuotaAccountKey!);
+            StartOfficialQuotaRefresh(logical);
+        }
+    }
+
+    private AccountRecord? FindRotationAccount(string? accountKey)
+    {
+        if (!PatGatewayRotationStore.TryNormalizeAccountKey(accountKey, out var normalized))
+        {
+            return null;
+        }
+        return _accounts.FirstOrDefault(account =>
+            (account.IsAccessToken || account.IsCompatibleApi || account.IsOfficialOAuth) &&
+            QuotaAccountIdentity.CreateKey(account).Equals(normalized, StringComparison.Ordinal));
+    }
+
+    private async Task ResumeRecoveredGatewayRotationAsync(
+        AccountRecord source,
+        AccountRecord target,
+        string targetKey,
+        CancellationTokenSource cancellation)
+    {
+        try
+        {
+            var activatedAtUtc = await WaitForPatGatewayRotationActivationAsync(
+                QuotaAccountIdentity.CreateKey(source),
+                targetKey,
+                cancellation.Token);
+            CompletePatGatewayRotation(target, activatedAtUtc);
+        }
+        catch (OperationCanceledException)
+        {
+            // A manual launch, form shutdown, or replaced route superseded the recovery.
+        }
+        catch (Exception ex)
+        {
+            if (!_formClosed && !IsDisposed)
+            {
+                _patAutoRotationState = PatAutoRotationState.Cooldown;
+                _patAutoRotationCooldownUntilUtc = DateTimeOffset.UtcNow.AddMinutes(1);
+                _statusBox.Text = "运行中轮换接管暂缓：" + ex.Message;
+            }
+        }
+        finally
+        {
+            if (ReferenceEquals(_patAutoRotationBoundaryCancellation, cancellation))
+            {
+                _patAutoRotationBoundaryCancellation = null;
+            }
+            cancellation.Dispose();
+            UpdatePatAutoRotationControls();
         }
     }
 
@@ -15507,6 +17470,60 @@ public partial class Form1 : Form
                     ? "关闭网关"
                     : "打开网关";
             _patGatewayToggleButton.Enabled = !_patGatewayActionRunning;
+        }
+    }
+
+    private async Task TogglePatAutoRotationAsync()
+    {
+        AccountRotationConfiguration.SetEnabled(
+            _appSettings,
+            !AccountRotationConfiguration.IsEnabled(_appSettings));
+        _themeService.SaveSettings(_appSettings);
+        if (!AccountRotationConfiguration.IsEnabled(_appSettings))
+        {
+            CancelPendingPatAutoRotation(resetState: true);
+            await CancelArmedPatGatewayRotationAsync();
+            _statusBox.Text = "已关闭账号轮换；额度监控仍会继续显示，但不会自动切换账号。";
+        }
+        else
+        {
+            _statusBox.Text =
+                "已开启账号轮换；5h 剩余额度进入动态安全余量并连续确认后，" +
+                "当前响应继续运行，下一次模型请求按轮换池顺序切换。";
+        }
+        UpdatePatAutoRotationControls();
+    }
+
+    private void UpdatePatAutoRotationControls()
+    {
+        if (!_patAutoRotationThresholdButton.IsDisposed)
+        {
+            _patAutoRotationThresholdButton.Text = _patAutoRotationLastDecision is { } decision
+                ? $"动态余量 {decision.SafetyMarginPercent:0.#}%"
+                : "动态余量";
+            _patAutoRotationThresholdButton.Enabled = false;
+        }
+        if (!_patAutoRotationToggleButton.IsDisposed)
+        {
+            _patAutoRotationToggleButton.Text = AccountRotationConfiguration.IsEnabled(_appSettings)
+                ? "关闭轮换"
+                : "打开轮换";
+        }
+        if (!_patAutoRotationStatusLabel.IsDisposed)
+        {
+            _patAutoRotationStatusLabel.Text = !AccountRotationConfiguration.IsEnabled(_appSettings)
+                ? "已关闭"
+                : _patAutoRotationState switch
+                {
+                    PatAutoRotationState.PendingQuotaExhaustion => "进入安全余量 · 校验候选账号",
+                    PatAutoRotationState.WaitingForRequestBoundary => "已就绪 · 下一次请求切换",
+                    PatAutoRotationState.Switching => "正在准备下一个账号",
+                    PatAutoRotationState.FallbackApi => "已进入备用轮换池",
+                    PatAutoRotationState.Cooldown => "暂缓 · 稍后重试",
+                    _ => _patAutoRotationLaunchContext == null
+                        ? "已开启 · 启动 PAT 后监控"
+                        : "监控中"
+                };
         }
     }
 

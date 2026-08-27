@@ -74,6 +74,18 @@ function Assert-CleanAppSettingsContent {
         'PatGatewayProxyPort',
         'PatGatewayProxyAutoDetect',
         'PatGatewayProxyScheme',
+        'PatGatewayEnabled',
+        'PatAutoRotationEnabled',
+        'PatAutoRotationUsedPercentThreshold',
+        'AccountRotationEnabled',
+        'AccountRotationPools',
+        'AccountRotationPrimaryOrder',
+        'AccountRotationBackupOrder',
+        'AccountRotationPrimaryCursorAccountKey',
+        'AccountRotationBackupCursorAccountKey',
+        'AccountRotationResetAtUtc',
+        'CodexFingerprintForwarding',
+        'ChatGptFeatureAccountBindings',
         'WindowWidth',
         'WindowHeight',
         'UseCodexDreamSkin',
@@ -98,6 +110,18 @@ function Assert-CleanAppSettingsContent {
     $patGatewayProxyPort = $settings.PSObject.Properties['PatGatewayProxyPort'].Value
     $patGatewayProxyAutoDetect = [bool]$settings.PSObject.Properties['PatGatewayProxyAutoDetect'].Value
     $patGatewayProxyScheme = [string]$settings.PSObject.Properties['PatGatewayProxyScheme'].Value
+    $patGatewayEnabled = [bool]$settings.PSObject.Properties['PatGatewayEnabled'].Value
+    $patAutoRotationEnabled = [bool]$settings.PSObject.Properties['PatAutoRotationEnabled'].Value
+    $patAutoRotationUsedPercentThreshold = [double]$settings.PSObject.Properties['PatAutoRotationUsedPercentThreshold'].Value
+    $accountRotationEnabled = [bool]$settings.PSObject.Properties['AccountRotationEnabled'].Value
+    $accountRotationPools = $settings.PSObject.Properties['AccountRotationPools'].Value
+    $accountRotationPrimaryOrder = @($settings.PSObject.Properties['AccountRotationPrimaryOrder'].Value)
+    $accountRotationBackupOrder = @($settings.PSObject.Properties['AccountRotationBackupOrder'].Value)
+    $accountRotationPrimaryCursor = $settings.PSObject.Properties['AccountRotationPrimaryCursorAccountKey'].Value
+    $accountRotationBackupCursor = $settings.PSObject.Properties['AccountRotationBackupCursorAccountKey'].Value
+    $accountRotationResets = $settings.PSObject.Properties['AccountRotationResetAtUtc'].Value
+    $fingerprintForwarding = $settings.PSObject.Properties['CodexFingerprintForwarding'].Value
+    $featureBindings = $settings.PSObject.Properties['ChatGptFeatureAccountBindings'].Value
     $windowWidth = [int]$settings.PSObject.Properties['WindowWidth'].Value
     $windowHeight = [int]$settings.PSObject.Properties['WindowHeight'].Value
     $useCodexDreamSkin = [bool]$settings.PSObject.Properties['UseCodexDreamSkin'].Value
@@ -109,6 +133,18 @@ function Assert-CleanAppSettingsContent {
         $null -ne $patGatewayProxyPort -or
         -not $patGatewayProxyAutoDetect -or
         $patGatewayProxyScheme -ne 'http' -or
+        -not $patGatewayEnabled -or
+        -not $patAutoRotationEnabled -or
+        [Math]::Abs($patAutoRotationUsedPercentThreshold - 98.0) -gt 0.001 -or
+        -not $accountRotationEnabled -or
+        @($accountRotationPools.PSObject.Properties).Count -ne 0 -or
+        $accountRotationPrimaryOrder.Count -ne 0 -or
+        $accountRotationBackupOrder.Count -ne 0 -or
+        $null -ne $accountRotationPrimaryCursor -or
+        $null -ne $accountRotationBackupCursor -or
+        @($accountRotationResets.PSObject.Properties).Count -ne 0 -or
+        @($fingerprintForwarding.PSObject.Properties).Count -ne 0 -or
+        @($featureBindings.PSObject.Properties).Count -ne 0 -or
         $windowWidth -ne 1038 -or
         $windowHeight -ne 615 -or
         $useCodexDreamSkin -or

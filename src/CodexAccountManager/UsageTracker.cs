@@ -1125,12 +1125,38 @@ public sealed class UsageTracker
         RecordSwitch(account.Name, QuotaAccountIdentity.CreateKey(account), source);
     }
 
+    public void RecordSwitch(
+        AccountRecord? account,
+        string source,
+        DateTimeOffset switchedAtUtc)
+    {
+        if (account == null)
+        {
+            return;
+        }
+
+        RecordSwitch(
+            account.Name,
+            QuotaAccountIdentity.CreateKey(account),
+            source,
+            switchedAtUtc);
+    }
+
     public void RecordSwitch(string accountName, string source = "switch")
     {
         RecordSwitch(accountName, accountKey: null, source: source);
     }
 
     private void RecordSwitch(string accountName, string? accountKey, string source)
+    {
+        RecordSwitch(accountName, accountKey, source, DateTimeOffset.UtcNow);
+    }
+
+    private void RecordSwitch(
+        string accountName,
+        string? accountKey,
+        string source,
+        DateTimeOffset switchedAtUtc)
     {
         if (string.IsNullOrWhiteSpace(accountName))
         {
@@ -1151,7 +1177,7 @@ public sealed class UsageTracker
             AccountName = normalizedAccountName,
             AccountKey = accountKey,
             ManagerScopeKey = _managerScopeKey,
-            SwitchedAtUtc = DateTimeOffset.UtcNow.ToString("O"),
+            SwitchedAtUtc = switchedAtUtc.ToUniversalTime().ToString("O"),
             Source = source
         });
 

@@ -429,6 +429,138 @@ internal sealed class ModernButton : Button
     }
 }
 
+internal sealed class ModernToggleSwitch : CheckBox
+{
+    private bool _hovered;
+
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public Color OnTrackColor { get; set; } = Color.SeaGreen;
+
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public Color OffTrackColor { get; set; } = Color.Gray;
+
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public Color KnobColor { get; set; } = Color.White;
+
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public Color TextColor { get; set; } = Color.Black;
+
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public Color BorderColor { get; set; } = Color.Transparent;
+
+    public ModernToggleSwitch()
+    {
+        AutoSize = false;
+        Text = "指纹透传";
+        Cursor = Cursors.Hand;
+        TextAlign = ContentAlignment.MiddleLeft;
+        UseMnemonic = false;
+        SetStyle(
+            ControlStyles.AllPaintingInWmPaint |
+            ControlStyles.OptimizedDoubleBuffer |
+            ControlStyles.ResizeRedraw |
+            ControlStyles.UserPaint |
+            ControlStyles.Selectable,
+            true);
+    }
+
+    protected override void OnMouseEnter(EventArgs eventArgs)
+    {
+        _hovered = true;
+        Invalidate();
+        base.OnMouseEnter(eventArgs);
+    }
+
+    protected override void OnMouseLeave(EventArgs eventArgs)
+    {
+        _hovered = false;
+        Invalidate();
+        base.OnMouseLeave(eventArgs);
+    }
+
+    protected override void OnCheckedChanged(EventArgs eventArgs)
+    {
+        Invalidate();
+        base.OnCheckedChanged(eventArgs);
+    }
+
+    protected override void OnEnabledChanged(EventArgs eventArgs)
+    {
+        Invalidate();
+        base.OnEnabledChanged(eventArgs);
+    }
+
+    protected override void OnPaint(PaintEventArgs eventArgs)
+    {
+        var graphics = eventArgs.Graphics;
+        graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        graphics.Clear(BackColor);
+
+        var trackWidth = Math.Clamp(Width / 3, 34, 42);
+        var trackHeight = Math.Clamp(Height - 10, 18, 22);
+        var track = new RectangleF(
+            Width - trackWidth - 7F,
+            (Height - trackHeight) / 2F,
+            trackWidth,
+            trackHeight);
+        var textBounds = new Rectangle(
+            7,
+            0,
+            Math.Max(1, (int)Math.Floor(track.Left) - 13),
+            Height);
+        var textColor = Enabled
+            ? TextColor
+            : UiDesign.Blend(TextColor, BackColor, 0.48F);
+        TextRenderer.DrawText(
+            graphics,
+            Text,
+            Font,
+            textBounds,
+            textColor,
+            TextFormatFlags.Left |
+            TextFormatFlags.VerticalCenter |
+            TextFormatFlags.SingleLine |
+            TextFormatFlags.EndEllipsis |
+            TextFormatFlags.NoPrefix);
+
+        var trackColor = Checked ? OnTrackColor : OffTrackColor;
+        if (_hovered && Enabled)
+        {
+            trackColor = UiDesign.Blend(trackColor, Color.White, 0.10F);
+        }
+        if (!Enabled)
+        {
+            trackColor = UiDesign.Blend(trackColor, BackColor, 0.45F);
+        }
+        using (var trackPath = UiDesign.CreateRoundedPath(track, track.Height / 2F))
+        using (var trackBrush = new SolidBrush(trackColor))
+        using (var trackPen = new Pen(BorderColor, 1F))
+        {
+            graphics.FillPath(trackBrush, trackPath);
+            if (BorderColor.A > 0)
+            {
+                graphics.DrawPath(trackPen, trackPath);
+            }
+        }
+
+        var inset = 2.5F;
+        var knobSize = track.Height - inset * 2F;
+        var knobLeft = Checked
+            ? track.Right - inset - knobSize
+            : track.Left + inset;
+        using (var knobBrush = new SolidBrush(KnobColor))
+        {
+            graphics.FillEllipse(knobBrush, knobLeft, track.Top + inset, knobSize, knobSize);
+        }
+
+        if (Focused && ShowFocusCues)
+        {
+            var focus = Rectangle.Inflate(ClientRectangle, -2, -2);
+            ControlPaint.DrawFocusRectangle(graphics, focus, TextColor, BackColor);
+        }
+    }
+}
+
 internal sealed class ModernInputShell : Panel
 {
     private readonly Control _input;
