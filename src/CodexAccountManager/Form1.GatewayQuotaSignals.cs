@@ -6,11 +6,14 @@ public partial class Form1
         TimeSpan.FromMilliseconds(500);
     private static readonly TimeSpan GatewayQuotaSignalRetryInterval =
         TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan GatewayRecoveryRetryInterval =
+        TimeSpan.FromSeconds(5);
 
     private readonly PatGatewayQuotaSignalAttemptTracker _patGatewayQuotaSignalAttempts = new();
     private PatGatewayQuotaSignalStore? _patGatewayQuotaSignalStore;
     private DateTimeOffset? _patGatewayQuotaSignalCheckedAtUtc;
     private DateTimeOffset? _patGatewayActivitySignalCheckedAtUtc;
+    private DateTimeOffset? _patGatewayRecoveryAttemptedAtUtc;
     private bool _patGatewayActivitySignalPollRunning;
 
     /// <summary>
@@ -177,6 +180,23 @@ public partial class Form1
         try
         {
             var activity = await LocalPatGateway.ReadActivitySnapshotAsync();
+            if (activity == null &&
+                (_patGatewayRecoveryAttemptedAtUtc is not { } lastRecoveryAttempt ||
+                 DateTimeOffset.UtcNow - lastRecoveryAttempt >= GatewayRecoveryRetryInterval))
+            {
+                // A gateway process can disappear independently of the Manager (for
+                // example, an old build used to throw while releasing its named mutex).
+                // Recreate only the loopback gateway; never close or relaunch Codex.
+                _patGatewayRecoveryAttemptedAtUtc = DateTimeOffset.UtcNow;
+                await LocalPatGateway.EnsureRunningAsync(restartOnProxyMismatch: false);
+                activity = await LocalPatGateway.ReadActivitySnapshotAsync();
+                if (activity != null)
+                {
+                    ManagerLifecycleDiagnostics.Write(
+                        "pat-gateway-recovered-without-codex-restart",
+                        "source=quota-signal-monitor");
+                }
+            }
             if (activity == null)
             {
                 return;

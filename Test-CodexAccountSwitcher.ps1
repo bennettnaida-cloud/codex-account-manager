@@ -2965,6 +2965,8 @@ if ($patGatewayQuotaSignalStoreSource -notmatch 'FileName\s*=\s*"pat-gateway-quo
     $gatewayQuotaSignalFormSource -notmatch 'RefreshPersistedPatGatewayQuotaSignalIfNeeded' -or
     $gatewayQuotaSignalFormSource -notmatch 'QueuePatGatewayActivitySignalRefreshIfNeeded' -or
     $gatewayQuotaSignalFormSource -notmatch 'LocalPatGateway\.ReadActivitySnapshotAsync' -or
+    $gatewayQuotaSignalFormSource -notmatch 'LocalPatGateway\.EnsureRunningAsync\(restartOnProxyMismatch:\s*false\)' -or
+    $gatewayQuotaSignalFormSource -notmatch 'pat-gateway-recovered-without-codex-restart' -or
     $gatewayQuotaSignalFormSource -notmatch 'TryRecoverPatAutoRotationLaunchContextAsync' -or
     $gatewayQuotaSignalFormSource -notmatch 'PreparePatAutoRotationAsync' -or
     $formSource -notmatch 'RefreshPersistedPatGatewayQuotaSignalIfNeeded\(\)') {
