@@ -13,6 +13,8 @@ internal static class AccountRotationConfiguration
     internal const string BackupValue = "backup";
     internal const string NoneValue = "none";
     internal static readonly TimeSpan PrimaryResetGracePeriod = TimeSpan.FromMinutes(1);
+    private static readonly ISet<string> EmptyAccountKeySet =
+        new HashSet<string>(StringComparer.Ordinal);
 
     internal static bool IsEnabled(AppSettings settings) =>
         settings.AccountRotationEnabled ?? settings.PatAutoRotationEnabled;
@@ -225,7 +227,8 @@ internal static class AccountRotationConfiguration
         IReadOnlySet<string> unavailableAccountKeys,
         DateTimeOffset nowUtc,
         Func<AccountRecord, bool> hasUsableCredential,
-        Func<AccountRecord, bool>? canSelectAccount = null)
+        Func<AccountRecord, bool>? canSelectAccount = null,
+        ISet<string>? hardUnavailableAccountKeys = null)
     {
         ArgumentNullException.ThrowIfNull(settings);
         ArgumentNullException.ThrowIfNull(accounts);
@@ -233,6 +236,7 @@ internal static class AccountRotationConfiguration
         ArgumentNullException.ThrowIfNull(unavailableAccountKeys);
         ArgumentNullException.ThrowIfNull(hasUsableCredential);
         canSelectAccount ??= static _ => true;
+        hardUnavailableAccountKeys ??= EmptyAccountKeySet;
 
         var currentKey = QuotaAccountIdentity.CreateKey(current);
         var primary = BuildEligibleRing(
@@ -243,7 +247,8 @@ internal static class AccountRotationConfiguration
             unavailableAccountKeys,
             nowUtc,
             hasUsableCredential,
-            canSelectAccount);
+            canSelectAccount,
+            hardUnavailableAccountKeys);
         var backup = BuildEligibleRing(
             settings,
             accounts,
@@ -252,7 +257,8 @@ internal static class AccountRotationConfiguration
             unavailableAccountKeys,
             nowUtc,
             hasUsableCredential,
-            canSelectAccount);
+            canSelectAccount,
+            hardUnavailableAccountKeys);
 
         // Never expose backup candidates while any primary candidate is still eligible.
         // This prevents a transient/unknown primary quota probe from skipping directly to
@@ -401,6 +407,21 @@ internal static class AccountRotationConfiguration
                 "A reset primary account did not return after its one-minute grace period.");
         }
 
+        candidates = BuildCandidates(
+            settings,
+            accounts,
+            a,
+            unavailable,
+            DateTimeOffset.UtcNow,
+            _ => true,
+            hardUnavailableAccountKeys: unavailable);
+        if (candidates.Any(account => account.Name == "b") ||
+            candidates.FirstOrDefault()?.Name != "oauth")
+        {
+            throw new InvalidOperationException(
+                "A credential already attempted by one request must remain hard-excluded even after reset grace elapsed.");
+        }
+
 
         SetPool(settings, accounts, oauth, AccountRotationPool.Primary);
         candidates = BuildCandidates(
@@ -440,7 +461,8 @@ internal static class AccountRotationConfiguration
         IReadOnlySet<string> unavailableAccountKeys,
         DateTimeOffset nowUtc,
         Func<AccountRecord, bool> hasUsableCredential,
-        Func<AccountRecord, bool> canSelectAccount)
+        Func<AccountRecord, bool> canSelectAccount,
+        ISet<string> hardUnavailableAccountKeys)
     {
         var ordered = GetOrderedAccounts(settings, accounts, pool).ToList();
         if (ordered.Count == 0)
@@ -464,6 +486,7 @@ internal static class AccountRotationConfiguration
             {
                 var key = QuotaAccountIdentity.CreateKey(account);
                 return !key.Equals(currentKey, StringComparison.Ordinal) &&
+                       !hardUnavailableAccountKeys.Contains(key) &&
                        !IsStillUnavailable(
                            settings,
                            key,
@@ -594,4 +617,5 @@ internal static class AccountRotationConfiguration
     private static bool IsCursorValid(string? cursor, IReadOnlyList<string> order) =>
         string.IsNullOrWhiteSpace(cursor) ||
         order.Contains(cursor.Trim().ToUpperInvariant(), StringComparer.Ordinal);
+
 }

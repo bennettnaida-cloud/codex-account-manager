@@ -322,7 +322,9 @@ public partial class Form1 : Form
     private readonly Dictionary<string, long> _quotaRuntimeStateGenerations =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _collapsedAccountGroups = new(StringComparer.OrdinalIgnoreCase);
-    private readonly HashSet<string> _collapsedUnifiedHistoryGroups = new(StringComparer.OrdinalIgnoreCase);
+    // An absent key means the directory stays collapsed. This keeps the history page compact on
+    // first open while preserving every manual expansion for the lifetime of the manager window.
+    private readonly HashSet<string> _expandedUnifiedHistoryGroups = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, int> _unifiedHistoryGroupVisibleLimits =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<WorkspaceView, WorkspaceViewCacheEntry> _workspaceViewCache = [];
@@ -3815,6 +3817,26 @@ public partial class Form1 : Form
 
     private void SyncCurrentAccountSelection(bool persistSettings = true)
     {
+        // During request-level rotation the shared desktop credential remains the stable
+        // transport account by design; the gateway route is the logical account actually
+        // paying for model requests.  Re-reading the shared auth file here used to flip the
+        // UI and usage attribution back to that transport account on every quota refresh,
+        // then the gateway reconciler flipped it forward again.  Keep the committed logical
+        // account authoritative until an explicit manual launch clears the rotation context.
+        if (AccountRotationConfiguration.IsEnabled(_appSettings) &&
+            _patAutoRotationGatewayTransportActive &&
+            _patAutoRotationLaunchContext?.ClientMode == WindowsClientMode.OfficialCodex &&
+            GetCurrentAccountRecord() is { } logicalAccount &&
+            AccountRotationConfiguration.GetPool(_appSettings, logicalAccount) !=
+                AccountRotationPool.None)
+        {
+            SetCurrentAccount(
+                logicalAccount.Name,
+                false,
+                persistSettings: persistSettings);
+            return;
+        }
+
         // appsettings is only a hint after a reboot or an external login. The shared
         // profile on disk is authoritative and can be compared without any network call.
         var matchingProfiles = _accounts
@@ -4324,9 +4346,9 @@ public partial class Form1 : Form
             8.9F,
             FontStyle.Regular,
             scale,
-            160,
-            42,
-            10,
+            112,
+            34,
+            8,
             hasIcon: true);
         var refreshSize = MeasureUnifiedHistoryButton(
             "刷新",
@@ -4334,14 +4356,17 @@ public partial class Form1 : Form
             8.9F,
             FontStyle.Regular,
             scale,
-            116,
-            42,
-            10,
+            84,
+            34,
+            8,
             hasIcon: true);
         var actionHeight = Math.Max(createSize.Height, refreshSize.Height);
         var actionsWidth = createSize.Width + gap + refreshSize.Width;
         var availableHorizontalTextWidth = width - left - gap - actionsWidth - right;
-        var stacked = availableHorizontalTextWidth < ScaleUnifiedHistoryPixel(260, scale);
+        // Keep the narrow 560 px workspace in the vertical layout even after compacting
+        // the action buttons. Otherwise the shorter buttons make the summary appear to fit
+        // while leaving too little room for the full directory/status sentence.
+        var stacked = availableHorizontalTextWidth < ScaleUnifiedHistoryPixel(300, scale);
         var titleHeight = Math.Max(
             ScaleUnifiedHistoryPixel(32, scale),
             MeasureUnifiedHistoryText(titleText, fontFamily, 10F, FontStyle.Bold, scale).Height +
@@ -4414,27 +4439,27 @@ public partial class Form1 : Form
             8.5F,
             FontStyle.Bold,
             scale,
-            86,
-            36,
-            12);
+            64,
+            30,
+            8);
         var renameSize = MeasureUnifiedHistoryButton(
             "重命名",
             fontFamily,
             8.9F,
             FontStyle.Regular,
             scale,
-            92,
-            36,
-            10);
+            72,
+            32,
+            8);
         var deleteSize = MeasureUnifiedHistoryButton(
             "删除目录",
             fontFamily,
             8.9F,
             FontStyle.Regular,
             scale,
-            92,
-            36,
-            10);
+            84,
+            32,
+            8);
         var countMeasured = MeasureUnifiedHistoryText(
             countText,
             fontFamily,
@@ -4442,8 +4467,8 @@ public partial class Form1 : Form
             FontStyle.Bold,
             scale);
         var countWidth = Math.Max(
-            ScaleUnifiedHistoryPixel(72, scale),
-            countMeasured.Width + ScaleUnifiedHistoryPixel(20, scale));
+            ScaleUnifiedHistoryPixel(64, scale),
+            countMeasured.Width + ScaleUnifiedHistoryPixel(16, scale));
         var managementWidth = hasManagement
             ? renameSize.Width + gap + deleteSize.Width + gap
             : 0;
@@ -4543,9 +4568,9 @@ public partial class Form1 : Form
             8.9F,
             FontStyle.Regular,
             scale,
-            140,
+            116,
             34,
-            10,
+            8,
             hasIcon: true);
         var archiveSize = MeasureUnifiedHistoryButton(
             archiveText,
@@ -4553,18 +4578,18 @@ public partial class Form1 : Form
             8.9F,
             FontStyle.Regular,
             scale,
-            112,
-            42,
-            10);
+            84,
+            34,
+            8);
         var deleteSize = MeasureUnifiedHistoryButton(
             "删除",
             fontFamily,
             8.9F,
             FontStyle.Regular,
             scale,
-            104,
-            42,
-            10);
+            68,
+            34,
+            8);
         var statusMeasured = MeasureUnifiedHistoryText(
             statusText,
             fontFamily,
@@ -4573,11 +4598,11 @@ public partial class Form1 : Form
             scale);
         var statusSize = new Size(
             Math.Max(
-                ScaleUnifiedHistoryPixel(132, scale),
-                statusMeasured.Width + ScaleUnifiedHistoryPixel(20, scale)),
+                ScaleUnifiedHistoryPixel(80, scale),
+                statusMeasured.Width + ScaleUnifiedHistoryPixel(16, scale)),
             Math.Max(
-                ScaleUnifiedHistoryPixel(34, scale),
-                statusMeasured.Height + ScaleUnifiedHistoryPixel(10, scale)));
+                ScaleUnifiedHistoryPixel(30, scale),
+                statusMeasured.Height + ScaleUnifiedHistoryPixel(8, scale)));
         var actionHeight = Math.Max(classifySize.Height, Math.Max(archiveSize.Height, deleteSize.Height));
         var firstColumnWidth = Math.Max(statusSize.Width, classifySize.Width);
         var wideActionsWidth = firstColumnWidth + gap + archiveSize.Width + gap + deleteSize.Width;
@@ -4816,7 +4841,7 @@ public partial class Form1 : Form
                 }
 
                 var collapsed = !searching &&
-                                _collapsedUnifiedHistoryGroups.Contains(group.Key);
+                                !_expandedUnifiedHistoryGroups.Contains(group.Key);
                 foreach (var row in groupRows)
                 {
                     row.Visible = !collapsed;
@@ -4940,6 +4965,12 @@ public partial class Form1 : Form
         return groups;
     }
 
+    private static bool IsUnifiedHistoryGroupCollapsed(
+        string groupKey,
+        bool searching,
+        ISet<string> expandedGroups) =>
+        !searching && !expandedGroups.Contains(groupKey);
+
     private int GetUnifiedHistoryGroupVisibleLimit(string groupKey)
     {
         return _unifiedHistoryGroupVisibleLimits.TryGetValue(groupKey, out var value)
@@ -4999,7 +5030,7 @@ public partial class Form1 : Form
         IReadOnlyList<Control> groupRows,
         bool searching)
     {
-        var collapsed = !searching && _collapsedUnifiedHistoryGroups.Contains(group.Key);
+        var collapsed = !searching && !_expandedUnifiedHistoryGroups.Contains(group.Key);
         var hasManagement = group.Section is { IsPinned: false };
         var toggleText = searching ? "匹配" : collapsed ? "展开" : "收起";
         var geometry = CalculateUnifiedHistoryGroupHeaderGeometry(
@@ -5105,10 +5136,10 @@ public partial class Form1 : Form
                 return;
             }
 
-            var collapseRows = _collapsedUnifiedHistoryGroups.Add(group.Key);
-            if (!collapseRows)
+            var expandRows = _expandedUnifiedHistoryGroups.Add(group.Key);
+            if (!expandRows)
             {
-                _collapsedUnifiedHistoryGroups.Remove(group.Key);
+                _expandedUnifiedHistoryGroups.Remove(group.Key);
             }
             using (NativeWindowTheme.SuspendRedraw(_cardsPanel))
             {
@@ -5117,10 +5148,10 @@ public partial class Form1 : Form
                 {
                     foreach (var row in groupRows)
                     {
-                        row.Visible = !collapseRows;
+                        row.Visible = expandRows;
                     }
-                    toggle.Text = collapseRows ? "展开" : "收起";
-                    toggle.AccessibleName = collapseRows ? "展开目录" : "收起目录";
+                    toggle.Text = expandRows ? "收起" : "展开";
+                    toggle.AccessibleName = expandRows ? "收起目录" : "展开目录";
                     _toolTip.SetToolTip(toggle, toggle.AccessibleName);
                 }
                 finally
@@ -5587,7 +5618,7 @@ public partial class Form1 : Form
         await RunBusyAsync(async () =>
         {
             var section = await _codex.CreateThreadSectionAsync(dialog.SectionName, sharedHome);
-            _collapsedUnifiedHistoryGroups.Remove("section:" + section.Id);
+            _expandedUnifiedHistoryGroups.Remove("section:" + section.Id);
             ResetUnifiedHistoryGroupPagination();
             InvalidateUnifiedHistoryCache(clearCachedData: false);
             await RefreshUnifiedHistoryAsync(force: true, _workspaceLoadGeneration);
@@ -5668,7 +5699,7 @@ public partial class Form1 : Form
         await RunBusyAsync(async () =>
         {
             await _codex.DeleteThreadSectionAsync(section.Id, sharedHome);
-            _collapsedUnifiedHistoryGroups.Remove("section:" + section.Id);
+            _expandedUnifiedHistoryGroups.Remove("section:" + section.Id);
             _unifiedHistoryGroupVisibleLimits.Remove("section:" + section.Id);
             InvalidateUnifiedHistoryCache(clearCachedData: false);
             await RefreshUnifiedHistoryAsync(force: true, _workspaceLoadGeneration);
@@ -15858,7 +15889,7 @@ public partial class Form1 : Form
                 : "PAT";
         _statusBox.Text =
             $"已在模型请求边界无缝轮换到{(enteredBackup ? "备用池" : "使用池")}的" +
-            $" {kind} 账号 {target.Name}；Codex 未关闭或重启，上一条请求没有重放。";
+            $" {kind} 账号 {target.Name}；切换在响应输出前完成，Codex 与当前任务都保持运行。";
         RenderCards();
         ResetCardsScrollPosition();
         if (!target.IsCompatibleApi)

@@ -139,6 +139,23 @@ internal sealed class PatGatewayQuotaSignalStore
         }
     }
 
+    internal IReadOnlyList<PatGatewayQuotaSignal> ReadLatestPerAccount(
+        DateTimeOffset nowUtc)
+    {
+        lock (_gate)
+        {
+            return SelectCurrentSignals(LoadUnsafe(), nowUtc)
+                .GroupBy(signal => signal.AccountKey, StringComparer.Ordinal)
+                .Select(group => group
+                    .OrderByDescending(signal => signal.ObservedAtUtc)
+                    .ThenByDescending(signal => signal.Sequence)
+                    .First())
+                .OrderByDescending(signal => signal.ObservedAtUtc)
+                .ThenByDescending(signal => signal.Sequence)
+                .ToList();
+        }
+    }
+
     private static IEnumerable<PatGatewayQuotaSignal> SelectCurrentSignals(
         SignalFile file,
         DateTimeOffset nowUtc)
@@ -280,6 +297,16 @@ internal sealed class PatGatewayQuotaSignalStore
             {
                 throw new InvalidOperationException(
                     "Gateway quota signal did not survive a process restart.");
+            }
+            var recoveredAccounts = restarted.ReadLatestPerAccount(now);
+            if (recoveredAccounts.Count != 2 ||
+                recoveredAccounts.Single(signal => signal.AccountKey == firstKey).Sequence !=
+                    laterFirst.Sequence ||
+                recoveredAccounts.Single(signal => signal.AccountKey == secondKey).Sequence !=
+                    second.Sequence)
+            {
+                throw new InvalidOperationException(
+                    "Gateway restart must recover the latest quota signal for every account in the ring.");
             }
             var afterRestart = restarted.Record(secondKey, now.AddSeconds(-4));
             if (afterRestart.Sequence != laterFirst.Sequence + 1L)

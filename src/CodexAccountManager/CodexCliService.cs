@@ -6267,11 +6267,11 @@ public sealed partial class CodexCliService
 
         var syntheticSnapshots = new[]
         {
-            new WindowsClientProcessSnapshot(10, 100, "ChatGPT", 0, 0),
-            new WindowsClientProcessSnapshot(11, 110, "ChatGPT", 1, 10),
-            new WindowsClientProcessSnapshot(12, 120, "Codex", 2, 11),
-            new WindowsClientProcessSnapshot(20, 200, "ChatGPT", 0, 0),
-            new WindowsClientProcessSnapshot(21, 210, "Codex", 2, 20)
+            new WindowsClientProcessSnapshot(10, 100, "ChatGPT", @"C:\Program Files\WindowsApps\OpenAI.Codex_1\app\ChatGPT.exe", 0, 0),
+            new WindowsClientProcessSnapshot(11, 110, "ChatGPT", @"C:\Program Files\WindowsApps\OpenAI.Codex_1\app\ChatGPT.exe", 1, 10),
+            new WindowsClientProcessSnapshot(12, 120, "Codex", @"C:\Program Files\WindowsApps\OpenAI.Codex_1\app\Codex.exe", 2, 11),
+            new WindowsClientProcessSnapshot(20, 200, "ChatGPT", @"C:\Program Files\WindowsApps\OpenAI.Codex_1\app\ChatGPT.exe", 0, 0),
+            new WindowsClientProcessSnapshot(21, 210, "Codex", @"C:\Program Files\WindowsApps\OpenAI.Codex_1\app\Codex.exe", 2, 20)
         };
         var selectedTree = SelectWindowsClientProcessTreeSnapshots(
             syntheticSnapshots,
@@ -6281,6 +6281,27 @@ public sealed partial class CodexCliService
         {
             throw new InvalidOperationException(
                 "Official Codex clean recovery selected processes outside the exact activation tree.");
+        }
+
+        var protectedShutdownNames = new[]
+        {
+            "CodexAccountManager",
+            "CodexAccountManager.exe",
+            "WindowsTerminal",
+            "powershell",
+            "pwsh",
+            "cmd",
+            "conhost",
+            "OpenConsole"
+        };
+        if (protectedShutdownNames.Any(name =>
+                !IsProtectedWindowsClientShutdownProcessName(name)) ||
+            IsProtectedWindowsClientShutdownProcessName("ChatGPT") ||
+            IsProtectedWindowsClientShutdownProcessName("Codex") ||
+            IsProtectedWindowsClientShutdownProcessName("codex-plus-plus-manager"))
+        {
+            throw new InvalidOperationException(
+                "Exact Codex shutdown must protect Account Manager and terminal hosts without excluding reviewed Codex executables.");
         }
 
         using var currentProcess = Process.GetCurrentProcess();
@@ -12971,9 +12992,13 @@ catch {
             {
                 try
                 {
-                    if ((!IsCodexWindowsClientProcess(process, packageRoot) &&
+                    var processName = process.ProcessName;
+                    if (process.Id == Environment.ProcessId ||
+                        IsProtectedWindowsClientShutdownProcessName(processName) ||
+                        (!IsCodexWindowsClientProcess(process, packageRoot) &&
                          !IsCodexPlusPlusLauncherProcess(process)) ||
-                        process.HasExited)
+                        process.HasExited ||
+                        !TryGetProcessExecutablePath(process, out var executablePath))
                     {
                         continue;
                     }
@@ -12983,7 +13008,8 @@ catch {
                     snapshots.Add(new WindowsClientProcessSnapshot(
                         process.Id,
                         process.StartTime.ToUniversalTime().Ticks,
-                        process.ProcessName,
+                        processName,
+                        executablePath,
                         GetShutdownPriority(process, packageRoot),
                         parentProcessIds.TryGetValue(process.Id, out var parentProcessId)
                             ? parentProcessId
@@ -13121,13 +13147,30 @@ catch {
             ? null
             : Path.GetDirectoryName(clientPath);
         var processes = new List<Process>();
+        var rejectedTargetCount = 0;
         foreach (var target in shutdownTargets)
         {
+            if (target.ProcessId == Environment.ProcessId)
+            {
+                rejectedTargetCount++;
+                continue;
+            }
+
             if (TryOpenWindowsClientSnapshot(target, packageRoot, out var process))
             {
                 processes.Add(process!);
             }
+            else
+            {
+                rejectedTargetCount++;
+            }
         }
+
+        WriteCodexPlusPlusLaunchDiagnostic(
+            "windows-client-exact-shutdown-plan",
+            $"requested_count={shutdownTargets.Count}; verified_count={processes.Count}; " +
+            $"rejected_count={rejectedTargetCount}; manager_pid_excluded={processes.All(process => process.Id != Environment.ProcessId)}; " +
+            "force_kill_scope=single-process");
 
         try
         {
@@ -13161,18 +13204,26 @@ catch {
 
             // Use one shared force-stop budget instead of adding a timeout for every
             // renderer/helper process. This bounds shutdown even when Codex has many children.
-            foreach (var process in processes)
+            for (var index = processes.Count - 1; index >= 0; index--)
             {
+                var process = processes[index];
                 try
                 {
                     if (!process.HasExited)
                     {
-                        process.Kill(entireProcessTree: true);
+                        // Never terminate a ChatGPT process tree here. Account Manager or a
+                        // terminal can legitimately be an indirect descendant when Codex
+                        // launched the task that started this switch. Every helper/root that
+                        // belongs to the captured Codex instance is already represented by its
+                        // own PID + start time + name + executable-path snapshot and is stopped
+                        // individually.
+                        process.Kill();
                     }
                 }
                 catch
                 {
-                    // A parent tree kill may already have removed this process.
+                    // A graceful close or an individually stopped parent may already have
+                    // removed this exact process.
                 }
             }
             WaitForProcessesToExit(processes, WindowsClientForceShutdownTimeout);
@@ -13198,9 +13249,14 @@ catch {
         try
         {
             var candidate = Process.GetProcessById(snapshot.ProcessId);
-            if (candidate.HasExited ||
-                !candidate.ProcessName.Equals(snapshot.ProcessName, StringComparison.OrdinalIgnoreCase) ||
+            var candidateProcessName = candidate.ProcessName;
+            if (candidate.Id == Environment.ProcessId ||
+                candidate.HasExited ||
+                IsProtectedWindowsClientShutdownProcessName(candidateProcessName) ||
+                !candidateProcessName.Equals(snapshot.ProcessName, StringComparison.OrdinalIgnoreCase) ||
                 candidate.StartTime.ToUniversalTime().Ticks != snapshot.StartTimeUtcTicks ||
+                !TryGetProcessExecutablePath(candidate, out var executablePath) ||
+                !PathsEqual(executablePath, snapshot.ExecutablePath) ||
                 (!IsCodexWindowsClientProcess(candidate, packageRoot) &&
                  !IsCodexPlusPlusLauncherProcess(candidate)))
             {
@@ -13215,6 +13271,27 @@ catch {
         {
             process?.Dispose();
             process = null;
+            return false;
+        }
+    }
+
+    private static bool TryGetProcessExecutablePath(Process process, out string executablePath)
+    {
+        executablePath = "";
+        try
+        {
+            var candidate = process.MainModule?.FileName;
+            if (string.IsNullOrWhiteSpace(candidate))
+            {
+                return false;
+            }
+
+            executablePath = Path.GetFullPath(candidate);
+            return true;
+        }
+        catch
+        {
+            executablePath = "";
             return false;
         }
     }
@@ -13308,6 +13385,23 @@ catch {
         {
             return false;
         }
+    }
+
+    private static bool IsProtectedWindowsClientShutdownProcessName(string processName)
+    {
+        var normalized = (processName ?? "").Trim();
+        if (normalized.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+        {
+            normalized = normalized[..^4];
+        }
+
+        return normalized.Equals("CodexAccountManager", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Equals("WindowsTerminal", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Equals("powershell", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Equals("pwsh", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Equals("cmd", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Equals("conhost", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Equals("OpenConsole", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool IsCodexWindowsClientProcess(Process process, string? packageRoot)
@@ -16497,6 +16591,7 @@ catch {
         int ProcessId,
         long StartTimeUtcTicks,
         string ProcessName,
+        string ExecutablePath,
         int ShutdownPriority,
         int ParentProcessId);
     private sealed record WindowsClientSharedProfileSnapshot(

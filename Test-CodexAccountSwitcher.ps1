@@ -110,6 +110,7 @@ $localPatGatewaySource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAcc
 $localPatGatewayControlSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\LocalPatGatewayControl.cs') -Raw -Encoding UTF8
 $patAutoRotationSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\PatAutoRotation.cs') -Raw -Encoding UTF8
 $accountRotationSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\AccountRotationConfiguration.cs') -Raw -Encoding UTF8
+$accountRotationFormSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\Form1.AccountRotation.cs') -Raw -Encoding UTF8
 $patGatewayRotationStoreSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\PatGatewayRotationStore.cs') -Raw -Encoding UTF8
 $patGatewayQuotaSignalStoreSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\PatGatewayQuotaSignalStore.cs') -Raw -Encoding UTF8
 $gatewayQuotaSignalFormSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\Form1.GatewayQuotaSignals.cs') -Raw -Encoding UTF8
@@ -346,6 +347,30 @@ if ($formSource -notmatch 'AccountRowMinWidth' -or
 }
 if ($formSource -match '_cardsPanel\.BringToFront\(\)') {
     throw 'Cards panel must not cover the bottom status area.'
+}
+$accountRotationPoolButtonLabels = [regex]::Match(
+    $accountRotationFormSource,
+    '(?s)private static string GetAccountRotationPoolButtonLabel\(AccountRotationPool pool\)\s*=>\s*pool switch.*?\};')
+$accountRotationSummaryLayout = [regex]::Match(
+    $accountRotationFormSource,
+    '(?s)private Control CreateAccountRotationSummary\(int width\).*?(?=\r?\n\s*private string BuildAccountRotationCursorSummary)')
+$accountRotationRowLayout = [regex]::Match(
+    $accountRotationFormSource,
+    '(?s)private Control CreateAccountRotationRow\(.*?(?=\r?\n\s*private Button CreateAccountRotationMoveButton)')
+if (-not $accountRotationPoolButtonLabels.Success -or
+    $accountRotationPoolButtonLabels.Value -notmatch 'AccountRotationPool\.Primary\s*=>\s*"放入备用轮换池"' -or
+    $accountRotationPoolButtonLabels.Value -notmatch 'AccountRotationPool\.Backup\s*=>\s*"放入使用轮换池"' -or
+    -not $accountRotationRowLayout.Success -or
+    $accountRotationRowLayout.Value -notmatch 'GetInteractivePoolToggleTarget\(pool\)' -or
+    $accountRotationRowLayout.Value -notmatch 'poolButton\.Click\s*\+=.*?ToggleAccountRotationPool\(account\)' -or
+    $accountRotationRowLayout.Value -notmatch '(?s)noneButton\.Click\s*\+=.*?SetAccountRotationPoolFromUi\(\s*account,\s*AccountRotationPool\.None\s*\)' -or
+    -not $accountRotationSummaryLayout.Success -or
+    $accountRotationSummaryLayout.Value -notmatch 'MeasureAccountRotationWrappedTextHeight' -or
+    $accountRotationSummaryLayout.Value -notmatch 'Height\s*=\s*panelHeight' -or
+    $accountRotationSummaryLayout.Value -notmatch 'Height\s*=\s*cursorSummaryHeight' -or
+    [regex]::Matches($accountRotationSummaryLayout.Value, 'AutoEllipsis\s*=\s*false').Count -lt 2 -or
+    $accountRotationFormSource -notmatch '(?s)private static int MeasureAccountRotationWrappedTextHeight\(.*?TextFormatFlags\.WordBreak') {
+    throw 'Account-rotation rows must show destination actions, keep None independent, and wrap the complete rotation summary at high DPI.'
 }
 $accountSwitchRowLayout = [regex]::Match(
     $formSource,
@@ -1377,6 +1402,55 @@ $applyOfficialAccountDisplayMethod = $applyOfficialAccountDisplayMatch.Value
 $readAccountIdentityMethod = $readAccountIdentityMatch.Value
 $nativeAccountDisplayMethod = $nativeAccountDisplayMatch.Value
 $buildAccountDisplayScriptMethod = $buildAccountDisplayScriptMatch.Value
+
+$captureWindowsClientSnapshotsMatch = [regex]::Match(
+    $cliServiceSource,
+    '(?s)private static IReadOnlyList<WindowsClientProcessSnapshot> CaptureWindowsClientProcessSnapshots\(\).*?(?=\r?\n\s*private static IReadOnlyList<WindowsClientProcessSnapshot> CaptureWindowsClientProcessTreeSnapshots)')
+$stopWindowsClientProcessesMatch = [regex]::Match(
+    $cliServiceSource,
+    '(?s)private static void StopWindowsClientProcesses\(.*?(?=\r?\n\s*private static bool TryOpenWindowsClientSnapshot)')
+$tryOpenWindowsClientSnapshotMatch = [regex]::Match(
+    $cliServiceSource,
+    '(?s)private static bool TryOpenWindowsClientSnapshot\(.*?(?=\r?\n\s*private static bool TryGetProcessExecutablePath)')
+$protectedWindowsClientShutdownNameMatch = [regex]::Match(
+    $cliServiceSource,
+    '(?s)private static bool IsProtectedWindowsClientShutdownProcessName\(.*?(?=\r?\n\s*private static bool IsCodexWindowsClientProcess)')
+$windowsClientProcessSnapshotRecordMatch = [regex]::Match(
+    $cliServiceSource,
+    '(?s)private sealed record WindowsClientProcessSnapshot\(.*?\);')
+if (-not $captureWindowsClientSnapshotsMatch.Success -or
+    -not $stopWindowsClientProcessesMatch.Success -or
+    -not $tryOpenWindowsClientSnapshotMatch.Success -or
+    -not $protectedWindowsClientShutdownNameMatch.Success -or
+    -not $windowsClientProcessSnapshotRecordMatch.Success) {
+    throw 'Could not isolate the exact Codex process snapshot and shutdown safety methods.'
+}
+$captureWindowsClientSnapshotsMethod = $captureWindowsClientSnapshotsMatch.Value
+$stopWindowsClientProcessesMethod = $stopWindowsClientProcessesMatch.Value
+$tryOpenWindowsClientSnapshotMethod = $tryOpenWindowsClientSnapshotMatch.Value
+$protectedWindowsClientShutdownNameMethod = $protectedWindowsClientShutdownNameMatch.Value
+if ($captureWindowsClientSnapshotsMethod -notmatch 'process\.Id == Environment\.ProcessId' -or
+    $captureWindowsClientSnapshotsMethod -notmatch 'IsProtectedWindowsClientShutdownProcessName\(processName\)' -or
+    $captureWindowsClientSnapshotsMethod -notmatch 'TryGetProcessExecutablePath\(process, out var executablePath\)' -or
+    $windowsClientProcessSnapshotRecordMatch.Value -notmatch 'string ExecutablePath' -or
+    $tryOpenWindowsClientSnapshotMethod -notmatch 'candidate\.Id == Environment\.ProcessId' -or
+    $tryOpenWindowsClientSnapshotMethod -notmatch 'IsProtectedWindowsClientShutdownProcessName\(candidateProcessName\)' -or
+    $tryOpenWindowsClientSnapshotMethod -notmatch 'candidate\.StartTime\.ToUniversalTime\(\)\.Ticks != snapshot\.StartTimeUtcTicks' -or
+    $tryOpenWindowsClientSnapshotMethod -notmatch 'PathsEqual\(executablePath, snapshot\.ExecutablePath\)' -or
+    $stopWindowsClientProcessesMethod -notmatch 'TryOpenWindowsClientSnapshot\(target, packageRoot, out var process\)' -or
+    $stopWindowsClientProcessesMethod -notmatch 'windows-client-exact-shutdown-plan' -or
+    $stopWindowsClientProcessesMethod -notmatch 'manager_pid_excluded=' -or
+    $stopWindowsClientProcessesMethod -notmatch 'force_kill_scope=single-process' -or
+    $stopWindowsClientProcessesMethod -notmatch 'process\.Kill\(\);' -or
+    $stopWindowsClientProcessesMethod -match 'Kill\s*\(\s*entireProcessTree' -or
+    $stopWindowsClientProcessesMethod -match 'Process\.GetProcesses|GetProcessesByName' -or
+    $protectedWindowsClientShutdownNameMethod -notmatch 'CodexAccountManager' -or
+    $protectedWindowsClientShutdownNameMethod -notmatch 'WindowsTerminal' -or
+    $protectedWindowsClientShutdownNameMethod -notmatch 'powershell' -or
+    $protectedWindowsClientShutdownNameMethod -notmatch 'OpenConsole' -or
+    $cliServiceSource -notmatch 'protectedShutdownNames\.Any') {
+    throw 'Codex shutdown must kill only individually revalidated snapshots and must never tree-kill Account Manager or terminal descendants.'
+}
 
 if ($cliServiceSource -notmatch 'LaunchWindowsClient' -or
     $cliServiceSource -notmatch 'ResolveCodexPlusPlusLauncherPath' -or
@@ -2919,7 +2993,8 @@ if ($installerDefaultsSource -notmatch '"PatGatewayEnabled"\s*:\s*true' -or
     $oneClickPackageSource -notmatch 'patAutoRotationUsedPercentThreshold') {
     throw 'The clean one-click package must enable the PAT gateway and 98% automatic request-boundary rotation by default and validate those fields.'
 }
-if ($localPatGatewaySource -notmatch 'RotationProtocolValue\s*=\s*"request-boundary-v4"' -or
+if ($localPatGatewaySource -notmatch 'RotationProtocolValue\s*=\s*"request-boundary-v5"' -or
+    $localPatGatewaySource -notmatch 'DurableRotationProtocolValue\s*=\s*"request-boundary-v4"' -or
     $localPatGatewaySource -notmatch 'CompatibleRotationProtocolValue\s*=\s*"request-boundary-v3"' -or
     $localPatGatewaySource -notmatch 'HasCompatibleLegacyRotationProtocolAsync' -or
     $localPatGatewaySource -notmatch 'HasCompatibleRotationProtocol' -or
@@ -2949,17 +3024,29 @@ if ($localPatGatewaySource -notmatch 'RotationArmPath\s*=\s*"__rotation/arm"' -o
     $localPatGatewaySource -notmatch 'ApplyRotationAtRequestBoundaryAsync' -or
     $localPatGatewaySource -notmatch '_rotationActivationGate' -or
     $localPatGatewaySource -notmatch 'GetActivitySnapshot\(\)\.ActiveModelRequests\s*==\s*0' -or
-    $gatewayHandleMatch.Value -notmatch '(?s)var isModelRequest = IsModelRequest\(.*?ApplyRotationAtRequestBoundaryAsync\(.*?BeginModelRequest\(credential\.AccountKey\).*?RewriteCompatibleApiRequestBodyAsync\(.*?BuildUpstreamRequest\(.*?client\.SendAsync\(' -or
+    $gatewayHandleMatch.Value -notmatch '(?s)var isModelRequest = IsModelRequest\(.*?ApplyRotationAtRequestBoundaryAsync\(.*?ReadReplayableModelRequestBodyAsync\(.*?BeginModelRequest\(credential\.AccountKey\).*?while \(finalUpstreamResponse == null\).*?BuildUpstreamRequest\(.*?client\.SendAsync\(' -or
     $gatewayHandleMatch.Value -notmatch 'StatusCode\s*==\s*HttpStatusCode\.TooManyRequests' -or
     ([regex]::Matches($gatewayHandleMatch.Value, 'client\.SendAsync\(')).Count -ne 1 -or
-    $gatewayHandleMatch.Value -match '(?i)replay|resend|retry\s*\(') {
-    throw 'The authenticated v4 gateway must activate only at a POST /responses boundary, count the full request lifetime, report state through healthz, send upstream once, and never replay a 429.'
+    $gatewayHandleMatch.Value -notmatch 'TrySelectNextTransparentRotationCredential' -or
+    $gatewayHandleMatch.Value -notmatch 'CommitTransparentRotationAsync' -or
+    $gatewayHandleMatch.Value -notmatch 'lastQuotaResponse' -or
+    $gatewayHandleMatch.Value -notmatch 'downstream_bytes=0' -or
+    $localPatGatewaySource -notmatch '(?s)ReadReplayableModelRequestBodyAsync.*?MemoryStream.*?ReplayableModelRequestBody' -or
+    $localPatGatewaySource -notmatch 'ReplayableModelRequestBodyMaxBytes' -or
+    $localPatGatewaySource -notmatch 'hardUnavailableAccountKeys:\s*attemptedAccountKeys' -or
+    $localPatGatewaySource -notmatch 'identity-network-failure' -or
+    $localPatGatewaySource -notmatch 'upstream-network-failure' -or
+    $localPatGatewaySource -notmatch '(?s)_rotationActivationGate\.Release\(\);.*?Task\.Delay\(TimeSpan\.FromMilliseconds\(25\)' -or
+    $localPatGatewaySource -notmatch '(?s)TrySelectNextTransparentRotationCredential.*?AccountRotationConfiguration\.BuildCandidates.*?ResolveRotationCredential' -or
+    $localPatGatewaySource -notmatch '(?s)CommitTransparentRotationAsync.*?_rotationStore\.Arm.*?_rotationStore\.Activate') {
+    throw 'The authenticated v5 gateway must buffer model bodies in memory, retry a pre-output 429 through the ordered rings, and commit only the successful logical route.'
 }
 if ($patGatewayQuotaSignalStoreSource -notmatch 'FileName\s*=\s*"pat-gateway-quota-signals-v1\.json"' -or
     $patGatewayQuotaSignalStoreSource -notmatch 'FileOptions\.WriteThrough' -or
     $patGatewayQuotaSignalStoreSource -notmatch 'File\.Move\(temporaryPath, _path, overwrite: true\)' -or
     $patGatewayQuotaSignalStoreSource -notmatch 'DuplicateWindow' -or
     $patGatewayQuotaSignalStoreSource -notmatch 'SignalLifetime' -or
+    $patGatewayQuotaSignalStoreSource -notmatch 'ReadLatestPerAccount' -or
     $patGatewayQuotaSignalStoreSource -notmatch 'NextSequence' -or
     $patGatewayQuotaSignalStoreSource -notmatch 'Manager restart must recover an unexpired durable quota signal' -or
     $gatewayQuotaSignalFormSource -notmatch 'RefreshPersistedPatGatewayQuotaSignalIfNeeded' -or
@@ -2968,6 +3055,10 @@ if ($patGatewayQuotaSignalStoreSource -notmatch 'FileName\s*=\s*"pat-gateway-quo
     $gatewayQuotaSignalFormSource -notmatch 'LocalPatGateway\.EnsureRunningAsync\(restartOnProxyMismatch:\s*false\)' -or
     $gatewayQuotaSignalFormSource -notmatch 'pat-gateway-recovered-without-codex-restart' -or
     $gatewayQuotaSignalFormSource -notmatch 'TryRecoverPatAutoRotationLaunchContextAsync' -or
+    $gatewayQuotaSignalFormSource -notmatch 'ReconcileTransparentPatGatewayRotation' -or
+    $gatewayQuotaSignalFormSource -notmatch '(?s)signal\.ObservedAtUtc\s*>=\s*activatedAtUtc\s*-\s*PatGatewayQuotaSignalStore\.SignalLifetime.*?signal\.ObservedAtUtc\s*<=\s*activatedAtUtc\.AddSeconds\(5\)' -or
+    $formSource -notmatch 'the gateway route is the logical account actually' -or
+    $gatewayQuotaSignalFormSource -notmatch 'CompletePatGatewayRotation\(target, activatedAtUtc\)' -or
     $gatewayQuotaSignalFormSource -notmatch 'PreparePatAutoRotationAsync' -or
     $formSource -notmatch 'RefreshPersistedPatGatewayQuotaSignalIfNeeded\(\)') {
     throw 'HTTP 429 signals must be hash-only, atomically durable, deduplicated, expiring, bridgeable from v3, and independently consumed by the Manager.'
@@ -2982,7 +3073,7 @@ if ($gatewayResolveRotationMatch.Value -notmatch 'CodexCliService\.ReadAccessTok
     $gatewayResolveRotationMatch.Value -notmatch 'baseUri\.Query' -or
     $gatewayResolveRotationMatch.Value -notmatch 'baseUri\.Fragment' -or
     $localPatGatewaySource -notmatch 'CompatibleApiRequestBodyMaxBytes' -or
-    $localPatGatewaySource -notmatch 'RewriteCompatibleApiRequestBodyAsync' -or
+    $localPatGatewaySource -notmatch 'ReadReplayableModelRequestBodyAsync' -or
     $gatewayRewriteApiBodyMatch.Value -notmatch 'modelCount\s*>\s*1' -or
     $gatewayRewriteApiBodyMatch.Value -notmatch 'writer\.WriteString\("model",\s*model\.Trim\(\)\)' -or
     $gatewayRewriteApiBodyMatch.Value -notmatch 'property\.WriteTo\(writer\)' -or
@@ -3026,9 +3117,9 @@ if (([regex]::Matches(
     $completePatRotationMatch.Value -notmatch 'ResetPatAutoRotationObservationAfterSwitch\(fallbackApi:\s*enteredBackup\)' -or
     $completePatRotationMatch.Value -notmatch 'QueueHotRotatedOfficialAccountDisplay\(target,\s*_accounts\)' -or
     $completePatRotationMatch.Value -notmatch '(?s)if \(!target\.IsCompatibleApi\).*?StartOfficialQuotaRefresh\(target\)' -or
-    $completePatRotationMatch.Value -notmatch 'Codex 未关闭或重启' -or
+    $completePatRotationMatch.Value -notmatch 'Codex 与当前任务都保持运行' -or
     $completePatRotationMatch.Value -match 'LaunchAccountAsync|OpenOfficialCodexThreadAsync|LocalPatGateway\.ClearRotationAsync|StopWindowsClientProcesses|LaunchWindowsClient') {
-    throw 'PAT/OAuth/API rotation must use one preflighted request-boundary state machine, enter backup immediately only after primary candidates fail, and never clear the route, reopen a task, restart Codex, replay a request, or expose an API key over remote HTTP.'
+    throw 'PAT/OAuth/API rotation must use one request-boundary state machine, enter backup only after primary candidates fail, keep Codex running, and never expose an API key over remote HTTP.'
 }
 if ($initializeGatewayMatch.Value -notmatch '_preserveExistingPatGatewayOnStartup' -or
     $initializeGatewayMatch.Value -notmatch 'restartOnProxyMismatch:\s*!_preserveExistingPatGatewayOnStartup' -or

@@ -10,6 +10,7 @@ public partial class Form1
         TimeSpan.FromSeconds(5);
 
     private readonly PatGatewayQuotaSignalAttemptTracker _patGatewayQuotaSignalAttempts = new();
+    private readonly HashSet<long> _patGatewayReconciledQuotaSignalSequences = [];
     private PatGatewayQuotaSignalStore? _patGatewayQuotaSignalStore;
     private DateTimeOffset? _patGatewayQuotaSignalCheckedAtUtc;
     private DateTimeOffset? _patGatewayActivitySignalCheckedAtUtc;
@@ -131,7 +132,7 @@ public partial class Form1
             _patAutoRotationBoundaryCancellation = cancellation;
             _statusBox.Text =
                 $"网关已确认 {current.Name} 的模型请求返回 HTTP 429；" +
-                "正在独立准备下一个轮换账号。失败请求不会重放，下一次模型请求将在边界直接使用新账号。";
+                "正在准备下一个轮换账号；v5 网关会在响应输出前透明重试同一请求，旧网关则在下一次请求边界切换。";
             UpdatePatAutoRotationControls();
             _ = PreparePatAutoRotationAsync(accountKey, now, cancellation);
         }
@@ -203,6 +204,7 @@ public partial class Form1
             }
 
             PersistPatGatewayQuotaSignalSnapshotBestEffort(activity);
+            ReconcileTransparentPatGatewayRotation(activity);
             if (!_patAutoRotationGatewayTransportActive ||
                 _patAutoRotationLaunchContext == null)
             {
@@ -222,6 +224,71 @@ public partial class Form1
         {
             _patGatewayActivitySignalPollRunning = false;
         }
+    }
+
+    private void ReconcileTransparentPatGatewayRotation(
+        LocalPatGatewayActivitySnapshot activity)
+    {
+        var rotation = activity.Rotation;
+        if (rotation?.Status != PatGatewayRotationStatus.Active ||
+            rotation.ActivatedAtUtc is not { } activatedAtUtc ||
+            FindRotationAccount(rotation.TargetAccountKey) is not { } target)
+        {
+            return;
+        }
+
+        // v5 can commit the active route before the 500 ms UI poll sees the durable
+        // source 429. Preserve that exhaustion first so the circular ring cannot select
+        // the source again on the following request.  This must also run after a Manager
+        // restart where CurrentAccountName may already have been reconciled to the target.
+        if (FindRotationAccount(rotation.SourceAccountKey) is { } source)
+        {
+            try
+            {
+                _patGatewayQuotaSignalStore ??=
+                    new PatGatewayQuotaSignalStore(_store.RootPath);
+                var sourceKey = QuotaAccountIdentity.CreateKey(source);
+                var signal = _patGatewayQuotaSignalStore.ReadLatestForAccount(
+                    sourceKey,
+                    DateTimeOffset.UtcNow);
+                if (signal != null &&
+                    signal.ObservedAtUtc >=
+                        activatedAtUtc - PatGatewayQuotaSignalStore.SignalLifetime &&
+                    signal.ObservedAtUtc <= activatedAtUtc.AddSeconds(5) &&
+                    !_patGatewayReconciledQuotaSignalSequences.Contains(signal.Sequence))
+                {
+                    var sourceWindow = GetCachedFiveHourWindowForGatewaySignal(sourceKey);
+                    RecordPatRotationAccountExhausted(
+                        source,
+                        sourceWindow?.ResetsAtUtc,
+                        signal.ObservedAtUtc);
+                    _patGatewayReconciledQuotaSignalSequences.Add(signal.Sequence);
+                }
+            }
+            catch (Exception ex) when (
+                ex is IOException or UnauthorizedAccessException or InvalidDataException or
+                InvalidOperationException or NotSupportedException or ArgumentException or
+                System.Text.Json.JsonException)
+            {
+                // Route reconciliation is still authoritative. A later durable-file poll
+                // can retry the optional reset metadata without undoing the active route.
+            }
+        }
+
+        var targetKey = QuotaAccountIdentity.CreateKey(target);
+        if (GetCurrentAccountRecord() is { } current &&
+            QuotaAccountIdentity.CreateKey(current).Equals(
+                targetKey,
+                StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        CancelPendingPatAutoRotation(resetState: false);
+        CompletePatGatewayRotation(target, activatedAtUtc);
+        ManagerLifecycleDiagnostics.Write(
+            "pat-gateway-transparent-route-reconciled",
+            "active_target_changed=true");
     }
 
     private UsageRateLimitWindow? GetCachedFiveHourWindowForGatewaySignal(string accountKey)

@@ -56,10 +56,31 @@ public partial class Form1
             AccountRotationConfiguration.GetPool(_appSettings, account) == AccountRotationPool.Backup);
         var noneCount = Math.Max(0, _accounts.Count - primaryCount - backupCount);
         var accent = enabled ? _palette.SuccessColor : _palette.MutedTextColor;
+        var rightReserve = horizontal ? 174 : 0;
+        var summaryTextWidth = Math.Max(120, width - 48 - rightReserve);
+        var countsText = $"使用 {primaryCount}  ·  备用 {backupCount}  ·  未参与 {noneCount}";
+        using var countsMeasurementFont = new Font(Font.FontFamily, 8.9F);
+        var countsHeight = MeasureAccountRotationWrappedTextHeight(
+            countsText,
+            countsMeasurementFont,
+            summaryTextWidth,
+            27);
+        var cursorSummaryTop = 47 + countsHeight + 3;
+        var cursorSummaryText = BuildAccountRotationCursorSummary();
+        using var cursorSummaryMeasurementFont = new Font(Font.FontFamily, 8.5F);
+        var cursorSummaryHeight = MeasureAccountRotationWrappedTextHeight(
+            cursorSummaryText,
+            cursorSummaryMeasurementFont,
+            summaryTextWidth,
+            26);
+        var switchTop = horizontal ? 25 : cursorSummaryTop + cursorSummaryHeight + 10;
+        var panelHeight = horizontal
+            ? Math.Max(122, cursorSummaryTop + cursorSummaryHeight + 18)
+            : switchTop + 48;
         var panel = new RoundedPanel
         {
             Width = width,
-            Height = horizontal ? 122 : 158,
+            Height = panelHeight,
             Radius = 16,
             BorderColor = UiDesign.Blend(_palette.BorderColor, accent, 0.22F),
             BackColor = _palette.CardColor,
@@ -72,13 +93,12 @@ public partial class Form1
             AccessibleName = enabled ? "账号轮换已开启" : "账号轮换已关闭"
         };
 
-        var rightReserve = horizontal ? 174 : 24;
         var title = new Label
         {
             Text = "轮换状态",
             Left = 24,
             Top = 14,
-            Width = Math.Max(180, width - 48 - rightReserve),
+            Width = summaryTextWidth,
             Height = 30,
             Font = new Font(Font.FontFamily, 10.4F, FontStyle.Bold),
             TextAlign = ContentAlignment.MiddleLeft,
@@ -89,14 +109,14 @@ public partial class Form1
 
         var counts = new Label
         {
-            Text = $"使用 {primaryCount}  ·  备用 {backupCount}  ·  未参与 {noneCount}",
+            Text = countsText,
             Left = 24,
             Top = 47,
-            Width = Math.Max(220, width - 48 - (horizontal ? rightReserve : 0)),
-            Height = 27,
+            Width = summaryTextWidth,
+            Height = countsHeight,
             Font = new Font(Font.FontFamily, 8.9F),
             TextAlign = ContentAlignment.MiddleLeft,
-            AutoEllipsis = true,
+            AutoEllipsis = false,
             UseMnemonic = false
         };
         ThemeStyler.ApplyLabel(counts, _palette, true);
@@ -104,21 +124,20 @@ public partial class Form1
 
         var cursorSummary = new Label
         {
-            Text = BuildAccountRotationCursorSummary(),
+            Text = cursorSummaryText,
             Left = 24,
-            Top = 77,
-            Width = Math.Max(220, width - 48 - (horizontal ? rightReserve : 0)),
-            Height = 26,
+            Top = cursorSummaryTop,
+            Width = summaryTextWidth,
+            Height = cursorSummaryHeight,
             Font = new Font(Font.FontFamily, 8.5F),
             TextAlign = ContentAlignment.MiddleLeft,
-            AutoEllipsis = true,
+            AutoEllipsis = false,
             UseMnemonic = false
         };
         ThemeStyler.ApplyLabel(cursorSummary, _palette, true);
         _toolTip.SetToolTip(cursorSummary, cursorSummary.Text);
         panel.Controls.Add(cursorSummary);
 
-        var switchTop = horizontal ? 25 : 110;
         var switchLeft = horizontal ? width - 80 : 24;
         var state = new Label
         {
@@ -555,15 +574,15 @@ public partial class Form1
 
     private static string GetAccountRotationPoolButtonLabel(AccountRotationPool pool) => pool switch
     {
-        AccountRotationPool.Primary => "使用轮换池",
-        AccountRotationPool.Backup => "备用轮换池",
-        _ => "加入使用轮换池"
+        AccountRotationPool.Primary => "放入备用轮换池",
+        AccountRotationPool.Backup => "放入使用轮换池",
+        _ => "放入使用轮换池"
     };
 
     private int MeasureAccountRotationPoolActionWidth()
     {
         using var buttonFont = new Font(Font.FontFamily, 8.9F);
-        var measuredWidth = new[] { "备用轮换池", "使用轮换池", "加入使用轮换池" }
+        var measuredWidth = new[] { "放入备用轮换池", "放入使用轮换池" }
             .Select(text => TextRenderer.MeasureText(
                 text,
                 buttonFont,
@@ -574,7 +593,23 @@ public partial class Form1
             .Max();
         // Keep enough horizontal padding for the custom ModernButton renderer and
         // a little spare room at 125–200% DPI so labels never become ellipses.
-        return Math.Clamp(measuredWidth + 58, 176, 236);
+        return Math.Max(202, measuredWidth + 58);
+    }
+
+    private static int MeasureAccountRotationWrappedTextHeight(
+        string text,
+        Font font,
+        int width,
+        int minimumHeight)
+    {
+        var measured = TextRenderer.MeasureText(
+            text,
+            font,
+            new Size(Math.Max(1, width), int.MaxValue),
+            TextFormatFlags.WordBreak |
+            TextFormatFlags.NoPadding |
+            TextFormatFlags.NoPrefix);
+        return Math.Max(minimumHeight, measured.Height + 4);
     }
 
     private async Task SetAccountRotationEnabledFromUiAsync(bool enabled)
