@@ -111,6 +111,8 @@ $localPatGatewayControlSource = Get-Content -LiteralPath (Join-Path $root 'src\C
 $patAutoRotationSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\PatAutoRotation.cs') -Raw -Encoding UTF8
 $accountRotationSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\AccountRotationConfiguration.cs') -Raw -Encoding UTF8
 $patGatewayRotationStoreSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\PatGatewayRotationStore.cs') -Raw -Encoding UTF8
+$patGatewayQuotaSignalStoreSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\PatGatewayQuotaSignalStore.cs') -Raw -Encoding UTF8
+$gatewayQuotaSignalFormSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\Form1.GatewayQuotaSignals.cs') -Raw -Encoding UTF8
 $localProxyDetectorSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\LocalProxyDetector.cs') -Raw -Encoding UTF8
 $quotaSnapshotStoreSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\QuotaSnapshotStore.cs') -Raw -Encoding UTF8
 $dreamSkinServiceSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\CodexDreamSkinService.cs') -Raw -Encoding UTF8
@@ -1431,9 +1433,13 @@ if ($switchWindowsClientMethod -notmatch 'ValidateWindowsClientAccountAsync\(\s*
     $switchWindowsClientMethod -notmatch 'projection\.ClientLaunchStarted\s*=\s*LaunchWindowsClient\(' -or
     $switchWindowsClientMethod -notmatch 'allowOfficialRendererPatch:\s*ShouldApplyOfficialRendererPatch\(' -or
     $switchWindowsClientMethod -notmatch 'projection\.ClientLaunchError' -or
-    $switchWindowsClientMethod -notmatch 'must not silently restore the old account' -or
+    $switchWindowsClientMethod -notmatch 'ShouldRollbackFailedExplicitChatGptFeatureSwitch\(' -or
+    $switchWindowsClientMethod -notmatch 'RecoverFailedExplicitChatGptFeatureSwitch\(' -or
+    $switchWindowsClientMethod -notmatch 'previousSharedProfileSnapshot' -or
+    $cliServiceSource -notmatch 'Dual-login rollback policy did not stay limited to a failed committed profile switch' -or
+    $cliServiceSource -notmatch 'A successful dual-login launch was incorrectly selected for rollback' -or
     $switchWindowsClientMethod -match 'SharedHistoryMerger\.Merge') {
-    throw 'Switching must use a same-profile fast path, project only on a real account change, and never roll credentials back after a launcher failure.'
+    throw 'Switching must reuse an exact profile, project only on a real account change, and scope launch rollback to a failed committed dual-login switch.'
 }
 if ($prepareWindowsClientMethod -notmatch 'WindowsClientSwitchMutexName' -or
     $prepareWindowsClientMethod -notmatch '(?s)WindowsClientSwitchMutexName.*?ValidateWindowsClientAccountAsync\(.*?CanReuseSharedProfileWithoutNetwork\(' -or
@@ -2901,7 +2907,8 @@ if ($settingsSource -notmatch 'PatAutoRotationEnabled\s*\{\s*get;\s*set;\s*\}\s*
     $accountRotationSource -notmatch 'Never expose backup candidates while any primary candidate is still eligible' -or
     $programSource -notmatch 'PatAutoRotationPolicy\.Validate\(\)' -or
     $programSource -notmatch 'AccountRotationConfiguration\.Validate\(\)' -or
-    $programSource -notmatch 'PatGatewayRotationStore\.Validate\(\)') {
+    $programSource -notmatch 'PatGatewayRotationStore\.Validate\(\)' -or
+    $programSource -notmatch 'PatGatewayQuotaSignalStore\.Validate\(\)') {
     throw 'Account rotation must use persistent primary/backup rings, reset grace, and a dynamic per-request quota safety margin.'
 }
 if ($installerDefaultsSource -notmatch '"PatGatewayEnabled"\s*:\s*true' -or
@@ -2912,7 +2919,11 @@ if ($installerDefaultsSource -notmatch '"PatGatewayEnabled"\s*:\s*true' -or
     $oneClickPackageSource -notmatch 'patAutoRotationUsedPercentThreshold') {
     throw 'The clean one-click package must enable the PAT gateway and 98% automatic request-boundary rotation by default and validate those fields.'
 }
-if ($localPatGatewaySource -notmatch 'RotationProtocolValue\s*=\s*"request-boundary-v3"' -or
+if ($localPatGatewaySource -notmatch 'RotationProtocolValue\s*=\s*"request-boundary-v4"' -or
+    $localPatGatewaySource -notmatch 'CompatibleRotationProtocolValue\s*=\s*"request-boundary-v3"' -or
+    $localPatGatewaySource -notmatch 'HasCompatibleLegacyRotationProtocolAsync' -or
+    $localPatGatewaySource -notmatch 'HasCompatibleRotationProtocol' -or
+    $localPatGatewaySource -notmatch '(?s)internal int Run\(\).*?RunListenerAsync\(\)\.GetAwaiter\(\)\.GetResult\(\).*?mutex\.ReleaseMutex\(\)' -or
     $patGatewayRotationStoreSource -notmatch 'FileName\s*=\s*"account-auto-rotation-route-v2\.json"' -or
     $patGatewayRotationStoreSource -notmatch 'LegacyFileName\s*=\s*"pat-auto-rotation-route-v1\.json"' -or
     $patGatewayRotationStoreSource -notmatch 'SchemaVersion\s*=\s*2' -or
@@ -2942,7 +2953,22 @@ if ($localPatGatewaySource -notmatch 'RotationArmPath\s*=\s*"__rotation/arm"' -o
     $gatewayHandleMatch.Value -notmatch 'StatusCode\s*==\s*HttpStatusCode\.TooManyRequests' -or
     ([regex]::Matches($gatewayHandleMatch.Value, 'client\.SendAsync\(')).Count -ne 1 -or
     $gatewayHandleMatch.Value -match '(?i)replay|resend|retry\s*\(') {
-    throw 'The authenticated v3 gateway must activate only at a POST /responses boundary, count the full request lifetime, report state through healthz, send upstream once, and never replay a 429.'
+    throw 'The authenticated v4 gateway must activate only at a POST /responses boundary, count the full request lifetime, report state through healthz, send upstream once, and never replay a 429.'
+}
+if ($patGatewayQuotaSignalStoreSource -notmatch 'FileName\s*=\s*"pat-gateway-quota-signals-v1\.json"' -or
+    $patGatewayQuotaSignalStoreSource -notmatch 'FileOptions\.WriteThrough' -or
+    $patGatewayQuotaSignalStoreSource -notmatch 'File\.Move\(temporaryPath, _path, overwrite: true\)' -or
+    $patGatewayQuotaSignalStoreSource -notmatch 'DuplicateWindow' -or
+    $patGatewayQuotaSignalStoreSource -notmatch 'SignalLifetime' -or
+    $patGatewayQuotaSignalStoreSource -notmatch 'NextSequence' -or
+    $patGatewayQuotaSignalStoreSource -notmatch 'Manager restart must recover an unexpired durable quota signal' -or
+    $gatewayQuotaSignalFormSource -notmatch 'RefreshPersistedPatGatewayQuotaSignalIfNeeded' -or
+    $gatewayQuotaSignalFormSource -notmatch 'QueuePatGatewayActivitySignalRefreshIfNeeded' -or
+    $gatewayQuotaSignalFormSource -notmatch 'LocalPatGateway\.ReadActivitySnapshotAsync' -or
+    $gatewayQuotaSignalFormSource -notmatch 'TryRecoverPatAutoRotationLaunchContextAsync' -or
+    $gatewayQuotaSignalFormSource -notmatch 'PreparePatAutoRotationAsync' -or
+    $formSource -notmatch 'RefreshPersistedPatGatewayQuotaSignalIfNeeded\(\)') {
+    throw 'HTTP 429 signals must be hash-only, atomically durable, deduplicated, expiring, bridgeable from v3, and independently consumed by the Manager.'
 }
 if ($gatewayResolveRotationMatch.Value -notmatch 'CodexCliService\.ReadAccessTokenCredential' -or
     $gatewayResolveRotationMatch.Value -notmatch 'ReadOfficialOAuthRotationCredential' -or

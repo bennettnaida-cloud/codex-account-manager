@@ -47,6 +47,14 @@ static class Program
         {
             return RunSelfTest();
         }
+        if (args.Contains("--dual-login-recovery-self-test", StringComparer.OrdinalIgnoreCase))
+        {
+            return RunDualLoginRecoverySelfTest();
+        }
+        if (args.Contains("--gateway-quota-signal-self-test", StringComparer.OrdinalIgnoreCase))
+        {
+            return RunGatewayQuotaSignalSelfTest();
+        }
         if (args.Contains("--oauth-link-probe", StringComparer.OrdinalIgnoreCase))
         {
             return RunOAuthLinkProbeAsync().GetAwaiter().GetResult();
@@ -99,8 +107,73 @@ static class Program
             AppUpdateService.RefreshNativeFastBridgeArgument,
             StringComparer.OrdinalIgnoreCase);
         ApplicationConfiguration.Initialize();
-        Application.Run(new Form1(preserveExistingPatGateway, refreshNativeFastBridge));
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += OnApplicationThreadException;
+        AppDomain.CurrentDomain.UnhandledException += OnCurrentDomainUnhandledException;
+        TaskScheduler.UnobservedTaskException += OnUnobservedTaskException;
+        ManagerLifecycleDiagnostics.Write(
+            "manager-message-loop-started",
+            $"preserve_gateway={preserveExistingPatGateway}; refresh_bridge={refreshNativeFastBridge}");
+        try
+        {
+            Application.Run(new Form1(preserveExistingPatGateway, refreshNativeFastBridge));
+        }
+        finally
+        {
+            ManagerLifecycleDiagnostics.Write("manager-message-loop-ended");
+        }
         return 0;
+    }
+
+    private static void OnApplicationThreadException(
+        object sender,
+        ThreadExceptionEventArgs eventArgs)
+    {
+        ManagerLifecycleDiagnostics.WriteException(
+            "ui-thread-exception-contained",
+            eventArgs.Exception);
+        try
+        {
+            MessageBox.Show(
+                "本次操作发生异常，但 Account Manager 已保持运行。请查看状态提示后重试。\n\n" +
+                $"诊断日志：{ManagerLifecycleDiagnostics.LogPath}",
+                "Codex Account Manager",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
+        catch
+        {
+            // The original UI exception has already been contained and recorded.
+        }
+    }
+
+    private static void OnCurrentDomainUnhandledException(
+        object sender,
+        UnhandledExceptionEventArgs eventArgs)
+    {
+        if (eventArgs.ExceptionObject is Exception exception)
+        {
+            ManagerLifecycleDiagnostics.WriteException(
+                "app-domain-unhandled-exception",
+                exception,
+                $"terminating={eventArgs.IsTerminating}");
+        }
+        else
+        {
+            ManagerLifecycleDiagnostics.Write(
+                "app-domain-unhandled-non-exception",
+                $"terminating={eventArgs.IsTerminating}");
+        }
+    }
+
+    private static void OnUnobservedTaskException(
+        object? sender,
+        UnobservedTaskExceptionEventArgs eventArgs)
+    {
+        ManagerLifecycleDiagnostics.WriteException(
+            "unobserved-task-exception-contained",
+            eventArgs.Exception);
+        eventArgs.SetObserved();
     }
 
     private static int RunLocalPatConfigMigration()
@@ -194,10 +267,12 @@ static class Program
             PatAutoRotationPolicy.Validate();
             AccountRotationConfiguration.Validate();
             PatGatewayRotationStore.Validate();
+            PatGatewayQuotaSignalStore.Validate();
             CodexTaskBoundaryMonitor.Validate();
             CodexCliService.ValidateDesktopSidebarProjection();
             CodexCliService.ValidateSharedProfileProjection();
             CodexCliService.ValidateExplicitChatGptFeatureProjection();
+            CodexCliService.ValidateDualLoginLaunchTransaction();
             CodexCliService.ValidateServiceTierAccountIsolation();
             CodexCliService.ValidateOfficialOAuthBrowserFlow();
             CodexCliService.ValidateOfficialOAuthProfileProjection();
@@ -296,6 +371,37 @@ static class Program
             }
 
             Console.WriteLine($"Self test passed. Root={store.RootPath}; Accounts={accounts.Count}");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(ex.Message);
+            return 1;
+        }
+    }
+
+    private static int RunDualLoginRecoverySelfTest()
+    {
+        try
+        {
+            CodexCliService.ValidateDualLoginLaunchTransaction();
+            CodexCliService.ValidateOfficialCodexLaunchRecovery();
+            Console.WriteLine("Dual-login recovery self-test passed.");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(ex.Message);
+            return 1;
+        }
+    }
+
+    private static int RunGatewayQuotaSignalSelfTest()
+    {
+        try
+        {
+            PatGatewayQuotaSignalStore.Validate();
+            Console.WriteLine("Gateway quota-signal persistence self-test passed.");
             return 0;
         }
         catch (Exception ex)

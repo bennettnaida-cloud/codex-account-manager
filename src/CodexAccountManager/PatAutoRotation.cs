@@ -131,7 +131,8 @@ internal static class PatAutoRotationPolicy
     internal const int RequiredConsecutiveOfficialObservations = 2;
     internal static readonly TimeSpan MinimumOfficialObservationSpacing = TimeSpan.FromSeconds(5);
     internal static readonly TimeSpan GatewayQuietPeriod = TimeSpan.FromSeconds(3);
-    internal static readonly TimeSpan QuotaLimitedSignalLifetime = TimeSpan.FromMinutes(15);
+    internal static readonly TimeSpan QuotaLimitedSignalLifetime =
+        PatGatewayQuotaSignalStore.SignalLifetime;
     internal const int RequiredConsecutiveSafeBoundaryChecks = 3;
     internal const double AssumedRecentRequestPercent = 1D;
     internal const double MinimumSafetyMarginPercent = 1.5D;
@@ -385,6 +386,16 @@ internal static class PatAutoRotationPolicy
             recentRequestUsedPercent: 0.5D,
             lastQuotaLimitedAtUtc: now.AddSeconds(-1),
             now);
+        var retainedWindowDecision = EvaluateQuotaSafety(
+            new UsageRateLimitWindow(20, 300, now.AddHours(1)),
+            recentRequestUsedPercent: null,
+            lastQuotaLimitedAtUtc: now.AddHours(-2),
+            now);
+        var retainedWithoutWindowDecision = EvaluateQuotaSafety(
+            window: null,
+            recentRequestUsedPercent: null,
+            lastQuotaLimitedAtUtc: now.AddHours(-2),
+            now);
         if (SelectFiveHourWindow(reversed)?.UsedPercent != 98 ||
             !IsThresholdReached(SelectFiveHourWindow(reversed), 98, now) ||
             IsThresholdReached(
@@ -396,6 +407,9 @@ internal static class PatAutoRotationPolicy
             availableDecision.ShouldRotate ||
             !limitedDecision.IsImmediatelyExhausted ||
             limitedDecision.Reason != "http-429" ||
+            !retainedWindowDecision.IsImmediatelyExhausted ||
+            retainedWindowDecision.Reason != "http-429" ||
+            retainedWithoutWindowDecision.ShouldRotate ||
             IsGatewayQuiet(
                 new LocalPatGatewayActivitySnapshot(1, now, null, null),
                 now.AddSeconds(10)) ||

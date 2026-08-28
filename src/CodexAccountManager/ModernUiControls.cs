@@ -448,6 +448,14 @@ internal sealed class ModernToggleSwitch : CheckBox
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public Color BorderColor { get; set; } = Color.Transparent;
 
+    /// <summary>
+    /// Keeps the compact toggle readable when its label is wider than the text
+    /// column. Fingerprint forwarding uses the complete label rather than an
+    /// ellipsis; other compact toggles retain the historical ellipsis behavior.
+    /// </summary>
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public bool UseTextEllipsis { get; set; } = true;
+
     public ModernToggleSwitch()
     {
         AutoSize = false;
@@ -511,17 +519,18 @@ internal sealed class ModernToggleSwitch : CheckBox
         var textColor = Enabled
             ? TextColor
             : UiDesign.Blend(TextColor, BackColor, 0.48F);
+        var textFlags = TextFormatFlags.Left |
+                        TextFormatFlags.VerticalCenter |
+                        TextFormatFlags.SingleLine |
+                        TextFormatFlags.NoPrefix |
+                        (UseTextEllipsis ? TextFormatFlags.EndEllipsis : TextFormatFlags.NoClipping);
         TextRenderer.DrawText(
             graphics,
             Text,
             Font,
             textBounds,
             textColor,
-            TextFormatFlags.Left |
-            TextFormatFlags.VerticalCenter |
-            TextFormatFlags.SingleLine |
-            TextFormatFlags.EndEllipsis |
-            TextFormatFlags.NoPrefix);
+            textFlags);
 
         var trackColor = Checked ? OnTrackColor : OffTrackColor;
         if (_hovered && Enabled)

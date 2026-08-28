@@ -135,6 +135,19 @@ internal static class AccountRotationConfiguration
         };
     }
 
+    /// <summary>
+    /// Returns the destination used by the compact per-account pool toggle.
+    /// The toggle intentionally only switches between the two participating pools;
+    /// <see cref="AccountRotationPool.None"/> is handled by its own explicit action.
+    /// </summary>
+    internal static AccountRotationPool GetInteractivePoolToggleTarget(AccountRotationPool current) =>
+        current switch
+        {
+            AccountRotationPool.Primary => AccountRotationPool.Backup,
+            AccountRotationPool.Backup => AccountRotationPool.Primary,
+            _ => AccountRotationPool.Primary
+        };
+
     internal static void SetPool(
         AppSettings settings,
         IReadOnlyList<AccountRecord> accounts,
@@ -316,6 +329,14 @@ internal static class AccountRotationConfiguration
 
     internal static void Validate()
     {
+        if (GetInteractivePoolToggleTarget(AccountRotationPool.None) != AccountRotationPool.Primary ||
+            GetInteractivePoolToggleTarget(AccountRotationPool.Primary) != AccountRotationPool.Backup ||
+            GetInteractivePoolToggleTarget(AccountRotationPool.Backup) != AccountRotationPool.Primary)
+        {
+            throw new InvalidOperationException(
+                "The account rotation pool toggle must switch participating pools without cycling through None.");
+        }
+
         var root = Path.Combine(Path.GetTempPath(), "account-rotation-plan-test");
         var a = new AccountRecord { Name = "a", CodexHome = Path.Combine(root, "a") };
         var b = new AccountRecord { Name = "b", CodexHome = Path.Combine(root, "b") };

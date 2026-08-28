@@ -27,7 +27,7 @@ internal sealed class CustomCodexThemeDialog : Form
     private readonly PictureBox _backgroundThumbnail = new();
     private readonly ModernButton _chooseBackgroundButton = new();
     private readonly ModernButton _clearBackgroundButton = new();
-    private readonly ToolTip _toolTip = new() { AutoPopDelay = 30000, ShowAlways = true };
+    private readonly ConstrainedToolTip _toolTip = new() { AutoPopDelay = 30000, ShowAlways = true };
     private readonly Dictionary<string, Button> _colorButtons = new(StringComparer.Ordinal);
     private readonly CodexThemePreviewControl _preview = new();
     private string? _backgroundImagePath;

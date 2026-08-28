@@ -282,13 +282,10 @@ public partial class Form1 : Form
     private readonly AppUpdateService _updateService = new();
     private readonly Label _headerTitle = new();
     private readonly Label _headerSubtitle = new();
-    private readonly ToolTip _toolTip = new()
-    {
-        AutoPopDelay = 30000,
-        InitialDelay = 450,
-        ReshowDelay = 150,
-        ShowAlways = true
-    };
+    // Native WinForms tooltips do not wrap long, unbroken diagnostic text on
+    // every Windows build.  Keep the manager-wide tooltip constrained so account
+    // paths and rotation explanations stay inside the application window.
+    private readonly ConstrainedToolTip _toolTip = new();
     private readonly System.Windows.Forms.Timer _quotaRefreshTimer = new();
     private readonly System.Windows.Forms.Timer _layoutRefreshTimer = new() { Interval = 120 };
     private FileSystemWatcher? _usageLogWatcher;
@@ -797,6 +794,8 @@ public partial class Form1 : Form
         _headerTitle.Height = 62;
         _headerTitle.Font = new Font(Font.FontFamily, 14.6F, FontStyle.Bold);
         _headerTitle.TextAlign = ContentAlignment.MiddleLeft;
+        _headerTitle.AutoEllipsis = false;
+        _headerTitle.AutoSize = false;
         _headerTitle.UseMnemonic = false;
         _headerTitle.UseCompatibleTextRendering = true;
         _headerTitle.Name = "HeaderTitle";
@@ -920,14 +919,18 @@ public partial class Form1 : Form
             eventArgs.SuppressKeyPress = true;
             SaveEditedPatGatewayProxy();
         };
-        FormClosing += (_, _) =>
+        FormClosing += (_, eventArgs) =>
         {
+            ManagerLifecycleDiagnostics.Write(
+                "manager-form-closing",
+                $"reason={eventArgs.CloseReason}");
             SaveEditedProjectPath(updateStatus: false);
             SaveEditedPatGatewayProxy(updateStatus: false, markManual: false);
             SaveWindowBounds();
         };
         FormClosed += (_, _) =>
         {
+            ManagerLifecycleDiagnostics.Write("manager-form-closed");
             _formClosed = true;
             _workspaceLoadGeneration++;
             _proxyDetectionCancellation?.Cancel();
@@ -1684,6 +1687,7 @@ public partial class Form1 : Form
         {
             RefreshQuotaUsageIfNeeded();
             RefreshOfficialQuotaIfNeeded();
+            RefreshPersistedPatGatewayQuotaSignalIfNeeded();
             RefreshAccountRotationPrimaryReturnIfNeeded();
         };
         _quotaRefreshTimer.Start();
@@ -8525,8 +8529,9 @@ public partial class Form1 : Form
             Bounds = bounds,
             Text = "指纹透传",
             Checked = enabled,
+            UseTextEllipsis = false,
             BackColor = backgroundColor,
-            Font = new Font(Font.FontFamily, 8.1F, FontStyle.Bold),
+            Font = new Font(Font.FontFamily, 8.5F, FontStyle.Bold),
             AccessibleName = $"{account.Name} Codex 指纹透传"
         };
         ApplyFingerprintForwardingToggleStyle(toggle);
@@ -8612,9 +8617,12 @@ public partial class Form1 : Form
     {
         const int side = 18;
         const int gap = 10;
-        const int badgeWidth = 148;
+        const int statusBadgeWidth = 148;
+        // Give the fingerprint label a little more breathing room so the
+        // complete “指纹透传” caption and switch track remain visible together.
+        const int fingerprintBadgeWidth = 172;
         var actionWidth = Math.Clamp(measuredActionWidth, 184, 288);
-        var badgeRowWidth = (badgeWidth * 2) + gap;
+        var badgeRowWidth = statusBadgeWidth + fingerprintBadgeWidth + gap;
         var actionRowWidth = (actionWidth * 2) + gap;
         var rightWidth = Math.Max(badgeRowWidth, actionRowWidth);
         var minimumWideWidth = (side * 2) + 250 + 180 + (gap * 2) + rightWidth;
@@ -8640,8 +8648,8 @@ public partial class Form1 : Form
             104,
             new Rectangle(side, 10, summaryWidth, 32),
             new Rectangle(side, 46, summaryWidth, 30),
-            new Rectangle(badgeLeft, 10, badgeWidth, 30),
-            new Rectangle(badgeLeft + badgeWidth + gap, 10, badgeWidth, 30),
+            new Rectangle(badgeLeft, 10, statusBadgeWidth, 30),
+            new Rectangle(badgeLeft + statusBadgeWidth + gap, 10, fingerprintBadgeWidth, 30),
             new Rectangle(actionLeft, 52, actionWidth, 38),
             new Rectangle(actionLeft + actionWidth + gap, 52, actionWidth, 38));
     }
@@ -15121,6 +15129,45 @@ public partial class Form1 : Form
         AccountRecord? chatGptFeatureAccount = null,
         bool automaticRotation = false)
     {
+        try
+        {
+            return await LaunchAccountCoreAsync(
+                account,
+                mode,
+                chatGptFeatureAccount,
+                automaticRotation);
+        }
+        catch (Exception ex)
+        {
+            // Button Click handlers are async void. Exceptions thrown before RunBusyAsync used
+            // to escape through WinFormsSynchronizationContext and could terminate the Manager
+            // while the old Codex process had already been closed. Keep the whole launch entry
+            // behind one UI-safe boundary, including rotation cleanup and settings persistence.
+            ManagerLifecycleDiagnostics.WriteException(
+                "account-launch-entry-failed",
+                ex,
+                $"mode={mode}; dual_login={chatGptFeatureAccount != null}; automatic={automaticRotation}");
+            var message = chatGptFeatureAccount == null
+                ? $"启动账号 {account.Name} 失败：{ex.Message}"
+                : $"启动 {account.Name} 的语音/手机双登录失败：{ex.Message}";
+            if (automaticRotation)
+            {
+                _statusBox.Text = message;
+            }
+            else
+            {
+                ShowError(message);
+            }
+            return false;
+        }
+    }
+
+    private async Task<bool> LaunchAccountCoreAsync(
+        AccountRecord account,
+        WindowsClientMode mode,
+        AccountRecord? chatGptFeatureAccount = null,
+        bool automaticRotation = false)
+    {
         if (!TryGetProjectPathForLaunch(out var projectPath))
         {
             return false;
@@ -15222,7 +15269,10 @@ public partial class Form1 : Form
                     GetCodexAppearanceRuntimePresetId(startupAppearance),
                     GetCodexAppearanceLabelById(_appSettings.CodexAppearancePresetId));
             _statusCache[account.Name] = projection.Status;
-            SetCurrentAccount(account.Name, false, recordUsageSwitch: true);
+            if (!projection.FailedLaunchProfileRestored)
+            {
+                SetCurrentAccount(account.Name, false, recordUsageSwitch: true);
+            }
             if (projection.CodexDreamSkinFailed)
             {
                 _appSettings.UseCodexDreamSkin = false;
@@ -15231,7 +15281,11 @@ public partial class Form1 : Form
             var projectConfigStatus = projection.ProjectConfigWasSanitized
                 ? "已移除项目级模型覆盖；"
                 : "项目未发现模型覆盖；";
-            _statusBox.Text = projection.CodexDreamSkinFailed
+            _statusBox.Text = projection.FailedLaunchProfileRestored
+                ? projection.PreviousClientRelaunchStarted
+                    ? $"{account.Name} 的双登录启动失败；已恢复切换前凭据，并自动请求重新打开原 Codex。"
+                    : $"{account.Name} 的双登录启动失败；已恢复切换前凭据，但原 Codex 未能自动重新打开。"
+                : projection.CodexDreamSkinFailed
                 ? projection.ClientLaunchStarted
                     ? projection.CodexOfficialAppearanceRestored
                         ? $"已切换到 {account.Name}；主题同步失败，已恢复官方外观并重新打开 {clientName}。"
@@ -15281,6 +15335,16 @@ public partial class Form1 : Form
                     automaticRotation);
                 StartOfficialQuotaRefreshAfterLaunch(account);
                 return;
+            }
+
+            if (projection.FailedLaunchProfileRestored)
+            {
+                throw new InvalidOperationException(
+                    $"{clientName} 启动失败，但切换前凭据已经恢复" +
+                    (projection.PreviousClientRelaunchStarted
+                        ? "，并已自动请求重新打开原 Codex"
+                        : "；原 Codex 未能自动重新打开") +
+                    $"：{projection.ClientLaunchError ?? "未返回启动结果"}");
             }
 
             throw new InvalidOperationException(
@@ -17162,6 +17226,13 @@ public partial class Form1 : Form
             _patGatewayRuntimeRunning = true;
             if (await LocalPatGateway.RequiresRotationProtocolUpgradeAsync())
             {
+                PersistPatGatewayQuotaSignalSnapshotBestEffort(
+                    await LocalPatGateway.ReadOwnedActivitySnapshotAsync());
+                // v3 already supports authenticated request-boundary routes. Recover the
+                // current logical account before waiting for the full task boundary so a
+                // durable 429 can arm the next account immediately; the listener upgrade
+                // itself remains deferred and never interrupts Codex.
+                await TryRecoverPatAutoRotationLaunchContextAsync();
                 _patGatewayRuntimeStatus = "旧网关仍在服务 · 当前任务结束后无缝升级";
                 UpdatePatGatewayControls();
                 await UpgradePatGatewayAtSafeBoundaryAsync();
@@ -17220,6 +17291,7 @@ public partial class Form1 : Form
                     !taskBoundary.HasActiveTask &&
                     await LocalPatGateway.RequiresRotationProtocolUpgradeAsync())
                 {
+                    PersistPatGatewayQuotaSignalSnapshotBestEffort(activity);
                     _patGatewayRuntimeStatus = "正在无缝升级网关 · Codex 保持运行";
                     UpdatePatGatewayControls();
                     if (!await LocalPatGateway.ShutdownIfRunningAsync())
@@ -17240,7 +17312,8 @@ public partial class Form1 : Form
         }
     }
 
-    private async Task TryRecoverPatAutoRotationLaunchContextAsync()
+    private async Task TryRecoverPatAutoRotationLaunchContextAsync(
+        LocalPatGatewayActivitySnapshot? knownActivity = null)
     {
         if (!AccountRotationConfiguration.IsEnabled(_appSettings) ||
             _formClosed ||
@@ -17250,20 +17323,22 @@ public partial class Form1 : Form
             return;
         }
 
-        var activity = await LocalPatGateway.ReadActivitySnapshotAsync();
+        var activity = knownActivity ?? await LocalPatGateway.ReadActivitySnapshotAsync();
         if (activity == null)
         {
             return;
         }
         var rotation = activity.Rotation;
+        var observed = FindRotationAccount(activity.LastModelRequestAccountKey);
+        var selected = GetCurrentAccountRecord();
         var transport = rotation?.Status is PatGatewayRotationStatus.Armed or PatGatewayRotationStatus.Active
             ? FindRotationAccount(rotation.TransportAccountKey)
-            : GetCurrentAccountRecord();
+            : observed ?? selected;
         var logical = rotation?.Status switch
         {
             PatGatewayRotationStatus.Armed => FindRotationAccount(rotation.SourceAccountKey),
             PatGatewayRotationStatus.Active => FindRotationAccount(rotation.TargetAccountKey),
-            _ => GetCurrentAccountRecord()
+            _ => observed ?? selected
         };
         if (transport == null ||
             (!transport.IsAccessToken && !transport.IsOfficialOAuth) ||
@@ -17275,35 +17350,26 @@ public partial class Form1 : Form
             return;
         }
 
-        AccountRecord? featureAccount = null;
-        foreach (var candidate in _accounts.Where(account => account.IsOfficialOAuth))
+        var profileMatches = TryResolvePatAutoRotationSharedProfile(
+            transport,
+            out var featureAccount);
+        if (!profileMatches &&
+            rotation?.Status is not (PatGatewayRotationStatus.Armed or
+                PatGatewayRotationStatus.Active) &&
+            selected != null &&
+            !ReferenceEquals(selected, transport) &&
+            (selected.IsAccessToken || selected.IsOfficialOAuth) &&
+            AccountRotationConfiguration.GetPool(_appSettings, selected) !=
+                AccountRotationPool.None &&
+            TryResolvePatAutoRotationSharedProfile(selected, out var selectedFeatureAccount))
         {
-            try
-            {
-                if (_codex.IsSharedChatGptFeatureProfileAlreadySelected(transport, candidate))
-                {
-                    featureAccount = candidate;
-                    break;
-                }
-            }
-            catch
-            {
-                // A malformed unrelated OAuth profile must not weaken exact projection checks.
-            }
-        }
-        var profileMatches = featureAccount != null;
-        if (!profileMatches)
-        {
-            try
-            {
-                profileMatches = _codex.IsSharedProfileAlreadySelected(
-                    transport,
-                    routeOfficialOAuthThroughGateway: transport.IsOfficialOAuth);
-            }
-            catch
-            {
-                profileMatches = false;
-            }
+            // The health snapshot can describe the last completed request from an older
+            // profile. Prefer it when it still matches the projected desktop credential,
+            // otherwise fall back to the explicitly selected account.
+            transport = selected;
+            logical = selected;
+            featureAccount = selectedFeatureAccount;
+            profileMatches = true;
         }
         if (!profileMatches)
         {
@@ -17351,6 +17417,39 @@ public partial class Form1 : Form
         {
             _officialQuotaRefreshAttemptedAt.Remove(_launchedOfficialQuotaAccountKey!);
             StartOfficialQuotaRefresh(logical);
+        }
+    }
+
+    private bool TryResolvePatAutoRotationSharedProfile(
+        AccountRecord transport,
+        out AccountRecord? featureAccount)
+    {
+        featureAccount = null;
+        foreach (var candidate in _accounts.Where(account => account.IsOfficialOAuth))
+        {
+            try
+            {
+                if (_codex.IsSharedChatGptFeatureProfileAlreadySelected(transport, candidate))
+                {
+                    featureAccount = candidate;
+                    return true;
+                }
+            }
+            catch
+            {
+                // A malformed unrelated OAuth profile must not weaken exact projection checks.
+            }
+        }
+
+        try
+        {
+            return _codex.IsSharedProfileAlreadySelected(
+                transport,
+                routeOfficialOAuthThroughGateway: transport.IsOfficialOAuth);
+        }
+        catch
+        {
+            return false;
         }
     }
 

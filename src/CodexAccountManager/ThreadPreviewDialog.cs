@@ -10,7 +10,7 @@ public sealed class ThreadPreviewDialog : Form
     private readonly TextBox _findBox = new();
     private readonly Label _findStatusLabel = new();
     private readonly Label _noticeLabel = new();
-    private readonly ToolTip _toolTip = new();
+    private readonly ConstrainedToolTip _toolTip = new();
     private readonly string _copyText;
     private readonly string _exportFileName;
 

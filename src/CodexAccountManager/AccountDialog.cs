@@ -39,7 +39,7 @@ public sealed class AccountDialog : Form
     private readonly PillLabel _oauthStatusBadge = new();
     private readonly Control[] _apiControls;
     private readonly ThemePalette _palette;
-    private readonly ToolTip _pathToolTip = new()
+    private readonly ConstrainedToolTip _pathToolTip = new()
     {
         AutoPopDelay = 15000,
         InitialDelay = 350,

@@ -23,7 +23,16 @@ internal static class LocalPatGateway
     private const string MarkerValue = "pat-v1";
     private const string ProxyKeyHeader = "X-Codex-Account-Manager-Proxy-Key";
     internal const string RotationProtocolHeader = "X-Codex-Account-Manager-Rotation";
-    internal const string RotationProtocolValue = "request-boundary-v3";
+    // v3 already implements authenticated arm/clear control calls and activates a
+    // prepared route at the next model-request boundary.  v4 adds durable quota
+    // signals; it does not change that routing contract.  Keep the capability marker
+    // separate from the preferred protocol so an in-flight v3 gateway can rotate now
+    // and upgrade later without restarting Codex.
+    internal const string CompatibleRotationProtocolValue = "request-boundary-v3";
+    // v4 makes a quota-limited event durable and independently observable by the
+    // Manager. Older gateways can keep an in-flight request alive, then upgrade at the
+    // existing safe gateway boundary without restarting Codex.
+    internal const string RotationProtocolValue = "request-boundary-v4";
     private static readonly SemaphoreSlim StartupLock = new(1, 1);
 
     internal static int RunProcess(string[] args)
@@ -38,10 +47,7 @@ internal static class LocalPatGateway
                 Path.GetFullPath(args[rootIndex + 1]));
         }
 
-        return new LocalPatGatewayHost(MarkerHeader, MarkerValue)
-            .RunAsync()
-            .GetAwaiter()
-            .GetResult();
+        return new LocalPatGatewayHost(MarkerHeader, MarkerValue).Run();
     }
 
     internal static void EnsureRunning()
@@ -208,18 +214,18 @@ internal static class LocalPatGateway
 
     internal static Task<LocalPatGatewayActivitySnapshot?> ReadActivitySnapshotAsync(
         CancellationToken cancellationToken = default) =>
-        ReadActivitySnapshotCoreAsync(requireCurrentProtocol: true, cancellationToken);
+        ReadActivitySnapshotCoreAsync(requireCompatibleProtocol: true, cancellationToken);
 
     internal static Task<LocalPatGatewayActivitySnapshot?> ReadOwnedActivitySnapshotAsync(
         CancellationToken cancellationToken = default) =>
-        ReadActivitySnapshotCoreAsync(requireCurrentProtocol: false, cancellationToken);
+        ReadActivitySnapshotCoreAsync(requireCompatibleProtocol: false, cancellationToken);
 
     internal static async Task<bool> RequiresRotationProtocolUpgradeAsync(
         CancellationToken cancellationToken = default) =>
         await ProbeAsync(cancellationToken) == GatewayHealth.UpgradeRequired;
 
     private static async Task<LocalPatGatewayActivitySnapshot?> ReadActivitySnapshotCoreAsync(
-        bool requireCurrentProtocol,
+        bool requireCompatibleProtocol,
         CancellationToken cancellationToken)
     {
         using var client = CreateLoopbackClient();
@@ -233,7 +239,7 @@ internal static class LocalPatGateway
             using var response = await client.SendAsync(request, cancellationToken);
             if (!HasExpectedMarker(response) ||
                 !HasExpectedControlProof(response, challenge) ||
-                (requireCurrentProtocol && !HasExpectedRotationProtocol(response)) ||
+                (requireCompatibleProtocol && !HasCompatibleRotationProtocol(response)) ||
                 !response.IsSuccessStatusCode)
             {
                 return null;
@@ -265,7 +271,12 @@ internal static class LocalPatGateway
                     ? Math.Max(0L, completedModelRequests)
                     : null,
                 ReadAccountKey(activity, "lastModelRequestAccountKey"),
-                ReadAccountKey(activity, "lastQuotaLimitedAccountKey"));
+                ReadAccountKey(activity, "lastQuotaLimitedAccountKey"),
+                activity.TryGetProperty("lastQuotaLimitedSequence", out var sequenceValue) &&
+                sequenceValue.TryGetInt64(out var lastQuotaLimitedSequence) &&
+                lastQuotaLimitedSequence > 0L
+                    ? lastQuotaLimitedSequence
+                    : null);
         }
         catch (Exception ex) when (
             ex is HttpRequestException or
@@ -291,7 +302,8 @@ internal static class LocalPatGateway
         }
 
         await EnsureRunningAsync(cancellationToken, restartOnProxyMismatch: false);
-        if (await ProbeAsync(cancellationToken) == GatewayHealth.UpgradeRequired)
+        if (await ProbeAsync(cancellationToken) == GatewayHealth.UpgradeRequired &&
+            !await HasCompatibleLegacyRotationProtocolAsync(cancellationToken))
         {
             throw new InvalidOperationException(
                 "当前网关版本不支持 PAT/API 无缝轮换；已保留正在运行的请求，请等待安全升级完成。");
@@ -322,6 +334,10 @@ internal static class LocalPatGateway
         if (!HasExpectedMarker(response))
         {
             throw new InvalidOperationException("本地 PAT 网关没有返回可信的轮换协议标记。");
+        }
+        if (!HasCompatibleRotationProtocol(response))
+        {
+            throw new InvalidOperationException("本地 PAT 网关返回了不兼容的轮换协议标记。");
         }
         if (!response.IsSuccessStatusCode)
         {
@@ -600,6 +616,42 @@ internal static class LocalPatGateway
                values.Contains(RotationProtocolValue, StringComparer.Ordinal);
     }
 
+    private static bool HasCompatibleRotationProtocol(HttpResponseMessage response)
+    {
+        return response.Headers.TryGetValues(RotationProtocolHeader, out var values) &&
+               values.Any(IsCompatibleRotationProtocolValue);
+    }
+
+    internal static bool IsCompatibleRotationProtocolValue(string? value) =>
+        string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, CompatibleRotationProtocolValue, StringComparison.Ordinal);
+
+    private static async Task<bool> HasCompatibleLegacyRotationProtocolAsync(
+        CancellationToken cancellationToken)
+    {
+        using var client = CreateLoopbackClient();
+        try
+        {
+            var challenge = LocalPatGatewayControl.CreateChallenge();
+            using var request = new HttpRequestMessage(HttpMethod.Get, ListenerPrefix + "healthz");
+            request.Headers.TryAddWithoutValidation(
+                LocalPatGatewayControl.ChallengeHeader,
+                challenge);
+            using var response = await client.SendAsync(request, cancellationToken);
+            return response.IsSuccessStatusCode &&
+                   HasExpectedMarker(response) &&
+                   HasExpectedControlProof(response, challenge) &&
+                   response.Headers.TryGetValues(RotationProtocolHeader, out var values) &&
+                   values.Contains(CompatibleRotationProtocolValue, StringComparer.Ordinal);
+        }
+        catch (Exception ex) when (
+            ex is HttpRequestException or TaskCanceledException or IOException or
+            InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
     private static bool HasExpectedControlProof(
         HttpResponseMessage response,
         string challenge)
@@ -667,7 +719,8 @@ internal sealed record LocalPatGatewayActivitySnapshot(
     PatGatewayRotationSnapshot? Rotation = null,
     long? CompletedModelRequests = null,
     string? LastModelRequestAccountKey = null,
-    string? LastQuotaLimitedAccountKey = null);
+    string? LastQuotaLimitedAccountKey = null,
+    long? LastQuotaLimitedSequence = null);
 
 internal sealed class LocalPatGatewayHost
 {
@@ -775,6 +828,7 @@ internal sealed class LocalPatGatewayHost
     private readonly AccountStore _accountStore;
     private readonly ThemeService _themeService;
     private readonly PatGatewayRotationStore _rotationStore;
+    private readonly PatGatewayQuotaSignalStore _quotaSignalStore;
     private readonly object _rotationGate = new();
     private readonly SemaphoreSlim _rotationActivationGate = new(1, 1);
     private readonly ConcurrentDictionary<string, HttpClient> _clients = new(StringComparer.OrdinalIgnoreCase);
@@ -789,6 +843,7 @@ internal sealed class LocalPatGatewayHost
     private DateTimeOffset? _lastModelRequestStartedAtUtc;
     private DateTimeOffset? _lastModelRequestCompletedAtUtc;
     private DateTimeOffset? _lastQuotaLimitedAtUtc;
+    private long? _lastQuotaLimitedSequence;
 
     internal LocalPatGatewayHost(string markerHeader, string markerValue)
     {
@@ -798,10 +853,29 @@ internal sealed class LocalPatGatewayHost
         _accountStore = new AccountStore();
         _themeService = new ThemeService(_accountStore.RootPath);
         _rotationStore = new PatGatewayRotationStore(_accountStore.RootPath);
+        _quotaSignalStore = new PatGatewayQuotaSignalStore(_accountStore.RootPath);
+        if (_quotaSignalStore.ReadLatest(DateTimeOffset.UtcNow) is { } recoveredQuotaSignal)
+        {
+            // Rehydrate health diagnostics too. The Manager consumes the file directly,
+            // but this keeps the authenticated health snapshot truthful after a gateway
+            // process upgrade or crash recovery.
+            _lastQuotaLimitedAccountKey = recoveredQuotaSignal.AccountKey;
+            _lastQuotaLimitedAtUtc = recoveredQuotaSignal.ObservedAtUtc;
+            _lastQuotaLimitedSequence = recoveredQuotaSignal.Sequence;
+        }
     }
 
     internal static void ValidateRoutingAndCredentialClassification()
     {
+        if (!LocalPatGateway.IsCompatibleRotationProtocolValue("request-boundary-v3") ||
+            !LocalPatGateway.IsCompatibleRotationProtocolValue("request-boundary-v4") ||
+            LocalPatGateway.IsCompatibleRotationProtocolValue("request-boundary-v2") ||
+            LocalPatGateway.IsCompatibleRotationProtocolValue(null))
+        {
+            throw new InvalidOperationException(
+                "Gateway routing compatibility must accept only request-boundary v3/v4.");
+        }
+
         var pat = ParseBearerCredential("Bearer at-test-only-not-a-real-token");
         var fakeOauth =
             "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ0ZXN0LW9ubHkifQ.signature-test-only-not-real";
@@ -1081,7 +1155,7 @@ internal sealed class LocalPatGatewayHost
         }
     }
 
-    internal async Task<int> RunAsync()
+    internal int Run()
     {
         using var mutex = new Mutex(false, MutexName);
         var acquired = false;
@@ -1100,6 +1174,25 @@ internal sealed class LocalPatGatewayHost
                 return 0;
             }
 
+            // A Windows mutex is thread-affine: the same thread that calls WaitOne must
+            // call ReleaseMutex. Keep acquisition/release in this synchronous wrapper and
+            // block it on the async listener. Releasing from an async continuation caused
+            // the old gateway to crash exactly when a safe upgrade/shutdown was requested.
+            return RunListenerAsync().GetAwaiter().GetResult();
+        }
+        finally
+        {
+            if (acquired)
+            {
+                mutex.ReleaseMutex();
+            }
+        }
+    }
+
+    private async Task<int> RunListenerAsync()
+    {
+        try
+        {
             using var listener = new HttpListener();
             listener.Prefixes.Add(LocalPatGateway.ListenerPrefix);
             listener.Start();
@@ -1132,10 +1225,6 @@ internal sealed class LocalPatGatewayHost
             foreach (var client in _clients.Values)
             {
                 client.Dispose();
-            }
-            if (acquired)
-            {
-                mutex.ReleaseMutex();
             }
         }
     }
@@ -1426,6 +1515,7 @@ internal sealed class LocalPatGatewayHost
                     completedModelRequests = activity.CompletedModelRequests,
                     lastModelRequestAccountKey = activity.LastModelRequestAccountKey,
                     lastQuotaLimitedAccountKey = activity.LastQuotaLimitedAccountKey,
+                    lastQuotaLimitedSequence = activity.LastQuotaLimitedSequence,
                     lastModelRequestStartedAtUnixMs = activity.LastModelRequestStartedAtUtc?.ToUnixTimeMilliseconds(),
                     lastModelRequestCompletedAtUnixMs = activity.LastModelRequestCompletedAtUtc?.ToUnixTimeMilliseconds(),
                     lastQuotaLimitedAtUnixMs = activity.LastQuotaLimitedAtUtc?.ToUnixTimeMilliseconds()
@@ -2091,10 +2181,35 @@ internal sealed class LocalPatGatewayHost
 
     private void RecordQuotaLimited(string? accountKey)
     {
+        var normalizedAccountKey = NormalizeOptionalAccountKey(accountKey);
+        var observedAtUtc = DateTimeOffset.UtcNow;
+        PatGatewayQuotaSignal? durableSignal = null;
+        if (normalizedAccountKey != null)
+        {
+            try
+            {
+                // Commit before forwarding the 429 response. If the gateway or Manager
+                // exits immediately afterwards, the next Manager process can still arm a
+                // route for the next model-request boundary. A persistence failure never
+                // replaces the real upstream 429 with a local gateway error.
+                durableSignal = _quotaSignalStore.Record(
+                    normalizedAccountKey,
+                    observedAtUtc);
+            }
+            catch (Exception ex) when (
+                ex is IOException or UnauthorizedAccessException or InvalidDataException or
+                NotSupportedException or ArgumentException or OverflowException)
+            {
+                // The authenticated in-memory health signal remains available as a
+                // best-effort fallback for this gateway process.
+            }
+        }
+
         lock (_activityGate)
         {
-            _lastQuotaLimitedAccountKey = NormalizeOptionalAccountKey(accountKey);
-            _lastQuotaLimitedAtUtc = DateTimeOffset.UtcNow;
+            _lastQuotaLimitedAccountKey = normalizedAccountKey;
+            _lastQuotaLimitedAtUtc = durableSignal?.ObservedAtUtc ?? observedAtUtc;
+            _lastQuotaLimitedSequence = durableSignal?.Sequence;
         }
     }
 
@@ -2113,7 +2228,8 @@ internal sealed class LocalPatGatewayHost
                 Rotation: null,
                 completedForLastAccount,
                 _lastModelRequestAccountKey,
-                _lastQuotaLimitedAccountKey);
+                _lastQuotaLimitedAccountKey,
+                _lastQuotaLimitedSequence);
         }
     }
 

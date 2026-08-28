@@ -2,7 +2,10 @@ namespace CodexAccountManager;
 
 public partial class Form1
 {
-    private const int AccountRotationHorizontalMinWidth = 720;
+    // Two explicit actions (pool toggle + None) and the order arrows need a little
+    // more room than the old single three-state button.  Below this width the row
+    // stacks its actions instead of clipping the account identity.
+    private const int AccountRotationHorizontalMinWidth = 900;
 
     private void RenderAccountRotationWorkspace(string query, int workspaceWidth)
     {
@@ -330,7 +333,7 @@ public partial class Form1
         var row = new RoundedPanel
         {
             Width = width,
-            Height = horizontal ? 94 : 148,
+            Height = horizontal ? 94 : 188,
             Radius = 14,
             BorderColor = UiDesign.Blend(_palette.BorderColor, accent, 0.14F),
             BackColor = _palette.CardColor,
@@ -353,7 +356,21 @@ public partial class Form1
         orderBadge.Height = 30;
         row.Controls.Add(orderBadge);
 
-        var actionWidth = horizontal ? 230 : Math.Min(280, Math.Max(230, width - 44));
+        const int arrowWidth = 42;
+        const int gap = 8;
+        const int noneButtonWidth = 92;
+        var poolButtonWidth = horizontal
+            ? Math.Max(176, MeasureAccountRotationPoolActionWidth())
+            : Math.Min(
+                Math.Max(150, MeasureAccountRotationPoolActionWidth()),
+                Math.Max(
+                    132,
+                    Math.Min(360, Math.Max(300, width - 44)) -
+                    noneButtonWidth -
+                    (arrowWidth * 2) -
+                    (gap * 3)));
+        var controlsWidth = poolButtonWidth + noneButtonWidth + (arrowWidth * 2) + (gap * 3);
+        var actionWidth = controlsWidth;
         var summaryWidth = horizontal
             ? Math.Max(180, width - 94 - actionWidth - 26)
             : Math.Max(160, width - 98);
@@ -388,31 +405,56 @@ public partial class Form1
         _toolTip.SetToolTip(detail, detail.Text);
         row.Controls.Add(detail);
 
-        var arrowWidth = 42;
-        var gap = 8;
-        var poolButtonWidth = horizontal
-            ? 130
-            : Math.Min(168, Math.Max(130, actionWidth - (arrowWidth * 2) - (gap * 2)));
-        var controlsWidth = poolButtonWidth + (arrowWidth * 2) + (gap * 2);
-        var controlsLeft = width - 22 - controlsWidth;
-        var controlsTop = horizontal ? 26 : 94;
+        var controlsLeft = horizontal
+            ? width - 22 - controlsWidth
+            : Math.Max(22, (width - controlsWidth) / 2);
+        var controlsTop = horizontal ? 26 : 132;
 
+        var poolToggleTarget =
+            AccountRotationConfiguration.GetInteractivePoolToggleTarget(pool);
+        var poolButtonLabel = GetAccountRotationPoolButtonLabel(pool);
         var poolButton = MakeActionButton(
-            GetAccountRotationPoolLabel(pool),
+            poolButtonLabel,
             controlsLeft,
             controlsTop,
             poolButtonWidth,
-            primary: pool == AccountRotationPool.Primary);
+            primary: pool != AccountRotationPool.Backup);
         poolButton.Height = 42;
-        poolButton.AccessibleName = $"设置 {account.Name} 的轮换池";
-        _toolTip.SetToolTip(poolButton, "切换轮换池");
-        poolButton.Click += (_, _) => CycleAccountRotationPool(account);
+        poolButton.AccessibleName =
+            $"将 {account.Name} 切换到{GetAccountRotationPoolLabel(poolToggleTarget)}";
+        _toolTip.SetToolTip(poolButton, pool == AccountRotationPool.None
+            ? "点击加入使用轮换池；使用轮换池与备用轮换池之间可直接互切。"
+            : $"当前在{GetAccountRotationPoolLabel(pool)}；" +
+              $"点击切换到{GetAccountRotationPoolLabel(poolToggleTarget)}。" +
+              "不参与请使用右侧独立按钮。");
+        poolButton.Click += (_, _) => ToggleAccountRotationPool(account);
         row.Controls.Add(poolButton);
+
+        var noneButton = MakeActionButton(
+            "不参与",
+            controlsLeft + poolButtonWidth + gap,
+            controlsTop,
+            noneButtonWidth,
+            primary: false);
+        noneButton.Height = 42;
+        noneButton.Enabled = pool != AccountRotationPool.None;
+        noneButton.AccessibleName = pool == AccountRotationPool.None
+            ? $"{account.Name} 当前不参与账号轮换"
+            : $"将 {account.Name} 移出轮换池";
+        _toolTip.SetToolTip(noneButton, pool == AccountRotationPool.None
+            ? "当前账号未参与轮换。左侧按钮可加入使用轮换池。"
+            : "点击将账号设为不参与；不会改变其他账号的轮换顺序。");
+        noneButton.Click += (_, _) => SetAccountRotationPoolFromUi(
+            account,
+            AccountRotationPool.None);
+        row.Controls.Add(noneButton);
+
+        var arrowLeft = controlsLeft + poolButtonWidth + noneButtonWidth + gap * 2;
 
         var canMove = pool != AccountRotationPool.None;
         var up = CreateAccountRotationMoveButton(
             "↑",
-            controlsLeft + poolButtonWidth + gap,
+            arrowLeft,
             controlsTop,
             "上移",
             canMove && index > 0);
@@ -421,7 +463,7 @@ public partial class Form1
 
         var down = CreateAccountRotationMoveButton(
             "↓",
-            controlsLeft + poolButtonWidth + gap + arrowWidth + gap,
+            arrowLeft + arrowWidth + gap,
             controlsTop,
             "下移",
             canMove && index >= 0 && index < count - 1);
@@ -511,6 +553,30 @@ public partial class Form1
         _ => "不参与"
     };
 
+    private static string GetAccountRotationPoolButtonLabel(AccountRotationPool pool) => pool switch
+    {
+        AccountRotationPool.Primary => "使用轮换池",
+        AccountRotationPool.Backup => "备用轮换池",
+        _ => "加入使用轮换池"
+    };
+
+    private int MeasureAccountRotationPoolActionWidth()
+    {
+        using var buttonFont = new Font(Font.FontFamily, 8.9F);
+        var measuredWidth = new[] { "备用轮换池", "使用轮换池", "加入使用轮换池" }
+            .Select(text => TextRenderer.MeasureText(
+                text,
+                buttonFont,
+                Size.Empty,
+                TextFormatFlags.SingleLine |
+                TextFormatFlags.NoPadding |
+                TextFormatFlags.NoPrefix).Width)
+            .Max();
+        // Keep enough horizontal padding for the custom ModernButton renderer and
+        // a little spare room at 125–200% DPI so labels never become ellipses.
+        return Math.Clamp(measuredWidth + 58, 176, 236);
+    }
+
     private async Task SetAccountRotationEnabledFromUiAsync(bool enabled)
     {
         var previousEnabled = _appSettings.AccountRotationEnabled;
@@ -537,7 +603,16 @@ public partial class Form1
         RerenderAccountRotationWorkspacePreservingScroll();
     }
 
-    private void CycleAccountRotationPool(AccountRecord account)
+    private void ToggleAccountRotationPool(AccountRecord account)
+    {
+        var current = AccountRotationConfiguration.GetPool(_appSettings, account);
+        var target = AccountRotationConfiguration.GetInteractivePoolToggleTarget(current);
+        SetAccountRotationPoolFromUi(account, target);
+    }
+
+    private void SetAccountRotationPoolFromUi(
+        AccountRecord account,
+        AccountRotationPool target)
     {
         var pools = new Dictionary<string, string>(
             _appSettings.AccountRotationPools,
@@ -546,15 +621,8 @@ public partial class Form1
         var backupOrder = _appSettings.AccountRotationBackupOrder.ToList();
         var primaryCursor = _appSettings.AccountRotationPrimaryCursorAccountKey;
         var backupCursor = _appSettings.AccountRotationBackupCursorAccountKey;
-        var current = AccountRotationConfiguration.GetPool(_appSettings, account);
-        var next = current switch
-        {
-            AccountRotationPool.None => AccountRotationPool.Primary,
-            AccountRotationPool.Primary => AccountRotationPool.Backup,
-            _ => AccountRotationPool.None
-        };
-
-        AccountRotationConfiguration.SetPool(_appSettings, _accounts, account, next);
+        var previousPool = AccountRotationConfiguration.GetPool(_appSettings, account);
+        AccountRotationConfiguration.SetPool(_appSettings, _accounts, account, target);
         if (!TrySaveAppSettings(out var error))
         {
             _appSettings.AccountRotationPools = pools;
@@ -567,7 +635,11 @@ public partial class Form1
             return;
         }
 
-        _statusBox.Text = $"{account.Name} 已设为{GetAccountRotationPoolLabel(next)}。";
+        _statusBox.Text = target == AccountRotationPool.None
+            ? $"{account.Name} 已设为不参与轮换。"
+            : previousPool == AccountRotationPool.None
+                ? $"{account.Name} 已加入{GetAccountRotationPoolLabel(target)}。"
+                : $"{account.Name} 已切换到{GetAccountRotationPoolLabel(target)}。";
         RerenderAccountRotationWorkspacePreservingScroll();
     }
 

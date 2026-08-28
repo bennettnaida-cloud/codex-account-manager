@@ -1956,6 +1956,7 @@ public sealed partial class CodexCliService
                 var shutdownNativeFastPorts = switchRequired
                     ? CaptureOfficialNativeFastPortsOwnedBy(shutdownTargets)
                     : Array.Empty<int>();
+                WindowsClientSharedProfileSnapshot? previousSharedProfileSnapshot = null;
             WindowsClientAccountProjection projection;
             if (sharedProfileAlreadySelected)
             {
@@ -1988,6 +1989,17 @@ public sealed partial class CodexCliService
                         "Codex did not remain fully closed, or a native bridge port did not release cleanly. " +
                         "Account credentials were not changed; close Codex completely and retry.");
                 }
+                if (IsExplicitChatGptFeatureSwitch(
+                        mode,
+                        accessTokenMode,
+                        chatGptFeatureAccount))
+                {
+                    // Keep an operation-owned, in-memory copy of only the five managed shared
+                    // profile files. ProjectWindowsClientAccount also creates durable backups,
+                    // but this snapshot lets a projection failure restore the pre-switch profile
+                    // even when it throws before it can return its backup metadata.
+                    previousSharedProfileSnapshot = CaptureWindowsClientSharedProfileSnapshot();
+                }
                 WindowsClientAccountProjection? pendingProjection = null;
                 try
                 {
@@ -2003,21 +2015,60 @@ public sealed partial class CodexCliService
                     pendingProjection.ProfileChanged = true;
                     projection = pendingProjection;
                 }
-                catch
+                catch (Exception projectionError)
                 {
-                    if (pendingProjection != null)
+                    Exception? restoreError = null;
+                    var profileRestored = false;
+                    if (previousSharedProfileSnapshot != null)
                     {
                         try
                         {
-                            RestoreProjectModelOverrides(pendingProjection);
-                            RestoreDesktopProfileModelState(pendingProjection);
-                            RestoreDesktopSidebarState(pendingProjection);
-                            RestoreWindowsClientAccountProjection(pendingProjection);
+                            RestoreWindowsClientSwitchProjection(
+                                pendingProjection,
+                                previousSharedProfileSnapshot);
+                            profileRestored = WindowsClientSharedProfileMatchesSnapshot(
+                                previousSharedProfileSnapshot);
+                        }
+                        catch (Exception ex)
+                        {
+                            restoreError = ex;
+                        }
+                    }
+                    else if (pendingProjection != null)
+                    {
+                        try
+                        {
+                            RestoreWindowsClientSwitchProjection(
+                                pendingProjection,
+                                previousSharedProfileSnapshot: null);
                         }
                         catch
                         {
-                            // Preserve the original projection failure; all backup paths remain available.
+                            // Preserve the original behavior for non-dual-login switches: backup
+                            // paths remain available for manual recovery if restoration itself fails.
                         }
+                    }
+
+                    if (previousSharedProfileSnapshot != null)
+                    {
+                        var previousClientRelaunchStarted = profileRestored &&
+                            TryLaunchOfficialCodexFallback(projectPath, launchGeneration);
+                        WriteCodexPlusPlusLaunchDiagnostic(
+                            profileRestored
+                                ? "official-dual-projection-rolled-back"
+                                : "official-dual-projection-rollback-failed",
+                            $"previous_client_relaunch_started={previousClientRelaunchStarted}; " +
+                            $"restore_error={restoreError?.GetType().Name ?? "none"}");
+                        throw new InvalidOperationException(
+                            "双登录配置投放失败。" +
+                            (profileRestored
+                                ? previousClientRelaunchStarted
+                                    ? "切换前的凭据已恢复，并已自动请求重新打开原 Codex。"
+                                    : "切换前的凭据已恢复，但原 Codex 未能自动重新打开。"
+                                : "切换前的凭据未能完整恢复；为避免继续写入，本次没有再次启动 Codex。"),
+                            restoreError == null
+                                ? projectionError
+                                : new AggregateException(projectionError, restoreError));
                     }
 
                     throw;
@@ -2060,12 +2111,24 @@ public sealed partial class CodexCliService
             }
             catch (Exception ex)
             {
-                // Credential projection is the committed part of a switch. A launcher failure
-                // must not silently restore the old account; the UI can report this error and
-                // retry launching without another credential rewrite.
                 projection.ClientLaunchStarted = false;
                 projection.CodexPlusPlusLaunchStarted = false;
                 projection.ClientLaunchError = MaskSensitive(ex.Message);
+            }
+
+            if (ShouldRollbackFailedExplicitChatGptFeatureSwitch(
+                    projection,
+                    mode,
+                    accessTokenMode,
+                    chatGptFeatureAccount,
+                    switchRequired) &&
+                previousSharedProfileSnapshot != null)
+            {
+                RecoverFailedExplicitChatGptFeatureSwitch(
+                    projection,
+                    previousSharedProfileSnapshot,
+                    projectPath,
+                    launchGeneration);
             }
 
             return projection;
@@ -2108,6 +2171,109 @@ public sealed partial class CodexCliService
         return accessTokenMode == AccessTokenSharedProfileMode.ApiCompatible &&
                chatGptFeatureAccount == null &&
                (modelAccount.IsAccessToken || modelAccount.IsCompatibleApi);
+    }
+
+    private static bool IsExplicitChatGptFeatureSwitch(
+        WindowsClientMode mode,
+        AccessTokenSharedProfileMode accessTokenMode,
+        AccountRecord? chatGptFeatureAccount)
+    {
+        return mode == WindowsClientMode.OfficialCodex &&
+               accessTokenMode == AccessTokenSharedProfileMode.ChatGptDesktop &&
+               chatGptFeatureAccount != null;
+    }
+
+    private static bool ShouldRollbackFailedExplicitChatGptFeatureSwitch(
+        WindowsClientAccountProjection projection,
+        WindowsClientMode mode,
+        AccessTokenSharedProfileMode accessTokenMode,
+        AccountRecord? chatGptFeatureAccount,
+        bool switchRequired)
+    {
+        ArgumentNullException.ThrowIfNull(projection);
+        return IsExplicitChatGptFeatureSwitch(
+                   mode,
+                   accessTokenMode,
+                   chatGptFeatureAccount) &&
+               switchRequired &&
+               projection.ProfileChanged &&
+               !projection.ClientLaunchStarted;
+    }
+
+    private void RecoverFailedExplicitChatGptFeatureSwitch(
+        WindowsClientAccountProjection projection,
+        WindowsClientSharedProfileSnapshot previousSharedProfileSnapshot,
+        string projectPath,
+        long launchGeneration)
+    {
+        var targetLaunchError = projection.ClientLaunchError ??
+                                "未返回可验证的启动结果";
+        if (!IsCurrentWindowsClientLaunchGeneration(launchGeneration))
+        {
+            projection.FailedLaunchRecoveryError =
+                "另一个账号启动已接管当前操作，旧凭据没有被并发回写。";
+            return;
+        }
+
+        var failedLaunchTargets = CaptureWindowsClientProcessSnapshots();
+        var failedLaunchPorts = CaptureOfficialNativeFastPortsOwnedBy(failedLaunchTargets);
+        // LaunchOfficialCodex owns cleanup of every PID/start-time identity that it
+        // deliberately created.  Do not broaden a rollback into killing every Codex
+        // process visible at this later instant: the user may have manually reopened a
+        // client while the launch was failing.  Restore credentials only after passive
+        // proof that no official client/owned CDP listener remains.
+        if (!WaitForWindowsClientProcessAndPortRelease(
+                failedLaunchTargets,
+                failedLaunchPorts,
+                launchGeneration,
+                OfficialCodexRecoveryReleaseTimeout) ||
+            !WaitForOfficialCodexSwitchQuiescence(
+                launchGeneration,
+                OfficialCodexRecoveryReleaseTimeout))
+        {
+            projection.FailedLaunchRecoveryError =
+                "失败的 Codex 进程或端口未完全释放，未在运行中的客户端下回写旧凭据。";
+            projection.ClientLaunchError = targetLaunchError + "；" +
+                                           projection.FailedLaunchRecoveryError;
+            WriteCodexPlusPlusLaunchDiagnostic(
+                "official-dual-launch-rollback-quiescence-failed",
+                $"process_count={failedLaunchTargets.Count}; data_preserved=true");
+            return;
+        }
+
+        try
+        {
+            RestoreWindowsClientSwitchProjection(
+                projection,
+                previousSharedProfileSnapshot);
+            if (!WindowsClientSharedProfileMatchesSnapshot(previousSharedProfileSnapshot))
+            {
+                throw new InvalidOperationException(
+                    "恢复后的共享凭据与切换前快照不一致。");
+            }
+
+            projection.FailedLaunchProfileRestored = true;
+            projection.ProfileChanged = false;
+            projection.PreviousClientRelaunchStarted =
+                TryLaunchOfficialCodexFallback(projectPath, launchGeneration);
+            projection.ClientLaunchError = targetLaunchError + "；" +
+                (projection.PreviousClientRelaunchStarted
+                    ? "已恢复切换前凭据，并自动请求重新打开原 Codex"
+                    : "已恢复切换前凭据，但原 Codex 未能自动重新打开");
+            WriteCodexPlusPlusLaunchDiagnostic(
+                "official-dual-launch-rolled-back",
+                $"previous_client_relaunch_started={projection.PreviousClientRelaunchStarted}; " +
+                "shared_profile_verified=true");
+        }
+        catch (Exception ex)
+        {
+            projection.FailedLaunchRecoveryError = MaskSensitive(ex.Message);
+            projection.ClientLaunchError = targetLaunchError +
+                "；切换前凭据恢复失败：" + projection.FailedLaunchRecoveryError;
+            WriteCodexPlusPlusLaunchDiagnostic(
+                "official-dual-launch-rollback-failed",
+                $"error_type={ex.GetType().Name}; data_preserved=true");
+        }
     }
 
     private void PrepareChatGptFeatureAccount(
@@ -3803,6 +3969,18 @@ public sealed partial class CodexCliService
                !allowOfficialRendererPatch;
     }
 
+    private static OfficialCodexStartupReadinessPolicy SelectOfficialCodexStartupReadinessPolicy(
+        bool allowRendererPatch)
+    {
+        // A controlled renderer reload needs a synchronous routes + IPC contract because the
+        // manager itself caused that reload. Official OAuth and explicit dual-login launches do
+        // not patch/reload the renderer; a delayed log line there must never become permission to
+        // kill a visible client and restart it. Their readiness is observed in the background.
+        return allowRendererPatch
+            ? OfficialCodexStartupReadinessPolicy.VerifySynchronouslyForRendererPatch
+            : OfficialCodexStartupReadinessPolicy.PreserveActivationAndObserveInBackground;
+    }
+
     private bool LaunchCodexPlusPlus(
         string projectPath,
         string codexHome,
@@ -3959,6 +4137,7 @@ public sealed partial class CodexCliService
         // the patched page must complete the same handshake again afterwards.  Treating the
         // bridge's script-verification event as application readiness can strand Electron on a
         // white shell while persisted atoms are still synchronizing.
+        var launchStartedUtc = DateTime.UtcNow;
         var launchLogBaseline = CaptureOfficialCodexLaunchLogBaseline();
         WindowsClientActivationIdentity activationIdentity;
         int? nativeFastPort = null;
@@ -3997,6 +4176,31 @@ public sealed partial class CodexCliService
             throw new InvalidOperationException(
                 "Official Codex package activation failed before a verifiable client process was created.",
                 packageActivationError);
+        }
+
+        if (SelectOfficialCodexStartupReadinessPolicy(allowRendererPatch) ==
+            OfficialCodexStartupReadinessPolicy.PreserveActivationAndObserveInBackground)
+        {
+            // The COM activation already returned an immutable PID/start-time identity. For
+            // OAuth/dual-login this is the commit point: do not reinterpret a slow renderer log
+            // or busy IPC queue as a crash and destructively recycle the process. The existing
+            // background observer will deliver the optional project deep link only after the
+            // runtime becomes healthy, and will merely log a timeout without stopping Codex.
+            if (!IsWindowsClientActivationIdentityAlive(activationIdentity))
+            {
+                throw new InvalidOperationException(
+                    "Official Codex exited immediately after package activation.");
+            }
+
+            OpenNewTaskAfterOfficialCodexLaunchInBackground(
+                projectPath,
+                launchStartedUtc,
+                activationIdentity,
+                launchGeneration);
+            WriteCodexPlusPlusLaunchDiagnostic(
+                "official-non-destructive-readiness-observer-started",
+                $"pid={activationIdentity.ProcessId}; patch=false; restart_on_ready_timeout=false");
+            return true;
         }
 
         var observedFirstAttemptProcessTree = new List<WindowsClientProcessSnapshot>();
@@ -5964,6 +6168,10 @@ public sealed partial class CodexCliService
         if (OfficialCodexPrimaryPageReadyTimeout < TimeSpan.FromSeconds(60) ||
             OfficialCodexPostPatchPageReadyTimeout < TimeSpan.FromSeconds(30) ||
             OfficialCodexReadyStableDuration < TimeSpan.FromMilliseconds(400) ||
+            SelectOfficialCodexStartupReadinessPolicy(allowRendererPatch: true) !=
+                OfficialCodexStartupReadinessPolicy.VerifySynchronouslyForRendererPatch ||
+            SelectOfficialCodexStartupReadinessPolicy(allowRendererPatch: false) !=
+                OfficialCodexStartupReadinessPolicy.PreserveActivationAndObserveInBackground ||
             DecideOfficialCodexRecovery(
                 OfficialCodexLaunchAttemptOutcome.Ready,
                 recoveryAlreadyAttempted: false) != OfficialCodexRecoveryDecision.Complete ||
@@ -6083,6 +6291,131 @@ public sealed partial class CodexCliService
         }
 
         OfficialCodexLogReadiness.Validate();
+    }
+
+    internal static void ValidateDualLoginLaunchTransaction()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            "codex-dual-login-transaction-" + Guid.NewGuid().ToString("N"));
+        var sharedHome = Path.Combine(root, "shared");
+        var projectHome = Path.Combine(root, "project");
+        var backupHome = Path.Combine(root, "backups");
+        var oldSharedHome = Environment.GetEnvironmentVariable(SharedCodexHomeOverrideVariable);
+        try
+        {
+            Environment.SetEnvironmentVariable(SharedCodexHomeOverrideVariable, sharedHome);
+            Directory.CreateDirectory(sharedHome);
+            Directory.CreateDirectory(projectHome);
+            Directory.CreateDirectory(backupHome);
+
+            var originalManagedFiles = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase)
+            {
+                [Path.Combine(sharedHome, AuthFileName)] =
+                    System.Text.Encoding.UTF8.GetBytes("{\"auth\":\"before\"}"),
+                [Path.Combine(sharedHome, ConfigFileName)] =
+                    System.Text.Encoding.UTF8.GetBytes("model = \"before\"\n"),
+                [Path.Combine(sharedHome, DesktopSelectionFileName)] =
+                    System.Text.Encoding.UTF8.GetBytes("{\"selection\":\"before\"}"),
+                [Path.Combine(sharedHome, ActiveAccountStateFileName)] =
+                    System.Text.Encoding.UTF8.GetBytes("{\"active\":\"before\"}")
+            };
+            foreach (var (path, contents) in originalManagedFiles)
+            {
+                File.WriteAllBytes(path, contents);
+            }
+
+            // Cockpit auth intentionally starts absent; rollback must remove a newly created one.
+            var snapshot = CaptureWindowsClientSharedProfileSnapshot();
+            foreach (var file in snapshot.Files)
+            {
+                File.WriteAllText(file.Path, "changed");
+            }
+
+            var globalStatePath = Path.Combine(sharedHome, GlobalStateFileName);
+            var globalStateBackupPath = Path.Combine(backupHome, "global-state.json");
+            File.WriteAllText(globalStateBackupPath, "{\"sidebar\":\"before\"}");
+            File.WriteAllText(globalStatePath, "{\"sidebar\":\"changed\"}");
+            var projectConfigPath = Path.Combine(projectHome, ConfigFileName);
+            var projectConfigBackupPath = Path.Combine(backupHome, "project-config.toml");
+            File.WriteAllText(projectConfigBackupPath, "model = \"project-before\"\n");
+            File.WriteAllText(projectConfigPath, "model = \"project-changed\"\n");
+            var modelCachePath = Path.Combine(sharedHome, "models_cache.json");
+            var modelCacheBackupPath = Path.Combine(backupHome, "models-cache.json");
+            File.WriteAllText(modelCacheBackupPath, "{\"models\":\"before\"}");
+            File.WriteAllText(modelCachePath, "{\"models\":\"changed\"}");
+
+            var projection = new WindowsClientAccountProjection
+            {
+                DefaultCodexHome = sharedHome,
+                ProfileChanged = true,
+                GlobalStatePath = globalStatePath,
+                GlobalStateBackupPath = globalStateBackupPath,
+                GlobalStateExisted = true,
+                ModelCacheBackupPath = modelCacheBackupPath,
+                ModelCacheExisted = true,
+                ProjectConfigPath = projectConfigPath,
+                ProjectConfigBackupPath = projectConfigBackupPath,
+                ProjectConfigExisted = true
+            };
+            new CodexCliService().RestoreWindowsClientSwitchProjection(projection, snapshot);
+            if (!WindowsClientSharedProfileMatchesSnapshot(snapshot) ||
+                File.ReadAllText(globalStatePath) != "{\"sidebar\":\"before\"}" ||
+                File.ReadAllText(projectConfigPath) != "model = \"project-before\"\n" ||
+                File.ReadAllText(modelCachePath) != "{\"models\":\"before\"}")
+            {
+                throw new InvalidOperationException(
+                    "A failed dual-login launch did not restore every switch-owned file.");
+            }
+
+            var oauthAccount = new AccountRecord
+            {
+                Name = "oauth-fixture",
+                CodexHome = Path.Combine(root, "oauth"),
+                AuthKind = AccountAuthKind.OfficialOAuth
+            };
+            if (!ShouldRollbackFailedExplicitChatGptFeatureSwitch(
+                    projection,
+                    WindowsClientMode.OfficialCodex,
+                    AccessTokenSharedProfileMode.ChatGptDesktop,
+                    oauthAccount,
+                    switchRequired: true) ||
+                ShouldRollbackFailedExplicitChatGptFeatureSwitch(
+                    projection,
+                    WindowsClientMode.OfficialCodex,
+                    AccessTokenSharedProfileMode.ApiCompatible,
+                    oauthAccount,
+                    switchRequired: true) ||
+                ShouldRollbackFailedExplicitChatGptFeatureSwitch(
+                    projection,
+                    WindowsClientMode.OfficialCodex,
+                    AccessTokenSharedProfileMode.ChatGptDesktop,
+                    oauthAccount,
+                    switchRequired: false))
+            {
+                throw new InvalidOperationException(
+                    "Dual-login rollback policy did not stay limited to a failed committed profile switch.");
+            }
+            projection.ClientLaunchStarted = true;
+            if (ShouldRollbackFailedExplicitChatGptFeatureSwitch(
+                    projection,
+                    WindowsClientMode.OfficialCodex,
+                    AccessTokenSharedProfileMode.ChatGptDesktop,
+                    oauthAccount,
+                    switchRequired: true))
+            {
+                throw new InvalidOperationException(
+                    "A successful dual-login launch was incorrectly selected for rollback.");
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(SharedCodexHomeOverrideVariable, oldSharedHome);
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
     }
 
     public Task OpenWindowsClientThreadAsync(
@@ -8288,6 +8621,148 @@ catch {
             Path.Combine(projection.DefaultCodexHome, ActiveAccountStateFileName),
             projection.ActiveAccountStateBackupPath,
             projection.ActiveAccountStateExisted);
+    }
+
+    private void RestoreWindowsClientSwitchProjection(
+        WindowsClientAccountProjection? projection,
+        WindowsClientSharedProfileSnapshot? previousSharedProfileSnapshot)
+    {
+        var failures = new List<Exception>();
+
+        static void Attempt(List<Exception> failures, Action action)
+        {
+            try
+            {
+                action();
+            }
+            catch (Exception ex)
+            {
+                failures.Add(ex);
+            }
+        }
+
+        if (projection != null)
+        {
+            // Reverse the order used by the switch transaction. Each category is attempted even
+            // if another restore fails so one locked optional file cannot prevent auth/config
+            // recovery. The operation-owned profile snapshot below is the final exactness guard.
+            Attempt(failures, () => RestoreProjectModelOverrides(projection));
+            Attempt(failures, () => RestoreDesktopProfileModelState(projection));
+            Attempt(failures, () => RestoreDesktopSidebarState(projection));
+            Attempt(failures, () => RestoreWindowsClientAccountProjection(projection));
+        }
+
+        if (previousSharedProfileSnapshot != null)
+        {
+            Attempt(
+                failures,
+                () => RestoreWindowsClientSharedProfileSnapshot(
+                    previousSharedProfileSnapshot));
+        }
+
+        if (failures.Count > 0)
+        {
+            throw new AggregateException(
+                "One or more files could not be restored after the failed Codex switch.",
+                failures);
+        }
+    }
+
+    private static WindowsClientSharedProfileSnapshot CaptureWindowsClientSharedProfileSnapshot()
+    {
+        var profileHome = Path.GetFullPath(GetDefaultCodexHome());
+        Directory.CreateDirectory(profileHome);
+        var managedPaths = new[]
+        {
+            Path.Combine(profileHome, AuthFileName),
+            Path.Combine(profileHome, CockpitAuthFileName),
+            Path.Combine(profileHome, ConfigFileName),
+            Path.Combine(profileHome, DesktopSelectionFileName),
+            Path.Combine(profileHome, ActiveAccountStateFileName)
+        };
+        return new WindowsClientSharedProfileSnapshot(
+            managedPaths.Select(CaptureWindowsClientSharedProfileFile).ToArray());
+    }
+
+    private static WindowsClientSharedProfileFileSnapshot CaptureWindowsClientSharedProfileFile(
+        string path)
+    {
+        if (!File.Exists(path))
+        {
+            return new WindowsClientSharedProfileFileSnapshot(path, false, Array.Empty<byte>());
+        }
+
+        using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete);
+        using var memory = new MemoryStream();
+        stream.CopyTo(memory);
+        return new WindowsClientSharedProfileFileSnapshot(path, true, memory.ToArray());
+    }
+
+    private static void RestoreWindowsClientSharedProfileSnapshot(
+        WindowsClientSharedProfileSnapshot snapshot)
+    {
+        var failures = new List<Exception>();
+        foreach (var file in snapshot.Files)
+        {
+            try
+            {
+                if (file.Existed)
+                {
+                    WriteBytesAtomically(file.Path, file.Contents);
+                }
+                else if (File.Exists(file.Path))
+                {
+                    ClearReadOnlyAttribute(file.Path);
+                    File.Delete(file.Path);
+                }
+            }
+            catch (Exception ex)
+            {
+                failures.Add(ex);
+            }
+        }
+
+        if (failures.Count > 0)
+        {
+            throw new AggregateException(
+                "The managed shared profile could not be restored exactly.",
+                failures);
+        }
+    }
+
+    private static bool WindowsClientSharedProfileMatchesSnapshot(
+        WindowsClientSharedProfileSnapshot snapshot)
+    {
+        foreach (var expected in snapshot.Files)
+        {
+            if (File.Exists(expected.Path) != expected.Existed)
+            {
+                return false;
+            }
+            if (!expected.Existed)
+            {
+                continue;
+            }
+
+            try
+            {
+                var actual = CaptureWindowsClientSharedProfileFile(expected.Path);
+                if (!actual.Existed || !actual.Contents.AsSpan().SequenceEqual(expected.Contents))
+                {
+                    return false;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static void NormalizeDesktopSidebarState(WindowsClientAccountProjection projection)
@@ -15572,6 +16047,31 @@ catch {
         }
     }
 
+    private static void WriteBytesAtomically(string targetPath, ReadOnlySpan<byte> contents)
+    {
+        var directory = Path.GetDirectoryName(targetPath);
+        if (!string.IsNullOrWhiteSpace(directory))
+        {
+            Directory.CreateDirectory(directory);
+        }
+
+        var tempTarget = targetPath + ".tmp-" + Guid.NewGuid().ToString("N");
+        try
+        {
+            File.WriteAllBytes(tempTarget, contents);
+            ClearReadOnlyAttribute(targetPath);
+            File.Move(tempTarget, targetPath, true);
+        }
+        finally
+        {
+            if (File.Exists(tempTarget))
+            {
+                ClearReadOnlyAttribute(tempTarget);
+                File.Delete(tempTarget);
+            }
+        }
+    }
+
     private static void RestoreFile(string targetPath, string? backupPath, bool existedBefore)
     {
         if (existedBefore && !string.IsNullOrWhiteSpace(backupPath) && File.Exists(backupPath))
@@ -15969,6 +16469,12 @@ catch {
         Stop
     }
 
+    private enum OfficialCodexStartupReadinessPolicy
+    {
+        VerifySynchronouslyForRendererPatch,
+        PreserveActivationAndObserveInBackground
+    }
+
     private enum OfficialCodexNativeFastAttachOutcome
     {
         AlreadyPatched,
@@ -15993,6 +16499,12 @@ catch {
         string ProcessName,
         int ShutdownPriority,
         int ParentProcessId);
+    private sealed record WindowsClientSharedProfileSnapshot(
+        IReadOnlyList<WindowsClientSharedProfileFileSnapshot> Files);
+    private sealed record WindowsClientSharedProfileFileSnapshot(
+        string Path,
+        bool Existed,
+        byte[] Contents);
     private sealed record WindowsClientActivationIdentity(
         int ProcessId,
         long? StartTimeUtcTicks);
@@ -16058,6 +16570,9 @@ public sealed class WindowsClientAccountProjection
     public WindowsClientMode ClientMode { get; set; } = WindowsClientMode.CodexPlusPlus;
     public bool ClientLaunchStarted { get; set; }
     public string? ClientLaunchError { get; set; }
+    public bool FailedLaunchProfileRestored { get; set; }
+    public bool PreviousClientRelaunchStarted { get; set; }
+    public string? FailedLaunchRecoveryError { get; set; }
     public bool CodexPlusPlusLaunchStarted { get; set; }
     public bool CodexDreamSkinFailed { get; set; }
     public bool CodexOfficialAppearanceRestored { get; set; }
