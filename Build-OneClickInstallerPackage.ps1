@@ -84,7 +84,12 @@ function Assert-CleanAppSettingsContent {
         'AccountRotationPrimaryCursorAccountKey',
         'AccountRotationBackupCursorAccountKey',
         'AccountRotationResetAtUtc',
+        'AccountRotationQuotaEvidenceVersion',
         'CodexFingerprintForwarding',
+        'CodexFingerprintModes',
+        'CodexFingerprintSeeds',
+        'AccountRotationSessionAffinityEnabled',
+        'AccountRotationSessionAffinityTtlSeconds',
         'ChatGptFeatureAccountBindings',
         'WindowWidth',
         'WindowHeight',
@@ -120,7 +125,12 @@ function Assert-CleanAppSettingsContent {
     $accountRotationPrimaryCursor = $settings.PSObject.Properties['AccountRotationPrimaryCursorAccountKey'].Value
     $accountRotationBackupCursor = $settings.PSObject.Properties['AccountRotationBackupCursorAccountKey'].Value
     $accountRotationResets = $settings.PSObject.Properties['AccountRotationResetAtUtc'].Value
+    $accountRotationQuotaEvidenceVersion = [int]$settings.PSObject.Properties['AccountRotationQuotaEvidenceVersion'].Value
     $fingerprintForwarding = $settings.PSObject.Properties['CodexFingerprintForwarding'].Value
+    $fingerprintModes = $settings.PSObject.Properties['CodexFingerprintModes'].Value
+    $fingerprintSeeds = $settings.PSObject.Properties['CodexFingerprintSeeds'].Value
+    $sessionAffinityEnabled = [bool]$settings.PSObject.Properties['AccountRotationSessionAffinityEnabled'].Value
+    $sessionAffinityTtlSeconds = [int]$settings.PSObject.Properties['AccountRotationSessionAffinityTtlSeconds'].Value
     $featureBindings = $settings.PSObject.Properties['ChatGptFeatureAccountBindings'].Value
     $windowWidth = [int]$settings.PSObject.Properties['WindowWidth'].Value
     $windowHeight = [int]$settings.PSObject.Properties['WindowHeight'].Value
@@ -143,7 +153,12 @@ function Assert-CleanAppSettingsContent {
         $null -ne $accountRotationPrimaryCursor -or
         $null -ne $accountRotationBackupCursor -or
         @($accountRotationResets.PSObject.Properties).Count -ne 0 -or
+        $accountRotationQuotaEvidenceVersion -ne 3 -or
         @($fingerprintForwarding.PSObject.Properties).Count -ne 0 -or
+        @($fingerprintModes.PSObject.Properties).Count -ne 0 -or
+        @($fingerprintSeeds.PSObject.Properties).Count -ne 0 -or
+        -not $sessionAffinityEnabled -or
+        $sessionAffinityTtlSeconds -ne 3600 -or
         @($featureBindings.PSObject.Properties).Count -ne 0 -or
         $windowWidth -ne 1038 -or
         $windowHeight -ne 615 -or

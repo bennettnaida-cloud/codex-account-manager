@@ -155,7 +155,8 @@ internal sealed class PatGatewayRotationStore
     internal PatGatewayRotationSnapshot Arm(
         string sourceAccountKey,
         string targetAccountKey,
-        DateTimeOffset armedAtUtc)
+        DateTimeOffset armedAtUtc,
+        bool replaceExistingArmedTarget = false)
     {
         if (!TryNormalizeAccountKey(sourceAccountKey, out var source) ||
             !TryNormalizeAccountKey(targetAccountKey, out var target) ||
@@ -170,6 +171,25 @@ internal sealed class PatGatewayRotationStore
             string.Equals(existing.TargetAccountKey, target, StringComparison.Ordinal))
         {
             return existing;
+        }
+
+        if (replaceExistingArmedTarget &&
+            existing.Status == PatGatewayRotationStatus.Armed &&
+            string.Equals(existing.SourceAccountKey, source, StringComparison.Ordinal) &&
+            TryNormalizeAccountKey(existing.TransportAccountKey, out var armedTransport))
+        {
+            // A user-requested force switch may supersede an automatic/manual target that
+            // has not crossed a request boundary yet. Preserve the stable desktop transport
+            // and atomically replace only the logical target in the same route document.
+            var replacement = new PatGatewayRotationSnapshot(
+                PatGatewayRotationStatus.Armed,
+                armedTransport,
+                source,
+                target,
+                armedAtUtc.ToUniversalTime(),
+                null);
+            Save(replacement);
+            return replacement;
         }
 
         string transport;
@@ -260,6 +280,24 @@ internal sealed class PatGatewayRotationStore
         {
             var store = new PatGatewayRotationStore(root);
             var armed = store.Arm(a, b, DateTimeOffset.UtcNow);
+            var forced = store.Arm(
+                a,
+                c,
+                DateTimeOffset.UtcNow.AddMilliseconds(500),
+                replaceExistingArmedTarget: true);
+            if (forced.Status != PatGatewayRotationStatus.Armed ||
+                forced.TransportAccountKey != a ||
+                forced.SourceAccountKey != a ||
+                forced.TargetAccountKey != c)
+            {
+                throw new InvalidOperationException(
+                    "A force switch did not atomically replace the pending target.");
+            }
+            armed = store.Arm(
+                a,
+                b,
+                DateTimeOffset.UtcNow.AddMilliseconds(750),
+                replaceExistingArmedTarget: true);
             var active = store.Activate(armed, DateTimeOffset.UtcNow.AddSeconds(1));
             var chained = store.Arm(b, c, DateTimeOffset.UtcNow.AddSeconds(2));
             var serialized = File.ReadAllText(store.Path);

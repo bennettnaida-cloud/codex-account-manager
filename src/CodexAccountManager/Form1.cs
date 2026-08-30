@@ -17,7 +17,8 @@ public partial class Form1 : Form
         QuotaUsage,
         AccountRotation,
         ThemeSettings,
-        SystemConfig
+        SystemConfig,
+        ProxyManagement
     }
 
     private enum QuotaTrendScope
@@ -30,7 +31,8 @@ public partial class Form1 : Form
         UsageReport? Report,
         DateTime LatestWriteTimeUtc,
         DateTime LoadedAtUtc,
-        int InvalidationVersion);
+        int InvalidationVersion,
+        string? CurrentAccountKey);
 
     private sealed record UnifiedHistoryLoadResult(
         IReadOnlyList<UnifiedThreadRecord> Threads,
@@ -70,6 +72,13 @@ public partial class Form1 : Form
         string Title,
         IReadOnlyList<AccountRecord> Accounts);
 
+    private sealed record FingerprintModeOption(
+        CodexFingerprintMode Mode,
+        string Label)
+    {
+        public override string ToString() => Label;
+    }
+
     private sealed record WorkspaceViewCacheEntry(
         int WorkspaceWidth,
         Control[] Controls);
@@ -92,6 +101,7 @@ public partial class Form1 : Form
         int Height,
         Rectangle Primary,
         Rectangle Secondary,
+        Rectangle AccountStateBadge,
         Rectangle StatusBadge,
         Rectangle TokenBadge,
         Rectangle Check,
@@ -155,6 +165,9 @@ public partial class Form1 : Form
 
     private sealed class QuotaUsageRowBinding
     {
+        // Bind an already-rendered row to the immutable credential-directory identity.
+        // Display names are user-editable and are not safe as an async update key.
+        public required string AccountKey { get; init; }
         public required string AccountName { get; init; }
         public required string QuotaLimitType { get; init; }
         public required Label Kind { get; init; }
@@ -185,6 +198,7 @@ public partial class Form1 : Form
 
     private sealed class QuotaUsageDetailBinding
     {
+        public required string AccountKey { get; init; }
         public required string AccountName { get; init; }
         public required string QuotaLimitType { get; init; }
         public required Label Subtitle { get; init; }
@@ -270,6 +284,10 @@ public partial class Form1 : Form
     private readonly Label _statusBox = new();
     private readonly ThemePicker _themeModePicker = new();
     private readonly ModernButton _updateAvailableButton = new();
+    // Quota workspace action: runs one independent, low-cost probe per account without
+    // changing the desktop account or interrupting Codex.  Keep this as a persistent
+    // control so switching between quota list/detail views does not leave a stale handler.
+    private readonly ModernButton _bulkQuotaTestButton = new();
     private readonly Label _currentVersionLabel = new();
     private readonly ModernButton _addAccountNavButton = new();
     private readonly ModernButton _accountSwitchNavButton = new();
@@ -279,6 +297,7 @@ public partial class Form1 : Form
     private readonly ModernButton _accountRotationNavButton = new();
     private readonly ModernButton _themeSettingsNavButton = new();
     private readonly ModernButton _systemConfigNavButton = new();
+    private readonly ModernButton _proxyManagementNavButton = new();
     private readonly AppUpdateService _updateService = new();
     private readonly Label _headerTitle = new();
     private readonly Label _headerSubtitle = new();
@@ -398,6 +417,9 @@ public partial class Form1 : Form
     private CancellationTokenSource? _accountRotationPrimaryReturnCancellation;
     private QuotaRotationDecision? _patAutoRotationLastDecision;
     private readonly HashSet<string> _minimalQuotaTestsInProgress = new(StringComparer.Ordinal);
+    private bool _bulkQuotaTestInProgress;
+    private int _bulkQuotaTestCompleted;
+    private int _bulkQuotaTestTotal;
     private string _patGatewayRuntimeStatus = "等待启动";
     private CancellationTokenSource? _proxyDetectionCancellation;
     private ModernInputShell? _searchShell;
@@ -409,6 +431,7 @@ public partial class Form1 : Form
     private BufferedFlowLayoutPanel? _controlsRow;
     private Panel? _sidebarFooter;
     private Label? _managerAppearanceLabel;
+    private ProxySidebarPanel? _proxySidebar;
 
     public Form1(
         bool preserveExistingPatGatewayOnStartup = false,
@@ -581,6 +604,17 @@ public partial class Form1 : Form
         _themeService.SaveSettings(_appSettings);
     }
 
+    private string? ResolveApplicationIconPath()
+    {
+        var candidates = new[]
+        {
+            Path.Combine(_store.RootPath, "assets", "CodexAccountManager.ico"),
+            Path.Combine(AppContext.BaseDirectory, "assets", "CodexAccountManager.ico"),
+            Path.Combine(AppContext.BaseDirectory, "CodexAccountManager.ico")
+        };
+        return candidates.FirstOrDefault(File.Exists);
+    }
+
     private void BuildUi()
     {
         AutoScaleMode = AutoScaleMode.Dpi;
@@ -604,10 +638,17 @@ public partial class Form1 : Form
         UpdateStyles();
         HandleCreated += (_, _) => NativeWindowTheme.Apply(this, ThemeStyler.IsDark(_palette));
 
-        var iconPath = Path.Combine(_store.RootPath, "assets", "CodexAccountManager.ico");
-        if (File.Exists(iconPath))
+        var iconPath = ResolveApplicationIconPath();
+        if (iconPath != null)
         {
             Icon = new Icon(iconPath);
+        }
+        else
+        {
+            // Published single-file builds may not carry the old data-root assets
+            // directory. Extract the icon embedded in the executable so the title bar,
+            // taskbar and shortcut keep the manager's identity after cleanup/migration.
+            try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
         }
 
         var layout = new BufferedTableLayoutPanel
@@ -640,11 +681,14 @@ public partial class Form1 : Form
             Top = 12,
             AccessibleName = "Codex Account Manager"
         };
-        if (File.Exists(iconPath))
+        try
         {
-            using var icon = new Icon(iconPath);
-            logo.Image = icon.ToBitmap();
+            using var icon = iconPath != null
+                ? new Icon(iconPath)
+                : (Icon == null ? null : (Icon)Icon.Clone());
+            if (icon != null) logo.Image = icon.ToBitmap();
         }
+        catch { }
         sidebar.Controls.Add(logo);
 
         _currentVersionLabel.Text = $"当前版本 {AppUpdateService.DisplayVersion}";
@@ -669,6 +713,7 @@ public partial class Form1 : Form
         ConfigureSidebarNavButton(_accountRotationNavButton, "账号轮换", 278, WorkspaceView.AccountRotation);
         ConfigureSidebarNavButton(_themeSettingsNavButton, "Codex 主题", 322, WorkspaceView.ThemeSettings);
         ConfigureSidebarNavButton(_systemConfigNavButton, "系统配置", 366, WorkspaceView.SystemConfig);
+        ConfigureSidebarNavButton(_proxyManagementNavButton, "代理节点", 410, WorkspaceView.ProxyManagement);
         sidebar.Controls.Add(_addAccountNavButton);
         sidebar.Controls.Add(_accountSwitchNavButton);
         sidebar.Controls.Add(_unifiedHistoryNavButton);
@@ -677,6 +722,7 @@ public partial class Form1 : Form
         sidebar.Controls.Add(_accountRotationNavButton);
         sidebar.Controls.Add(_themeSettingsNavButton);
         sidebar.Controls.Add(_systemConfigNavButton);
+        sidebar.Controls.Add(_proxyManagementNavButton);
 
         _themeModePicker.SetBounds(0, 0, 360, 46);
         _themeModePicker.Font = new Font(Font.FontFamily, 9F);
@@ -881,6 +927,41 @@ public partial class Form1 : Form
         };
         controlsRow.Controls.Add(_searchShell);
 
+        // Keep the bulk quota probe as a persistent control so its progress/handler survive
+        // list refreshes. It is reparented to the first quota account-group header rather
+        // than sitting over the hero artwork; the action is hidden on other workspaces.
+        _bulkQuotaTestButton.Name = "BulkMinimalQuotaTestAction";
+        _bulkQuotaTestButton.Text = "一键测试全部账号";
+        // The previous 190px reservation was too narrow once the refresh glyph,
+        // padding and Chinese caption were measured at 125%/150% DPI.  Keep a
+        // generous initial width; UpdateHeaderControlLayout will refine it for the
+        // actual monitor while never shrinking below the text's comfortable width.
+        _bulkQuotaTestButton.SetBounds(0, 8, 328, 46);
+        _bulkQuotaTestButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        _bulkQuotaTestButton.Margin = Padding.Empty;
+        _bulkQuotaTestButton.Tag = "primary";
+        _bulkQuotaTestButton.Padding = new Padding(16, 0, 16, 0);
+        _bulkQuotaTestButton.Radius = 13;
+        _bulkQuotaTestButton.Font = new Font(Font.FontFamily, 9.4F, FontStyle.Bold);
+        _bulkQuotaTestButton.MinimumFontSize = 8.2F;
+        _bulkQuotaTestButton.AutoShrinkText = true;
+        _bulkQuotaTestButton.AllowMultilineText = false;
+        _bulkQuotaTestButton.TextAlign = ContentAlignment.MiddleCenter;
+        _bulkQuotaTestButton.IconText = string.Empty;
+        _bulkQuotaTestButton.IconWidth = 0;
+        _bulkQuotaTestButton.ShowIconTile = false;
+        _bulkQuotaTestButton.AccessibleName = "一键测试全部账号";
+        _bulkQuotaTestButton.Visible = false;
+        _bulkQuotaTestButton.Click += async (_, _) => await SendMinimalQuotaTestsForAllAsync();
+        ThemeStyler.ApplyPrimaryButton(_bulkQuotaTestButton, _palette);
+        // A translucent icon tile makes the action read as one deliberate command
+        // instead of a plain text pill, while remaining legible in both themes.
+        _bulkQuotaTestButton.IconTileColor = Color.FromArgb(58, Color.White);
+        _bulkQuotaTestButton.IconTileBorderColor = Color.FromArgb(92, Color.White);
+        // The bulk quota action is attached to the quota account-group header when that
+        // page is rendered.  Keeping it out of the hero prevents the button from covering
+        // the starfield artwork and makes it sit next to the group's collapse control.
+
         controlsRow.SizeChanged += (_, _) => UpdateHeaderControlLayout();
 
         _projectPathBox.Text = ResolveInitialProjectPath();
@@ -926,14 +1007,46 @@ public partial class Form1 : Form
             ManagerLifecycleDiagnostics.Write(
                 "manager-form-closing",
                 $"reason={eventArgs.CloseReason}");
-            SaveEditedProjectPath(updateStatus: false);
-            SaveEditedPatGatewayProxy(updateStatus: false, markManual: false);
-            SaveWindowBounds();
+            // Closing is a best-effort persistence point.  A second Manager/update helper
+            // may still hold the settings file for a few milliseconds; never let that
+            // sharing violation abort the close sequence or take the visible Manager down
+            // together with Codex.
+            try
+            {
+                SaveEditedProjectPath(updateStatus: false);
+            }
+            catch (Exception ex)
+            {
+                ManagerLifecycleDiagnostics.WriteException(
+                    "manager-close-project-settings-save-failed",
+                    ex);
+            }
+            try
+            {
+                SaveEditedPatGatewayProxy(updateStatus: false, markManual: false);
+            }
+            catch (Exception ex)
+            {
+                ManagerLifecycleDiagnostics.WriteException(
+                    "manager-close-proxy-settings-save-failed",
+                    ex);
+            }
+            try
+            {
+                SaveWindowBounds();
+            }
+            catch (Exception ex)
+            {
+                ManagerLifecycleDiagnostics.WriteException(
+                    "manager-close-window-settings-save-failed",
+                    ex);
+            }
         };
         FormClosed += (_, _) =>
         {
             ManagerLifecycleDiagnostics.Write("manager-form-closed");
             _formClosed = true;
+            _bulkQuotaTestInProgress = false;
             _workspaceLoadGeneration++;
             _proxyDetectionCancellation?.Cancel();
             _proxyDetectionCancellation?.Dispose();
@@ -986,6 +1099,7 @@ public partial class Form1 : Form
         _accountLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         _accountLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         contentLayout.Controls.Add(_accountLayout, 0, 1);
+        _proxySidebar = new ProxySidebarPanel(_store.RootPath, () => _accounts, text => _statusBox.Text = text);
 
         _cardsPanel.Dock = DockStyle.Fill;
         _cardsPanel.AutoScroll = true;
@@ -1228,7 +1342,7 @@ public partial class Form1 : Form
         var navGap = Math.Max(8, sidebar.Padding.Bottom * 2 / 3);
         var footerWidth = Math.Max(160, _systemConfigNavButton.Width);
         var footerTop = Math.Max(
-            _systemConfigNavButton.Bottom + navGap,
+            _proxyManagementNavButton.Bottom + navGap,
             sidebar.ClientSize.Height - footer.Height - bottomInset);
         footer.SetBounds(sideInset, footerTop, footerWidth, footer.Height);
         footer.BringToFront();
@@ -1242,6 +1356,7 @@ public partial class Form1 : Form
         NativeWindowTheme.ApplyScrollable(_cardsPanel, ThemeStyler.IsDark(_palette));
 
         ApplyThemeRecursive(this);
+        _proxySidebar?.ApplyPalette(_palette);
         ThemeStyler.ApplyInput(_searchBox, _palette);
         if (_searchShell != null)
         {
@@ -1349,6 +1464,10 @@ public partial class Form1 : Form
                 {
                     ApplyHistoryActionButtonStyle(button, danger: false);
                 }
+                else if (Equals(button.Tag, "history-primary"))
+                {
+                    ApplyHistoryActionButtonStyle(button, danger: false, prominent: true);
+                }
                 else if (Equals(button.Tag, "history-danger"))
                 {
                     ApplyHistoryActionButtonStyle(button, danger: true);
@@ -1372,6 +1491,10 @@ public partial class Form1 : Form
                 else if (Equals(button.Tag, "token-update"))
                 {
                     ApplyTokenUpdateButtonStyle(button);
+                }
+                else if (Equals(button.Tag, "quota-bulk-primary"))
+                {
+                    ApplyQuotaBulkTestButtonStyle(button);
                 }
                 else if (Equals(button.Tag, "primary"))
                 {
@@ -1427,6 +1550,7 @@ public partial class Form1 : Form
                 WorkspaceView.AccountRotation => "↻",
                 WorkspaceView.ThemeSettings => "◐",
                 WorkspaceView.SystemConfig => "⚙",
+                WorkspaceView.ProxyManagement => "⌁",
                 _ => "•"
             };
             modern.IconWidth = 24;
@@ -1558,10 +1682,15 @@ public partial class Form1 : Form
         {
             foreach (var control in previous.Controls)
             {
-                control.Dispose();
+                if (!ReferenceEquals(control, _proxySidebar)) control.Dispose();
             }
         }
 
+        // ProxySidebarPanel is persistent because it owns a node resolver/core pool.
+        // Detach it before caching/disposal; otherwise switching directories while a
+        // test is running disposes its controls and the continuation raises
+        // ObjectDisposedException on the UI thread.
+        DetachPersistentControl(_proxySidebar);
         var controls = _cardsPanel.Controls.Cast<Control>().ToArray();
         _cardsPanel.SuspendLayout();
         try
@@ -1589,7 +1718,7 @@ public partial class Form1 : Form
         {
             foreach (var control in entry.Controls)
             {
-                control.Dispose();
+                if (!ReferenceEquals(control, _proxySidebar)) control.Dispose();
             }
             return false;
         }
@@ -1602,9 +1731,10 @@ public partial class Form1 : Form
             // otherwise returning from SystemConfig destroys the project-path textbox
             // and the next account launch sees an empty directory.
             DetachPersistentSystemConfigControls();
+            DetachPersistentControl(_proxySidebar);
             foreach (var current in _cardsPanel.Controls.Cast<Control>().ToArray())
             {
-                current.Dispose();
+                if (!ReferenceEquals(current, _proxySidebar)) current.Dispose();
             }
             _cardsPanel.Controls.Clear();
             _cardsPanel.Controls.AddRange(entry.Controls);
@@ -1625,7 +1755,7 @@ public partial class Form1 : Form
         {
             foreach (var control in entry.Controls)
             {
-                control.Dispose();
+                if (!ReferenceEquals(control, _proxySidebar)) control.Dispose();
             }
         }
         _workspaceViewCache.Clear();
@@ -1725,10 +1855,13 @@ public partial class Form1 : Form
     {
         if (_formClosed || IsDisposed ||
             !AccountRotationConfiguration.IsEnabled(_appSettings) ||
-            !_patAutoRotationGatewayTransportActive ||
-            _patAutoRotationLaunchContext?.ClientMode != WindowsClientMode.OfficialCodex ||
+            !_appSettings.PatGatewayEnabled ||
             _patAutoRotationBoundaryCancellation != null ||
-            GetCurrentAccountRecord() is not { } current ||
+            !TryResolvePersistedPatGatewayLogicalAccount(
+                allowArmedSource: false,
+                out var current,
+                out _) ||
+            current == null ||
             AccountRotationConfiguration.GetPool(_appSettings, current) !=
                 AccountRotationPool.Backup)
         {
@@ -1745,22 +1878,16 @@ public partial class Form1 : Form
 
         PruneResetPatAutoRotationAccounts();
 
-        // Re-enter the primary pool at the position after its persisted cursor. The
-        // backup account is deliberately used only as the current-key exclusion; it must
-        // not reset the independent primary ring to item 1.
-        var primaryCandidates = AccountRotationConfiguration
-            .BuildCandidates(
-                _appSettings,
-                _accounts,
-                current,
-                _patAutoRotationUnavailableAccountKeys,
-                now,
-                HasUsableAccountCredential)
-            .Where(account =>
-                AccountRotationConfiguration.GetPool(_appSettings, account) ==
-                AccountRotationPool.Primary)
-            .ToList();
-        if (primaryCandidates.Count == 0)
+        // While a backup account is active, only inspect local account-isolated snapshots
+        // and durable gateway evidence. This notices newly-added primary accounts with
+        // known remaining quota without continuously probing OpenAI.
+        if (!TrySelectLatestAccountRotationCandidate(
+                QuotaAccountIdentity.CreateKey(current),
+                attemptedAccountKeys: new HashSet<string>(StringComparer.Ordinal),
+                resetDuePrimaryOnly: true,
+                out _,
+                out _,
+                out _))
         {
             return;
         }
@@ -1768,18 +1895,71 @@ public partial class Form1 : Form
         var cancellation = new CancellationTokenSource();
         _accountRotationPrimaryReturnCancellation = cancellation;
         _patAutoRotationBoundaryCancellation = cancellation;
-        _ = PreparePrimaryPoolReturnAsync(current, primaryCandidates, cancellation);
+        _ = PreparePrimaryPoolReturnAsync(current, cancellation);
+    }
+
+    private bool TryResolvePersistedPatGatewayLogicalAccount(
+        bool allowArmedSource,
+        out AccountRecord? account,
+        out string accountKey)
+    {
+        account = null;
+        accountKey = string.Empty;
+        if (!AccountRotationConfiguration.IsEnabled(_appSettings) ||
+            !_appSettings.PatGatewayEnabled)
+        {
+            return false;
+        }
+
+        var route = new PatGatewayRotationStore(_store.RootPath).Load();
+        string? logicalKey = route.Status switch
+        {
+            PatGatewayRotationStatus.Active => route.TargetAccountKey,
+            PatGatewayRotationStatus.Armed when allowArmedSource => route.SourceAccountKey,
+            PatGatewayRotationStatus.Armed => null,
+            _ => null
+        };
+        if (route.Status == PatGatewayRotationStatus.Armed && !allowArmedSource)
+        {
+            // Another worker or a user action has already selected the next request-boundary
+            // target. Do not let the periodic backup monitor overwrite that pending route.
+            return false;
+        }
+
+        if (!PatGatewayRotationStore.TryNormalizeAccountKey(logicalKey, out accountKey))
+        {
+            _patGatewaySuccessfulActivityStore ??=
+                new PatGatewaySuccessfulActivityStore(_store.RootPath);
+            var successful = _patGatewaySuccessfulActivityStore.ReadLatest();
+            var latestSwitchAtUtc = _usageTracker.GetLatestAccountSwitchAtUtc();
+            logicalKey = successful != null &&
+                         (latestSwitchAtUtc is not { } latestSwitch ||
+                          successful.CompletedAtUtc >= latestSwitch)
+                ? successful.AccountKey
+                : GetCurrentAccountRecord() is { } selected
+                    ? QuotaAccountIdentity.CreateKey(selected)
+                    : null;
+            if (!PatGatewayRotationStore.TryNormalizeAccountKey(logicalKey, out accountKey))
+            {
+                return false;
+            }
+        }
+
+        account = FindRotationAccount(accountKey);
+        return account != null &&
+               AccountRotationConfiguration.GetPool(_appSettings, account) !=
+                   AccountRotationPool.None;
     }
 
     private async Task PreparePrimaryPoolReturnAsync(
         AccountRecord source,
-        IReadOnlyList<AccountRecord> candidates,
         CancellationTokenSource cancellation)
     {
         var sourceKey = QuotaAccountIdentity.CreateKey(source);
+        var attemptedAccountKeys = new HashSet<string>(StringComparer.Ordinal);
         try
         {
-            foreach (var candidate in candidates)
+            while (true)
             {
                 cancellation.Token.ThrowIfCancellationRequested();
                 if (!IsPatAutoRotationContextCurrent(sourceKey))
@@ -1787,42 +1967,52 @@ public partial class Form1 : Form
                     return;
                 }
 
-                if (candidate.IsCompatibleApi)
+                // Reload accounts.json and appsettings.json for every decision. No queue of
+                // later accounts survives a UI reorder, and B is never inspected until A has
+                // actually failed this worker.
+                if (!TrySelectLatestAccountRotationCandidate(
+                        sourceKey,
+                        attemptedAccountKeys,
+                        resetDuePrimaryOnly: true,
+                        out _,
+                        out var candidate,
+                        out var candidatePool) ||
+                    candidate == null ||
+                    candidatePool != AccountRotationPool.Primary)
                 {
-                    try
-                    {
-                        await CodexCliService.EnsureCompatibleApiRotationPreflightAsync(
-                            candidate,
-                            cancellation.Token);
-                    }
-                    catch (Exception ex) when (
-                        ex is IOException or HttpRequestException or InvalidOperationException or
-                        UnauthorizedAccessException or System.Text.Json.JsonException)
-                    {
-                        continue;
-                    }
+                    break;
                 }
-                else
+                var targetKey = QuotaAccountIdentity.CreateKey(candidate);
+                attemptedAccountKeys.Add(targetKey);
+
+                // Selection above is based entirely on the latest local official snapshot,
+                // a due reset, and durable gateway evidence. Do not turn the backup-pool
+                // monitor into periodic network traffic.
+                RecordPatRotationAccountAvailable(candidate);
+
+                // A reorder can happen while the network preflight is running. Re-read the
+                // latest ring and arm only if this account is still the immediate next item.
+                var earlierFailures = new HashSet<string>(attemptedAccountKeys, StringComparer.Ordinal);
+                earlierFailures.Remove(targetKey);
+                if (!TrySelectLatestAccountRotationCandidate(
+                        sourceKey,
+                        earlierFailures,
+                        resetDuePrimaryOnly: true,
+                        out _,
+                        out var stillNext,
+                        out var stillNextPool) ||
+                    stillNext == null ||
+                    stillNextPool != AccountRotationPool.Primary ||
+                    !QuotaAccountIdentity.CreateKey(stillNext).Equals(targetKey, StringComparison.Ordinal))
                 {
-                    var quotaStatus = await ConfirmPatRotationCandidateQuotaAsync(
-                        candidate,
-                        cancellation.Token);
-                    if (quotaStatus != PatRotationCandidateQuotaStatus.Available)
-                    {
-                        if (quotaStatus == PatRotationCandidateQuotaStatus.Exhausted)
-                        {
-                            _patAutoRotationUnavailableAccountKeys.Add(
-                                QuotaAccountIdentity.CreateKey(candidate));
-                        }
-                        continue;
-                    }
+                    attemptedAccountKeys.Remove(targetKey);
+                    continue;
                 }
 
-                var targetKey = QuotaAccountIdentity.CreateKey(candidate);
                 var armed = await LocalPatGateway.ArmRotationAsync(
                     sourceKey,
                     targetKey,
-                    cancellation.Token);
+                    cancellationToken: cancellation.Token);
                 if (armed.Status != PatGatewayRotationStatus.Armed ||
                     !string.Equals(armed.SourceAccountKey, sourceKey, StringComparison.Ordinal) ||
                     !string.Equals(armed.TargetAccountKey, targetKey, StringComparison.Ordinal))
@@ -1832,7 +2022,7 @@ public partial class Form1 : Form
 
                 _patAutoRotationState = PatAutoRotationState.WaitingForRequestBoundary;
                 _statusBox.Text =
-                    $"使用轮换池账号 {candidate.Name} 已在额度重置后等待满 1 分钟；" +
+                    $"使用轮换池账号 {candidate.Name} 的本地额度信息已确认可用；" +
                     "当前响应继续，下一次模型请求自动返回使用轮换池。";
                 UpdatePatAutoRotationControls();
                 var activatedAtUtc = await WaitForPatGatewayRotationActivationAsync(
@@ -1842,6 +2032,12 @@ public partial class Form1 : Form
                 CompletePatGatewayRotation(candidate, activatedAtUtc);
                 return;
             }
+
+            // No locally available primary account was found. The timer still runs at
+            // 250 ms for the quota UI, but local-only return checks are deliberately
+            // throttled to ten seconds. A one-minute backoff made a newly refreshed or
+            // newly added primary account look as if the backup pool could never return.
+            _accountRotationPrimaryReturnCheckedAtUtc = DateTimeOffset.UtcNow;
         }
         catch (OperationCanceledException)
         {
@@ -2020,6 +2216,9 @@ public partial class Form1 : Form
         var cachedLogWriteTimeUtc = _lastQuotaUsageLogWriteTimeUtc;
         var cachedAtUtc = _quotaUsageLoadedAtUtc;
         var usageLogWatcherReady = _usageLogWatcherReady;
+        var currentAccountKey = GetCurrentAccountRecord() is { } currentAccount
+            ? QuotaAccountIdentity.CreateKey(currentAccount)
+            : null;
         var accountSnapshot = _accounts
             .Select(account => new AccountRecord
             {
@@ -2050,7 +2249,8 @@ public partial class Form1 : Form
                     null,
                     latestWriteTimeUtc,
                     DateTime.UtcNow,
-                    invalidationVersion);
+                    invalidationVersion,
+                    currentAccountKey);
             }
 
             var report = _usageTracker.BuildReport(accountSnapshot);
@@ -2058,7 +2258,8 @@ public partial class Form1 : Form
                 report,
                 usageLogWatcherReady ? DateTime.UtcNow : GetLatestUsageLogWriteTimeUtc(),
                 DateTime.UtcNow,
-                invalidationVersion);
+                invalidationVersion,
+                currentAccountKey);
         });
         _quotaUsageLoadTask = loadTask;
         SetQuotaRefreshIndicator(updating: true);
@@ -2067,7 +2268,13 @@ public partial class Form1 : Form
         {
             var result = await loadTask;
             var resultIsCurrent = result.InvalidationVersion == _quotaUsageInvalidationVersion;
-            if (result.Report != null && resultIsCurrent)
+            var currentAccountStillMatches = string.Equals(
+                result.CurrentAccountKey,
+                GetCurrentAccountRecord() is { } liveCurrent
+                    ? QuotaAccountIdentity.CreateKey(liveCurrent)
+                    : null,
+                StringComparison.Ordinal);
+            if (result.Report != null && resultIsCurrent && currentAccountStillMatches)
             {
                 _quotaUsageCache = result.Report;
                 _lastQuotaUsageLogWriteTimeUtc = result.LatestWriteTimeUtc;
@@ -2080,7 +2287,8 @@ public partial class Form1 : Form
                 !IsDisposed &&
                 _quotaUsageRequestedGeneration == _workspaceLoadGeneration &&
                 result.Report != null &&
-                resultIsCurrent)
+                resultIsCurrent &&
+                currentAccountStillMatches)
             {
                 ApplyLiveRateLimitSnapshots(result.Report);
                 UpdateQuotaLimitProfilesFromReport(result.Report);
@@ -2103,6 +2311,13 @@ public partial class Form1 : Form
                          ? !TryUpdateQuotaDetailInPlace(result.Report)
                          : !TryUpdateQuotaUsageInPlace(result.Report))))
                 {
+                    RenderCards();
+                }
+                else if (_activeView == WorkspaceView.AccountRotation)
+                {
+                    // The rotation rows now read the same effective UsageReport as the
+                    // quota workspace.  Repaint them when a background report arrives so
+                    // their 5h percentage/reset never lags behind the quota cards.
                     RenderCards();
                 }
             }
@@ -2200,9 +2415,18 @@ public partial class Form1 : Form
         foreach (var binding in bindings)
         {
             var account = _accounts.FirstOrDefault(candidate =>
-                candidate.Name.Equals(binding.AccountName, StringComparison.OrdinalIgnoreCase));
-            var usage = report.Accounts.FirstOrDefault(candidate =>
-                candidate.AccountName.Equals(binding.AccountName, StringComparison.OrdinalIgnoreCase));
+                QuotaAccountIdentity.CreateKey(candidate).Equals(
+                    binding.AccountKey,
+                    StringComparison.Ordinal));
+            // Rows created before identity binding (or a synthetic test fixture) may not
+            // carry a key. Keep the name fallback only for that legacy case; when a report
+            // contains keyed summaries, never fall back to another account with the same
+            // display name.
+            account ??= string.IsNullOrWhiteSpace(binding.AccountKey)
+                ? _accounts.FirstOrDefault(candidate =>
+                    candidate.Name.Equals(binding.AccountName, StringComparison.OrdinalIgnoreCase))
+                : null;
+            var usage = account == null ? null : FindUsageForAccount(report, account);
             if (account == null || usage == null)
             {
                 return false;
@@ -2244,11 +2468,10 @@ public partial class Form1 : Form
 
         var account = _accounts.FirstOrDefault(candidate =>
             candidate.Name.Equals(_selectedAccountName, StringComparison.OrdinalIgnoreCase));
-        var usage = report.Accounts.FirstOrDefault(candidate =>
-            candidate.AccountName.Equals(_selectedAccountName, StringComparison.OrdinalIgnoreCase));
+        var usage = account == null ? null : FindUsageForAccount(report, account);
         if (account == null || usage == null ||
             _cardsPanel.Controls[0].Tag is not QuotaUsageDetailBinding binding ||
-            !binding.AccountName.Equals(account.Name, StringComparison.OrdinalIgnoreCase))
+            !binding.AccountKey.Equals(QuotaAccountIdentity.CreateKey(account), StringComparison.Ordinal))
         {
             return false;
         }
@@ -2356,6 +2579,47 @@ public partial class Form1 : Form
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Resolves a report summary by the credential-directory identity.  A report produced by
+    /// older builds has no AccountKey, so it is still readable by name; once any keyed
+    /// summaries are present, a missing key is treated as a cache miss instead of risking a
+    /// cross-account quota display.
+    /// </summary>
+    private static AccountUsageSummary? FindUsageForAccount(
+        UsageReport report,
+        AccountRecord account)
+    {
+        var accountKey = QuotaAccountIdentity.CreateKey(account);
+        var keyed = report.Accounts.FirstOrDefault(summary =>
+            summary.AccountKey?.Equals(accountKey, StringComparison.Ordinal) == true);
+        if (keyed != null)
+        {
+            return keyed;
+        }
+
+        if (report.Accounts.Any(summary => !string.IsNullOrWhiteSpace(summary.AccountKey)))
+        {
+            return null;
+        }
+
+        return report.Accounts.FirstOrDefault(summary =>
+            summary.AccountName.Equals(account.Name, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private AccountRecord? FindAccountForUsage(AccountUsageSummary usage)
+    {
+        if (!string.IsNullOrWhiteSpace(usage.AccountKey))
+        {
+            return _accounts.FirstOrDefault(account =>
+                QuotaAccountIdentity.CreateKey(account).Equals(
+                    usage.AccountKey,
+                    StringComparison.Ordinal));
+        }
+
+        return _accounts.FirstOrDefault(account =>
+            account.Name.Equals(usage.AccountName, StringComparison.OrdinalIgnoreCase));
     }
 
     private static void SetLabelText(Label label, string text)
@@ -3014,6 +3278,7 @@ public partial class Form1 : Form
                 {
                     geometry.Primary,
                     geometry.Secondary,
+                    geometry.AccountStateBadge,
                     geometry.StatusBadge,
                     geometry.TokenBadge,
                     geometry.Check,
@@ -3023,10 +3288,13 @@ public partial class Form1 : Form
                         bounds.Width <= 0 ||
                         bounds.Height <= 0 ||
                         !rowBounds.Contains(bounds)) ||
+                    geometry.Primary.IntersectsWith(geometry.AccountStateBadge) ||
                     geometry.Primary.IntersectsWith(geometry.StatusBadge) ||
+                    geometry.AccountStateBadge.IntersectsWith(geometry.StatusBadge) ||
                     geometry.Secondary.IntersectsWith(geometry.Check) ||
                     geometry.StatusBadge.IntersectsWith(geometry.TokenBadge) ||
                     geometry.Check.IntersectsWith(geometry.Update) ||
+                    geometry.TokenBadge.Width < 264 ||
                     geometry.Update.Width - 24 < measuredTextWidth)
                 {
                     throw new InvalidOperationException(
@@ -3090,10 +3358,11 @@ public partial class Form1 : Form
             WorkspaceView.AccountSwitch => "选择账号并用 Codex++、Codex 或 CLI 启动。",
             WorkspaceView.UnifiedHistory => "查看、全文搜索和管理本地聊天。",
             WorkspaceView.StatusCheck => "检查登录状态并管理账号凭据。",
-            WorkspaceView.QuotaUsage => "本地用量估算与额度窗口。",
+            WorkspaceView.QuotaUsage => GetQuotaWorkspaceSubtitle(),
             WorkspaceView.AccountRotation => "配置账号参与范围与轮换顺序。",
             WorkspaceView.ThemeSettings => "选择、预览并应用 Codex 外观。",
             WorkspaceView.SystemConfig => "启动目录与项目设置。",
+            WorkspaceView.ProxyManagement => "管理代理节点，并为每个账号绑定独立出口。",
             _ => ""
         };
         var subtitleDetail = _activeView switch
@@ -3102,17 +3371,40 @@ public partial class Form1 : Form
             WorkspaceView.UnifiedHistory =>
                 "阅读本地聊天；分类经 Codex 官方目录接口并自动备份，不启动或登录 Codex++。",
             WorkspaceView.StatusCheck => "状态检查按账号单独执行；ChatGPT 登录、Access Token 与 API Key 均按账号目录隔离。",
-            WorkspaceView.QuotaUsage => "按官方返回显示 5h、周或月额度窗口；不会在后台轮流登录账号。",
+            WorkspaceView.QuotaUsage =>
+                "按账号凭据显示官方 5h、周或月额度窗口；不会在后台轮流登录账号。",
             WorkspaceView.AccountRotation => "使用池优先；全部不可用时进入备用池，并从上次使用位置继续。",
             WorkspaceView.ThemeSettings => "Codex 主题可以独立启用、应用或恢复，不影响账号与聊天记录。",
             WorkspaceView.SystemConfig => "项目根目录保存本地配置，启动目录用于打开 Codex。",
+            WorkspaceView.ProxyManagement => "账号绑定使用稳定 AccountKey；自动轮换时会随实际账号同步切换代理。",
             _ => _headerSubtitle.Text
         };
         _toolTip.SetToolTip(_headerSubtitle, subtitleDetail);
         if (_controlsRow != null)
         {
-            _controlsRow.Visible = _activeView is not WorkspaceView.ThemeSettings and
-                                   not WorkspaceView.SystemConfig;
+            _controlsRow.Visible = _activeView is not
+                (WorkspaceView.ThemeSettings or WorkspaceView.SystemConfig or WorkspaceView.ProxyManagement);
+        }
+        if (!_bulkQuotaTestButton.IsDisposed)
+        {
+            // The control is hosted by the first quota account-group header. It must never
+            // be shown over the hero artwork while switching workspaces or refreshing the
+            // page; once the header renderer has attached it, preserve visibility while a
+            // batch test updates its progress text.
+            _bulkQuotaTestButton.Visible = _activeView == WorkspaceView.QuotaUsage &&
+                                           _bulkQuotaTestButton.Parent is RoundedPanel;
+            _bulkQuotaTestButton.Text = _bulkQuotaTestInProgress
+                ? _bulkQuotaTestTotal > 0
+                    ? $"测试中 {_bulkQuotaTestCompleted}/{_bulkQuotaTestTotal}"
+                    : "测试中…"
+                : "一键测试全部账号";
+            _bulkQuotaTestButton.Enabled = !_bulkQuotaTestInProgress;
+            _bulkQuotaTestButton.AccessibleName = _bulkQuotaTestInProgress
+                ? $"正在一键测试全部账号（{_bulkQuotaTestCompleted}/{_bulkQuotaTestTotal}）"
+                : "一键测试全部账号";
+            _toolTip.SetToolTip(
+                _bulkQuotaTestButton,
+                "按当前显示/轮换顺序逐个使用各账号自己的凭据测试一次；不会切换桌面账号，不会关闭 Codex 或网关。兼容 API 账号没有官方 5h 重置接口，会标记为跳过。");
         }
         UpdateHeaderControlLayout();
         _searchBox.PlaceholderText = _activeView == WorkspaceView.UnifiedHistory
@@ -3132,6 +3424,14 @@ public partial class Form1 : Form
         }
     }
 
+    private string GetQuotaWorkspaceSubtitle()
+    {
+        var current = GetCurrentAccountRecord();
+        return current == null
+            ? "本地用量估算与额度窗口 · 当前使用：尚未启动账号。"
+            : $"本地用量估算与额度窗口 · 当前使用：{current.Name}";
+    }
+
     private static string GetWorkspaceTitle(WorkspaceView view)
     {
         return view switch
@@ -3143,6 +3443,7 @@ public partial class Form1 : Form
             WorkspaceView.AccountRotation => "账号轮换",
             WorkspaceView.ThemeSettings => "Codex 主题",
             WorkspaceView.SystemConfig => "系统配置",
+            WorkspaceView.ProxyManagement => "代理节点",
             _ => "账号工作台"
         };
     }
@@ -3156,6 +3457,7 @@ public partial class Form1 : Form
         ApplySidebarNavButton(_accountRotationNavButton, _activeView == WorkspaceView.AccountRotation);
         ApplySidebarNavButton(_themeSettingsNavButton, _activeView == WorkspaceView.ThemeSettings);
         ApplySidebarNavButton(_systemConfigNavButton, _activeView == WorkspaceView.SystemConfig);
+        ApplySidebarNavButton(_proxyManagementNavButton, _activeView == WorkspaceView.ProxyManagement);
     }
 
     private void ApplySidebarNavButton(Button button, bool selected)
@@ -3167,6 +3469,7 @@ public partial class Form1 : Form
             _ when ReferenceEquals(button, _accountRotationNavButton) => _palette.TertiaryAccentColor,
             _ when ReferenceEquals(button, _themeSettingsNavButton) => _palette.AccentColor,
             _ when ReferenceEquals(button, _systemConfigNavButton) => _palette.SecondaryAccentColor,
+            _ when ReferenceEquals(button, _proxyManagementNavButton) => _palette.TertiaryAccentColor,
             _ => _palette.AccentColor
         };
         button.FlatStyle = FlatStyle.Flat;
@@ -3457,6 +3760,23 @@ public partial class Form1 : Form
 
         var available = Math.Max(260, _controlsRow.ClientSize.Width - _controlsRow.Padding.Horizontal);
         _searchShell.Width = Math.Max(260, Math.Min(500, available));
+
+        // The bulk action is anchored in the hero's upper-right corner.  Reposition it on
+        // every resize (including per-monitor DPI changes) so its complete caption never
+        // gets clipped by the meteor artwork or the window edge.
+        if (_headerPanel is { IsDisposed: false } header &&
+            _bulkQuotaTestButton is { IsDisposed: false } &&
+            ReferenceEquals(_bulkQuotaTestButton.Parent, header))
+        {
+            const int rightInset = 28;
+            const int top = 8;
+            // Reserve enough room for the full caption at the current DPI.  The
+            // old 178–214px range produced an ellipsis on normal 125% displays.
+            var buttonWidth = Math.Min(340, Math.Max(300, header.ClientSize.Width / 4));
+            var left = Math.Max(12, header.ClientSize.Width - rightInset - buttonWidth);
+            _bulkQuotaTestButton.SetBounds(left, top, buttonWidth, 46);
+            _bulkQuotaTestButton.BringToFront();
+        }
     }
 
     private async Task CheckForUpdatesAsync(bool manual)
@@ -3732,6 +4052,7 @@ public partial class Form1 : Form
             _quotaUsageCache = null;
         }
         SyncCurrentAccountSelection(persistCurrentAccountSelection);
+        _proxySidebar?.SetAccounts(_accounts, _selectedAccountName);
         _usageTracker.EnsureCurrentAccountTracking(GetCurrentAccountRecord());
         RenderCards();
         if (_activeView == WorkspaceView.QuotaUsage)
@@ -3837,6 +4158,28 @@ public partial class Form1 : Form
             return;
         }
 
+        // With the local gateway enabled, the shared desktop auth profile is the
+        // transport credential, not necessarily the logical account that paid the last
+        // model request.  On startup (before the gateway activity snapshot has been
+        // recovered) preferring that profile would overwrite a remembered 158/152/etc.
+        // selection with whichever transport account happened to be used by the previous
+        // request.  Keep the user's persisted logical account stable; the gateway
+        // success marker will retarget it later only after a completed response.
+        var rememberedLogical = _accounts.FirstOrDefault(account =>
+            account.Name.Equals(_currentAccountName, StringComparison.OrdinalIgnoreCase));
+        if (AccountRotationConfiguration.IsEnabled(_appSettings) &&
+            _appSettings.PatGatewayEnabled &&
+            rememberedLogical != null &&
+            AccountRotationConfiguration.GetPool(_appSettings, rememberedLogical) !=
+                AccountRotationPool.None)
+        {
+            SetCurrentAccount(
+                rememberedLogical.Name,
+                false,
+                persistSettings: persistSettings);
+            return;
+        }
+
         // appsettings is only a hint after a reboot or an external login. The shared
         // profile on disk is authoritative and can be compared without any network call.
         var matchingProfiles = _accounts
@@ -3865,9 +4208,7 @@ public partial class Form1 : Form
         // reboot, while the client is closed, or for a compatible API profile), retain
         // the last account explicitly launched by this manager. This keeps the current
         // account marker and current-first ordering stable without any network request.
-        var remembered = _accounts.FirstOrDefault(account =>
-            account.Name.Equals(_currentAccountName, StringComparison.OrdinalIgnoreCase));
-        SetCurrentAccount(remembered?.Name, false, persistSettings: persistSettings);
+        SetCurrentAccount(rememberedLogical?.Name, false, persistSettings: persistSettings);
     }
 
     private void RenderCards()
@@ -3895,6 +4236,12 @@ public partial class Form1 : Form
         ApplyDetailViewportMode();
         _cardsPanel.SuspendLayout();
         DetachPersistentSystemConfigControls();
+        DetachPersistentControl(_proxySidebar);
+        // This button is a persistent field but its parent is recreated with the quota
+        // group header on every render. Detach it before disposing old cards so the
+        // persistent control is not disposed together with the previous header.
+        DetachPersistentControl(_bulkQuotaTestButton);
+        _bulkQuotaTestButton.Visible = false;
         foreach (var oldControl in _cardsPanel.Controls.Cast<Control>().ToArray())
         {
             oldControl.Dispose();
@@ -3940,6 +4287,30 @@ public partial class Form1 : Form
             else
             {
                 RenderUnifiedHistory(query, workspaceWidth, _unifiedHistoryCache);
+            }
+            _cardsPanel.ResumeLayout();
+            return;
+        }
+
+        if (_activeView == WorkspaceView.ProxyManagement)
+        {
+            if (_proxySidebar != null)
+            {
+                // FlowLayoutPanel calculates a zero-width bounds rectangle for a child
+                // docked to Top while using TopDown/no-wrap flow.  The controls still get
+                // native handles, but they are painted behind the left navigation rail,
+                // which makes this workspace appear completely blank.  Treat the proxy
+                // workspace like every other card in this list: give it an explicit width
+                // and let the flow panel own only its vertical position.
+                _proxySidebar.Dock = DockStyle.None;
+                _proxySidebar.Margin = Padding.Empty;
+                _proxySidebar.AutoSize = false;
+                _proxySidebar.Width = Math.Max(320, workspaceWidth);
+                _proxySidebar.Height = Math.Max(820, _cardsPanel.ClientSize.Height - 4);
+                _proxySidebar.Visible = true;
+                _proxySidebar.SetAccounts(_accounts, _selectedAccountName);
+                _cardsPanel.Controls.Add(_proxySidebar);
+                _proxySidebar.BringToFront();
             }
             _cardsPanel.ResumeLayout();
             return;
@@ -4003,17 +4374,30 @@ public partial class Form1 : Form
 
         if (_activeView == WorkspaceView.QuotaUsage && _showAccountDetail)
         {
-            var usage = usageReport!.Accounts.First(summary => summary.AccountName.Equals(selectedAccount.Name, StringComparison.OrdinalIgnoreCase));
+            var usage = FindUsageForAccount(usageReport!, selectedAccount) ??
+                        new AccountUsageSummary
+                        {
+                            AccountName = selectedAccount.Name,
+                            AccountKey = QuotaAccountIdentity.CreateKey(selectedAccount)
+                        };
             _cardsPanel.Controls.Add(CreateQuotaUsageDetailCard(selectedAccount, usage, workspaceWidth));
             _cardsPanel.ResumeLayout();
             return;
         }
 
+        var bulkQuotaActionAttached = false;
         foreach (var group in BuildAccountGroups(visible, usageReport))
         {
             var groupRows = new List<Control>(group.Accounts.Count);
             var collapsed = IsAccountGroupCollapsed(group.Key);
-            _cardsPanel.Controls.Add(CreateAccountGroupHeader(group, workspaceWidth, groupRows));
+            var showBulkQuotaAction = _activeView == WorkspaceView.QuotaUsage &&
+                                      !bulkQuotaActionAttached;
+            _cardsPanel.Controls.Add(CreateAccountGroupHeader(
+                group,
+                workspaceWidth,
+                groupRows,
+                showBulkQuotaAction));
+            bulkQuotaActionAttached |= showBulkQuotaAction;
             PumpHeaderAnimationFrame();
 
             foreach (var account in group.Accounts)
@@ -4023,7 +4407,12 @@ public partial class Form1 : Form
                     WorkspaceView.StatusCheck => CreateStatusTokenRow(account, workspaceWidth),
                     WorkspaceView.QuotaUsage => CreateQuotaUsageRow(
                         account,
-                        usageReport!.Accounts.First(summary => summary.AccountName.Equals(account.Name, StringComparison.OrdinalIgnoreCase)),
+                        FindUsageForAccount(usageReport!, account) ??
+                        new AccountUsageSummary
+                        {
+                            AccountName = account.Name,
+                            AccountKey = QuotaAccountIdentity.CreateKey(account)
+                        },
                         workspaceWidth),
                     _ => CreateAccountSwitchRow(account, workspaceWidth)
                 };
@@ -4091,7 +4480,7 @@ public partial class Form1 : Form
         var compact = (_showAccountDetail &&
                        _activeView is WorkspaceView.AccountSwitch or WorkspaceView.QuotaUsage) ||
                       (_showCodexAppearanceDetail && _activeView == WorkspaceView.ThemeSettings) ||
-                      _activeView == WorkspaceView.SystemConfig;
+                      _activeView is WorkspaceView.SystemConfig or WorkspaceView.ProxyManagement;
         // Every workspace uses one stable hero footprint. Hiding the search row on a
         // detail page must not resize the starfield banner or shift the page below it.
         _contentLayout.RowStyles[0].Height = WorkspaceHeroHeight;
@@ -4105,13 +4494,63 @@ public partial class Form1 : Form
         IReadOnlyList<AccountRecord> accounts,
         UsageReport? usageReport = null)
     {
-        List<AccountRecord> CurrentFirst(IEnumerable<AccountRecord> source) =>
-            source.OrderByDescending(IsCurrentAccount).ToList();
+        // The quota page is a view of the rotation ring, not a second scheduler.  Build
+        // one immutable rank map for this render so every quota category follows the same
+        // circular order.  The helper reads the saved primary/backup order and anchors it
+        // at the account that is actually serving requests (3,4,5,6,7,8,1,2), without
+        // changing cursors or performing any quota/credential operation.
+        var currentAccountKey = GetCurrentAccountRecord() is { } currentAccount
+            ? QuotaAccountIdentity.CreateKey(currentAccount)
+            : null;
+        var quotaDisplayOrder = (_activeView is WorkspaceView.QuotaUsage or WorkspaceView.AccountSwitch) &&
+                AccountRotationConfiguration.IsEnabled(_appSettings)
+            ? AccountRotationConfiguration.GetQuotaDisplayOrder(
+                _appSettings,
+                _accounts,
+                currentAccountKey)
+            : Array.Empty<AccountRecord>();
+        var displayRank = quotaDisplayOrder
+            .Select((account, index) =>
+                new KeyValuePair<string, int>(QuotaAccountIdentity.CreateKey(account), index))
+            .GroupBy(pair => pair.Key, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.First().Value, StringComparer.Ordinal);
+        var sourceRank = _accounts
+            .Select((account, index) =>
+                new KeyValuePair<string, int>(QuotaAccountIdentity.CreateKey(account), index))
+            .GroupBy(pair => pair.Key, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.First().Value, StringComparer.Ordinal);
+
+        int DisplayRank(AccountRecord account)
+        {
+            var key = QuotaAccountIdentity.CreateKey(account);
+            return displayRank.TryGetValue(key, out var rank)
+                ? rank
+                : int.MaxValue;
+        }
+
+        List<AccountRecord> CurrentFirst(IEnumerable<AccountRecord> source)
+        {
+            var list = source.ToList();
+            if (displayRank.Count == 0)
+            {
+                // Keep the established non-rotation behavior and its current-account
+                // emphasis when the feature is disabled or no ring is configured.
+                return list.OrderByDescending(IsCurrentAccount).ToList();
+            }
+
+            return list
+                .OrderBy(DisplayRank)
+                .ThenBy(account =>
+                {
+                    var key = QuotaAccountIdentity.CreateKey(account);
+                    return sourceRank.TryGetValue(key, out var rank) ? rank : int.MaxValue;
+                })
+                .ToList();
+        }
 
         string EffectiveQuotaLimitType(AccountRecord account)
         {
-            var usage = usageReport?.Accounts.FirstOrDefault(summary =>
-                summary.AccountName.Equals(account.Name, StringComparison.OrdinalIgnoreCase));
+            var usage = usageReport == null ? null : FindUsageForAccount(usageReport, account);
             return usage == null
                 ? account.QuotaLimitType
                 : ResolveQuotaLimitType(account, usage);
@@ -4148,6 +4587,9 @@ public partial class Form1 : Form
 
         return groups
             .OrderByDescending(group => group.Accounts.Any(IsCurrentAccount))
+            .ThenBy(group => group.Accounts.Count == 0
+                ? int.MaxValue
+                : group.Accounts.Min(DisplayRank))
             .ToList();
     }
 
@@ -4171,7 +4613,8 @@ public partial class Form1 : Form
     private Control CreateAccountGroupHeader(
         AccountGroupSection group,
         int width,
-        IReadOnlyList<Control> groupRows)
+        IReadOnlyList<Control> groupRows,
+        bool showBulkQuotaAction = false)
     {
         var collapsed = IsAccountGroupCollapsed(group.Key);
         var accent = GetAccountGroupAccent(group.Key);
@@ -4181,6 +4624,9 @@ public partial class Form1 : Form
         const int headerGap = 8;
         var toggleLeft = width - rightPadding - toggleWidth;
         var countLeft = toggleLeft - headerGap - countWidth;
+        const int bulkActionWidth = 218;
+        var bulkActionLeft = countLeft - headerGap - bulkActionWidth;
+        var titleRight = showBulkQuotaAction ? bulkActionLeft : countLeft;
         var panel = new RoundedPanel
         {
             Width = width,
@@ -4203,7 +4649,7 @@ public partial class Form1 : Form
             Text = group.Title,
             Left = 20,
             Top = 4,
-            Width = Math.Max(160, countLeft - 32),
+            Width = Math.Max(160, titleRight - 32),
             Height = 40,
             Font = new Font(Font.FontFamily, 9.6F, FontStyle.Bold),
             TextAlign = ContentAlignment.MiddleLeft,
@@ -4223,6 +4669,29 @@ public partial class Form1 : Form
         count.Height = 28;
         count.Cursor = Cursors.Hand;
         panel.Controls.Add(count);
+
+        if (showBulkQuotaAction)
+        {
+            // Reparent the persistent action only after the old card tree has been
+            // detached. This keeps its click handler/progress state while ensuring the
+            // button is aligned with the count and collapse controls rather than the hero.
+            _bulkQuotaTestButton.Parent?.Controls.Remove(_bulkQuotaTestButton);
+            _bulkQuotaTestButton.SetBounds(bulkActionLeft, 7, bulkActionWidth, 36);
+            _bulkQuotaTestButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            _bulkQuotaTestButton.Width = bulkActionWidth;
+            _bulkQuotaTestButton.Height = 36;
+            _bulkQuotaTestButton.Radius = 18;
+            _bulkQuotaTestButton.Padding = new Padding(14, 0, 14, 0);
+            _bulkQuotaTestButton.Font = new Font(Font.FontFamily, 8.8F, FontStyle.Bold);
+            _bulkQuotaTestButton.MinimumFontSize = 8F;
+            _bulkQuotaTestButton.AutoShrinkText = true;
+            _bulkQuotaTestButton.TextAlign = ContentAlignment.MiddleCenter;
+            _bulkQuotaTestButton.Tag = "quota-bulk-primary";
+            _bulkQuotaTestButton.Visible = true;
+            _bulkQuotaTestButton.BringToFront();
+            ApplyQuotaBulkTestButtonStyle(_bulkQuotaTestButton);
+            panel.Controls.Add(_bulkQuotaTestButton);
+        }
 
         var toggle = MakeAccountGroupToggleButton(collapsed, toggleLeft, 7);
         toggle.AccessibleName = collapsed ? "展开分组" : "收起分组";
@@ -5236,7 +5705,8 @@ public partial class Form1 : Form
             geometry.Create.Left,
             geometry.Create.Top,
             geometry.Create.Width,
-            iconText: "＋");
+            iconText: "＋",
+            prominent: true);
         create.Height = geometry.Create.Height;
         create.Click += async (_, _) => await CreateUnifiedHistorySectionAsync();
         panel.Controls.Add(create);
@@ -7969,6 +8439,7 @@ public partial class Form1 : Form
         }
 
         _selectedAccountName = accountName;
+        _proxySidebar?.SetAccounts(_accounts, _selectedAccountName);
         if (detailView)
         {
             _showAccountDetail = true;
@@ -8004,6 +8475,13 @@ public partial class Form1 : Form
         bool recordUsageSwitch = false,
         bool persistSettings = true)
     {
+        var previousAccountName = _currentAccountName;
+        var selectionFollowedPreviousCurrent =
+            string.IsNullOrWhiteSpace(_selectedAccountName) ||
+            string.Equals(
+                _selectedAccountName,
+                previousAccountName,
+                StringComparison.OrdinalIgnoreCase);
         var normalizedAccountName = string.IsNullOrWhiteSpace(accountName) ? null : accountName;
         var accountChanged = !string.Equals(
             _currentAccountName,
@@ -8012,6 +8490,21 @@ public partial class Form1 : Form
         if (accountChanged)
         {
             ClearWorkspaceViewCache();
+            // The local usage report contains account-attribution boundaries.  A current
+            // account change is therefore a real report boundary even when it was observed
+            // by the gateway, recovered after a restart, or synchronized from the shared
+            // profile rather than created by the explicit launch button.  Keeping the old
+            // report here was the reason a newly selected 158 account could briefly show the
+            // preceding account's amount/status until an unrelated log append arrived.
+            InvalidateQuotaUsageCache(clearCachedData: true);
+            Interlocked.Exchange(ref _usageLogDirty, 1);
+            if (selectionFollowedPreviousCurrent && normalizedAccountName != null)
+            {
+                // A detail card opened for the current account should follow an actual
+                // account switch.  If the user deliberately opened another account's detail,
+                // preserve that independent viewing choice.
+                _selectedAccountName = normalizedAccountName;
+            }
         }
         _currentAccountName = normalizedAccountName;
         _appSettings.CurrentAccountName = _currentAccountName;
@@ -8022,7 +8515,21 @@ public partial class Form1 : Form
         if (recordUsageSwitch && accountChanged)
         {
             _usageTracker.RecordSwitch(GetCurrentAccountRecord());
-            InvalidateQuotaUsageCache(clearCachedData: false);
+        }
+
+        if (accountChanged && !_formClosed && !IsDisposed)
+        {
+            // Replace any previous account-specific diagnostic (in particular an old 429
+            // message) immediately.  The gateway/activity reconciler may provide a more
+            // precise message a moment later, but it must never leave the old account name
+            // in the status bar while the new quota report is loading.
+            _statusBox.Text = normalizedAccountName == null
+                ? "当前账号已清除，正在刷新额度…"
+                : $"当前账号已切换到：{normalizedAccountName}；正在刷新官方额度…";
+            if (_activeView == WorkspaceView.QuotaUsage)
+            {
+                _ = RefreshQuotaUsageAsync(force: true, _workspaceLoadGeneration);
+            }
         }
 
         if (render)
@@ -8452,6 +8959,9 @@ public partial class Form1 : Form
         var authReady = HasUsableAccountCredential(account);
         var stateText = GetCredentialStateText(account, authReady);
         var detailText = GetCredentialModelText(account);
+        var accountDisplayName = string.IsNullOrWhiteSpace(account.Name)
+            ? "未命名账号"
+            : account.Name.Trim();
         var detailTip = account.IsOfficialOAuth
             ? $"账号目录：{account.CodexHome}；由官方 Codex 自动续期 ChatGPT 登录"
             : account.IsCompatibleApi
@@ -8478,35 +8988,64 @@ public partial class Form1 : Form
 
         var primary = new Label
         {
-            Text = $"{account.Name}  ·  {stateText}",
+            // Match the account-switch page: the display name is the visual anchor,
+            // while credential/auth details live on the secondary line. Previously the
+            // name was embedded in a muted sentence beginning with “账号信息：”, which
+            // made the currently selected account hard to spot at a glance.
+            Text = accountDisplayName,
+            Name = "AccountDisplayName",
             Bounds = geometry.Primary,
-            Font = new Font(Font.FontFamily, 9.7F, FontStyle.Bold),
+            Font = new Font(Font.FontFamily, 10F, FontStyle.Bold),
             AutoEllipsis = true,
+            AutoSize = false,
+            Visible = true,
+            ForeColor = _palette.TextColor,
             TextAlign = ContentAlignment.MiddleLeft,
             UseCompatibleTextRendering = true,
             UseMnemonic = false,
             Cursor = Cursors.Hand
         };
         ThemeStyler.ApplyLabel(primary, _palette);
-        _toolTip.SetToolTip(primary, $"{account.Name} · {stateText}");
+        _toolTip.SetToolTip(primary, $"账号：{accountDisplayName} · {stateText}");
         primary.Click += (_, _) => SelectAccount(account.Name);
         row.Controls.Add(primary);
 
         var secondary = new Label
         {
-            Text = $"{account.AuthKindLabel}  ·  {detailText}",
+            // Keep the same two-line hierarchy as the account-switch row. The complete
+            // credential/model description remains available in the tooltip and the
+            // account name above is now the prominent, immediately recognizable label.
+            Text = $"{account.AuthKindLabel}  ·  {stateText}  ·  {detailText}",
+            Name = "AccountCredentialSummary",
             Bounds = geometry.Secondary,
             Font = new Font(Font.FontFamily, 8.5F),
             AutoEllipsis = true,
+            AutoSize = false,
+            Visible = true,
+            ForeColor = _palette.MutedTextColor,
             TextAlign = ContentAlignment.MiddleLeft,
             UseCompatibleTextRendering = true,
             UseMnemonic = false,
             Cursor = Cursors.Hand
         };
         ThemeStyler.ApplyLabel(secondary, _palette, true);
-        _toolTip.SetToolTip(secondary, $"{account.AuthKindLabel} · {detailTip}");
+        _toolTip.SetToolTip(
+            secondary,
+            $"账号信息：{accountDisplayName} · {account.AuthKindLabel} · {detailTip}");
         secondary.Click += (_, _) => SelectAccount(account.Name);
         row.Controls.Add(secondary);
+
+        // Reuse the exact current-account badge from the account-switch page. Besides
+        // making the two pages visually consistent, this removes the need to infer the
+        // active account from the thin accent line on the card.
+        var accountStateBadge = MakeAccountStateBadge(
+            account,
+            geometry.AccountStateBadge.Left,
+            geometry.AccountStateBadge.Top);
+        accountStateBadge.Size = geometry.AccountStateBadge.Size;
+        accountStateBadge.Cursor = Cursors.Hand;
+        accountStateBadge.Click += (_, _) => SelectAccount(account.Name);
+        row.Controls.Add(accountStateBadge);
 
         var statusBadge = MakeBadge(
             $"{(status == null ? "○" : "●")}  {GetStatusBadgeText(status)}",
@@ -8519,11 +9058,11 @@ public partial class Form1 : Form
         _toolTip.SetToolTip(statusBadge, status == null ? "尚未检查登录状态" : status.Text);
         row.Controls.Add(statusBadge);
 
-        var fingerprintToggle = MakeFingerprintForwardingToggle(
+        var fingerprintMode = MakeFingerprintModePicker(
             account,
             geometry.TokenBadge,
             row.BackColor);
-        row.Controls.Add(fingerprintToggle);
+        row.Controls.Add(fingerprintMode);
 
         var check = MakeStatusCheckButton(
             geometry.Check.Left,
@@ -8542,83 +9081,83 @@ public partial class Form1 : Form
         update.Click += async (_, _) => await UpdateTokenAsync(account);
         row.Controls.Add(update);
 
+        // Native combo boxes and owner-drawn badges can change their window z-order after
+        // creation.  Keep both identity labels above the card surface so an account name is
+        // never hidden when the fingerprint picker creates its native handle.
+        primary.BringToFront();
+        secondary.BringToFront();
+        accountStateBadge.BringToFront();
+
         return row;
     }
 
-    private ModernToggleSwitch MakeFingerprintForwardingToggle(
+    private Control MakeFingerprintModePicker(
         AccountRecord account,
         Rectangle bounds,
         Color backgroundColor)
     {
         _appSettings.CodexFingerprintForwarding ??= new Dictionary<string, bool>(
             StringComparer.Ordinal);
-        var enabled = AccountRotationConfiguration.IsFingerprintForwardingEnabled(
+        _appSettings.CodexFingerprintModes ??= new Dictionary<string, string>(
+            StringComparer.Ordinal);
+        _appSettings.CodexFingerprintSeeds ??= new Dictionary<string, string>(
+            StringComparer.Ordinal);
+        var previousMode = AccountRotationConfiguration.GetFingerprintMode(
             _appSettings,
             account);
-        var toggle = new ModernToggleSwitch
+        var picker = new ThemedComboBox
         {
             Bounds = bounds,
-            Text = "指纹透传",
-            Checked = enabled,
-            UseTextEllipsis = false,
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            IntegralHeight = false,
+            DropDownHeight = 180,
+            DropDownWidth = Math.Max(bounds.Width, 288),
             BackColor = backgroundColor,
             Font = new Font(Font.FontFamily, 8.5F, FontStyle.Bold),
-            AccessibleName = $"{account.Name} Codex 指纹透传"
+            AccessibleName = $"{account.Name} Codex 指纹模式"
         };
-        ApplyFingerprintForwardingToggleStyle(toggle);
-        _toolTip.SetToolTip(
-            toggle,
-            "仅在该账号经本地网关转发时，透传明确白名单内的 Codex 客户端元数据。" +
-            "Authorization、Cookie、ChatGPT 账号和工作区身份头始终不会跨账号透传；" +
-            "兼容 API 还会移除 attestation 与内部身份元数据。官方 OAuth 原生直连时不受此设置影响。");
-
-        toggle.Click += (_, _) =>
+        var options = new List<FingerprintModeOption>
         {
-            var previous = AccountRotationConfiguration.IsFingerprintForwardingEnabled(
-                _appSettings,
-                account);
-            if (toggle.Checked == previous)
+            new(CodexFingerprintMode.GatewayDefault, "指纹：网关默认"),
+            new(CodexFingerprintMode.Passthrough, "指纹：不收敛（透传）"),
+            new(CodexFingerprintMode.Device, "指纹：设备收敛"),
+            new(CodexFingerprintMode.Session, "指纹：会话收敛"),
+            new(CodexFingerprintMode.Full, "指纹：完全收敛")
+        };
+        picker.Items.AddRange(options.Cast<object>().ToArray());
+        var initialOption = options.FirstOrDefault(option => option.Mode == previousMode) ?? options[0];
+        previousMode = initialOption.Mode;
+        picker.SelectedItem = initialOption;
+        ThemeStyler.ApplyComboBox(picker, _palette);
+        _toolTip.SetToolTip(
+            picker,
+            "仅对经本地网关转发的请求生效。网关默认沿用旧版客户端元数据过滤；" +
+            "不收敛会转发网关允许的指纹字段但不改写；设备收敛只按账号稳定 installation；" +
+            "会话收敛还固定账号 session，并按客户端 session 派生 thread；" +
+            "完全收敛会把 thread/window 也收敛到账号 session。可安全解析时，请求头和 JSON 请求体使用同一计划；" +
+            "身份头始终隔离，兼容 API 仍移除 attestation 与内部身份元数据。");
+
+        picker.SelectionChangeCommitted += (_, _) =>
+        {
+            if (picker.SelectedItem is not FingerprintModeOption selected ||
+                selected.Mode == previousMode)
             {
                 return;
             }
 
-            AccountRotationConfiguration.ToggleFingerprintForwarding(_appSettings, account);
+            AccountRotationConfiguration.SetFingerprintMode(_appSettings, account, selected.Mode);
             if (!TrySaveAppSettings(out var error))
             {
-                AccountRotationConfiguration.ToggleFingerprintForwarding(_appSettings, account);
-                toggle.Checked = previous;
-                ApplyFingerprintForwardingToggleStyle(toggle);
-                _statusBox.Text = "指纹透传设置未保存：" + error;
+                AccountRotationConfiguration.SetFingerprintMode(_appSettings, account, previousMode);
+                picker.SelectedItem = options.First(option => option.Mode == previousMode);
+                _statusBox.Text = "指纹模式未保存：" + error;
                 return;
             }
 
-            ApplyFingerprintForwardingToggleStyle(toggle);
-            _statusBox.Text = toggle.Checked
-                ? $"已为 {account.Name} 开启安全指纹透传；仅使用客户端元数据白名单。"
-                : $"已为 {account.Name} 关闭指纹透传；后续请求使用网关默认客户端元数据。";
+            previousMode = selected.Mode;
+            _statusBox.Text = $"已将 {account.Name} 的指纹模式设为 {selected.Label.Replace("指纹：", "", StringComparison.Ordinal)}。";
         };
-        return toggle;
-    }
-
-    private void ApplyFingerprintForwardingToggleStyle(ModernToggleSwitch toggle)
-    {
-        var dark = ThemeStyler.IsDark(_palette);
-        toggle.OnTrackColor = _palette.SuccessColor;
-        toggle.OffTrackColor = UiDesign.Blend(
-            _palette.BorderColor,
-            _palette.MutedTextColor,
-            dark ? 0.38F : 0.24F);
-        toggle.KnobColor = dark
-            ? UiDesign.Blend(_palette.TextColor, Color.White, 0.12F)
-            : Color.White;
-        toggle.TextColor = toggle.Enabled
-            ? toggle.Checked ? _palette.SuccessColor : _palette.MutedTextColor
-            : _palette.MutedTextColor;
-        toggle.BorderColor = UiDesign.Blend(
-            _palette.BorderColor,
-            toggle.Checked ? _palette.SuccessColor : _palette.MutedTextColor,
-            0.32F);
-        toggle.Invalidate();
+        return picker;
     }
 
     private StatusTokenRowGeometry CalculateStatusTokenRowGeometry(int width) =>
@@ -8648,10 +9187,10 @@ public partial class Form1 : Form
     {
         const int side = 18;
         const int gap = 10;
+        const int accountStateBadgeWidth = 132;
         const int statusBadgeWidth = 148;
-        // Give the fingerprint label a little more breathing room so the
-        // complete “指纹透传” caption and switch track remain visible together.
-        const int fingerprintBadgeWidth = 172;
+        // The five-mode fingerprint picker needs enough room for its complete label.
+        const int fingerprintBadgeWidth = 264;
         var actionWidth = Math.Clamp(measuredActionWidth, 184, 288);
         var badgeRowWidth = statusBadgeWidth + fingerprintBadgeWidth + gap;
         var actionRowWidth = (actionWidth * 2) + gap;
@@ -8660,29 +9199,62 @@ public partial class Form1 : Form
         var narrow = width < Math.Max(900, minimumWideWidth);
         if (narrow)
         {
-            var halfWidth = Math.Max(120, (width - side * 2 - gap) / 2);
+            var innerWidth = width - side * 2;
+            var actionHalfWidth = Math.Max(120, (innerWidth - gap) / 2);
+            var narrowFingerprintWidth = Math.Min(
+                fingerprintBadgeWidth,
+                Math.Max(120, innerWidth - gap - statusBadgeWidth));
+            var narrowStatusWidth = Math.Max(
+                120,
+                innerWidth - gap - narrowFingerprintWidth);
             return new StatusTokenRowGeometry(
-                178,
-                new Rectangle(side, 10, width - side * 2, 32),
-                new Rectangle(side, 44, width - side * 2, 30),
-                new Rectangle(side, 84, halfWidth, 30),
-                new Rectangle(side + halfWidth + gap, 84, halfWidth, 30),
-                new Rectangle(side, 124, halfWidth, 38),
-                new Rectangle(side + halfWidth + gap, 124, halfWidth, 38));
+                192,
+                // Match the 38 px account-name line used by CreateAccountSwitchRow.
+                // The previous 32 px rectangle clipped the entire 10 pt bold label on
+                // high-DPI desktops even though the smaller secondary line remained visible.
+                new Rectangle(
+                    side,
+                    10,
+                    innerWidth - gap - accountStateBadgeWidth,
+                    38),
+                new Rectangle(side, 52, innerWidth, 32),
+                new Rectangle(
+                    side + innerWidth - accountStateBadgeWidth,
+                    12,
+                    accountStateBadgeWidth,
+                    34),
+                new Rectangle(side, 96, narrowStatusWidth, 32),
+                new Rectangle(
+                    side + narrowStatusWidth + gap,
+                    96,
+                    narrowFingerprintWidth,
+                    32),
+                new Rectangle(side, 140, actionHalfWidth, 38),
+                new Rectangle(
+                    side + actionHalfWidth + gap,
+                    140,
+                    actionHalfWidth,
+                    38));
         }
 
         var rightLeft = width - side - rightWidth;
         var badgeLeft = width - side - badgeRowWidth;
         var actionLeft = width - side - actionRowWidth;
         var summaryWidth = Math.Max(220, rightLeft - side - gap);
+        var accountStateBadgeLeft = rightLeft - gap - accountStateBadgeWidth;
         return new StatusTokenRowGeometry(
-            104,
-            new Rectangle(side, 10, summaryWidth, 32),
-            new Rectangle(side, 46, summaryWidth, 30),
-            new Rectangle(badgeLeft, 10, statusBadgeWidth, 30),
-            new Rectangle(badgeLeft + statusBadgeWidth + gap, 10, fingerprintBadgeWidth, 30),
-            new Rectangle(actionLeft, 52, actionWidth, 38),
-            new Rectangle(actionLeft + actionWidth + gap, 52, actionWidth, 38));
+            112,
+            new Rectangle(
+                side,
+                10,
+                Math.Max(120, accountStateBadgeLeft - side - gap),
+                38),
+            new Rectangle(side, 54, summaryWidth, 32),
+            new Rectangle(accountStateBadgeLeft, 12, accountStateBadgeWidth, 34),
+            new Rectangle(badgeLeft, 10, statusBadgeWidth, 32),
+            new Rectangle(badgeLeft + statusBadgeWidth + gap, 10, fingerprintBadgeWidth, 32),
+            new Rectangle(actionLeft, 60, actionWidth, 38),
+            new Rectangle(actionLeft + actionWidth + gap, 60, actionWidth, 38));
     }
 
     private Control CreateTokenRow(AccountRecord account, int width)
@@ -8879,31 +9451,54 @@ public partial class Form1 : Form
         IReadOnlyList<AccountRecord> accounts,
         IReadOnlyDictionary<string, LiveRateLimitSnapshot> snapshots)
     {
+        var accountsByKey = accounts
+            .Where(account => !string.IsNullOrWhiteSpace(account.CodexHome))
+            .GroupBy(QuotaAccountIdentity.CreateKey, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.First(), StringComparer.Ordinal);
         var accountKeysByName = accounts.ToDictionary(
             account => account.Name,
             QuotaAccountIdentity.CreateKey,
             StringComparer.OrdinalIgnoreCase);
         foreach (var usage in report.Accounts)
         {
-            if (!accountKeysByName.TryGetValue(usage.AccountName, out var accountKey) ||
+            // A keyed summary is authoritative.  Do not remap it by a stale display name
+            // after an account rename/reorder; that was the remaining path that could put
+            // one account's official reset time on another account's card.
+            var hasSummaryKey = !string.IsNullOrWhiteSpace(usage.AccountKey);
+            var accountKey = usage.AccountKey;
+            if (!hasSummaryKey &&
+                !accountKeysByName.TryGetValue(usage.AccountName, out accountKey))
+            {
+                continue;
+            }
+            if (accountKey == null ||
+                !accountsByKey.ContainsKey(accountKey) ||
                 !snapshots.TryGetValue(accountKey, out var snapshot))
             {
                 continue;
             }
 
+            usage.AccountKey = accountKey;
+
             // This is the latest persisted official observation for the account, not a
             // short-lived UI cache.  Its wall-clock age must not make a later restart fall
             // back to an older rollout-log value.  ApplyLiveRateLimitSnapshot compares
             // ObservedAtUtc, so a genuinely newer official log still wins.
-            ApplyLiveRateLimitSnapshot(usage, snapshot);
+            var hasForeignWindowMatch = HasForeignQuotaWindowMatch(
+                usage,
+                accountKey,
+                snapshots);
+            ApplyLiveRateLimitSnapshot(usage, snapshot, hasForeignWindowMatch);
         }
     }
 
     private static void ApplyLiveRateLimitSnapshot(
         AccountUsageSummary usage,
-        LiveRateLimitSnapshot snapshot)
+        LiveRateLimitSnapshot snapshot,
+        bool forceConflictingWindow = false)
     {
-        var snapshotIsNotOlder = !usage.RateLimitObservedAtUtc.HasValue ||
+        var snapshotIsNotOlder = forceConflictingWindow ||
+                                 !usage.RateLimitObservedAtUtc.HasValue ||
                                  snapshot.ObservedAtUtc >= usage.RateLimitObservedAtUtc.Value;
         var hasPrimarySnapshot = snapshot.UsedPercent.HasValue ||
                                  snapshot.WindowMinutes.HasValue ||
@@ -8911,16 +9506,16 @@ public partial class Form1 : Form
         var hasSecondarySnapshot = snapshot.SecondaryUsedPercent.HasValue ||
                                    snapshot.SecondaryWindowMinutes.HasValue ||
                                    snapshot.SecondaryResetsAtUtc.HasValue;
-        var primaryApplied = hasPrimarySnapshot && !LiveQuotaWindowConflicts(
+        var primaryApplied = hasPrimarySnapshot && (forceConflictingWindow || !LiveQuotaWindowConflicts(
             usage,
             snapshot.ObservedAtUtc,
             snapshot.WindowMinutes,
-            snapshot.ResetsAtUtc);
-        var secondaryApplied = hasSecondarySnapshot && !LiveQuotaWindowConflicts(
+            snapshot.ResetsAtUtc));
+        var secondaryApplied = hasSecondarySnapshot && (forceConflictingWindow || !LiveQuotaWindowConflicts(
             usage,
             snapshot.ObservedAtUtc,
             snapshot.SecondaryWindowMinutes,
-            snapshot.SecondaryResetsAtUtc);
+            snapshot.SecondaryResetsAtUtc));
         if (primaryApplied)
         {
             usage.RateLimitUsedPercent = snapshot.UsedPercent ?? usage.RateLimitUsedPercent;
@@ -8949,18 +9544,73 @@ public partial class Form1 : Form
         }
     }
 
+    private static bool HasForeignQuotaWindowMatch(
+        AccountUsageSummary usage,
+        string currentAccountKey,
+        IReadOnlyDictionary<string, LiveRateLimitSnapshot> snapshots)
+    {
+        // The shared .codex session log can contain delayed token_count records from a
+        // request that started before the gateway rotated. If that record's reset window
+        // exactly matches another account's persisted official snapshot, it cannot be used
+        // as evidence for the current summary. This check is deliberately conservative:
+        // it requires both the window length and reset boundary to match and ignores the
+        // current account's own snapshot.
+        return snapshots.Any(entry =>
+            !string.Equals(entry.Key, currentAccountKey, StringComparison.Ordinal) &&
+            (QuotaWindowMatches(
+                 usage.RateLimitWindowMinutes,
+                 usage.RateLimitResetAtUtc,
+                 entry.Value.WindowMinutes,
+                 entry.Value.ResetsAtUtc) ||
+             QuotaWindowMatches(
+                 usage.SecondaryRateLimitWindowMinutes,
+                 usage.SecondaryRateLimitResetAtUtc,
+                 entry.Value.SecondaryWindowMinutes,
+                 entry.Value.SecondaryResetsAtUtc)));
+    }
+
+    private static bool QuotaWindowMatches(
+        long? usageWindowMinutes,
+        DateTimeOffset? usageResetAtUtc,
+        long? snapshotWindowMinutes,
+        DateTimeOffset? snapshotResetAtUtc)
+    {
+        return usageWindowMinutes.HasValue &&
+               usageResetAtUtc.HasValue &&
+               snapshotWindowMinutes.HasValue &&
+               snapshotResetAtUtc.HasValue &&
+               usageWindowMinutes.Value == snapshotWindowMinutes.Value &&
+               (usageResetAtUtc.Value - snapshotResetAtUtc.Value).Duration() <=
+               TimeSpan.FromMinutes(2);
+    }
+
     private static bool LiveQuotaWindowConflicts(
         AccountUsageSummary usage,
         DateTimeOffset liveObservedAtUtc,
         long? liveWindowMinutes,
         DateTimeOffset? liveResetAtUtc)
     {
+        var liveKind = AccountQuotaLimitType.ClassifyWindow(liveWindowMinutes);
+        var currentWindow = liveKind == AccountQuotaWindowKind.Unknown
+            ? null
+            : usage.GetQuotaWindow(liveKind);
         if (usage.RateLimitObservedAtUtc.HasValue)
         {
             // Observation time is authoritative across reset-cycle transitions. A newer
             // official read must replace an older model-log percentage even when its reset
-            // timestamp moved by days; an older cached read must never overwrite newer logs.
-            return liveObservedAtUtc < usage.RateLimitObservedAtUtc.Value;
+            // timestamp moved by days. There is one important exception: a shared gateway
+            // log can be appended after rotation while still carrying a quota window whose
+            // reset had already passed before this account's official snapshot was read.
+            // Such a stale window cannot be newer evidence for this account merely because
+            // its token_count line reached disk later.
+            if (liveObservedAtUtc >= usage.RateLimitObservedAtUtc.Value)
+            {
+                return false;
+            }
+            return currentWindow?.ResetAtUtc is not { } currentResetAtUtc ||
+                   liveResetAtUtc is not { } newResetAtUtc ||
+                   currentResetAtUtc > liveObservedAtUtc ||
+                   newResetAtUtc <= liveObservedAtUtc;
         }
 
         if (!liveWindowMinutes.HasValue && !liveResetAtUtc.HasValue)
@@ -8968,10 +9618,6 @@ public partial class Form1 : Form
             return false;
         }
 
-        var liveKind = AccountQuotaLimitType.ClassifyWindow(liveWindowMinutes);
-        var currentWindow = liveKind == AccountQuotaWindowKind.Unknown
-            ? null
-            : usage.GetQuotaWindow(liveKind);
         var hasAnyCurrentWindow = usage.GetQuotaWindow(AccountQuotaWindowKind.FiveHour) != null ||
                                   usage.GetQuotaWindow(AccountQuotaWindowKind.Weekly) != null ||
                                   usage.GetQuotaWindow(AccountQuotaWindowKind.Monthly) != null;
@@ -8991,8 +9637,7 @@ public partial class Form1 : Form
         var changed = false;
         foreach (var usage in report.Accounts)
         {
-            var account = _accounts.FirstOrDefault(candidate =>
-                candidate.Name.Equals(usage.AccountName, StringComparison.OrdinalIgnoreCase));
+            var account = FindAccountForUsage(usage);
             if (account == null || account.IsCompatibleApi)
             {
                 continue;
@@ -9026,8 +9671,7 @@ public partial class Form1 : Form
                 continue;
             }
 
-            var usage = report.Accounts.FirstOrDefault(summary =>
-                summary.AccountName.Equals(account.Name, StringComparison.OrdinalIgnoreCase));
+            var usage = FindUsageForAccount(report, account);
             if (usage == null)
             {
                 continue;
@@ -9365,6 +10009,14 @@ public partial class Form1 : Form
             if (_quotaUsageCache != null)
             {
                 ApplyLiveRateLimitSnapshots(_quotaUsageCache);
+                UpdateQuotaLimitProfilesFromReport(_quotaUsageCache);
+                if (!_formClosed && !IsDisposed && _activeView == WorkspaceView.AccountRotation)
+                {
+                    // Official reads can complete while the user is on the rotation page.
+                    // Repaint that page immediately so it observes the same snapshot as
+                    // the quota cards instead of waiting for the next usage-log refresh.
+                    RenderCards();
+                }
             }
         }
     }
@@ -10230,6 +10882,7 @@ public partial class Form1 : Form
 
         row.Tag = new QuotaUsageRowBinding
         {
+            AccountKey = QuotaAccountIdentity.CreateKey(account),
             AccountName = account.Name,
             QuotaLimitType = quotaLimitType,
             Kind = kind,
@@ -10483,6 +11136,7 @@ public partial class Form1 : Form
         var monitorBinding = (PassiveQuotaMonitorBinding)monitor.Tag!;
         card.Tag = new QuotaUsageDetailBinding
         {
+            AccountKey = QuotaAccountIdentity.CreateKey(account),
             AccountName = account.Name,
             QuotaLimitType = quotaLimitType,
             Subtitle = subtitle,
@@ -13305,6 +13959,35 @@ public partial class Form1 : Form
                 "A newer official quota refresh must replace an older model-log snapshot across reset cycles.");
         }
 
+        var staleSharedGatewayLog = new AccountUsageSummary
+        {
+            AccountName = "stale-shared-gateway-window",
+            RateLimitUsedPercent = 7D,
+            RateLimitWindowMinutes = 300,
+            RateLimitResetAtUtc = now.AddHours(-1),
+            RateLimitObservedAtUtc = now.AddMinutes(10)
+        };
+        var currentAccountSnapshot = new LiveRateLimitSnapshot(
+            4D,
+            300,
+            now.AddHours(4),
+            null,
+            null,
+            null,
+            null,
+            null,
+            "team",
+            now);
+        ApplyLiveRateLimitSnapshot(staleSharedGatewayLog, currentAccountSnapshot);
+        if (staleSharedGatewayLog.RateLimitUsedPercent != 4D ||
+            staleSharedGatewayLog.RateLimitResetAtUtc != now.AddHours(4) ||
+            staleSharedGatewayLog.RateLimitObservedAtUtc != now)
+        {
+            throw new InvalidOperationException(
+                "A late shared-gateway log entry with an already-expired reset window must " +
+                "not override the account's current official quota snapshot.");
+        }
+
         var persistedAt = now.AddHours(-2);
         var persistedWeeklyReset = now.AddDays(7);
         var persistedFiveHourReset = now.AddHours(5);
@@ -13404,6 +14087,62 @@ public partial class Form1 : Form
             throw new InvalidOperationException(
                 "An older persisted quota snapshot must never overwrite a newer official log observation.");
         }
+
+        // A shared session directory may finish a request after the gateway has rotated.
+        // If that late record carries another account's exact reset boundary, restore the
+        // current account's own snapshot instead of displaying the other account's quota.
+        var foreignAccount = new AccountRecord
+        {
+            Name = "foreign-quota-source",
+            CodexHome = Path.Combine(Path.GetTempPath(), "foreign-quota-source"),
+            AuthKind = AccountAuthKind.AccessToken
+        };
+        var foreignKey = QuotaAccountIdentity.CreateKey(foreignAccount);
+        var foreignReset = now.AddHours(4);
+        var isolatedSnapshots = new Dictionary<string, LiveRateLimitSnapshot>(StringComparer.Ordinal)
+        {
+            [persistedAccountKey] = persistedSnapshots[persistedAccountKey],
+            [foreignKey] = new LiveRateLimitSnapshot(
+                77D,
+                300,
+                foreignReset,
+                null,
+                null,
+                null,
+                null,
+                null,
+                "foreign-team",
+                now.AddMinutes(-3))
+        };
+        var lateForeignLog = new UsageReport
+        {
+            Accounts =
+            [
+                new AccountUsageSummary
+                {
+                    AccountName = persistedAccount.Name,
+                    AccountKey = persistedAccountKey,
+                    RateLimitUsedPercent = 77D,
+                    RateLimitWindowMinutes = 300,
+                    RateLimitResetAtUtc = foreignReset,
+                    RateLimitObservedAtUtc = now.AddHours(1),
+                    PlanType = "foreign-team"
+                }
+            ]
+        };
+        ApplyLiveRateLimitSnapshots(
+            lateForeignLog,
+            [persistedAccount, foreignAccount],
+            isolatedSnapshots);
+        var isolated = lateForeignLog.Accounts.Single();
+        if (isolated.RateLimitUsedPercent != isolatedSnapshots[persistedAccountKey].UsedPercent ||
+            isolated.RateLimitWindowMinutes != isolatedSnapshots[persistedAccountKey].WindowMinutes ||
+            isolated.RateLimitResetAtUtc != isolatedSnapshots[persistedAccountKey].ResetsAtUtc ||
+            !string.Equals(isolated.PlanType, persistedSnapshots[persistedAccountKey].PlanType, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "A late quota record matching another account must not remain on the current account card.");
+        }
     }
 
     internal static void ValidateQuotaRuntimeAccountIsolation()
@@ -13460,6 +14199,7 @@ public partial class Form1 : Form
                 new AccountUsageSummary { AccountName = replacementAccount.Name }
             ]
         };
+        report.Accounts[0].AccountKey = replacementKey;
         var snapshots = new Dictionary<string, LiveRateLimitSnapshot>(StringComparer.OrdinalIgnoreCase)
         {
             [originalKey] = new LiveRateLimitSnapshot(
@@ -14325,11 +15065,16 @@ public partial class Form1 : Form
         int top,
         int width,
         bool danger = false,
-        string iconText = "")
+        string iconText = "",
+        bool prominent = false)
     {
         var button = (ModernButton)MakeActionButton(text, left, top, width, primary: false);
         var scale = GetUnifiedHistoryDpiScale();
-        button.Tag = danger ? "history-danger" : "history-tonal";
+        button.Tag = danger
+            ? "history-danger"
+            : prominent
+                ? "history-primary"
+                : "history-tonal";
         button.Radius = ScaleUnifiedHistoryPixel(11, scale);
         var horizontalPadding = ScaleUnifiedHistoryPixel(10, scale);
         button.Padding = new Padding(horizontalPadding, 0, horizontalPadding, 0);
@@ -14338,14 +15083,68 @@ public partial class Form1 : Form
             ? 0
             : ScaleUnifiedHistoryPixel(20, scale);
         button.AutoShrinkText = false;
-        ApplyHistoryActionButtonStyle(button, danger);
+        ApplyHistoryActionButtonStyle(button, danger, prominent);
         return button;
     }
 
-    private void ApplyHistoryActionButtonStyle(Button button, bool danger)
+    private void ApplyHistoryActionButtonStyle(
+        Button button,
+        bool danger,
+        bool prominent = false)
     {
         var dark = ThemeStyler.IsDark(_palette);
         var accent = danger ? _palette.DangerColor : _palette.PrimaryColor;
+        if (prominent)
+        {
+            var prominentBaseColor = UiDesign.Blend(
+                _palette.PrimaryColor,
+                _palette.HeroStartColor,
+                dark ? 0.16F : 0.10F);
+            var prominentHoverColor = UiDesign.Blend(
+                _palette.PrimaryHoverColor,
+                _palette.SecondaryAccentColor,
+                0.22F);
+            var prominentPressedColor = UiDesign.Blend(
+                _palette.PrimaryPressedColor,
+                _palette.HeroStartColor,
+                0.14F);
+            var prominentBorderColor = Color.FromArgb(
+                dark ? 150 : 128,
+                UiDesign.Blend(_palette.PrimaryColor, Color.White, 0.48F));
+
+            button.FlatStyle = FlatStyle.Flat;
+            button.FlatAppearance.BorderSize = 1;
+            button.FlatAppearance.BorderColor = prominentBorderColor;
+            button.FlatAppearance.MouseOverBackColor = prominentHoverColor;
+            button.FlatAppearance.MouseDownBackColor = prominentPressedColor;
+            button.BackColor = prominentBaseColor;
+            button.ForeColor = Color.White;
+            button.Cursor = Cursors.Hand;
+            button.UseMnemonic = false;
+
+            if (button is ModernButton prominentButton)
+            {
+                prominentButton.BaseBackColor = prominentBaseColor;
+                prominentButton.HoverBackColor = prominentHoverColor;
+                prominentButton.PressedBackColor = prominentPressedColor;
+                prominentButton.BorderColor = prominentBorderColor;
+                prominentButton.GradientBackColor = Color.FromArgb(
+                    dark ? 132 : 156,
+                    _palette.SecondaryAccentColor);
+                prominentButton.ShadowColor = Color.FromArgb(
+                    dark ? 70 : 36,
+                    UiDesign.Blend(_palette.PrimaryColor, _palette.ShadowColor, 0.22F));
+                prominentButton.TextColor = Color.White;
+                prominentButton.UseSurfaceSheen = true;
+                prominentButton.ShowAccent = false;
+                prominentButton.ShowIconTile = true;
+                prominentButton.IconTileColor = Color.FromArgb(42, Color.White);
+                prominentButton.IconTileBorderColor = Color.FromArgb(72, Color.White);
+                prominentButton.Invalidate();
+            }
+            return;
+        }
+
         var baseColor = UiDesign.Blend(
             _palette.CardColor,
             accent,
@@ -14382,6 +15181,30 @@ public partial class Form1 : Form
             modern.DisabledBackColor = UiDesign.Blend(_palette.DisabledColor, _palette.CardColor, 0.32F);
             modern.DisabledTextColor = UiDesign.Blend(_palette.MutedTextColor, _palette.CardColor, 0.34F);
             modern.FocusColor = Color.FromArgb(180, accent);
+            modern.Invalidate();
+        }
+    }
+
+    private void ApplyQuotaBulkTestButtonStyle(Button button)
+    {
+        // Use the same filled action treatment as the account launch buttons, but keep
+        // the compact pill geometry needed by the group header. This remains legible on
+        // both light and dark palettes and gives the command a clear visual hierarchy.
+        ThemeStyler.ApplyPrimaryButton(button, _palette);
+        button.FlatStyle = FlatStyle.Flat;
+        button.FlatAppearance.BorderSize = 1;
+        button.Cursor = Cursors.Hand;
+        button.UseMnemonic = false;
+        if (button is ModernButton modern)
+        {
+            modern.Radius = 18;
+            modern.ShowIconTile = false;
+            modern.IconText = string.Empty;
+            modern.IconWidth = 0;
+            modern.Padding = new Padding(14, 0, 14, 0);
+            modern.AutoShrinkText = true;
+            modern.MinimumFontSize = 8F;
+            modern.UseSurfaceSheen = true;
             modern.Invalidate();
         }
     }
@@ -15213,7 +16036,11 @@ public partial class Form1 : Form
             _accountRotationPrimaryReturnCancellation = null;
             _patAutoRotationUnavailableAccountKeys.Clear();
             _patAutoRotationUnknownResetRetryAtUtc.Clear();
-            _ = await LocalPatGateway.ClearRotationAsync();
+            if (!await LocalPatGateway.ClearRotationAsync())
+            {
+                throw new InvalidOperationException(
+                    "未能清除旧的账号轮换路线；为避免界面账号与实际请求账号不一致，本次没有关闭或重启 Codex。");
+            }
             UpdatePatAutoRotationControls();
         }
 
@@ -15250,7 +16077,10 @@ public partial class Form1 : Form
                 account,
                 chatGptFeatureAccount);
         _statusBox.Text = profileAlreadySelected
-            ? $"正在使用现有凭据启动 {clientName}…"
+            ? mode == WindowsClientMode.OfficialCodex && !automaticRotation &&
+              chatGptFeatureAccount == null
+                ? $"正在强制关闭 Codex，并用 {account.Name} 的凭据重新打开…"
+                : $"正在使用现有凭据启动 {clientName}…"
             : chatGptFeatureAccount == null
                 ? $"正在切换到 {account.Name} 并启动 {clientName}…"
                 : $"正在用 {account.Name} 的模型凭据和 {chatGptFeatureAccount.Name} 的 ChatGPT 功能身份启动…";
@@ -15290,7 +16120,9 @@ public partial class Form1 : Form
                     GetCodexAppearanceRuntimeMode(startupAppearance),
                     GetCodexAppearanceRuntimePresetId(startupAppearance),
                     GetCodexAppearanceLabelById(_appSettings.CodexAppearancePresetId),
-                    routeOfficialOAuthThroughGateway)
+                    routeOfficialOAuthThroughGateway,
+                    forceClientRestart: mode == WindowsClientMode.OfficialCodex &&
+                                        !automaticRotation)
                 : await _codex.SwitchWindowsClientAccountWithChatGptFeaturesAsync(
                     account,
                     chatGptFeatureAccount,
@@ -15385,6 +16217,350 @@ public partial class Form1 : Form
         return projection?.ClientLaunchStarted == true;
     }
 
+    /// <summary>
+    /// Prepare a user-requested account change at the gateway request boundary.  A null
+    /// result means the account is outside the active route scope and the ordinary desktop
+    /// switch may proceed.  A non-null result means the click was handled (successfully or
+    /// with a safe, non-destructive error) and Codex was deliberately left running.
+    /// </summary>
+    private async Task<bool?> TryPrepareManualGatewayRotationAsync(AccountRecord target)
+    {
+        if (!_appSettings.PatGatewayEnabled ||
+            !AccountRotationConfiguration.IsEnabled(_appSettings) ||
+            AccountRotationConfiguration.GetPool(_appSettings, target) ==
+                AccountRotationPool.None ||
+            (!target.IsAccessToken && !target.IsOfficialOAuth && !target.IsCompatibleApi))
+        {
+            // Only accounts outside the configured gateway route scope may fall through to
+            // the ordinary desktop launch path. A transient desktop-process detection miss
+            // must never turn an explicit route change into a Codex shutdown/relaunch.
+            return null;
+        }
+
+        if (!_codex.IsOfficialWindowsClientRunning())
+        {
+            _statusBox.Text =
+                "当前没有运行中的 Codex；请使用账号切换页的“Codex 启动”强制投放账号并重新打开。";
+            return false;
+        }
+
+        var targetKey = QuotaAccountIdentity.CreateKey(target);
+        if (!HasUsableAccountCredential(target))
+        {
+            _statusBox.Text =
+                $"{target.Name} 没有可用的本地凭据；未改变路由，Codex 和网关保持运行。";
+            return false;
+        }
+        try
+        {
+            await LocalPatGateway.EnsureRunningAsync(
+                restartOnProxyMismatch: false);
+            if (_patAutoRotationBoundaryCancellation != null)
+            {
+                // A user choice wins over the automatic worker. Cancel the waiter first;
+                // the gateway route itself is replaced below without stopping Codex.
+                CancelPendingPatAutoRotation(resetState: false);
+            }
+            var activity = await LocalPatGateway.ReadActivitySnapshotAsync();
+            var route = activity?.Rotation;
+            if (route is not { Status: not PatGatewayRotationStatus.None })
+            {
+                // The gateway and Manager share this credential-free route file. If a
+                // transient health read times out, use its persisted logical account
+                // instead of guessing from CurrentAccountName, which may still name the
+                // pre-rotation account and would make every target fail with HTTP 409.
+                var persistedRoute = new PatGatewayRotationStore(_store.RootPath).Load();
+                if (persistedRoute.Status != PatGatewayRotationStatus.None)
+                {
+                    route = persistedRoute;
+                }
+            }
+
+            var projectedTransport = FindProjectedPatGatewayTransportAccount();
+            var rememberedCurrent = GetCurrentAccountRecord();
+            if (route is { Status: PatGatewayRotationStatus.Armed } &&
+                rememberedCurrent != null &&
+                PatGatewayRotationStore.TryNormalizeAccountKey(
+                    route.SourceAccountKey,
+                    out var routeSourceKey) &&
+                !routeSourceKey.Equals(
+                    QuotaAccountIdentity.CreateKey(rememberedCurrent),
+                    StringComparison.Ordinal))
+            {
+                // A pending route is valid only for the account that was current when it was
+                // armed. If the user explicitly selected another pool account afterwards,
+                // retaining the old source would make the next button click (and the quota
+                // header) jump backwards to that historical account.
+                if (!await LocalPatGateway.ClearRotationAsync())
+                {
+                    _statusBox.Text =
+                        "待切换路线的源账号已不是当前账号，且未能安全清除；请稍后重试。";
+                    return false;
+                }
+                route = null;
+            }
+            var routeCheckedAtUtc = DateTimeOffset.UtcNow;
+            if (route is { Status: PatGatewayRotationStatus.Armed } &&
+                (route.ArmedAtUtc is not { } armedAtUtc ||
+                 armedAtUtc > routeCheckedAtUtc.AddSeconds(5) ||
+                 routeCheckedAtUtc - armedAtUtc >
+                     LocalPatGatewayHost.ArmedRotationMaximumLifetime))
+            {
+                // The gateway will reject an expired armed route at the next boundary. Do
+                // not nevertheless reuse its historical source when the user clicks another
+                // target: that would move the Manager/quota UI back to the old account even
+                // though Codex is still running under the explicitly selected account.
+                if (!await LocalPatGateway.ClearRotationAsync())
+                {
+                    _statusBox.Text =
+                        "旧的待切换路线已经超时，且未能安全清除；请稍后重试。";
+                    return false;
+                }
+                route = null;
+            }
+            if (route is { Status: not PatGatewayRotationStatus.None } &&
+                projectedTransport != null &&
+                (!PatGatewayRotationStore.TryNormalizeAccountKey(
+                     route.TransportAccountKey,
+                     out var routeTransportKey) ||
+                 !routeTransportKey.Equals(
+                     QuotaAccountIdentity.CreateKey(projectedTransport),
+                     StringComparison.Ordinal)))
+            {
+                // A route recovered from the last successful request is unusable when the
+                // desktop profile has since been changed. The gateway only activates a route
+                // whose transport token matches the incoming Codex request, so retaining this
+                // mismatch would leave “主动切换” waiting forever.
+                if (!await LocalPatGateway.ClearRotationAsync())
+                {
+                    _statusBox.Text =
+                        "旧轮换路线与当前 Codex 凭据不一致，且未能安全清除；请稍后重试。";
+                    return false;
+                }
+                route = null;
+            }
+
+            var replacingPendingTarget =
+                route?.Status == PatGatewayRotationStatus.Armed &&
+                !string.Equals(route.TargetAccountKey, targetKey, StringComparison.Ordinal);
+            if (route?.Status == PatGatewayRotationStatus.Armed &&
+                !replacingPendingTarget)
+            {
+                var existingSource = FindRotationAccount(route.SourceAccountKey);
+                if (existingSource == null)
+                {
+                    _statusBox.Text = "待切换路线缺少有效源账号，未改变 Codex 或网关。";
+                    return false;
+                }
+                StartManualGatewayRotationWaiter(
+                    existingSource,
+                    target,
+                    targetKey);
+                return true;
+            }
+
+            string? persistedLogicalSourceKey = null;
+            if (route is not { Status: not PatGatewayRotationStatus.None } &&
+                projectedTransport == null &&
+                TryResolvePersistedPatGatewayLogicalAccount(
+                    allowArmedSource: true,
+                    out _,
+                    out var rememberedSourceKey))
+            {
+                // With no live route or positively projected desktop credential, prefer the
+                // last explicit account switch over an older successful gateway request.
+                // TryResolvePersistedPatGatewayLogicalAccount performs that timestamp check.
+                persistedLogicalSourceKey = rememberedSourceKey;
+            }
+
+            var sourceKey = route?.Status switch
+            {
+                PatGatewayRotationStatus.Armed => route.SourceAccountKey,
+                PatGatewayRotationStatus.Active => route.TargetAccountKey,
+                _ => projectedTransport == null
+                    ? persistedLogicalSourceKey ?? (activity == null
+                        ? null
+                        : SelectSuccessfulActivityMarker(activity).AccountKey)
+                    : QuotaAccountIdentity.CreateKey(projectedTransport)
+            };
+            if (!PatGatewayRotationStore.TryNormalizeAccountKey(sourceKey, out _) &&
+                TryResolvePersistedPatGatewayLogicalAccount(
+                    allowArmedSource: true,
+                    out _,
+                    out var persistedSourceKey))
+            {
+                sourceKey = persistedSourceKey;
+            }
+            if (!PatGatewayRotationStore.TryNormalizeAccountKey(sourceKey, out var normalizedSource))
+            {
+                // There is no trustworthy source identity to arm against.  Refuse the
+                // destructive fallback while rotation is enabled; the user can disable
+                // rotation explicitly if a full desktop profile switch is really needed.
+                _statusBox.Text =
+                    "无法确认当前网关账号，已保留 Codex 和网关运行；请先完成一次正常模型请求后再切换。";
+                return false;
+            }
+
+            if (normalizedSource.Equals(targetKey, StringComparison.Ordinal))
+            {
+                if (replacingPendingTarget && !await LocalPatGateway.ClearRotationAsync())
+                {
+                    _statusBox.Text =
+                        "未能取消原待生效目标；Codex 和网关保持运行，请稍后重试。";
+                    return false;
+                }
+                // The gateway route is already authoritative. Reconcile a stale Manager
+                // label/context immediately instead of claiming success while continuing
+                // to display the pre-rotation backup account.
+                await TryRecoverPatAutoRotationLaunchContextAsync(activity);
+                if (!string.Equals(
+                        _appSettings.CurrentAccountName,
+                        target.Name,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    SetCurrentAccount(target.Name, false, persistSettings: true);
+                    _codex.QueueHotRotatedOfficialAccountDisplay(target, _accounts);
+                    RenderCards();
+                }
+                _statusBox.Text = $"当前已经是 {target.Name}，未重启 Codex。";
+                return true;
+            }
+
+            var source = FindRotationAccount(normalizedSource);
+            if (source == null ||
+                AccountRotationConfiguration.GetPool(_appSettings, source) == AccountRotationPool.None)
+            {
+                _statusBox.Text =
+                    "当前账号不在轮换池中，未执行会关闭 Codex 的桌面切换；请先将源账号加入轮换池。";
+                return false;
+            }
+
+            var armed = await LocalPatGateway.ArmRotationAsync(
+                normalizedSource,
+                targetKey,
+                replaceExistingArmedTarget: replacingPendingTarget);
+            if (armed.Status != PatGatewayRotationStatus.Armed ||
+                !string.Equals(armed.SourceAccountKey, normalizedSource, StringComparison.Ordinal) ||
+                !string.Equals(armed.TargetAccountKey, targetKey, StringComparison.Ordinal))
+            {
+                _statusBox.Text =
+                    "网关没有确认本次安全切换，已保留 Codex 和网关运行；请稍后重试。";
+                return false;
+            }
+
+            _patGatewayRuntimeRunning = true;
+            _patGatewayRuntimeStatus = $"已开启 · 127.0.0.1:{LocalPatGateway.Port}";
+            StartManualGatewayRotationWaiter(source, target, targetKey);
+            _statusBox.Text =
+                $"已强制锁定从 {source.Name} 到 {target.Name}；" +
+                "当前任务继续运行，下一次模型请求边界生效。";
+            UpdatePatGatewayControls();
+            ManagerLifecycleDiagnostics.Write(
+                "manual-gateway-rotation-armed",
+                $"source={normalizedSource}; target={targetKey}; " +
+                $"replaced_pending={replacingPendingTarget}; quota_bypass=true; " +
+                "codex_restart=false; downstream_bytes=0");
+            return true;
+        }
+        catch (Exception ex) when (
+            ex is IOException or HttpRequestException or InvalidOperationException or
+            InvalidDataException or UnauthorizedAccessException or System.Text.Json.JsonException or
+            NotSupportedException or ArgumentException)
+        {
+            ManagerLifecycleDiagnostics.WriteException(
+                "manual-gateway-rotation-safe-path-failed",
+                ex,
+                $"target={targetKey}; codex_restart=false");
+            _statusBox.Text =
+                $"未能准备到 {target.Name} 的无缝切换；已保留 Codex 和网关运行。" +
+                $"原因：{ex.Message}";
+            // The account-click path is intentionally handled even on a control-plane
+            // failure.  Falling through to SwitchWindowsClientAccountAsync here would
+            // close a live Codex window immediately after the gateway error.
+            return false;
+        }
+    }
+
+    private AccountRecord? FindProjectedPatGatewayTransportAccount()
+    {
+        foreach (var account in _accounts.Where(account =>
+                     (account.IsAccessToken || account.IsOfficialOAuth) &&
+                     AccountRotationConfiguration.GetPool(_appSettings, account) !=
+                         AccountRotationPool.None))
+        {
+            if (TryResolvePatAutoRotationSharedProfile(account, out _))
+            {
+                return account;
+            }
+        }
+        return null;
+    }
+
+    private void StartManualGatewayRotationWaiter(
+        AccountRecord source,
+        AccountRecord target,
+        string targetKey)
+    {
+        CancelPendingPatAutoRotation(resetState: false);
+        // Arming only schedules a future request-boundary switch. It must not itself change
+        // the current-account label, Codex title, quota refresh target, or usage attribution.
+        // Those move together in CompletePatGatewayRotation only after the gateway reports
+        // that the route really activated.  If no account has ever been selected, source is
+        // the only safe initial display identity.
+        var displayedSource = GetCurrentAccountRecord();
+        if (displayedSource == null)
+        {
+            SetCurrentAccount(source.Name, false, persistSettings: true);
+            displayedSource = source;
+        }
+        _patAutoRotationLaunchContext ??= new PatAutoRotationLaunchContext(
+            WindowsClientMode.OfficialCodex,
+            ChatGptFeatureAccountName: null,
+            LaunchedAtUtc: DateTimeOffset.UtcNow);
+        _patAutoRotationGatewayTransportActive = true;
+        _patAutoRotationState = PatAutoRotationState.WaitingForRequestBoundary;
+        _launchedOfficialQuotaAccountKey = displayedSource.IsCompatibleApi
+            ? null
+            : QuotaAccountIdentity.CreateKey(displayedSource);
+        var cancellation = new CancellationTokenSource();
+        _patAutoRotationBoundaryCancellation = cancellation;
+        _ = ResumeRecoveredGatewayRotationAsync(
+            source,
+            target,
+            targetKey,
+            cancellation);
+        UpdatePatAutoRotationControls();
+    }
+
+    private async Task StartManualAccountRotationFromUiAsync(AccountRecord target)
+    {
+        if (_formClosed || IsDisposed)
+        {
+            return;
+        }
+
+        try
+        {
+            var result = await TryPrepareManualGatewayRotationAsync(target);
+            if (result == true)
+            {
+                // The request-boundary monitor will update the current-account label after
+                // the first completed response.  Re-render now so the button state and
+                // status text reflect the armed operation without pretending activation
+                // happened before a model request actually crossed the boundary.
+                RerenderAccountRotationWorkspacePreservingScroll();
+            }
+        }
+        catch (Exception ex)
+        {
+            ManagerLifecycleDiagnostics.WriteException(
+                "manual-gateway-rotation-ui-failed",
+                ex,
+                $"target={QuotaAccountIdentity.CreateKey(target)}");
+            _statusBox.Text = "主动轮换未执行；Codex 和网关保持运行：" + ex.Message;
+        }
+    }
+
     private void ConfigurePatAutoRotationLaunchContext(
         AccountRecord account,
         WindowsClientMode mode,
@@ -15466,6 +16642,23 @@ public partial class Form1 : Form
             // Official quota is still authoritative when the local activity probe is
             // temporarily unavailable; the policy falls back to its conservative reserve.
         }
+        if (activity?.RotationProtocol is { } observedProtocol)
+        {
+            _patGatewayObservedRotationProtocol = observedProtocol;
+        }
+        var transparentGatewayRetry =
+            LocalPatGateway.IsTransparentRotationProtocolValue(
+                _patGatewayObservedRotationProtocol);
+        var managerPreparedGatewayRotation =
+            LocalPatGateway.IsManagerPreparedRotationProtocolValue(
+                _patGatewayObservedRotationProtocol);
+        if (!managerPreparedGatewayRotation && !transparentGatewayRetry)
+        {
+            // Capability is deliberately fail-closed. Until the authenticated health
+            // snapshot proves a known request-boundary protocol, official quota polling
+            // must not arm a route speculatively.
+            return;
+        }
         var activityMatchesAccount = activity != null && string.Equals(
             activity.LastModelRequestAccountKey,
             accountKey,
@@ -15539,12 +16732,25 @@ public partial class Form1 : Form
 
         RecordPatRotationAccountExhausted(account, fiveHourWindow?.ResetsAtUtc, now);
         _patAutoRotationState = PatAutoRotationState.PendingQuotaExhaustion;
+
+        if (transparentGatewayRetry)
+        {
+            // v5/v6 select and validate the next credential inside the real model request.
+            // The quota observer may persist the source as exhausted, but it must never
+            // create a manager-side cancellation/Prepare task: doing so would pre-activate
+            // a route merely because the official quota endpoint reported a low margin.
+            _statusBox.Text =
+                $"{account.Name} 的官方 5h 额度已连续确认用尽；" +
+                "已记录其重置时间。下一次真实模型请求由透明网关按轮换顺序试号，" +
+                "只有完整成功的候选才会成为当前账号。";
+            UpdatePatAutoRotationControls();
+            return;
+        }
+
         var cancellation = new CancellationTokenSource();
         _patAutoRotationBoundaryCancellation = cancellation;
         _statusBox.Text =
-            $"{account.Name} 的 5h 剩余额度 " +
-            $"{decision.RemainingPercent?.ToString("0.#") ?? "未知"}% 已进入 " +
-            $"{decision.SafetyMarginPercent:0.#}% 动态安全余量；" +
+            $"{account.Name} 的官方 5h 额度已确认达到 100%；" +
             "正在校验下一个轮换账号，当前响应不会被关闭或重放。";
         UpdatePatAutoRotationControls();
         _ = PreparePatAutoRotationAsync(accountKey, now, cancellation);
@@ -15561,6 +16767,119 @@ public partial class Form1 : Form
         return (previous.Value - current.Value).Duration() <= TimeSpan.FromMinutes(2);
     }
 
+    private bool TrySelectLatestAccountRotationCandidate(
+        string sourceAccountKey,
+        ISet<string> attemptedAccountKeys,
+        bool resetDuePrimaryOnly,
+        out AccountRecord? source,
+        out AccountRecord? candidate,
+        out AccountRotationPool pool)
+    {
+        ArgumentNullException.ThrowIfNull(attemptedAccountKeys);
+        source = null;
+        candidate = null;
+        pool = AccountRotationPool.None;
+
+        // Treat the persisted files as the source of truth at every request boundary.
+        // The rotation page saves reorders immediately, so this also makes a reorder that
+        // happens during a slow quota/API check visible before another account is touched.
+        var latestAccounts = _store.LoadAccounts();
+        var latestSettings = _themeService.LoadSettings();
+        _ = AccountRotationConfiguration.Normalize(latestSettings, latestAccounts);
+        if (!AccountRotationConfiguration.IsEnabled(latestSettings))
+        {
+            return false;
+        }
+
+        source = latestAccounts.FirstOrDefault(account =>
+            QuotaAccountIdentity.CreateKey(account).Equals(
+                sourceAccountKey,
+                StringComparison.Ordinal));
+        if (source == null)
+        {
+            return false;
+        }
+
+        var nowUtc = DateTimeOffset.UtcNow;
+        var unavailable = new HashSet<string>(
+            _patAutoRotationUnavailableAccountKeys,
+            StringComparer.Ordinal);
+        Func<AccountRecord, bool>? runtimeFilter = null;
+        if (resetDuePrimaryOnly)
+        {
+            IReadOnlyDictionary<string, PersistedQuotaSnapshot> snapshots;
+            try
+            {
+                snapshots = _quotaSnapshotStore.LoadForAccounts(latestAccounts);
+            }
+            catch
+            {
+                snapshots = new Dictionary<string, PersistedQuotaSnapshot>(StringComparer.Ordinal);
+            }
+
+            IReadOnlyDictionary<string, PatGatewayQuotaSignal> confirmedExhaustions;
+            try
+            {
+                _patGatewayQuotaSignalStore ??=
+                    new PatGatewayQuotaSignalStore(_store.RootPath);
+                confirmedExhaustions = _patGatewayQuotaSignalStore
+                    .ReadLatestPerAccount(nowUtc)
+                    .ToDictionary(signal => signal.AccountKey, StringComparer.Ordinal);
+            }
+            catch
+            {
+                confirmedExhaustions =
+                    new Dictionary<string, PatGatewayQuotaSignal>(StringComparer.Ordinal);
+            }
+
+            var locallyAvailablePrimaryKeys = latestAccounts
+                .Where(account =>
+                    AccountRotationConfiguration.GetPool(latestSettings, account) ==
+                    AccountRotationPool.Primary)
+                .Where(account =>
+                {
+                    var key = QuotaAccountIdentity.CreateKey(account);
+                    if (latestSettings.AccountRotationResetAtUtc.TryGetValue(
+                            key,
+                            out var resetAtUtc) &&
+                        resetAtUtc + AccountRotationConfiguration.PrimaryResetGracePeriod <= nowUtc)
+                    {
+                        return true;
+                    }
+                    return snapshots.TryGetValue(key, out var snapshot) &&
+                           PatAutoRotationPolicy.HasLocallyAvailableFiveHourQuota(
+                               snapshot,
+                               confirmedExhaustions.GetValueOrDefault(key),
+                               nowUtc);
+                })
+                .Select(QuotaAccountIdentity.CreateKey)
+                .ToHashSet(StringComparer.Ordinal);
+
+            unavailable.ExceptWith(locallyAvailablePrimaryKeys);
+            foreach (var key in locallyAvailablePrimaryKeys)
+            {
+                // The loaded settings object is a selection snapshot. Removing a superseded
+                // marker here lets the shared ring selector consume newer local evidence;
+                // the chosen account is persisted as available before the route is armed.
+                latestSettings.AccountRotationResetAtUtc.Remove(key);
+            }
+            runtimeFilter = account => locallyAvailablePrimaryKeys.Contains(
+                QuotaAccountIdentity.CreateKey(account));
+        }
+
+        return AccountRotationConfiguration.TrySelectNextCandidate(
+            latestSettings,
+            latestAccounts,
+            source,
+            unavailable,
+            nowUtc,
+            HasUsableAccountCredential,
+            out candidate,
+            out pool,
+            runtimeFilter,
+            attemptedAccountKeys);
+    }
+
     private async Task PreparePatAutoRotationAsync(
         string accountKey,
         DateTimeOffset pendingSinceUtc,
@@ -15569,139 +16888,158 @@ public partial class Form1 : Form
         _ = pendingSinceUtc;
         try
         {
-            if (!IsPatAutoRotationContextCurrent(accountKey) ||
-                GetCurrentAccountRecord() is not { } current)
+            if (!IsPatAutoRotationContextCurrent(accountKey))
             {
                 return;
             }
 
             PruneResetPatAutoRotationAccounts();
-            var candidates = AccountRotationConfiguration.BuildCandidates(
-                _appSettings,
-                _accounts,
-                current,
-                _patAutoRotationUnavailableAccountKeys,
-                DateTimeOffset.UtcNow,
-                HasUsableAccountCredential);
             var hadUnknownQuotaCandidate = false;
+            var hadUnconfirmedPrimaryCandidate = false;
             string? lastCandidateFailure = null;
-            var pendingCandidates = new Queue<AccountRecord>(candidates);
-            var attemptedPrimaryKeys = candidates
-                .Where(candidate => AccountRotationConfiguration.GetPool(_appSettings, candidate) ==
-                                    AccountRotationPool.Primary)
-                .Select(QuotaAccountIdentity.CreateKey)
-                .ToHashSet(StringComparer.Ordinal);
-            var backupBatchAdded = candidates.Any(candidate =>
-                AccountRotationConfiguration.GetPool(_appSettings, candidate) ==
-                AccountRotationPool.Backup);
+            var attemptedAccountKeys = new HashSet<string>(StringComparer.Ordinal);
             while (true)
             {
-                while (pendingCandidates.TryDequeue(out var candidate))
+                cancellation.Token.ThrowIfCancellationRequested();
+                if (!IsPatAutoRotationContextCurrent(accountKey))
                 {
-                    cancellation.Token.ThrowIfCancellationRequested();
-                    _patAutoRotationState = PatAutoRotationState.Switching;
-                    _statusBox.Text = candidate.IsCompatibleApi
-                        ? $"正在校验 API 轮换账号 {candidate.Name}…"
-                        : $"正在只读确认账号 {candidate.Name} 的最新 5h 额度…";
-                    UpdatePatAutoRotationControls();
+                    return;
+                }
 
-                    if (candidate.IsCompatibleApi)
-                    {
-                        try
-                        {
-                            await CodexCliService.EnsureCompatibleApiRotationPreflightAsync(
-                                candidate,
-                                cancellation.Token);
-                        }
-                        catch (Exception ex) when (
-                            ex is IOException or HttpRequestException or InvalidOperationException or
-                            UnauthorizedAccessException or System.Text.Json.JsonException)
-                        {
-                            lastCandidateFailure = ex.Message;
-                            continue;
-                        }
-                    }
-                    else
-                    {
-                        var quotaStatus = await ConfirmPatRotationCandidateQuotaAsync(
-                            candidate,
-                            cancellation.Token);
-                        if (quotaStatus == PatRotationCandidateQuotaStatus.Unknown)
-                        {
-                            hadUnknownQuotaCandidate = true;
-                            continue;
-                        }
-                        if (quotaStatus == PatRotationCandidateQuotaStatus.Exhausted)
-                        {
-                            continue;
-                        }
-                    }
+                // Pick exactly one account from the newest saved order. The selector does
+                // not reveal the backup pool until every primary account has been excluded
+                // by an actual failed attempt in this worker.
+                if (!TrySelectLatestAccountRotationCandidate(
+                        accountKey,
+                        attemptedAccountKeys,
+                        resetDuePrimaryOnly: false,
+                        out var current,
+                        out var candidate,
+                        out var candidatePool) ||
+                    current == null ||
+                    candidate == null)
+                {
+                    break;
+                }
+                if (candidatePool == AccountRotationPool.Backup &&
+                    hadUnconfirmedPrimaryCandidate)
+                {
+                    // Backup is a last resort, not a substitute for a primary account whose
+                    // quota/preflight could not be confirmed. Entering it after a timeout or
+                    // transient identity failure is the source of seemingly random backup use.
+                    break;
+                }
+                var targetKey = QuotaAccountIdentity.CreateKey(candidate);
+                attemptedAccountKeys.Add(targetKey);
 
-                    var targetKey = QuotaAccountIdentity.CreateKey(candidate);
-                    PatGatewayRotationSnapshot armed;
+                _patAutoRotationState = PatAutoRotationState.Switching;
+                _statusBox.Text = candidate.IsCompatibleApi
+                    ? $"正在校验 API 轮换账号 {candidate.Name}…"
+                    : $"正在只读确认账号 {candidate.Name} 的最新 5h 额度…";
+                UpdatePatAutoRotationControls();
+
+                if (candidate.IsCompatibleApi)
+                {
                     try
                     {
-                        armed = await LocalPatGateway.ArmRotationAsync(
-                            accountKey,
-                            targetKey,
+                        await CodexCliService.EnsureCompatibleApiRotationPreflightAsync(
+                            candidate,
                             cancellation.Token);
                     }
                     catch (Exception ex) when (
                         ex is IOException or HttpRequestException or InvalidOperationException or
-                        InvalidDataException or UnauthorizedAccessException or
-                        System.Text.Json.JsonException)
+                        UnauthorizedAccessException or System.Text.Json.JsonException)
                     {
                         lastCandidateFailure = ex.Message;
+                        if (candidatePool == AccountRotationPool.Primary)
+                        {
+                            hadUnconfirmedPrimaryCandidate = true;
+                        }
                         continue;
                     }
-                    if (armed.Status != PatGatewayRotationStatus.Armed ||
-                        !string.Equals(armed.SourceAccountKey, accountKey, StringComparison.Ordinal) ||
-                        !string.Equals(armed.TargetAccountKey, targetKey, StringComparison.Ordinal))
+                }
+                else
+                {
+                    var quotaStatus = await ConfirmPatRotationCandidateQuotaAsync(
+                        candidate,
+                        cancellation.Token);
+                    if (quotaStatus == PatRotationCandidateQuotaStatus.Unknown)
                     {
-                        throw new InvalidDataException("本地 PAT 网关返回了不一致的轮换路由。");
+                        hadUnknownQuotaCandidate = true;
+                        if (candidatePool == AccountRotationPool.Primary)
+                        {
+                            hadUnconfirmedPrimaryCandidate = true;
+                        }
+                        continue;
                     }
+                    if (quotaStatus == PatRotationCandidateQuotaStatus.Exhausted)
+                    {
+                        continue;
+                    }
+                }
 
-                    _patAutoRotationState = PatAutoRotationState.WaitingForRequestBoundary;
-                    _statusBox.Text =
-                        $"已准备从 {current.Name} 轮换到 {candidate.Name}；" +
-                        "当前响应继续运行，下一次模型请求会直接使用新账号。";
-                    UpdatePatAutoRotationControls();
-                    var activated = await WaitForPatGatewayRotationActivationAsync(
+                // If the user changed the order while this one account was checked, do not
+                // arm the stale result. Put it back into consideration and select again from
+                // the newly saved ring.
+                var earlierFailures = new HashSet<string>(attemptedAccountKeys, StringComparer.Ordinal);
+                earlierFailures.Remove(targetKey);
+                if (!TrySelectLatestAccountRotationCandidate(
+                        accountKey,
+                        earlierFailures,
+                        resetDuePrimaryOnly: false,
+                        out _,
+                        out var stillNext,
+                        out _) ||
+                    stillNext == null ||
+                    !QuotaAccountIdentity.CreateKey(stillNext).Equals(targetKey, StringComparison.Ordinal))
+                {
+                    attemptedAccountKeys.Remove(targetKey);
+                    continue;
+                }
+
+                PatGatewayRotationSnapshot armed;
+                try
+                {
+                    armed = await LocalPatGateway.ArmRotationAsync(
                         accountKey,
                         targetKey,
-                        cancellation.Token);
-                    CompletePatGatewayRotation(candidate, activated);
-                    return;
+                        cancellationToken: cancellation.Token);
+                }
+                catch (Exception ex) when (
+                    ex is IOException or HttpRequestException or InvalidOperationException or
+                    InvalidDataException or UnauthorizedAccessException or
+                    System.Text.Json.JsonException)
+                {
+                    lastCandidateFailure = ex.Message;
+                    if (candidatePool == AccountRotationPool.Primary)
+                    {
+                        hadUnconfirmedPrimaryCandidate = true;
+                    }
+                    continue;
+                }
+                if (armed.Status != PatGatewayRotationStatus.Armed ||
+                    !string.Equals(armed.SourceAccountKey, accountKey, StringComparison.Ordinal) ||
+                    !string.Equals(armed.TargetAccountKey, targetKey, StringComparison.Ordinal))
+                {
+                    lastCandidateFailure = "本地 PAT 网关返回了不一致的轮换路由。";
+                    if (candidatePool == AccountRotationPool.Primary)
+                    {
+                        hadUnconfirmedPrimaryCandidate = true;
+                    }
+                    continue;
                 }
 
-                if (backupBatchAdded || attemptedPrimaryKeys.Count == 0)
-                {
-                    break;
-                }
-
-                // A primary account can become unavailable only after its fresh quota check.
-                // Rebuild once with those just-attempted accounts excluded so the same
-                // preparation cycle can enter the backup pool without a one-minute gap.
-                var temporarilyUnavailable = new HashSet<string>(
-                    _patAutoRotationUnavailableAccountKeys,
-                    StringComparer.Ordinal);
-                temporarilyUnavailable.UnionWith(attemptedPrimaryKeys);
-                var fallbackCandidates = AccountRotationConfiguration.BuildCandidates(
-                    _appSettings,
-                    _accounts,
-                    current,
-                    temporarilyUnavailable,
-                    DateTimeOffset.UtcNow,
-                    HasUsableAccountCredential)
-                    .Where(candidate =>
-                        AccountRotationConfiguration.GetPool(_appSettings, candidate) ==
-                        AccountRotationPool.Backup)
-                    .ToList();
-                backupBatchAdded = true;
-                foreach (var fallback in fallbackCandidates)
-                {
-                    pendingCandidates.Enqueue(fallback);
-                }
+                _patAutoRotationState = PatAutoRotationState.WaitingForRequestBoundary;
+                _statusBox.Text =
+                    $"已准备从 {current.Name} 轮换到 {candidate.Name}；" +
+                    "当前响应继续运行，下一次模型请求会直接使用新账号。";
+                UpdatePatAutoRotationControls();
+                var activated = await WaitForPatGatewayRotationActivationAsync(
+                    accountKey,
+                    targetKey,
+                    cancellation.Token);
+                CompletePatGatewayRotation(candidate, activated);
+                return;
             }
 
             _patAutoRotationState = PatAutoRotationState.Cooldown;
@@ -15861,11 +17199,17 @@ public partial class Form1 : Form
         DateTimeOffset activatedAtUtc)
     {
         var targetKey = QuotaAccountIdentity.CreateKey(target);
+        // Write the attribution boundary before changing the current-account marker.  This
+        // lets SetCurrentAccount start a fresh report that already contains the new boundary
+        // instead of racing a background report against a just-about-to-be-written switch.
+        _usageTracker.RecordSwitch(target, "pat-gateway-rotation", activatedAtUtc);
         SetCurrentAccount(target.Name, false, persistSettings: true);
         _codex.QueueHotRotatedOfficialAccountDisplay(target, _accounts);
         _quotaSafetyMarginTracker.Reset(targetKey);
-        _usageTracker.RecordSwitch(target, "pat-gateway-rotation", activatedAtUtc);
-        InvalidateQuotaUsageCache(clearCachedData: false);
+        // A completed switch changes the logical pool and may make a primary snapshot
+        // eligible immediately. Do not carry the previous backup-return cooldown into
+        // the new request boundary.
+        _accountRotationPrimaryReturnCheckedAtUtc = null;
         _launchedOfficialQuotaAccountKey = target.IsCompatibleApi ? null : targetKey;
         if (!target.IsCompatibleApi)
         {
@@ -15912,8 +17256,9 @@ public partial class Form1 : Form
         foreach (var account in _accounts.Where(account => !account.IsCompatibleApi))
         {
             var accountKey = QuotaAccountIdentity.CreateKey(account);
-            var usage = _quotaUsageCache?.Accounts.FirstOrDefault(summary =>
-                summary.AccountName.Equals(account.Name, StringComparison.OrdinalIgnoreCase));
+            var usage = _quotaUsageCache == null
+                ? null
+                : FindUsageForAccount(_quotaUsageCache, account);
             var resetAtUtc = usage?.GetQuotaWindow(AccountQuotaWindowKind.FiveHour)?.ResetAtUtc;
             if (!resetAtUtc.HasValue &&
                 _appSettings.AccountRotationResetAtUtc.TryGetValue(accountKey, out var persistedReset))
@@ -15987,16 +17332,35 @@ public partial class Form1 : Form
 
     private bool IsPatAutoRotationContextCurrent(string accountKey)
     {
-        return AccountRotationConfiguration.IsEnabled(_appSettings) &&
-               _patAutoRotationGatewayTransportActive &&
-               _patAutoRotationLaunchContext?.ClientMode == WindowsClientMode.OfficialCodex &&
-               GetCurrentAccountRecord() is { } current &&
-               AccountRotationConfiguration.GetPool(_appSettings, current) !=
-                   AccountRotationPool.None &&
-               string.Equals(
-                   QuotaAccountIdentity.CreateKey(current),
-                   accountKey,
-                   StringComparison.Ordinal);
+        if (!AccountRotationConfiguration.IsEnabled(_appSettings))
+        {
+            return false;
+        }
+
+        var inMemoryContextCurrent =
+            _patAutoRotationGatewayTransportActive &&
+            _patAutoRotationLaunchContext?.ClientMode == WindowsClientMode.OfficialCodex &&
+            GetCurrentAccountRecord() is { } current &&
+            AccountRotationConfiguration.GetPool(_appSettings, current) !=
+                AccountRotationPool.None &&
+            string.Equals(
+                QuotaAccountIdentity.CreateKey(current),
+                accountKey,
+                StringComparison.Ordinal);
+        if (inMemoryContextCurrent)
+        {
+            return true;
+        }
+
+        // A Manager restart must not disable a live gateway chain. The route/success cache
+        // contains the actual logical account and is independent of desktop process
+        // detection, so both automatic exhaustion workers and backup-to-primary return can
+        // safely resume from it without sending an OpenAI probe.
+        return TryResolvePersistedPatGatewayLogicalAccount(
+                   allowArmedSource: true,
+                   out _,
+                   out var persistedAccountKey) &&
+               string.Equals(persistedAccountKey, accountKey, StringComparison.Ordinal);
     }
 
     private void ResetPatAutoRotationObservationAfterSwitch(bool fallbackApi)
@@ -16462,6 +17826,213 @@ public partial class Form1 : Form
         }
 
         RenderCards();
+    }
+
+    /// <summary>
+    /// Runs one independent quota probe for every configured account in the current
+    /// rotation/display order.  This deliberately does not call the desktop launch path:
+    /// each request carries its own credential and the local gateway marks it as a
+    /// quota-test, so the running Codex session, route cursor and session affinity are left
+    /// untouched.
+    /// </summary>
+    private async Task SendMinimalQuotaTestsForAllAsync()
+    {
+        if (_formClosed || IsDisposed)
+        {
+            return;
+        }
+        if (_bulkQuotaTestInProgress)
+        {
+            _statusBox.Text = "批量额度测试已经在进行中，请等待当前账号完成。";
+            return;
+        }
+
+        IReadOnlyList<AccountRecord> orderedAccounts;
+        try
+        {
+            // Reload just the small account/settings documents before taking the snapshot.
+            // A reorder saved in another manager window therefore applies to this batch,
+            // while the snapshot itself remains stable for the duration of the run.
+            var latestAccounts = _store.LoadAccounts();
+            var latestSettings = _themeService.LoadSettings();
+            _ = AccountRotationConfiguration.Normalize(latestSettings, latestAccounts);
+            var currentKey = latestAccounts.FirstOrDefault(account =>
+                    account.Name.Equals(_currentAccountName ?? string.Empty,
+                        StringComparison.OrdinalIgnoreCase)) is { } current
+                ? QuotaAccountIdentity.CreateKey(current)
+                : null;
+            orderedAccounts = AccountRotationConfiguration.IsEnabled(latestSettings)
+                ? AccountRotationConfiguration.GetQuotaDisplayOrder(
+                    latestSettings,
+                    latestAccounts,
+                    currentKey)
+                : latestAccounts.ToList();
+        }
+        catch (Exception ex) when (
+            ex is IOException or UnauthorizedAccessException or InvalidDataException or
+            System.Text.Json.JsonException or InvalidOperationException)
+        {
+            // The in-memory list is already a valid snapshot loaded by the form.  Falling
+            // back to it keeps the button useful if an external editor briefly holds a
+            // settings file lock.
+            orderedAccounts = _accounts.ToList();
+            ManagerLifecycleDiagnostics.WriteException(
+                "bulk-quota-order-reload-fallback",
+                ex);
+        }
+
+        orderedAccounts = orderedAccounts
+            .GroupBy(QuotaAccountIdentity.CreateKey, StringComparer.Ordinal)
+            .Select(group => group.First())
+            .ToList();
+        if (orderedAccounts.Count == 0)
+        {
+            _statusBox.Text = "没有可测试的账号。";
+            return;
+        }
+
+        var confirmation = MessageBox.Show(
+            this,
+            $"将按当前轮换/显示顺序逐个测试 {orderedAccounts.Count} 个账号。\n\n" +
+            "官方 OAuth/PAT 账号会各发送一次低成本模型请求，并随后只读回该账号最新额度与 5h 重置时间；" +
+            "这可能消耗极少量该账号额度。\n\n" +
+            "不会切换桌面账号，不会关闭或重启 Codex/网关，也不会改变轮换游标。" +
+            "兼容 API 账号没有官方 5h 套餐接口，将在结果中标记为跳过。\n\n是否继续？",
+            "确认一键测试全部账号",
+            MessageBoxButtons.OKCancel,
+            MessageBoxIcon.Warning,
+            MessageBoxDefaultButton.Button2);
+        if (confirmation != DialogResult.OK)
+        {
+            return;
+        }
+
+        _bulkQuotaTestInProgress = true;
+        _bulkQuotaTestCompleted = 0;
+        _bulkQuotaTestTotal = orderedAccounts.Count;
+        var succeeded = new List<string>();
+        var failed = new List<string>();
+        var skipped = new List<string>();
+        SetButtonsEnabled(false);
+        UpdateWorkspaceChrome();
+        try
+        {
+            for (var index = 0; index < orderedAccounts.Count; index++)
+            {
+                if (_formClosed || IsDisposed)
+                {
+                    break;
+                }
+
+                var account = orderedAccounts[index];
+                var ordinal = index + 1;
+                _statusBox.Text = $"正在测试第 {ordinal}/{orderedAccounts.Count} 个账号：{account.Name}";
+                _bulkQuotaTestCompleted = index;
+                UpdateWorkspaceChrome();
+
+                var accountKey = QuotaAccountIdentity.CreateKey(account);
+                if (account.IsCompatibleApi)
+                {
+                    skipped.Add($"{account.Name}（兼容 API：没有官方 5h 套餐额度接口）");
+                }
+                else if (!_codex.HasStoredQuotaTestCredential(account))
+                {
+                    // A batch must never open a login dialog halfway through.  The account
+                    // is reported explicitly so the user can log it in and run the batch
+                    // again later.
+                    skipped.Add($"{account.Name}（没有可用的本地登录凭据）");
+                }
+                else if (!_minimalQuotaTestsInProgress.Add(accountKey))
+                {
+                    skipped.Add($"{account.Name}（该账号已有测试在进行）");
+                }
+                else
+                {
+                    var generation = GetQuotaRuntimeStateGeneration(accountKey);
+                    try
+                    {
+                        var progress = new Progress<string>(stage =>
+                        {
+                            if (!_formClosed && !IsDisposed)
+                            {
+                                _statusBox.Text =
+                                    $"测试 {ordinal}/{orderedAccounts.Count} · {account.Name}：{stage}";
+                            }
+                        });
+                        await _codex.SendMinimalQuotaTestAsync(account, progress);
+                        var refreshed = await StartOfficialQuotaRefreshAfterMinimalTestAsync(
+                            accountKey,
+                            generation);
+                        succeeded.Add(refreshed
+                            ? $"{account.Name}（测试完成，额度/重置时间已刷新）"
+                            : $"{account.Name}（测试完成，官方额度回读暂未完成）");
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        skipped.Add($"{account.Name}（操作被取消）");
+                    }
+                    catch (Exception ex)
+                    {
+                        var detail = ex.Message.Replace('\r', ' ').Replace('\n', ' ').Trim();
+                        if (detail.Length > 180)
+                        {
+                            detail = detail[..180] + "…";
+                        }
+                        failed.Add($"{account.Name}（{detail}）");
+                        ManagerLifecycleDiagnostics.WriteException(
+                            "bulk-quota-test-account-failed",
+                            ex,
+                            $"account={accountKey}; ordinal={ordinal}");
+                    }
+                    finally
+                    {
+                        _minimalQuotaTestsInProgress.Remove(accountKey);
+                    }
+                }
+
+                _bulkQuotaTestCompleted = ordinal;
+                UpdateWorkspaceChrome();
+                // Yield once between accounts so repaint, status-bar layout and a user's
+                // close/navigation event are serviced even when a provider answers quickly.
+                await Task.Yield();
+            }
+        }
+        finally
+        {
+            _bulkQuotaTestInProgress = false;
+            _bulkQuotaTestCompleted = Math.Min(_bulkQuotaTestCompleted, _bulkQuotaTestTotal);
+            SetButtonsEnabled(true);
+            UpdateWorkspaceChrome();
+        }
+
+        if (_formClosed || IsDisposed)
+        {
+            return;
+        }
+
+        RenderCards();
+        var summary =
+            $"批量额度测试完成：成功 {succeeded.Count}，失败 {failed.Count}，跳过 {skipped.Count}。";
+        var details = new StringBuilder(summary);
+        if (succeeded.Count > 0)
+        {
+            details.Append("\n\n成功：\n").Append(string.Join("\n", succeeded));
+        }
+        if (failed.Count > 0)
+        {
+            details.Append("\n\n失败（可单独重试）：\n").Append(string.Join("\n", failed));
+        }
+        if (skipped.Count > 0)
+        {
+            details.Append("\n\n跳过：\n").Append(string.Join("\n", skipped));
+        }
+        _statusBox.Text = summary;
+        MessageBox.Show(
+            this,
+            details.ToString(),
+            "一键测试结果",
+            MessageBoxButtons.OK,
+            failed.Count == 0 ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
     }
 
     private async Task SendMinimalQuotaTestAsync(AccountRecord account)
@@ -17031,6 +18602,10 @@ public partial class Form1 : Form
                 button.Enabled = !_minimalQuotaTestsInProgress.Contains(
                     button.AccessibleDescription ?? string.Empty);
             }
+            else if (button.Name.Equals("BulkMinimalQuotaTestAction", StringComparison.Ordinal))
+            {
+                button.Enabled = !_bulkQuotaTestInProgress;
+            }
             else if (button.Name.Equals("DisabledUnifiedHistoryAction", StringComparison.Ordinal))
             {
                 button.Enabled = false;
@@ -17255,6 +18830,23 @@ public partial class Form1 : Form
             await LocalPatGateway.EnsureRunningAsync(
                 restartOnProxyMismatch: !_preserveExistingPatGatewayOnStartup);
             _patGatewayRuntimeRunning = true;
+            if (_preserveExistingPatGatewayOnStartup)
+            {
+                // Adopt the listener first. If it is an older protocol, wait for the
+                // existing request/task boundary before replacing only that listener;
+                // Codex and its current task remain untouched. This is important for
+                // the success-only account marker used by 2.2.9: keeping a v7 listener
+                // forever would force the Manager to guess from its last-started marker.
+                _patGatewayRuntimeStatus = "已保留现有网关 · 当前任务结束后安全升级";
+                await TryRecoverPatAutoRotationLaunchContextAsync();
+                if (await LocalPatGateway.RequiresRotationProtocolUpgradeAsync())
+                {
+                    await UpgradePatGatewayAtSafeBoundaryAsync();
+                    return;
+                }
+                _patGatewayRuntimeStatus = "已保留现有网关（未中断请求）";
+                return;
+            }
             if (await LocalPatGateway.RequiresRotationProtocolUpgradeAsync())
             {
                 PersistPatGatewayQuotaSignalSnapshotBestEffort(
@@ -17305,9 +18897,13 @@ public partial class Form1 : Form
             var activity = await LocalPatGateway.ReadOwnedActivitySnapshotAsync();
             var taskBoundary = await Task.Run(
                 () => _codexTaskBoundaryMonitor.Inspect(pendingSinceUtc));
+            // A Codex session can keep its task_started marker while it is doing local
+            // work, waiting for user input, or holding an unrelated tool turn. That marker
+            // is not an active model request and must not pin an old listener forever.
+            // The gateway activity counter plus its quiet period are the authoritative
+            // boundary for a listener-only hand-off; Codex itself is never stopped.
             var safe = activity != null &&
-                       PatAutoRotationPolicy.IsGatewayQuiet(activity, DateTimeOffset.UtcNow) &&
-                       !taskBoundary.HasActiveTask;
+                       PatAutoRotationPolicy.IsGatewayQuiet(activity, DateTimeOffset.UtcNow);
             consecutiveSafeChecks = safe ? consecutiveSafeChecks + 1 : 0;
             if (consecutiveSafeChecks >=
                 PatAutoRotationPolicy.RequiredConsecutiveSafeBoundaryChecks)
@@ -17319,7 +18915,6 @@ public partial class Form1 : Form
                     () => _codexTaskBoundaryMonitor.Inspect(pendingSinceUtc));
                 if (activity != null &&
                     PatAutoRotationPolicy.IsGatewayQuiet(activity, DateTimeOffset.UtcNow) &&
-                    !taskBoundary.HasActiveTask &&
                     await LocalPatGateway.RequiresRotationProtocolUpgradeAsync())
                 {
                     PersistPatGatewayQuotaSignalSnapshotBestEffort(activity);
@@ -17355,21 +18950,108 @@ public partial class Form1 : Form
         }
 
         var activity = knownActivity ?? await LocalPatGateway.ReadActivitySnapshotAsync();
-        if (activity == null)
+        if (activity != null && await RetireUnconfirmedLegacyGatewayRouteAsync(activity))
         {
             return;
         }
-        var rotation = activity.Rotation;
-        var observed = FindRotationAccount(activity.LastModelRequestAccountKey);
+        var rotation = activity?.Rotation;
+        if (rotation is not { Status: not PatGatewayRotationStatus.None })
+        {
+            var persistedRoute = new PatGatewayRotationStore(_store.RootPath).Load();
+            if (persistedRoute.Status != PatGatewayRotationStatus.None)
+            {
+                rotation = persistedRoute;
+            }
+        }
+        if (activity == null &&
+            rotation is not { Status: not PatGatewayRotationStatus.None })
+        {
+            return;
+        }
+        AccountRecord? projectedRecoveryTransport = null;
+        var rememberedRecoveryCurrent = GetCurrentAccountRecord();
+        if (rotation is { Status: PatGatewayRotationStatus.Armed } &&
+            rememberedRecoveryCurrent != null &&
+            PatGatewayRotationStore.TryNormalizeAccountKey(
+                rotation.SourceAccountKey,
+                out var recoveredSourceKey) &&
+            !recoveredSourceKey.Equals(
+                QuotaAccountIdentity.CreateKey(rememberedRecoveryCurrent),
+                StringComparison.Ordinal))
+        {
+            // Startup recovery must not resurrect a route whose source disagrees with the
+            // account the user most recently left selected. Retire it before choosing the
+            // logical/quota identity below.
+            if (!await LocalPatGateway.ClearRotationAsync())
+            {
+                return;
+            }
+            rotation = null;
+        }
+        var recoveredRouteCheckedAtUtc = DateTimeOffset.UtcNow;
+        if (rotation is { Status: PatGatewayRotationStatus.Armed } &&
+            (rotation.ArmedAtUtc is not { } recoveredArmedAtUtc ||
+             recoveredArmedAtUtc > recoveredRouteCheckedAtUtc.AddSeconds(5) ||
+             recoveredRouteCheckedAtUtc - recoveredArmedAtUtc >
+                 LocalPatGatewayHost.ArmedRotationMaximumLifetime))
+        {
+            // An expired pending route is not a current-account observation. Recovering its
+            // source here used to overwrite a newer explicit 158 selection and made the quota
+            // page appear to belong to the old backup account.
+            if (!await LocalPatGateway.ClearRotationAsync())
+            {
+                return;
+            }
+            rotation = null;
+        }
+        if (rotation is { Status: not PatGatewayRotationStatus.None } &&
+            FindProjectedPatGatewayTransportAccount() is { } projectedTransport &&
+            (!PatGatewayRotationStore.TryNormalizeAccountKey(
+                 rotation.TransportAccountKey,
+                 out var recoveredTransportKey) ||
+             !recoveredTransportKey.Equals(
+                 QuotaAccountIdentity.CreateKey(projectedTransport),
+                 StringComparison.Ordinal)))
+        {
+            // A Manager restart can expose a route created before a later desktop profile
+            // switch. Such a route can never activate because its transport token no longer
+            // matches incoming Codex requests. Retire it only after positively identifying
+            // the projected desktop credential, then use that account for UI/quota recovery.
+            if (!await LocalPatGateway.ClearRotationAsync())
+            {
+                return;
+            }
+            rotation = null;
+            projectedRecoveryTransport = projectedTransport;
+        }
+        // On v8 the last-started marker may point at a failed source while a later
+        // successful retry/affinity winner is the account actually serving Codex.  Recover
+        // from the success-only marker first so a Manager restart cannot project the failed
+        // source back into the current-account label or official quota target.  For v3-v7,
+        // SelectSuccessfulActivityMarker deliberately returns no marker: those protocols
+        // only report the last attempted credential and must never overwrite an explicitly
+        // selected account during startup recovery.
+        (string? AccountKey, DateTimeOffset? CompletedAtUtc, DateTimeOffset? StartedAtUtc)
+            successfulMarker = activity == null || projectedRecoveryTransport != null
+                ? default
+                : SelectSuccessfulActivityMarker(activity);
+        var latestExplicitSwitchAtUtc = _usageTracker.GetLatestAccountSwitchAtUtc();
+        var successfulObservedKey =
+            successfulMarker.CompletedAtUtc is { } successfulCompletedAtUtc &&
+            (latestExplicitSwitchAtUtc is not { } latestExplicitSwitch ||
+             successfulCompletedAtUtc >= latestExplicitSwitch)
+                ? successfulMarker.AccountKey
+                : null;
+        var observed = FindRotationAccount(successfulObservedKey);
         var selected = GetCurrentAccountRecord();
         var transport = rotation?.Status is PatGatewayRotationStatus.Armed or PatGatewayRotationStatus.Active
             ? FindRotationAccount(rotation.TransportAccountKey)
-            : observed ?? selected;
+            : projectedRecoveryTransport ?? observed ?? selected;
         var logical = rotation?.Status switch
         {
             PatGatewayRotationStatus.Armed => FindRotationAccount(rotation.SourceAccountKey),
             PatGatewayRotationStatus.Active => FindRotationAccount(rotation.TargetAccountKey),
-            _ => observed ?? selected
+            _ => projectedRecoveryTransport ?? observed ?? selected
         };
         if (transport == null ||
             (!transport.IsAccessToken && !transport.IsOfficialOAuth) ||

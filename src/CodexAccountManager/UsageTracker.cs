@@ -1081,6 +1081,23 @@ public sealed class UsageTracker
             .Distinct(StringComparer.OrdinalIgnoreCase);
     }
 
+    public DateTimeOffset? GetLatestAccountSwitchAtUtc()
+    {
+        var latest = LoadSwitchEvents()
+            .Where(candidate =>
+                string.Equals(
+                    candidate.ManagerScopeKey,
+                    _managerScopeKey,
+                    StringComparison.Ordinal))
+            .Select(candidate => candidate.GetSwitchedAtUtc())
+            .Where(switchedAtUtc => switchedAtUtc > DateTimeOffset.MinValue)
+            .DefaultIfEmpty()
+            .Max();
+        return latest > DateTimeOffset.MinValue
+                ? latest
+                : null;
+    }
+
     public void EnsureCurrentAccountTracking(AccountRecord? account)
     {
         if (account == null)
@@ -1306,7 +1323,11 @@ public sealed class UsageTracker
 
         var summaries = accounts.ToDictionary(
             account => account.Name,
-            account => new AccountUsageSummary { AccountName = account.Name },
+            account => new AccountUsageSummary
+            {
+                AccountName = account.Name,
+                AccountKey = QuotaAccountIdentity.CreateKey(account)
+            },
             StringComparer.OrdinalIgnoreCase);
 
         foreach (var usage in reportUsageEvents)
@@ -1966,10 +1987,21 @@ public sealed class UsageTracker
         DateTimeOffset weekStart,
         DateTimeOffset monthStart)
     {
-        var target = !string.IsNullOrWhiteSpace(usage.AccountName) &&
-            summaries.TryGetValue(usage.AccountName, out var summary)
-            ? summary
-            : null;
+        // Stable credential identity is authoritative. Display names are editable and
+        // global Codex session logs do not carry a name of their own; using the name first
+        // allowed a renamed/reordered account to inherit another account's 5h window. Legacy
+        // events still fall back to the display name when no key was recorded.
+        AccountUsageSummary? target = null;
+        if (!string.IsNullOrWhiteSpace(usage.AccountKey))
+        {
+            target = summaries.Values.FirstOrDefault(summary =>
+                string.Equals(summary.AccountKey, usage.AccountKey, StringComparison.Ordinal));
+        }
+        if (target == null && !string.IsNullOrWhiteSpace(usage.AccountName) &&
+            summaries.TryGetValue(usage.AccountName, out var summaryByName))
+        {
+            target = summaryByName;
+        }
         if (target != null)
         {
             target.Timeline.Add(usage);
@@ -3381,6 +3413,7 @@ public sealed class UsageTracker
         return new UsageEvent
         {
             AccountName = source.AccountName,
+            AccountKey = source.AccountKey,
             Model = source.Model,
             TimestampUtc = source.TimestampUtc,
             SessionStartedAtUtc = source.SessionStartedAtUtc,
@@ -4175,6 +4208,9 @@ public sealed class UsageTracker
         }
         var activeSwitch = FindActiveSwitch(attributionTimestamp, switchEvents);
         usage.AccountName = ResolveCurrentAccountName(activeSwitch?.Entry, accounts);
+        // Preserve the boundary's stable identity on the event itself. This keeps report
+        // aggregation correct after a user renames or reorders accounts.
+        usage.AccountKey = activeSwitch?.Entry.AccountKey;
         usage.ActivationEpochUtc = activeSwitch?.SwitchedAtUtc;
     }
 
@@ -4485,6 +4521,12 @@ public sealed class UsageReport
 public sealed class AccountUsageSummary
 {
     public string AccountName { get; set; } = "";
+    /// <summary>
+    /// Stable identity for the credential directory that owns this summary.  It is kept
+    /// separate from AccountName because users can rename accounts while a background quota
+    /// report is being loaded.
+    /// </summary>
+    public string? AccountKey { get; set; }
     public UsageBucket Hour { get; } = new();
     public UsageBucket FiveHours { get; } = new();
     public UsageBucket Day { get; } = new();
@@ -4709,6 +4751,11 @@ public sealed class ModelUsageBucket
 public sealed class UsageEvent
 {
     public string? AccountName { get; set; }
+    /// <summary>
+    /// Stable credential-directory identity for this event. Older persisted events may be
+    /// null and are resolved by the legacy display-name fallback.
+    /// </summary>
+    public string? AccountKey { get; set; }
     public string? Model { get; set; }
     public DateTimeOffset TimestampUtc { get; set; }
     public DateTimeOffset? SessionStartedAtUtc { get; set; }

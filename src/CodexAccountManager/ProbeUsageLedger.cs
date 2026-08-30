@@ -19,6 +19,7 @@ internal sealed record ProbeUsageRecord(
     public UsageEvent ToUsageEvent(string resolvedAccountName) => new()
     {
         AccountName = resolvedAccountName,
+        AccountKey = AccountKey,
         Model = Model,
         TimestampUtc = CompletedAtUtc.ToUniversalTime(),
         Source = UsageEventSource.LegacyProbe,

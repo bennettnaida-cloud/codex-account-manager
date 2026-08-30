@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.IO.Compression;
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
@@ -14,10 +15,18 @@ internal static class LocalPatGateway
     internal const string ProviderBaseUrl = "http://127.0.0.1:8317/backend-api/codex";
     internal const string ChatGptBaseUrl = "http://127.0.0.1:8317/backend-api";
     internal const string RequestTimeoutHeader = "X-Codex-Account-Manager-Request-Timeout-Ms";
+    // Requests sent by the manager's explicit quota-test button are intentionally
+    // independent of the running Codex session.  Keeping this marker on the loopback
+    // hop lets the gateway avoid changing global rotation/session state or the
+    // user-visible "last successful model account" while a test is in progress.
+    internal const string RequestPurposeHeader =
+        "X-Codex-Account-Manager-Request-Purpose";
+    internal const string QuotaTestRequestPurpose = "quota-test";
     internal const string ProcessArgument = "--local-pat-gateway";
     internal const string RootArgument = "--manager-root";
     internal const string RotationArmPath = "__rotation/arm";
     internal const string RotationClearPath = "__rotation/clear";
+    internal const string SessionAffinityInvalidatePath = "__affinity/invalidate-account";
 
     private const string MarkerHeader = "X-Codex-Account-Manager-Gateway";
     private const string MarkerValue = "pat-v1";
@@ -31,9 +40,29 @@ internal static class LocalPatGateway
     // v4 makes a quota-limited event durable and independently observable by the
     // Manager. v5 additionally buffers a model request in memory and, before any
     // downstream response byte is written, retries an upstream 429 through the ordered
-    // account rings. Older gateways remain readable until the existing safe boundary.
+    // account rings. v6 adds per-session/previous-response affinity and per-account
+    // fingerprint convergence. v7 classifies 429 responses and only persists/rotates on
+    // explicit quota-exhaustion evidence; ordinary concurrency/rate-limit 429 responses
+    // are retried on the same account and never poison the durable exhausted-account set.
+    // v8 additionally normalizes gzip/deflate/br model JSON before affinity inspection and
+    // requires three same-account confirmations before a body-only quota marker can rotate.
+    // v9 adds bounded zstd normalization, request-scoped confirmation for otherwise
+    // ambiguous repeated 429 responses, and pre-output 503 failover for compatible API
+    // relays (while keeping official-account infrastructure 503 responses fail-closed).
+    // v10 adds a successful-request start marker so streamed usage is attributed at the
+    // request boundary instead of the later EOF timestamp. v11 lets a compatible-API
+    // transport enter a prepared primary route and atomically replaces an unactivated
+    // target for the explicit force-switch action. Older gateways remain readable until a
+    // safe hand-off.
     internal const string DurableRotationProtocolValue = "request-boundary-v4";
-    internal const string RotationProtocolValue = "request-boundary-v5";
+    internal const string TransparentRotationProtocolValue = "request-boundary-v5";
+    internal const string FingerprintRotationProtocolValue = "request-boundary-v6";
+    internal const string ConfirmedQuotaRotationProtocolValue = "request-boundary-v7";
+    internal const string SafeContentEncodingRotationProtocolValue = "request-boundary-v8";
+    internal const string SuccessfulActivityRotationProtocolValue = "request-boundary-v10";
+    // v11 is required for backup compatible-API transports to honor a prepared primary
+    // route and for a force switch to replace a pending target under the gateway lock.
+    internal const string RotationProtocolValue = "request-boundary-v11";
     private static readonly SemaphoreSlim StartupLock = new(1, 1);
 
     internal static int RunProcess(string[] args)
@@ -229,7 +258,11 @@ internal static class LocalPatGateway
         bool requireCompatibleProtocol,
         CancellationToken cancellationToken)
     {
-        using var client = CreateLoopbackClient();
+        // This is an authenticated control-plane read used to choose the logical source
+        // account for a route mutation.  A 700 ms health-probe timeout is too aggressive
+        // under transient local disk/AV pressure: returning null there makes the Manager
+        // fall back to a stale UI account and every subsequent arm request fails with 409.
+        using var client = CreateLoopbackControlClient();
         try
         {
             var challenge = LocalPatGatewayControl.CreateChallenge();
@@ -245,6 +278,12 @@ internal static class LocalPatGateway
             {
                 return null;
             }
+
+            var rotationProtocol = response.Headers.TryGetValues(
+                    RotationProtocolHeader,
+                    out var rotationProtocolValues)
+                ? rotationProtocolValues.FirstOrDefault(IsCompatibleRotationProtocolValue)
+                : null;
 
             await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
             using var document = await JsonDocument.ParseAsync(
@@ -277,7 +316,11 @@ internal static class LocalPatGateway
                 sequenceValue.TryGetInt64(out var lastQuotaLimitedSequence) &&
                 lastQuotaLimitedSequence > 0L
                     ? lastQuotaLimitedSequence
-                    : null);
+                    : null,
+                rotationProtocol,
+                ReadAccountKey(activity, "lastSuccessfulModelRequestAccountKey"),
+                ReadUnixMilliseconds(activity, "lastSuccessfulModelRequestCompletedAtUnixMs"),
+                ReadUnixMilliseconds(activity, "lastSuccessfulModelRequestStartedAtUnixMs"));
         }
         catch (Exception ex) when (
             ex is HttpRequestException or
@@ -293,6 +336,7 @@ internal static class LocalPatGateway
     internal static async Task<PatGatewayRotationSnapshot> ArmRotationAsync(
         string sourceAccountKey,
         string targetAccountKey,
+        bool replaceExistingArmedTarget = false,
         CancellationToken cancellationToken = default)
     {
         if (!PatGatewayRotationStore.TryNormalizeAccountKey(sourceAccountKey, out var source) ||
@@ -312,7 +356,8 @@ internal static class LocalPatGateway
         var payload = JsonSerializer.SerializeToUtf8Bytes(new
         {
             sourceAccountKey = source,
-            targetAccountKey = target
+            targetAccountKey = target,
+            replaceExistingArmedTarget
         });
         using var client = CreateLoopbackControlClient();
         var challenge = LocalPatGatewayControl.CreateChallenge();
@@ -342,8 +387,41 @@ internal static class LocalPatGateway
         }
         if (!response.IsSuccessStatusCode)
         {
+            var controlError = await ReadGatewayControlErrorMessageAsync(
+                response,
+                cancellationToken);
+            if (replaceExistingArmedTarget &&
+                response.StatusCode == HttpStatusCode.Conflict &&
+                controlError?.Contains(
+                    "active logical account",
+                    StringComparison.OrdinalIgnoreCase) == true)
+            {
+                // v3-v10 gateways ignore the new replacement flag. Fall back only when the
+                // shared route still proves that the rejected operation is replacing the
+                // same unactivated source. This keeps an old listener usable until its safe
+                // in-place upgrade, without clearing a route for credential/config errors.
+                var existingStore = new PatGatewayRotationStore(new AccountStore().RootPath);
+                var existing = existingStore.Load();
+                if (existing.Status == PatGatewayRotationStatus.Armed &&
+                    string.Equals(existing.SourceAccountKey, source, StringComparison.Ordinal) &&
+                    !string.Equals(existing.TargetAccountKey, target, StringComparison.Ordinal))
+                {
+                    // The v10 listener reads this same credential-free file at every real
+                    // request boundary. Replace it with one same-directory atomic rename;
+                    // never clear first, otherwise a request arriving between two control
+                    // calls could briefly revive the old transport account.
+                    return existingStore.Arm(
+                        source,
+                        target,
+                        DateTimeOffset.UtcNow,
+                        replaceExistingArmedTarget: true);
+                }
+            }
             throw new InvalidOperationException(
-                $"本地 PAT 网关拒绝了轮换准备（HTTP {(int)response.StatusCode}）。");
+                $"本地 PAT 网关拒绝了轮换准备（HTTP {(int)response.StatusCode}）" +
+                (string.IsNullOrWhiteSpace(controlError)
+                    ? "。"
+                    : $"：{controlError}"));
         }
 
         await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
@@ -400,6 +478,72 @@ internal static class LocalPatGateway
         }
     }
 
+    internal static async Task<bool> InvalidateOrdinarySessionAffinityAsync(
+        string accountKey,
+        CancellationToken cancellationToken = default)
+    {
+        if (!PatGatewayRotationStore.TryNormalizeAccountKey(accountKey, out var normalized))
+        {
+            throw new ArgumentException(
+                "Session-affinity invalidation requires a valid account hash.",
+                nameof(accountKey));
+        }
+
+        var payload = JsonSerializer.SerializeToUtf8Bytes(new { accountKey = normalized });
+        using var client = CreateLoopbackControlClient();
+        try
+        {
+            var challenge = LocalPatGatewayControl.CreateChallenge();
+            using var request = new HttpRequestMessage(
+                HttpMethod.Post,
+                ListenerPrefix + SessionAffinityInvalidatePath);
+            request.Content = new ByteArrayContent(payload);
+            request.Content.Headers.ContentType =
+                new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
+            request.Headers.TryAddWithoutValidation(
+                LocalPatGatewayControl.ChallengeHeader,
+                challenge);
+            request.Headers.TryAddWithoutValidation(
+                LocalPatGatewayControl.ProofHeader,
+                LocalPatGatewayControl.CreateProof(
+                    LocalPatGatewayControl.LoadOrCreateSecret(),
+                    challenge,
+                    BuildSessionAffinityInvalidationPurpose(payload)));
+            using var response = await client.SendAsync(request, cancellationToken);
+            if (response.IsSuccessStatusCode &&
+                HasExpectedMarker(response) &&
+                HasExpectedRotationProtocol(response))
+            {
+                return true;
+            }
+        }
+        catch (Exception ex) when (
+            ex is HttpRequestException or TaskCanceledException or IOException or
+                InvalidOperationException or UnauthorizedAccessException)
+        {
+            // Fall through to an offline cache update. v3-v5 gateways do not hold
+            // session-affinity state; a temporarily unavailable v6 gateway will still
+            // enforce current pool eligibility before it can use an old ordinary alias.
+        }
+
+        try
+        {
+            var store = new AccountStore();
+            return new PatGatewaySessionAffinityStore(
+                    store.RootPath,
+                    LocalPatGatewayControl.LoadOrCreateSecret())
+                .InvalidateOrdinaryBindingsForAccount(normalized)
+                .Persisted;
+        }
+        catch (Exception ex) when (
+            ex is IOException or UnauthorizedAccessException or InvalidDataException or
+                InvalidOperationException or NotSupportedException or ArgumentException or
+                JsonException)
+        {
+            return false;
+        }
+    }
+
     internal static void ClearPersistedRotationRoute()
     {
         new PatGatewayRotationStore(new AccountStore().RootPath).Clear();
@@ -443,6 +587,9 @@ internal static class LocalPatGateway
 
     private static string BuildRotationArmPurpose(ReadOnlySpan<byte> payload) =>
         "rotation-arm\n" + Convert.ToHexString(SHA256.HashData(payload));
+
+    private static string BuildSessionAffinityInvalidationPurpose(ReadOnlySpan<byte> payload) =>
+        "session-affinity-invalidate\n" + Convert.ToHexString(SHA256.HashData(payload));
 
     private static DateTimeOffset? ReadUnixMilliseconds(JsonElement source, string propertyName)
     {
@@ -611,6 +758,39 @@ internal static class LocalPatGateway
                values.Contains(MarkerValue, StringComparer.Ordinal);
     }
 
+    private static async Task<string?> ReadGatewayControlErrorMessageAsync(
+        HttpResponseMessage response,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            using var document = await JsonDocument.ParseAsync(
+                stream,
+                cancellationToken: cancellationToken);
+            if (!document.RootElement.TryGetProperty("error", out var error) ||
+                error.ValueKind != JsonValueKind.Object ||
+                !error.TryGetProperty("message", out var message) ||
+                message.ValueKind != JsonValueKind.String)
+            {
+                return null;
+            }
+
+            var value = message.GetString()?.Trim();
+            return string.IsNullOrWhiteSpace(value)
+                ? null
+                : value.Length <= 512
+                    ? value
+                    : value[..512];
+        }
+        catch (Exception ex) when (
+            ex is IOException or JsonException or InvalidOperationException or
+            TaskCanceledException)
+        {
+            return null;
+        }
+    }
+
     private static bool HasExpectedRotationProtocol(HttpResponseMessage response)
     {
         return response.Headers.TryGetValues(RotationProtocolHeader, out var values) &&
@@ -625,6 +805,40 @@ internal static class LocalPatGateway
 
     internal static bool IsCompatibleRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, SuccessfulActivityRotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, "request-boundary-v9", StringComparison.Ordinal) ||
+        string.Equals(value, SafeContentEncodingRotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, ConfirmedQuotaRotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, FingerprintRotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, TransparentRotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, DurableRotationProtocolValue, StringComparison.Ordinal) ||
+               string.Equals(value, CompatibleRotationProtocolValue, StringComparison.Ordinal);
+
+    // v8-v9 introduced the success-only activity markers consumed by the Manager. v10
+    // extends that marker with the request start boundary; all remain readable while the
+    // new executable waits for a request-boundary listener hand-off.
+    internal static bool IsCurrentRotationProtocolValue(string? value) =>
+        string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, SuccessfulActivityRotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, SafeContentEncodingRotationProtocolValue, StringComparison.Ordinal);
+
+    internal static bool IsTransparentRotationProtocolValue(string? value) =>
+        string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, SuccessfulActivityRotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, "request-boundary-v9", StringComparison.Ordinal) ||
+        string.Equals(value, SafeContentEncodingRotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, ConfirmedQuotaRotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, FingerprintRotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, TransparentRotationProtocolValue, StringComparison.Ordinal);
+
+    internal static bool IsConfirmedQuotaRotationProtocolValue(string? value) =>
+        string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, SuccessfulActivityRotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, "request-boundary-v9", StringComparison.Ordinal) ||
+        string.Equals(value, SafeContentEncodingRotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, ConfirmedQuotaRotationProtocolValue, StringComparison.Ordinal);
+
+    internal static bool IsManagerPreparedRotationProtocolValue(string? value) =>
         string.Equals(value, DurableRotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, CompatibleRotationProtocolValue, StringComparison.Ordinal);
 
@@ -644,9 +858,15 @@ internal static class LocalPatGateway
                    HasExpectedMarker(response) &&
                    HasExpectedControlProof(response, challenge) &&
                    response.Headers.TryGetValues(RotationProtocolHeader, out var values) &&
-                   values.Any(value =>
-                       string.Equals(value, CompatibleRotationProtocolValue, StringComparison.Ordinal) ||
-                       string.Equals(value, DurableRotationProtocolValue, StringComparison.Ordinal));
+                    values.Any(value =>
+                        string.Equals(value, CompatibleRotationProtocolValue, StringComparison.Ordinal) ||
+                        string.Equals(value, DurableRotationProtocolValue, StringComparison.Ordinal) ||
+                        string.Equals(value, ConfirmedQuotaRotationProtocolValue, StringComparison.Ordinal) ||
+                        string.Equals(value, FingerprintRotationProtocolValue, StringComparison.Ordinal) ||
+                        string.Equals(value, TransparentRotationProtocolValue, StringComparison.Ordinal) ||
+                        string.Equals(value, SafeContentEncodingRotationProtocolValue, StringComparison.Ordinal) ||
+                        string.Equals(value, "request-boundary-v9", StringComparison.Ordinal) ||
+                        string.Equals(value, RotationProtocolValue, StringComparison.Ordinal));
         }
         catch (Exception ex) when (
             ex is HttpRequestException or TaskCanceledException or IOException or
@@ -724,12 +944,20 @@ internal sealed record LocalPatGatewayActivitySnapshot(
     long? CompletedModelRequests = null,
     string? LastModelRequestAccountKey = null,
     string? LastQuotaLimitedAccountKey = null,
-    long? LastQuotaLimitedSequence = null);
+    long? LastQuotaLimitedSequence = null,
+    string? RotationProtocol = null,
+    string? LastSuccessfulModelRequestAccountKey = null,
+    DateTimeOffset? LastSuccessfulModelRequestCompletedAtUtc = null,
+    DateTimeOffset? LastSuccessfulModelRequestStartedAtUtc = null);
 
 internal sealed class LocalPatGatewayHost
 {
     private const int CompatibleApiRequestBodyMaxBytes = 128 * 1024 * 1024;
     private const int ReplayableModelRequestBodyMaxBytes = CompatibleApiRequestBodyMaxBytes;
+    private const int SessionAffinityInspectableBodyMaxBytes = 4 * 1024 * 1024;
+    private const int SessionAffinityMetadataMaxCharacters = 64 * 1024;
+    private const int SessionAffinityIdentifierMaxCharacters = 512;
+    private const int SessionAffinityValuesPerKind = 3;
     private const string MutexName = "Local\\CodexAccountManager.LocalPatGateway.8317";
     private const string UpstreamOrigin = "https://chatgpt.com";
     private const string WhoAmIUrl =
@@ -740,6 +968,21 @@ internal sealed class LocalPatGatewayHost
         "codex_cli_rs/0.144.1 (Windows 10.0.0; x86_64) codex-account-manager";
     private static readonly TimeSpan IdentityCacheLifetime = TimeSpan.FromMinutes(30);
     private const int MaxUpstreamErrorBodyBytes = 16 * 1024;
+    private const int Transient429SameAccountRetryLimit = 2;
+    // A request may walk the latest configured ring after a transient 429, but a
+    // malformed or concurrently-mutated account store must never turn that walk into an
+    // unbounded retry loop.  The attempted-account set is the primary guard; this cap is
+    // a final bounded safety net for keys that change while the request is in flight.
+    private const int Transient429CandidateFailoverLimit = 32;
+    private const int StructuredQuota429ConfirmationCount = 3;
+    private static readonly TimeSpan Transient429DefaultRetryDelay =
+        TimeSpan.FromMilliseconds(500);
+    private static readonly TimeSpan Transient429MaximumRetryDelay =
+        TimeSpan.FromSeconds(8);
+    private static readonly TimeSpan QuotaResetUnknownFallbackCooldown =
+        TimeSpan.FromSeconds(5);
+    internal static readonly TimeSpan ArmedRotationMaximumLifetime =
+        TimeSpan.FromMinutes(15);
     private const string InactiveWorkspaceMemberMarker =
         "owner is not an active member of the selected workspace";
     private static readonly string[] InactiveWorkspaceMemberMarkers =
@@ -834,11 +1077,14 @@ internal sealed class LocalPatGatewayHost
     private readonly ThemeService _themeService;
     private readonly PatGatewayRotationStore _rotationStore;
     private readonly PatGatewayQuotaSignalStore _quotaSignalStore;
+    private readonly PatGatewaySuccessfulActivityStore _successfulActivityStore;
+    private readonly PatGatewaySessionAffinityStore _sessionAffinityStore;
+    private readonly AccountProxyResolver _proxyResolver;
     private readonly object _rotationGate = new();
     private readonly SemaphoreSlim _rotationActivationGate = new(1, 1);
     private readonly ConcurrentDictionary<string, HttpClient> _clients = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, IdentityCacheEntry> _identityCache = new(StringComparer.Ordinal);
-    private readonly ConcurrentDictionary<string, DateTimeOffset> _quotaLimitedAccountKeys =
+    private readonly ConcurrentDictionary<string, QuotaLimitObservation> _quotaLimitedAccounts =
         new(StringComparer.Ordinal);
     private readonly object _activityGate = new();
     private readonly Dictionary<string, long> _completedModelRequestsByAccount =
@@ -849,6 +1095,9 @@ internal sealed class LocalPatGatewayHost
     private string? _lastQuotaLimitedAccountKey;
     private DateTimeOffset? _lastModelRequestStartedAtUtc;
     private DateTimeOffset? _lastModelRequestCompletedAtUtc;
+    private string? _lastSuccessfulModelRequestAccountKey;
+    private DateTimeOffset? _lastSuccessfulModelRequestStartedAtUtc;
+    private DateTimeOffset? _lastSuccessfulModelRequestCompletedAtUtc;
     private DateTimeOffset? _lastQuotaLimitedAtUtc;
     private long? _lastQuotaLimitedSequence;
 
@@ -861,11 +1110,29 @@ internal sealed class LocalPatGatewayHost
         _themeService = new ThemeService(_accountStore.RootPath);
         _rotationStore = new PatGatewayRotationStore(_accountStore.RootPath);
         _quotaSignalStore = new PatGatewayQuotaSignalStore(_accountStore.RootPath);
+        _successfulActivityStore = new PatGatewaySuccessfulActivityStore(
+            _accountStore.RootPath);
+        var affinitySettings = _themeService.LoadSettings();
+        _ = AccountRotationConfiguration.Normalize(affinitySettings, _accountStore.LoadAccounts());
+        var affinityTtl = TimeSpan.FromSeconds(
+            Math.Clamp(affinitySettings.AccountRotationSessionAffinityTtlSeconds, 60, 86_400));
+        _sessionAffinityStore = new PatGatewaySessionAffinityStore(
+            _accountStore.RootPath,
+            _controlSecret,
+            bindingLifetime: affinityTtl);
+        _proxyResolver = new AccountProxyResolver(_accountStore.RootPath);
         var recoveredQuotaSignals = _quotaSignalStore.ReadLatestPerAccount(DateTimeOffset.UtcNow);
         foreach (var recoveredQuotaSignal in recoveredQuotaSignals)
         {
-            _quotaLimitedAccountKeys[recoveredQuotaSignal.AccountKey] =
-                recoveredQuotaSignal.ObservedAtUtc;
+            _quotaLimitedAccounts[recoveredQuotaSignal.AccountKey] = new QuotaLimitObservation(
+                recoveredQuotaSignal.ObservedAtUtc,
+                recoveredQuotaSignal.ResetAtUtc);
+        }
+        if (_successfulActivityStore.ReadLatest() is { } recoveredActivity)
+        {
+            _lastSuccessfulModelRequestAccountKey = recoveredActivity.AccountKey;
+            _lastSuccessfulModelRequestStartedAtUtc = recoveredActivity.StartedAtUtc;
+            _lastSuccessfulModelRequestCompletedAtUtc = recoveredActivity.CompletedAtUtc;
         }
         if (recoveredQuotaSignals.FirstOrDefault() is { } latestRecoveredQuotaSignal)
         {
@@ -884,11 +1151,40 @@ internal sealed class LocalPatGatewayHost
         if (!LocalPatGateway.IsCompatibleRotationProtocolValue("request-boundary-v3") ||
             !LocalPatGateway.IsCompatibleRotationProtocolValue("request-boundary-v4") ||
             !LocalPatGateway.IsCompatibleRotationProtocolValue("request-boundary-v5") ||
+            !LocalPatGateway.IsCompatibleRotationProtocolValue("request-boundary-v6") ||
+            !LocalPatGateway.IsCompatibleRotationProtocolValue("request-boundary-v7") ||
+            !LocalPatGateway.IsCompatibleRotationProtocolValue("request-boundary-v8") ||
+            !LocalPatGateway.IsCompatibleRotationProtocolValue("request-boundary-v9") ||
+            !LocalPatGateway.IsCompatibleRotationProtocolValue("request-boundary-v10") ||
+            !LocalPatGateway.IsManagerPreparedRotationProtocolValue("request-boundary-v3") ||
+            !LocalPatGateway.IsManagerPreparedRotationProtocolValue("request-boundary-v4") ||
+            LocalPatGateway.IsManagerPreparedRotationProtocolValue("request-boundary-v5") ||
+            LocalPatGateway.IsManagerPreparedRotationProtocolValue("request-boundary-v6") ||
+            LocalPatGateway.IsManagerPreparedRotationProtocolValue(null) ||
+            LocalPatGateway.IsTransparentRotationProtocolValue("request-boundary-v3") ||
+            LocalPatGateway.IsTransparentRotationProtocolValue("request-boundary-v4") ||
+            !LocalPatGateway.IsTransparentRotationProtocolValue("request-boundary-v5") ||
+            !LocalPatGateway.IsTransparentRotationProtocolValue("request-boundary-v6") ||
+            !LocalPatGateway.IsTransparentRotationProtocolValue("request-boundary-v7") ||
+            !LocalPatGateway.IsTransparentRotationProtocolValue("request-boundary-v8") ||
+            !LocalPatGateway.IsTransparentRotationProtocolValue("request-boundary-v9") ||
+            !LocalPatGateway.IsTransparentRotationProtocolValue("request-boundary-v10") ||
+            LocalPatGateway.IsConfirmedQuotaRotationProtocolValue("request-boundary-v6") ||
+            !LocalPatGateway.IsConfirmedQuotaRotationProtocolValue("request-boundary-v7") ||
+            !LocalPatGateway.IsConfirmedQuotaRotationProtocolValue("request-boundary-v8") ||
+            !LocalPatGateway.IsConfirmedQuotaRotationProtocolValue("request-boundary-v9") ||
+            !LocalPatGateway.IsConfirmedQuotaRotationProtocolValue("request-boundary-v10") ||
+            LocalPatGateway.IsCurrentRotationProtocolValue("request-boundary-v7") ||
+            !LocalPatGateway.IsCurrentRotationProtocolValue("request-boundary-v8") ||
+            LocalPatGateway.IsCurrentRotationProtocolValue("request-boundary-v9") ||
+            !LocalPatGateway.IsCurrentRotationProtocolValue("request-boundary-v10") ||
+            LocalPatGateway.IsTransparentRotationProtocolValue(null) ||
             LocalPatGateway.IsCompatibleRotationProtocolValue("request-boundary-v2") ||
             LocalPatGateway.IsCompatibleRotationProtocolValue(null))
         {
             throw new InvalidOperationException(
-                "Gateway routing compatibility must accept only request-boundary v3/v4/v5.");
+                "Gateway routing compatibility must accept only request-boundary v3-v10, " +
+                "with v7-v10 confirmed quota signals and v8/v10 success-only activity markers.");
         }
 
         var pat = ParseBearerCredential("Bearer at-test-only-not-a-real-token");
@@ -996,6 +1292,12 @@ internal sealed class LocalPatGatewayHost
             new Uri(LocalPatGateway.ListenerPrefix + "backend-api/codex/responses?stream=true"),
             out var compatibleUri);
         if (!activated ||
+            !ShouldApplyRotationAtRequestBoundary(
+                isModelRequest: true,
+                isIndependentAccountProbe: false) ||
+            ShouldApplyRotationAtRequestBoundary(
+                isModelRequest: true,
+                isIndependentAccountProbe: true) ||
             selected.Token != "at-target-test-only" ||
             unrelated.Token != "at-unrelated-test-only" ||
             !apiSelected.IsCompatibleApi ||
@@ -1013,7 +1315,410 @@ internal sealed class LocalPatGatewayHost
                 "Gateway request-boundary rotation selected or transformed the wrong PAT/API target.");
         }
 
+        using var remainingQuota429 = new HttpResponseMessage(HttpStatusCode.TooManyRequests)
+        {
+            Content = new StringContent(
+                "{\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\"}}")
+        };
+        remainingQuota429.Headers.TryAddWithoutValidation(
+            "x-codex-primary-used-percent",
+            "98");
+        remainingQuota429.Headers.TryAddWithoutValidation(
+            "x-codex-primary-reset-after-seconds",
+            "3600");
+        var remainingDecision = ClassifyUpstream429(
+            remainingQuota429,
+            Encoding.UTF8.GetBytes(
+                "{\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\"}}"),
+            DateTimeOffset.UtcNow);
+        using var exhausted429 = new HttpResponseMessage(HttpStatusCode.TooManyRequests)
+        {
+            Content = new StringContent("{}")
+        };
+        exhausted429.Headers.TryAddWithoutValidation(
+            "x-codex-secondary-used-percent",
+            "100");
+        exhausted429.Headers.TryAddWithoutValidation(
+            "x-codex-secondary-reset-after-seconds",
+            "1800");
+        var exhaustedDecision = ClassifyUpstream429(
+            exhausted429,
+            Encoding.UTF8.GetBytes("{}"),
+            DateTimeOffset.UtcNow);
+        using var structured429 = new HttpResponseMessage(HttpStatusCode.TooManyRequests)
+        {
+            Content = new StringContent("{}")
+        };
+        var structuredDecision = ClassifyUpstream429(
+            structured429,
+            Encoding.UTF8.GetBytes(
+                "{\"error\":{\"type\":\"usage_limit_reached\",\"resets_in_seconds\":120}}"),
+            DateTimeOffset.UtcNow);
+        var ambiguousUsageDecision = ClassifyUpstream429(
+            structured429,
+            Encoding.UTF8.GetBytes(
+                "{\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"limit reached\"}}"),
+            DateTimeOffset.UtcNow);
+        if (remainingDecision.IsQuotaExhausted ||
+            remainingDecision.Reason != "unconfirmed-rate-limit" ||
+            !exhaustedDecision.IsQuotaExhausted ||
+            exhaustedDecision.ResetAtUtc == null ||
+            structuredDecision.IsQuotaExhausted ||
+            !structuredDecision.RequiresSameAccountConfirmation ||
+            structuredDecision.ResetAtUtc == null ||
+            ambiguousUsageDecision.IsQuotaExhausted ||
+            ambiguousUsageDecision.RequiresSameAccountConfirmation)
+        {
+            throw new InvalidOperationException(
+                "429 classification must keep remaining/ambiguous quota on the same account, " +
+                "require repeated review for a structured reset, and rotate immediately only on explicit 100% evidence.");
+        }
+
+        // An unconfirmed 429 may cross accounts only after the bounded same-account
+        // review, and only when replay is safe.  This policy is request-scoped: it must
+        // reject strict response affinity, opaque bodies, disabled cross-account replay,
+        // and the hard candidate cap before the live selector is consulted.
+        if (!CanReplayUnconfirmed429AcrossAccounts(
+                requestHasEntityBody: true,
+                hasReplayableBody: true,
+                strictResponseAffinity: false,
+                allowCrossAccountReplay: true,
+                candidateFailoverCount: 0) ||
+            CanReplayUnconfirmed429AcrossAccounts(
+                requestHasEntityBody: true,
+                hasReplayableBody: false,
+                strictResponseAffinity: false,
+                allowCrossAccountReplay: true,
+                candidateFailoverCount: 0) ||
+            CanReplayUnconfirmed429AcrossAccounts(
+                requestHasEntityBody: true,
+                hasReplayableBody: true,
+                strictResponseAffinity: true,
+                allowCrossAccountReplay: true,
+                candidateFailoverCount: 0) ||
+            CanReplayUnconfirmed429AcrossAccounts(
+                requestHasEntityBody: true,
+                hasReplayableBody: true,
+                strictResponseAffinity: false,
+                allowCrossAccountReplay: false,
+                candidateFailoverCount: 0) ||
+            CanReplayUnconfirmed429AcrossAccounts(
+                requestHasEntityBody: true,
+                hasReplayableBody: true,
+                strictResponseAffinity: false,
+                allowCrossAccountReplay: true,
+                candidateFailoverCount: Transient429CandidateFailoverLimit))
+        {
+            throw new InvalidOperationException(
+                "An unconfirmed 429 must fail over only for safely replayable requests within the bounded request scope.");
+        }
+
+        // Retry-After is deliberately excluded from the confirmation signature because
+        // providers often decrement or regenerate it for each identical 429 response.
+        using var signature429A = new HttpResponseMessage(HttpStatusCode.TooManyRequests)
+        {
+            Content = new ByteArrayContent(Encoding.UTF8.GetBytes("{\"error\":\"rate_limit\"}"))
+        };
+        using var signature429B = new HttpResponseMessage(HttpStatusCode.TooManyRequests)
+        {
+            Content = new ByteArrayContent(Encoding.UTF8.GetBytes("{\"error\":\"rate_limit\"}"))
+        };
+        signature429A.Headers.TryAddWithoutValidation("Retry-After", "1");
+        signature429B.Headers.TryAddWithoutValidation("Retry-After", "2");
+        if (!string.Equals(
+                Build429ConfirmationSignature(
+                    signature429A,
+                    Encoding.UTF8.GetBytes("{\"error\":\"rate_limit\"}")),
+                Build429ConfirmationSignature(
+                    signature429B,
+                    Encoding.UTF8.GetBytes("{\"error\":\"rate_limit\"}")),
+                StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "429 confirmation signatures must remain stable when Retry-After changes.");
+        }
+
+        var compressedRequestFixture = Encoding.UTF8.GetBytes(
+            "{\"model\":\"gpt-test\",\"previous_response_id\":null,\"input\":\"压缩请求\"}");
+        static byte[] CompressFixture(
+            byte[] source,
+            Func<Stream, Stream> createCompressor)
+        {
+            using var output = new MemoryStream();
+            using (var compressor = createCompressor(output))
+            {
+                compressor.Write(source, 0, source.Length);
+            }
+            return output.ToArray();
+        }
+        var gzipFixture = CompressFixture(
+            compressedRequestFixture,
+            stream => new GZipStream(
+                stream,
+                CompressionLevel.SmallestSize,
+                leaveOpen: true));
+        var deflateFixture = CompressFixture(
+            compressedRequestFixture,
+            stream => new DeflateStream(
+                stream,
+                CompressionLevel.SmallestSize,
+                leaveOpen: true));
+        var brotliFixture = CompressFixture(
+            compressedRequestFixture,
+            stream => new BrotliStream(
+                stream,
+                CompressionLevel.SmallestSize,
+                leaveOpen: true));
+        var gzipThenBrotliFixture = CompressFixture(
+            gzipFixture,
+            stream => new BrotliStream(
+                stream,
+                CompressionLevel.SmallestSize,
+                leaveOpen: true));
+        byte[] zstdFixture;
+        using (var compressor = new ZstdSharp.Compressor())
+        {
+            zstdFixture = compressor.Wrap(compressedRequestFixture).ToArray();
+        }
+        if (!DecodeRequestBody(gzipFixture, "gzip").AsSpan().SequenceEqual(compressedRequestFixture) ||
+            !DecodeRequestBody(deflateFixture, "deflate").AsSpan().SequenceEqual(compressedRequestFixture) ||
+            !DecodeRequestBody(brotliFixture, "br").AsSpan().SequenceEqual(compressedRequestFixture) ||
+            !DecodeRequestBody(gzipThenBrotliFixture, "gzip, br").AsSpan()
+                .SequenceEqual(compressedRequestFixture) ||
+            !DecodeRequestBody(zstdFixture, "zstd").AsSpan()
+                .SequenceEqual(compressedRequestFixture))
+        {
+            throw new InvalidOperationException(
+                "Model request Content-Encoding normalization did not preserve inspectable JSON bytes " +
+                "for gzip, deflate, br, or zstd.");
+        }
+
+        var quotaObservationNow = DateTimeOffset.UtcNow;
+        if (!IsQuotaLimitObservationActive(
+                new QuotaLimitObservation(
+                    quotaObservationNow,
+                    quotaObservationNow.AddMinutes(5)),
+                quotaObservationNow.AddMinutes(1)) ||
+            IsQuotaLimitObservationActive(
+                new QuotaLimitObservation(
+                    quotaObservationNow.AddSeconds(-6),
+                    null),
+                quotaObservationNow) ||
+            !IsQuotaLimitObservationActive(
+                new QuotaLimitObservation(
+                    quotaObservationNow.AddSeconds(-4),
+                    null),
+                quotaObservationNow))
+        {
+            throw new InvalidOperationException(
+                "Confirmed quota cooldown must honor reset times and use only a short fallback when reset metadata is absent.");
+        }
+
+        var routeRoot = Path.Combine(
+            Path.GetTempPath(),
+            "gateway-route-freshness-test");
+        var routeSource = new AccountRecord
+        {
+            Name = "route-source",
+            CodexHome = Path.Combine(routeRoot, "source")
+        };
+        var routeTarget = new AccountRecord
+        {
+            Name = "route-target",
+            CodexHome = Path.Combine(routeRoot, "target")
+        };
+        var routeAccounts = new[] { routeSource, routeTarget };
+        var routeSettings = new AppSettings
+        {
+            AccountRotationEnabled = true,
+            AccountRotationQuotaEvidenceVersion =
+                AccountRotationConfiguration.CurrentQuotaEvidenceVersion
+        };
+        _ = AccountRotationConfiguration.Normalize(routeSettings, routeAccounts);
+        var routeSourceKey = QuotaAccountIdentity.CreateKey(routeSource);
+        var routeTargetKey = QuotaAccountIdentity.CreateKey(routeTarget);
+        var freshArmedRoute = new PatGatewayRotationSnapshot(
+            PatGatewayRotationStatus.Armed,
+            routeSourceKey,
+            routeSourceKey,
+            routeTargetKey,
+            quotaObservationNow.AddMinutes(-1),
+            null);
+        if (!IsRotationRouteEligible(
+                freshArmedRoute,
+                routeSettings,
+                routeAccounts,
+                quotaObservationNow) ||
+            IsRotationRouteEligible(
+                freshArmedRoute with
+                {
+                    ArmedAtUtc = quotaObservationNow - ArmedRotationMaximumLifetime -
+                                 TimeSpan.FromSeconds(1)
+                },
+                routeSettings,
+                routeAccounts,
+                quotaObservationNow))
+        {
+            throw new InvalidOperationException(
+                "A request-boundary route must expire instead of activating hours after it was prepared.");
+        }
+        routeSettings.AccountRotationResetAtUtc[routeSourceKey] =
+            quotaObservationNow.AddMinutes(-2);
+        var routeArmedBeforeReset = freshArmedRoute with
+        {
+            ArmedAtUtc = quotaObservationNow.AddMinutes(-3)
+        };
+        if (!IsRotationRouteEligible(
+                freshArmedRoute,
+                routeSettings,
+                routeAccounts,
+                quotaObservationNow) ||
+            IsRotationRouteEligible(
+                routeArmedBeforeReset,
+                routeSettings,
+                routeAccounts,
+                quotaObservationNow))
+        {
+            throw new InvalidOperationException(
+                "A route armed after a quota reset must remain eligible, while a route from the previous window must expire.");
+        }
+
         ValidateOfficialOAuthRotationCredential();
+    }
+
+    internal static void ValidateSessionAffinityRouting()
+    {
+        var headers = new System.Collections.Specialized.NameValueCollection
+        {
+            ["session-id"] = "session-header",
+            ["thread-id"] = "thread-header",
+            ["conversation-id"] = "conversation-header"
+        };
+        var request = ExtractSessionAffinityRequest(
+            headers,
+            Encoding.UTF8.GetBytes(
+                "{\"previous_response_id\":\"resp_affinity_fixture\"," +
+                "\"prompt_cache_key\":\"prompt-fixture\"}"),
+            contentEncoding: null);
+        var expectedKinds = new[]
+        {
+            PatGatewaySessionAffinityKeyKind.Response,
+            PatGatewaySessionAffinityKeyKind.Session
+        };
+        if (request.PreviousResponseId != "resp_affinity_fixture" ||
+            !request.AllowCrossAccountReplay ||
+            !request.RequiresOriginalAccount ||
+            !request.Keys.Select(key => key.Kind).SequenceEqual(expectedKinds) ||
+            !request.Keys.Select(key => key.Value).SequenceEqual(
+                [
+                    "resp_affinity_fixture",
+                    "session-header"
+                ]))
+        {
+            throw new InvalidOperationException(
+                "Session affinity did not preserve response priority and single-seed header selection.");
+        }
+
+        var malformed = ExtractSessionAffinityRequest(
+            headers,
+            Encoding.UTF8.GetBytes("{\"previous_response_id\":"),
+            contentEncoding: null);
+        var compressed = ExtractSessionAffinityRequest(
+            headers,
+            Encoding.UTF8.GetBytes("{}"),
+            contentEncoding: "gzip");
+        var ambiguous = ExtractSessionAffinityRequest(
+            headers,
+            Encoding.UTF8.GetBytes(
+                "{\"previous_response_id\":\"resp_first_fixture\"," +
+                "\"previous_response_id\":\"resp_second_fixture\"}"),
+            contentEncoding: null);
+        var invalidPrevious = ExtractSessionAffinityRequest(
+            headers,
+            Encoding.UTF8.GetBytes("{\"previous_response_id\":\"msg_not_response\"}"),
+            contentEncoding: null);
+        var nullPrevious = ExtractSessionAffinityRequest(
+            headers,
+            Encoding.UTF8.GetBytes("{\"previous_response_id\":null}"),
+            contentEncoding: null);
+        var emptyPrevious = ExtractSessionAffinityRequest(
+            headers,
+            Encoding.UTF8.GetBytes("{\"previous_response_id\":\"\"}"),
+            contentEncoding: null);
+        if (malformed.AllowCrossAccountReplay ||
+            compressed.AllowCrossAccountReplay ||
+            ambiguous.AllowCrossAccountReplay ||
+            !malformed.RequiresOriginalAccount ||
+            !compressed.RequiresOriginalAccount ||
+            !ambiguous.RequiresOriginalAccount ||
+            ambiguous.PreviousResponseId != null ||
+            ambiguous.Keys.Any(key => key.Kind == PatGatewaySessionAffinityKeyKind.Response) ||
+            invalidPrevious.AllowCrossAccountReplay ||
+            !invalidPrevious.RequiresOriginalAccount ||
+            invalidPrevious.PreviousResponseId != null ||
+            !nullPrevious.AllowCrossAccountReplay ||
+            nullPrevious.RequiresOriginalAccount ||
+            !emptyPrevious.AllowCrossAccountReplay ||
+            emptyPrevious.RequiresOriginalAccount ||
+            malformed.Keys.All(key => key.Kind != PatGatewaySessionAffinityKeyKind.Session))
+        {
+            throw new InvalidOperationException(
+                "Opaque or ambiguous continuation bodies must disable cross-account replay without discarding safe header aliases.");
+        }
+
+        var largeBody = Encoding.UTF8.GetBytes(
+            "{\"instructions\":\"" +
+            new string('x', SessionAffinityInspectableBodyMaxBytes + 1) +
+            "\",\"previous_response_id\":\"resp_large_affinity_fixture\"}");
+        var largeRequest = ExtractSessionAffinityRequest(
+            new System.Collections.Specialized.NameValueCollection(),
+            largeBody,
+            contentEncoding: "identity");
+        if (largeRequest.OpaqueBody ||
+            largeRequest.UnsafeContinuation ||
+            !largeRequest.AllowCrossAccountReplay ||
+            largeRequest.PreviousResponseId != "resp_large_affinity_fixture" ||
+            largeRequest.Keys.Count != 1 ||
+            largeRequest.Keys[0].Kind != PatGatewaySessionAffinityKeyKind.Response)
+        {
+            throw new InvalidOperationException(
+                "Large identity-encoded JSON did not receive bounded continuation inspection.");
+        }
+
+        var metadataHeaders = new System.Collections.Specialized.NameValueCollection
+        {
+            ["x-codex-turn-metadata"] =
+                "{\"session_id\":\"metadata-session\",\"thread_id\":\"metadata-thread\"}"
+        };
+        var metadata = ExtractSessionAffinityRequest(
+            metadataHeaders,
+            Encoding.UTF8.GetBytes("{}"),
+            contentEncoding: "identity");
+        if (!metadata.AllowCrossAccountReplay ||
+            metadata.RequiresOriginalAccount ||
+            !metadata.Keys.Select(key => key.Value).SequenceEqual(
+                ["metadata-session"]))
+        {
+            throw new InvalidOperationException(
+                "Codex turn metadata did not produce a safe single session affinity seed.");
+        }
+
+        var contentFallback = ExtractSessionAffinityRequest(
+            new System.Collections.Specialized.NameValueCollection(),
+            Encoding.UTF8.GetBytes(
+                "{\"model\":\"gpt-test\",\"messages\":[" +
+                "{\"role\":\"system\",\"content\":\"rules\"}," +
+                "{\"role\":\"user\",\"content\":\"hello\"}]}"),
+            contentEncoding: "identity");
+        if (contentFallback.Keys.Count != 1 ||
+            contentFallback.Keys[0].Kind != PatGatewaySessionAffinityKeyKind.Session ||
+            !contentFallback.Keys[0].Value.StartsWith(
+                OpenAIContentSessionSeed.Prefix,
+                StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "OpenAI content fallback did not produce one deterministic session seed.");
+        }
     }
 
     private static void ValidateOfficialOAuthRotationCredential()
@@ -1241,6 +1946,7 @@ internal sealed class LocalPatGatewayHost
             {
                 client.Dispose();
             }
+            _proxyResolver.Dispose();
         }
     }
 
@@ -1250,6 +1956,12 @@ internal sealed class LocalPatGatewayHost
         CancellationTokenSource shutdown)
     {
         var response = context.Response;
+        var affinityLeases = new List<PatGatewaySessionAffinityLease>();
+        // These buffered upstream responses may survive several in-request candidate
+        // attempts. Keep the references outside the try block so the unconditional finally
+        // can dispose them even when request handling exits through an early error.
+        HttpResponseMessage? lastTransient429Response = null;
+        HttpResponseMessage? lastQuotaResponse = null;
         response.Headers[_markerHeader] = _markerValue;
         try
         {
@@ -1295,6 +2007,13 @@ internal sealed class LocalPatGatewayHost
                 await HandleRotationClearAsync(context.Request, response);
                 return;
             }
+            if (path.Equals(
+                    "/" + LocalPatGateway.SessionAffinityInvalidatePath,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleSessionAffinityInvalidateAsync(context.Request, response);
+                return;
+            }
 
             if (!TryBuildUpstreamUri(context.Request.Url, out var upstreamUri))
             {
@@ -1322,8 +2041,15 @@ internal sealed class LocalPatGatewayHost
             credential = BindConfiguredAccountKey(credential);
 
             var isModelRequest = IsModelRequest(context.Request, upstreamUri);
-            if (isModelRequest && !credential.IsCompatibleApi)
+            var isIndependentAccountProbe = IsIndependentAccountProbe(context.Request);
+            var rotationBoundaryApplied = false;
+            if (ShouldApplyRotationAtRequestBoundary(
+                    isModelRequest,
+                    isIndependentAccountProbe))
             {
+                var routeBeforeBoundary = _rotationStore.Load();
+                rotationBoundaryApplied = routeBeforeBoundary.Status != PatGatewayRotationStatus.None &&
+                    IncomingMatchesRotationTransport(credential, routeBeforeBoundary);
                 credential = await ApplyRotationAtRequestBoundaryAsync(
                     credential,
                     requestCancellationToken);
@@ -1338,6 +2064,16 @@ internal sealed class LocalPatGatewayHost
                         context.Request,
                         requestCancellationToken);
                 }
+                catch (UnsupportedContentEncodingException ex)
+                {
+                    await WriteErrorAsync(
+                        response,
+                        HttpStatusCode.UnsupportedMediaType,
+                        "模型请求使用了网关无法安全解码的 Content-Encoding（" +
+                        SanitizeNetworkError(ex.Message) +
+                        "）。请改用 gzip、deflate、br、zstd 或 identity 后重试。");
+                    return;
+                }
                 catch (InvalidDataException ex)
                 {
                     await WriteErrorAsync(
@@ -1347,18 +2083,174 @@ internal sealed class LocalPatGatewayHost
                     return;
                 }
             }
-            using var modelRequestActivity = isModelRequest
+            var globalRouteCredential = credential;
+            var globalRouteSourceAccountKey = credential.AccountKey;
+            SessionAffinityRequest? affinityRequest = null;
+            PatGatewaySessionAffinityLease? activeAffinityLease = null;
+            var strictResponseAffinity = false;
+            if (isModelRequest)
+            {
+                // ReadReplayableModelRequestBodyAsync normalizes a supported request
+                // Content-Encoding (gzip/deflate/br/zstd) to identity before this point.
+                // Inspect the normalized bytes so the desktop Codex client can keep its
+                // normal compression behaviour without making the account-rotation
+                // boundary reject the request with a synthetic 415.
+                affinityRequest = ExtractSessionAffinityRequest(
+                    context.Request.Headers,
+                    replayableBody?.Bytes,
+                    contentEncoding: null);
+            }
+            if (isModelRequest &&
+                !isIndependentAccountProbe &&
+                !rotationBoundaryApplied &&
+                PatGatewayRotationStore.TryNormalizeAccountKey(
+                    globalRouteSourceAccountKey,
+                    out var normalizedGlobalAccountKey))
+            {
+                var affinitySettings = _themeService.LoadSettings();
+                if (AccountRotationConfiguration.IsEnabled(affinitySettings) &&
+                    IsSessionAffinityAccountEligible(
+                        affinitySettings,
+                        normalizedGlobalAccountKey))
+                {
+                    if (affinityRequest is { OpaqueBody: true })
+                    {
+                        // A compressed body can hide previous_response_id from the
+                        // account-affinity parser. Forwarding it through the current
+                        // global route could therefore replay an existing continuation
+                        // on the wrong credential after a rotation. Standard Codex and
+                        // Responses clients send identity-encoded JSON; reject only the
+                        // uninspectable form while automatic account rotation is enabled.
+                        await WriteErrorAsync(
+                            response,
+                            HttpStatusCode.UnsupportedMediaType,
+                            "开启账号轮换时，模型请求体必须是可检查的未压缩 JSON；" +
+                            "请移除 Content-Encoding 后重试。关闭账号轮换可恢复原样转发。");
+                        return;
+                    }
+                    if (affinityRequest is { UnsafeContinuation: true })
+                    {
+                        // A malformed, conflicting, or invalid continuation field is known
+                        // unsafe. Do not let a lower-priority alias turn it into a
+                        // cross-account replay, and do not forward it.
+                        await WriteErrorAsync(
+                            response,
+                            HttpStatusCode.BadRequest,
+                            "模型请求体包含无法安全确认的 previous_response_id；" +
+                            "请修正续聊字段，或开始一个不携带该字段的新会话。");
+                        return;
+                    }
+
+                    // Response-account affinity is an independent safety layer and stays
+                    // active while ordinary session stickiness is switched off. This
+                    // prevents the session toggle from turning a confirmed continuation
+                    // into a cross-account replay.
+                    strictResponseAffinity = affinityRequest?.PreviousResponseId != null;
+                    IReadOnlyList<PatGatewaySessionAffinityKey> routingKeys = affinityRequest == null
+                        ? []
+                        : affinitySettings.AccountRotationSessionAffinityEnabled
+                            ? affinityRequest.Keys
+                            : affinityRequest.Keys
+                                .Where(key => key.Kind == PatGatewaySessionAffinityKeyKind.Response)
+                                .ToArray();
+                    if (routingKeys.Count > 0)
+                    {
+                        activeAffinityLease = _sessionAffinityStore.ResolveOrClaim(
+                            routingKeys,
+                            normalizedGlobalAccountKey);
+                        affinityLeases.Add(activeAffinityLease);
+                        // Even an unknown previous_response_id may refer to state created
+                        // before this cache existed. A lower-priority ordinary session seed
+                        // must never be used as a route around an unconfirmed continuation.
+                        if (affinityRequest?.PreviousResponseId != null &&
+                            (activeAffinityLease.MatchedKind != PatGatewaySessionAffinityKeyKind.Response ||
+                             !activeAffinityLease.MatchedConfirmed))
+                        {
+                            await WriteErrorAsync(
+                                response,
+                                HttpStatusCode.Conflict,
+                                "previous_response_id 尚未在本地网关建立可信账号绑定；" +
+                                "为避免跨账号重放，网关没有发送本次续聊请求。" +
+                                "请先在同一网关创建新会话，或恢复原账号后重试。");
+                            return;
+                        }
+
+                        if (!activeAffinityLease.AccountKey.Equals(
+                                normalizedGlobalAccountKey,
+                                StringComparison.Ordinal))
+                        {
+                            var stickyAccountAvailable = IsSessionAffinityAccountEligible(
+                                affinitySettings,
+                                activeAffinityLease.AccountKey);
+                            if (stickyAccountAvailable)
+                            {
+                                try
+                                {
+                                    credential = ResolveRotationCredential(
+                                        activeAffinityLease.AccountKey);
+                                }
+                                catch (Exception ex) when (
+                                    ex is IOException or UnauthorizedAccessException or
+                                    JsonException or InvalidDataException or
+                                    InvalidOperationException or NotSupportedException or
+                                    ArgumentException or FormatException)
+                                {
+                                    stickyAccountAvailable = false;
+                                }
+                            }
+
+                            if (!stickyAccountAvailable)
+                            {
+                                if (strictResponseAffinity)
+                                {
+                                    await WriteErrorAsync(
+                                        response,
+                                        HttpStatusCode.Conflict,
+                                        "previous_response_id 绑定的原账号当前不可用；" +
+                                        "为避免跨账号重放续聊请求，网关没有自动换号。" +
+                                        "请恢复原账号，或开始一个不携带 previous_response_id 的新会话。");
+                                    return;
+                                }
+
+                                // Ordinary session aliases may escape an account that was
+                                // removed, disabled, or whose local credential is unreadable.
+                                // The provisional move is confirmed only after a complete
+                                // successful response; otherwise the durable old route returns.
+                                var movedToGlobal = _sessionAffinityStore.Move(
+                                    activeAffinityLease,
+                                    normalizedGlobalAccountKey);
+                                if (movedToGlobal != null)
+                                {
+                                    activeAffinityLease = movedToGlobal;
+                                    affinityLeases.Add(movedToGlobal);
+                                }
+                                credential = globalRouteCredential;
+                            }
+                        }
+                    }
+                }
+            }
+            using var modelRequestActivity = isModelRequest && !isIndependentAccountProbe
                 ? BeginModelRequest(credential.AccountKey)
                 : null;
             var attemptedAccountKeys = new HashSet<string>(StringComparer.Ordinal);
-            var retrySourceAccountKey = credential.AccountKey;
             var allowCompatibleApiRetry = CanRewriteCompatibleApiRequestBody(
                 context.Request,
                 replayableBody);
             var transparentRetryCount = 0;
-            HttpResponseMessage? lastQuotaResponse = null;
+            var transient429RetryCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+            var structured429Confirmations = new Dictionary<
+                string,
+                (int Count, DateTimeOffset? ResetAtUtc)>(StringComparer.Ordinal);
+            var unconfirmed429Confirmations = new Dictionary<
+                string,
+                (int Count, string Signature)>(StringComparer.Ordinal);
             GatewayCredential? lastQuotaCredential = null;
+            var globalRouteQuotaSeen = false;
             HttpResponseMessage? finalUpstreamResponse = null;
+            var hadSuccessfulTransparentRetry = false;
+            var transient429CandidateFailoverCount = 0;
+            var preserveAffinityBindingOnSuccess = false;
 
             while (finalUpstreamResponse == null)
             {
@@ -1395,6 +2287,24 @@ internal sealed class LocalPatGatewayHost
                         credential = lastQuotaCredential!;
                         break;
                     }
+                    if (TrySelectGlobalCredentialAfterAffinityFailure(
+                            credential,
+                            globalRouteCredential,
+                            strictResponseAffinity,
+                            activeAffinityLease,
+                            out var globalAfterMappingFailure))
+                    {
+                        if (!string.IsNullOrWhiteSpace(credential.AccountKey))
+                        {
+                            attemptedAccountKeys.Add(credential.AccountKey);
+                        }
+                        credential = globalAfterMappingFailure!;
+                        WriteTransparentRotationDiagnostic(
+                            "affinity-fallback",
+                            Math.Max(1, attemptedAccountKeys.Count),
+                            "unsafe-api-mapping");
+                        continue;
+                    }
                     await WriteErrorAsync(
                         response,
                         HttpStatusCode.BadGateway,
@@ -1404,8 +2314,11 @@ internal sealed class LocalPatGatewayHost
 
                 var useDirectConnection = credential.IsCompatibleApi &&
                                           LocalProxyDetector.IsLoopbackHost(upstreamUri.Host);
-                var proxyUri = useDirectConnection ? null : ResolveRequiredProxyUri();
-                if (!useDirectConnection && proxyUri == null)
+                var proxyResolution = useDirectConnection
+                    ? new ProxyResolution(true, null, null, "direct", "")
+                    : ResolveProxyForCredential(credential);
+                var proxyUri = proxyResolution.ProxyUri;
+                if (!useDirectConnection && !proxyResolution.Success)
                 {
                     if (lastQuotaResponse != null)
                     {
@@ -1417,15 +2330,16 @@ internal sealed class LocalPatGatewayHost
                     await WriteErrorAsync(
                         response,
                         HttpStatusCode.ServiceUnavailable,
-                        "未检测到可用的本地代理；为防止意外直连，上游请求已停止。");
+                        proxyResolution.Error.Length == 0
+                            ? "未检测到可用的本地代理；为防止意外直连，上游请求已停止。"
+                            : proxyResolution.Error);
                     return;
                 }
-                var clientKey = useDirectConnection
-                    ? "direct"
-                    : "proxy:" + proxyUri!.AbsoluteUri;
+                var clientKey = useDirectConnection ? "direct" : proxyResolution.PoolKey;
+                var proxyNode = _proxyResolver.GetNode(proxyResolution.NodeId);
                 var client = _clients.GetOrAdd(
                     clientKey,
-                    _ => CreateUpstreamClient(proxyUri));
+                    _ => CreateUpstreamClient(proxyResolution, proxyNode));
                 PatIdentity? identity = string.IsNullOrWhiteSpace(credential.ChatGptAccountId)
                     ? null
                     : new PatIdentity(credential.ChatGptAccountId, IsFedRamp: false);
@@ -1436,6 +2350,7 @@ internal sealed class LocalPatGatewayHost
                         identity = await GetIdentityAsync(
                             client,
                             credential.Token,
+                            clientKey,
                             requestCancellationToken);
                     }
                     catch (PatRejectedException ex)
@@ -1464,6 +2379,24 @@ internal sealed class LocalPatGatewayHost
                             lastQuotaResponse = null;
                             credential = lastQuotaCredential!;
                             break;
+                        }
+                        if (TrySelectGlobalCredentialAfterAffinityFailure(
+                                credential,
+                                globalRouteCredential,
+                                strictResponseAffinity,
+                                activeAffinityLease,
+                                out var globalAfterPatRejection))
+                        {
+                            if (!string.IsNullOrWhiteSpace(credential.AccountKey))
+                            {
+                                attemptedAccountKeys.Add(credential.AccountKey);
+                            }
+                            credential = globalAfterPatRejection!;
+                            WriteTransparentRotationDiagnostic(
+                                "affinity-fallback",
+                                Math.Max(1, attemptedAccountKeys.Count),
+                                "credential-rejected");
+                            continue;
                         }
                         await WritePatRejectionErrorAsync(
                             response,
@@ -1503,6 +2436,28 @@ internal sealed class LocalPatGatewayHost
                             credential = lastQuotaCredential!;
                             break;
                         }
+                        if (TrySelectGlobalCredentialAfterAffinityFailure(
+                                credential,
+                                globalRouteCredential,
+                                strictResponseAffinity,
+                                activeAffinityLease,
+                                out var globalAfterIdentityFailure))
+                        {
+                            if (!string.IsNullOrWhiteSpace(credential.AccountKey))
+                            {
+                                attemptedAccountKeys.Add(credential.AccountKey);
+                            }
+                            // Identity lookup failures are generally transient network
+                            // errors. Let this request escape the sticky account, but do
+                            // not make that temporary escape the new durable session route.
+                            preserveAffinityBindingOnSuccess = true;
+                            credential = globalAfterIdentityFailure!;
+                            WriteTransparentRotationDiagnostic(
+                                "affinity-fallback",
+                                Math.Max(1, attemptedAccountKeys.Count),
+                                "identity-network-failure");
+                            continue;
+                        }
                         await WriteErrorAsync(
                             response,
                             HttpStatusCode.BadGateway,
@@ -1513,7 +2468,12 @@ internal sealed class LocalPatGatewayHost
                 }
 
                 byte[]? requestBody = replayableBody?.Bytes;
-                var requestBodyWasRewritten = false;
+                // A decoded body must be sent as identity-encoded bytes. Treat the
+                // normalization as a rewrite for header/content-length handling; this
+                // also makes retries deterministic because every attempt uses the same
+                // replay buffer.
+                var requestBodyWasRewritten = replayableBody?.WasContentDecoded == true;
+                var fingerprintPlan = ResolveCodexFingerprintPlan(credential, context.Request);
                 if (credential.IsCompatibleApi)
                 {
                     try
@@ -1554,10 +2514,140 @@ internal sealed class LocalPatGatewayHost
                             credential = lastQuotaCredential!;
                             break;
                         }
+                        if (TrySelectGlobalCredentialAfterAffinityFailure(
+                                credential,
+                                globalRouteCredential,
+                                strictResponseAffinity,
+                                activeAffinityLease,
+                                out var globalAfterBodyFailure))
+                        {
+                            if (!string.IsNullOrWhiteSpace(credential.AccountKey))
+                            {
+                                attemptedAccountKeys.Add(credential.AccountKey);
+                            }
+                            credential = globalAfterBodyFailure!;
+                            WriteTransparentRotationDiagnostic(
+                                "affinity-fallback",
+                                Math.Max(1, attemptedAccountKeys.Count),
+                                "api-body-conversion");
+                            continue;
+                        }
                         await WriteErrorAsync(
                             response,
                             HttpStatusCode.BadRequest,
                             "兼容 API 请求无法安全转换：" + SanitizeNetworkError(ex.Message));
+                        return;
+                    }
+                }
+                if (fingerprintPlan.HasConvergedIdentifiers && requestBody != null)
+                {
+                    var rewritten = CodexFingerprintConvergence.RewriteRequestBody(
+                        requestBody,
+                        fingerprintPlan,
+                        out var fingerprintBodyModified);
+                    if (requestBody.Length > 0 && !fingerprintBodyModified)
+                    {
+                        if (lastQuotaResponse != null &&
+                            TrySelectNextTransparentRotationCredential(
+                                credential,
+                                attemptedAccountKeys,
+                                allowCompatibleApiRetry,
+                                out var nextAfterFingerprintFailure,
+                                out var skippedOrdinal,
+                                out _))
+                        {
+                            WriteTransparentRotationDiagnostic(
+                                "candidate-skipped",
+                                skippedOrdinal,
+                                "fingerprint-body-convergence");
+                            credential = nextAfterFingerprintFailure!;
+                            transparentRetryCount++;
+                            continue;
+                        }
+
+                        if (lastQuotaResponse != null)
+                        {
+                            finalUpstreamResponse = lastQuotaResponse;
+                            lastQuotaResponse = null;
+                            credential = lastQuotaCredential!;
+                            break;
+                        }
+                        if (TrySelectGlobalCredentialAfterAffinityFailure(
+                                credential,
+                                globalRouteCredential,
+                                strictResponseAffinity,
+                                activeAffinityLease,
+                                out var globalAfterFingerprintFailure))
+                        {
+                            if (!string.IsNullOrWhiteSpace(credential.AccountKey))
+                            {
+                                attemptedAccountKeys.Add(credential.AccountKey);
+                            }
+                            credential = globalAfterFingerprintFailure!;
+                            WriteTransparentRotationDiagnostic(
+                                "affinity-fallback",
+                                Math.Max(1, attemptedAccountKeys.Count),
+                                "fingerprint-body-convergence");
+                            continue;
+                        }
+                        await WriteErrorAsync(
+                            response,
+                            HttpStatusCode.BadRequest,
+                            "模型请求无法安全应用所选的 Codex 指纹收敛模式。");
+                        return;
+                    }
+                    requestBody = rewritten;
+                    requestBodyWasRewritten |= fingerprintBodyModified;
+                }
+
+                if (activeAffinityLease != null &&
+                    PatGatewayRotationStore.TryNormalizeAccountKey(
+                        credential.AccountKey,
+                        out var attemptAccountKey) &&
+                    !activeAffinityLease.AccountKey.Equals(
+                        attemptAccountKey,
+                        StringComparison.Ordinal))
+                {
+                    if (strictResponseAffinity)
+                    {
+                        await WriteErrorAsync(
+                            response,
+                            HttpStatusCode.Conflict,
+                            affinityRequest?.PreviousResponseId != null
+                                ? "previous_response_id 的续聊请求不能跨账号重放。"
+                                : "请求体无法安全确认续聊状态，不能跨账号重放。");
+                        return;
+                    }
+
+                    // Publish the candidate only as an in-memory provisional route just
+                    // before the model request is sent. Concurrent turns can follow it,
+                    // while any failed attempt still rolls back to the durable account.
+                    var movedForAttempt = _sessionAffinityStore.Move(
+                        activeAffinityLease,
+                        attemptAccountKey);
+                    if (movedForAttempt != null)
+                    {
+                        activeAffinityLease = movedForAttempt;
+                        affinityLeases.Add(movedForAttempt);
+                    }
+                    else if (lastQuotaResponse != null)
+                    {
+                        // A concurrent request changed this binding, or the request only
+                        // carries an unproven previous_response_id (response aliases are
+                        // intentionally non-movable). Preserve the original 429 instead of
+                        // replaying a continuation through an account we cannot bind.
+                        finalUpstreamResponse = lastQuotaResponse;
+                        lastQuotaResponse = null;
+                        credential = lastQuotaCredential!;
+                        break;
+                    }
+                    else
+                    {
+                        await WriteErrorAsync(
+                            response,
+                            HttpStatusCode.Conflict,
+                            "会话账号绑定刚刚被另一个请求更新；" +
+                            "为避免跨账号重放，本次请求未继续发送，请重试。");
                         return;
                     }
                 }
@@ -1569,7 +2659,7 @@ internal sealed class LocalPatGatewayHost
                     identity,
                     requestBody,
                     requestBodyWasRewritten,
-                    IsFingerprintForwardingEnabled(credential));
+                    fingerprintPlan);
                 HttpResponseMessage attemptResponse;
                 try
                 {
@@ -1582,31 +2672,19 @@ internal sealed class LocalPatGatewayHost
                 {
                     if (lastQuotaResponse != null)
                     {
-                        if (!string.IsNullOrWhiteSpace(credential.AccountKey))
-                        {
-                            attemptedAccountKeys.Add(credential.AccountKey);
-                        }
-                        if (TrySelectNextTransparentRotationCredential(
-                                credential,
-                                attemptedAccountKeys,
-                                allowCompatibleApiRetry,
-                                out var nextAfterSendFailure,
-                                out var skippedOrdinal,
-                                out _))
-                        {
-                            WriteTransparentRotationDiagnostic(
-                                "candidate-skipped",
-                                skippedOrdinal,
-                                "upstream-network-failure");
-                            credential = nextAfterSendFailure!;
-                            transparentRetryCount++;
-                            continue;
-                        }
-
-                        finalUpstreamResponse = lastQuotaResponse;
+                        // SendAsync does not prove that the request was not accepted by
+                        // the upstream before the connection failed. Never issue the
+                        // same non-idempotent request to a third account in that
+                        // indeterminate window; return the original quota response and
+                        // let the client decide whether to retry.
+                        lastQuotaResponse.Dispose();
                         lastQuotaResponse = null;
-                        credential = lastQuotaCredential!;
-                        break;
+                        await WriteErrorAsync(
+                            response,
+                            HttpStatusCode.BadGateway,
+                            "轮换账号的上游请求状态不确定，网关未继续换号；请由客户端决定是否重试。" +
+                            SanitizeNetworkError(ex.Message));
+                        return;
                     }
                     await WriteErrorAsync(
                         response,
@@ -1619,13 +2697,202 @@ internal sealed class LocalPatGatewayHost
                 if (modelRequestActivity != null &&
                     attemptResponse.StatusCode == HttpStatusCode.TooManyRequests)
                 {
-                    RecordQuotaLimited(credential.AccountKey);
+                    var buffered429Body = await BufferUpstreamErrorResponseAsync(
+                        attemptResponse,
+                        requestCancellationToken);
+                    var classification = ClassifyUpstream429(
+                        attemptResponse,
+                        buffered429Body,
+                        DateTimeOffset.UtcNow);
+                    var transientKey = NormalizeOptionalAccountKey(credential.AccountKey) ??
+                                       "unbound";
+                    if (!classification.IsQuotaExhausted &&
+                        classification.RequiresSameAccountConfirmation &&
+                        replayableBody != null)
+                    {
+                        var prior = structured429Confirmations.GetValueOrDefault(transientKey);
+                        var sameReset = prior.Count == 0 ||
+                                        (!prior.ResetAtUtc.HasValue &&
+                                         !classification.ResetAtUtc.HasValue) ||
+                                        (prior.ResetAtUtc.HasValue &&
+                                         classification.ResetAtUtc.HasValue &&
+                                         (prior.ResetAtUtc.Value - classification.ResetAtUtc.Value)
+                                         .Duration() <= TimeSpan.FromMinutes(2));
+                        var confirmedCount = sameReset ? prior.Count + 1 : 1;
+                        structured429Confirmations[transientKey] =
+                            (confirmedCount, classification.ResetAtUtc);
+                        if (confirmedCount >= StructuredQuota429ConfirmationCount)
+                        {
+                            classification = classification with
+                            {
+                                IsQuotaExhausted = true,
+                                RequiresSameAccountConfirmation = false,
+                                Reason = "structured-usage-limit-confirmed-three-times"
+                            };
+                        }
+                    }
+                    if (!classification.IsQuotaExhausted &&
+                        classification.Reason == "unconfirmed-rate-limit")
+                    {
+                        // A single ambiguous 429 is deliberately not treated as an
+                        // exhausted five-hour window.  When the same account returns the
+                        // same signal three times in this one request, however, the
+                        // upstream has supplied enough fresh evidence to try the next
+                        // configured account.  The signature prevents unrelated/transient
+                        // 429s from being combined, and the observation remains scoped to
+                        // this request (no durable poison marker is written until the
+                        // three-confirmation threshold is reached).
+                        var signature = Build429ConfirmationSignature(
+                            attemptResponse,
+                            buffered429Body);
+                        var prior = unconfirmed429Confirmations.GetValueOrDefault(transientKey);
+                        var confirmedCount = prior.Count > 0 &&
+                                              string.Equals(
+                                                  prior.Signature,
+                                                  signature,
+                                                  StringComparison.Ordinal)
+                            ? prior.Count + 1
+                            : 1;
+                        unconfirmed429Confirmations[transientKey] =
+                            (confirmedCount, signature);
+                        if (confirmedCount >= StructuredQuota429ConfirmationCount)
+                        {
+                            classification = classification with
+                            {
+                                IsQuotaExhausted = true,
+                                Reason = "unconfirmed-rate-limit-confirmed-three-times"
+                            };
+                            ManagerLifecycleDiagnostics.Write(
+                                "pat-gateway-http-429-confirmed",
+                                $"account={transientKey}; confirmations={confirmedCount}; " +
+                                "reason=unconfirmed-rate-limit; downstream_bytes=0");
+                        }
+                    }
+                    if (!classification.IsQuotaExhausted)
+                    {
+                        var retryCount = transient429RetryCounts.GetValueOrDefault(transientKey);
+                        var canRetrySameAccount =
+                            (!context.Request.HasEntityBody || replayableBody != null) &&
+                            retryCount < Transient429SameAccountRetryLimit;
+                        if (canRetrySameAccount)
+                        {
+                            transient429RetryCounts[transientKey] = retryCount + 1;
+                            var retryDelay = SelectTransient429RetryDelay(
+                                attemptResponse,
+                                retryCount);
+                            ManagerLifecycleDiagnostics.Write(
+                                "pat-gateway-http-429-transient-retry",
+                                $"same_account_attempt={retryCount + 2}; " +
+                                $"retry_delay_ms={(int)retryDelay.TotalMilliseconds}; " +
+                                $"reason={classification.Reason}; downstream_bytes=0");
+                            attemptResponse.Dispose();
+                            if (retryDelay > TimeSpan.Zero)
+                            {
+                                await Task.Delay(retryDelay, requestCancellationToken);
+                            }
+                            continue;
+                        }
+
+                        // The same-account review is deliberately bounded.  Only after it
+                        // is exhausted may a replayable request make a request-scoped
+                        // candidate hop.  This is intentionally separate from the confirmed
+                        // quota path below: no durable exhausted marker, route activation,
+                        // or global cursor update is allowed for an unconfirmed 429.
+                        var canReplayUnconfirmed429 = CanReplayUnconfirmed429AcrossAccounts(
+                            requestHasEntityBody: context.Request.HasEntityBody,
+                            hasReplayableBody: replayableBody != null,
+                            strictResponseAffinity: strictResponseAffinity,
+                            allowCrossAccountReplay: affinityRequest?.AllowCrossAccountReplay ?? true,
+                            candidateFailoverCount: transient429CandidateFailoverCount);
+                        if (canReplayUnconfirmed429 &&
+                            !string.IsNullOrWhiteSpace(credential.AccountKey))
+                        {
+                            // The selector reads accounts.json and the latest settings on
+                            // every call.  Marking this account only in the per-request
+                            // hard-exclusion set prevents a reordered/mutated ring from
+                            // selecting it again during this request.
+                            attemptedAccountKeys.Add(credential.AccountKey);
+                        }
+                        if (canReplayUnconfirmed429 &&
+                            TrySelectNextTransparentRotationCredential(
+                                credential,
+                                attemptedAccountKeys,
+                                allowCompatibleApiRetry,
+                                out var nextTransientCredential,
+                                out var transientRetryOrdinal,
+                                out var transientRetryPool,
+                                allowBackupPool: false))
+                        {
+                            lastTransient429Response?.Dispose();
+                            lastTransient429Response = attemptResponse;
+                            WriteTransparentRotationDiagnostic(
+                                "retry-selected",
+                                transientRetryOrdinal,
+                                transientRetryPool == AccountRotationPool.Primary
+                                    ? "unconfirmed-429-primary"
+                                    : "unconfirmed-429-backup");
+                            ManagerLifecycleDiagnostics.Write(
+                                "pat-gateway-http-429-transient-failover",
+                                $"source_account={transientKey}; " +
+                                $"candidate_ordinal={transientRetryOrdinal}; " +
+                                $"same_account_retries={retryCount}; " +
+                                "durable_quota_marker=false; global_cursor_advance=false; " +
+                                "downstream_bytes=0");
+                            credential = nextTransientCredential!;
+                            transient429CandidateFailoverCount++;
+                            transparentRetryCount++;
+                            // A transient candidate hop is request-scoped.  Do not persist
+                            // an ordinary session-affinity move merely because this turn
+                            // happened to succeed on the fallback account.
+                            preserveAffinityBindingOnSuccess = true;
+                            continue;
+                        }
+
+                        // If every latest-ring candidate also returned an unconfirmed 429,
+                        // return the newest real upstream response.  Discard remembered
+                        // confirmed/temporary responses so they cannot leak or mask the
+                        // final 429.  A subsequent request gets a fresh candidate review.
+                        lastTransient429Response?.Dispose();
+                        lastTransient429Response = null;
+                        lastQuotaResponse?.Dispose();
+                        lastQuotaResponse = null;
+                        finalUpstreamResponse = attemptResponse;
+                        ManagerLifecycleDiagnostics.Write(
+                            "pat-gateway-http-429-transient-returned",
+                            $"same_account_retries={retryCount}; " +
+                            $"candidate_failovers={transient429CandidateFailoverCount}; " +
+                            $"replayable={canReplayUnconfirmed429}; " +
+                            $"reason={classification.Reason}; downstream_bytes=0");
+                        break;
+                    }
+
+                    // A prior temporary 429 is no longer needed once this account has
+                    // supplied explicit exhaustion evidence.  The confirmed path below
+                    // owns the response remembered for transparent quota failover.
+                    lastTransient429Response?.Dispose();
+                    lastTransient429Response = null;
+                    RecordQuotaLimited(
+                        credential.AccountKey,
+                        classification.Reason,
+                        classification.ResetAtUtc);
+                    if (PatGatewayRotationStore.TryNormalizeAccountKey(
+                            credential.AccountKey,
+                            out var quotaAccountKey) &&
+                        PatGatewayRotationStore.TryNormalizeAccountKey(
+                            globalRouteSourceAccountKey,
+                            out var quotaGlobalSourceKey) &&
+                        quotaAccountKey.Equals(quotaGlobalSourceKey, StringComparison.Ordinal))
+                    {
+                        globalRouteQuotaSeen = true;
+                    }
                     if (!string.IsNullOrWhiteSpace(credential.AccountKey))
                     {
                         attemptedAccountKeys.Add(credential.AccountKey);
                     }
 
-                    var canReplay = !context.Request.HasEntityBody || replayableBody != null;
+                    var canReplay = !strictResponseAffinity &&
+                                    (affinityRequest?.AllowCrossAccountReplay ?? true) &&
+                                    (!context.Request.HasEntityBody || replayableBody != null);
                     if (canReplay &&
                         TrySelectNextTransparentRotationCredential(
                             credential,
@@ -1643,6 +2910,10 @@ internal sealed class LocalPatGatewayHost
                             retryOrdinal,
                             retryPool == AccountRotationPool.Primary ? "primary" : "backup");
                         credential = nextCredential!;
+                        // A quota response is an explicit safe-replay signal. If this
+                        // request later succeeds on the next account, its ordinary
+                        // session route may be durably rebound as in sub2api.
+                        preserveAffinityBindingOnSuccess = false;
                         transparentRetryCount++;
                         continue;
                     }
@@ -1660,10 +2931,119 @@ internal sealed class LocalPatGatewayHost
                     break;
                 }
 
+                // A trusted compatible-API relay commonly reports an exhausted shared
+                // pool as HTTP 503 instead of the official 429 envelope.  Treat that
+                // response as a bounded, request-scoped failover signal: replay only
+                // before any downstream byte is written, walk the latest configured
+                // ring once, and never persist the account as exhausted merely because
+                // a provider returned a generic 503.  Official OAuth/PAT accounts stay
+                // conservative and require an explicit quota/capacity marker so a
+                // transient ChatGPT outage cannot unexpectedly move a live session.
+                if (modelRequestActivity != null &&
+                    attemptResponse.StatusCode == HttpStatusCode.ServiceUnavailable)
+                {
+                    var buffered503Body = await BufferUpstreamErrorResponseAsync(
+                        attemptResponse,
+                        requestCancellationToken);
+                    var retryable503 = credential.IsCompatibleApi
+                        ? true
+                        : IsQuotaOrCapacityUnavailable503(attemptResponse, buffered503Body);
+                    if (retryable503)
+                    {
+                        if (PatGatewayRotationStore.TryNormalizeAccountKey(
+                                credential.AccountKey,
+                                out var unavailable503AccountKey) &&
+                            PatGatewayRotationStore.TryNormalizeAccountKey(
+                                globalRouteSourceAccountKey,
+                                out var global503SourceKey) &&
+                            unavailable503AccountKey.Equals(
+                                global503SourceKey,
+                                StringComparison.Ordinal))
+                        {
+                            // Reuse the existing commit gate for transparent failover:
+                            // a successful retry must advance the durable cursor even
+                            // when the relay used 503 rather than an official 429.
+                            globalRouteQuotaSeen = true;
+                        }
+                        if (!string.IsNullOrWhiteSpace(credential.AccountKey))
+                        {
+                            attemptedAccountKeys.Add(credential.AccountKey);
+                        }
+
+                        var canReplay503 = !strictResponseAffinity &&
+                                           (affinityRequest?.AllowCrossAccountReplay ?? true) &&
+                                           (!context.Request.HasEntityBody || replayableBody != null);
+                        if (canReplay503 &&
+                            TrySelectNextTransparentRotationCredential(
+                                credential,
+                                attemptedAccountKeys,
+                                allowCompatibleApiRetry,
+                                out var next503Credential,
+                                out var retry503Ordinal,
+                                out var retry503Pool))
+                        {
+                            lastQuotaResponse?.Dispose();
+                            lastQuotaResponse = attemptResponse;
+                            lastQuotaCredential = credential;
+                            WriteTransparentRotationDiagnostic(
+                                "retry-selected",
+                                retry503Ordinal,
+                                retry503Pool == AccountRotationPool.Primary ?
+                                    "primary-503" : "backup-503");
+                            ManagerLifecycleDiagnostics.Write(
+                                "pat-gateway-http-503-failover",
+                                $"account={NormalizeOptionalAccountKey(credential.AccountKey) ?? "unbound"}; " +
+                                $"compatible_api={credential.IsCompatibleApi}; " +
+                                $"candidate_ordinal={retry503Ordinal}; downstream_bytes=0");
+                            credential = next503Credential!;
+                            transparentRetryCount++;
+                            continue;
+                        }
+                    }
+
+                    // Keep the actual upstream 503 (including its body and Retry-After)
+                    // when there is no safe candidate.  This is preferable to turning a
+                    // provider outage into a synthetic 502 and lets Codex perform its
+                    // normal bounded retry policy.
+                    if (lastQuotaResponse != null)
+                    {
+                        lastQuotaResponse.Dispose();
+                        lastQuotaResponse = null;
+                    }
+                    finalUpstreamResponse = attemptResponse;
+                    ManagerLifecycleDiagnostics.Write(
+                        "pat-gateway-http-503-returned",
+                        $"compatible_api={credential.IsCompatibleApi}; " +
+                        $"retryable={retryable503}; downstream_bytes=0");
+                    break;
+                }
+
+                if (lastQuotaResponse == null &&
+                    attemptResponse.StatusCode is HttpStatusCode.Unauthorized or
+                        HttpStatusCode.Forbidden &&
+                    TrySelectGlobalCredentialAfterAffinityFailure(
+                        credential,
+                        globalRouteCredential,
+                        strictResponseAffinity,
+                        activeAffinityLease,
+                        out var globalAfterRejectedStickyResponse))
+                {
+                    attemptResponse.Dispose();
+                    if (!string.IsNullOrWhiteSpace(credential.AccountKey))
+                    {
+                        attemptedAccountKeys.Add(credential.AccountKey);
+                    }
+                    credential = globalAfterRejectedStickyResponse!;
+                    WriteTransparentRotationDiagnostic(
+                        "affinity-fallback",
+                        Math.Max(1, attemptedAccountKeys.Count),
+                        "credential-response-rejected");
+                    continue;
+                }
+
                 if (lastQuotaResponse != null &&
                     (attemptResponse.StatusCode is HttpStatusCode.Unauthorized or
-                        HttpStatusCode.Forbidden ||
-                     credential.IsCompatibleApi && !attemptResponse.IsSuccessStatusCode))
+                        HttpStatusCode.Forbidden))
                 {
                     attemptResponse.Dispose();
                     if (!string.IsNullOrWhiteSpace(credential.AccountKey))
@@ -1694,24 +3074,21 @@ internal sealed class LocalPatGatewayHost
                 }
 
                 finalUpstreamResponse = attemptResponse;
+                if (lastTransient429Response != null)
+                {
+                    lastTransient429Response.Dispose();
+                    lastTransient429Response = null;
+                    ManagerLifecycleDiagnostics.Write(
+                        "pat-gateway-http-429-transient-failover-succeeded",
+                        $"candidate_failovers={transient429CandidateFailoverCount}; " +
+                        "durable_quota_marker=false; global_cursor_advance=false; " +
+                        "downstream_bytes=0");
+                }
+                hadSuccessfulTransparentRetry = lastQuotaResponse != null;
                 if (lastQuotaResponse != null)
                 {
                     lastQuotaResponse.Dispose();
                     lastQuotaResponse = null;
-                    if (attemptResponse.IsSuccessStatusCode &&
-                        PatGatewayRotationStore.TryNormalizeAccountKey(
-                            retrySourceAccountKey,
-                            out var sourceAccountKey) &&
-                        PatGatewayRotationStore.TryNormalizeAccountKey(
-                            credential.AccountKey,
-                            out var targetAccountKey) &&
-                        !sourceAccountKey.Equals(targetAccountKey, StringComparison.Ordinal))
-                    {
-                        await CommitTransparentRotationAsync(
-                            sourceAccountKey,
-                            targetAccountKey,
-                            requestCancellationToken);
-                    }
                     ManagerLifecycleDiagnostics.Write(
                         "pat-gateway-transparent-retry-succeeded",
                         $"attempt_count={transparentRetryCount + 1}; downstream_bytes=0");
@@ -1736,10 +3113,140 @@ internal sealed class LocalPatGatewayHost
                         return;
                     }
                 }
-                await CopyUpstreamResponseAsync(
+                var responseIdObservation = await CopyUpstreamResponseAsync(
                     upstreamResponse,
                     response,
-                    requestCancellationToken);
+                    observeResponseId: isModelRequest &&
+                                       !isIndependentAccountProbe &&
+                                       upstreamResponse.IsSuccessStatusCode,
+                    cancellationToken: requestCancellationToken);
+
+                // The manager uses this successful, completed account marker to keep its
+                // current-account label and official quota refresh aligned with the
+                // credential that actually produced the response.  It is updated only
+                // after the response has been copied through to EOF, and explicit quota
+                // probes are excluded so a test never steals the running session's label.
+                // A trusted compatible relay is allowed to omit the Responses terminal/id
+                // envelope (some relays return a valid 2xx stream with a non-standard
+                // content type).  Requiring CanConfirmSession here made every transparent
+                // retry succeed for the user but left the global cursor and UI on the
+                // exhausted source.  An explicit failure/ambiguous observer result still
+                // blocks the marker; otherwise a completed HTTP 2xx is the account that
+                // served this turn.
+                var responseCompletedSuccessfully =
+                    upstreamResponse.IsSuccessStatusCode &&
+                    responseIdObservation is not
+                    {
+                        SawTerminalFailure: true
+                    } &&
+                    responseIdObservation is not
+                    {
+                        IsAmbiguous: true
+                    };
+                if (isModelRequest &&
+                    !isIndependentAccountProbe &&
+                    responseCompletedSuccessfully)
+                {
+                    // A 2xx envelope can still carry response.failed, an incomplete
+                    // stream, or malformed JSON.  The observer rejects an explicit failure
+                    // or conflicting response id; a relay that does not expose those
+                    // fields is still represented by the completed HTTP status above.
+                    RecordSuccessfulModelRequest(
+                        credential.AccountKey,
+                        modelRequestActivity?.StartedAtUtc);
+                }
+
+                if (isModelRequest && !isIndependentAccountProbe && affinityRequest != null &&
+                    upstreamResponse.IsSuccessStatusCode &&
+                    responseIdObservation is
+                        { CanConfirmSession: true } &&
+                    PatGatewayRotationStore.TryNormalizeAccountKey(
+                        credential.AccountKey,
+                        out var successfulAccountKey))
+                {
+                    PatGatewaySessionAffinityLease? leaseToConfirm =
+                        preserveAffinityBindingOnSuccess ? null : activeAffinityLease;
+                    if (!preserveAffinityBindingOnSuccess &&
+                        activeAffinityLease != null &&
+                        !activeAffinityLease.AccountKey.Equals(
+                            successfulAccountKey,
+                            StringComparison.Ordinal) &&
+                        !strictResponseAffinity)
+                    {
+                        var movedToWinner = _sessionAffinityStore.Move(
+                            activeAffinityLease,
+                            successfulAccountKey);
+                        if (movedToWinner != null)
+                        {
+                            activeAffinityLease = movedToWinner;
+                            affinityLeases.Add(movedToWinner);
+                            leaseToConfirm = movedToWinner;
+                        }
+                    }
+
+                    // A temporary identity-network escape may serve this turn through
+                    // the global account, but it must not overwrite the old durable
+                    // session route. Release that provisional move while still binding
+                    // any newly observed response ID to the account that produced it.
+                    // For a durable move, clear superseded provisional versions before
+                    // binding an input previous_response_id that was unknown when
+                    // routing began. Never release the current winner before aliases
+                    // are confirmed.
+                    for (var index = affinityLeases.Count - 1; index >= 0; index--)
+                    {
+                        var historical = affinityLeases[index];
+                        if (leaseToConfirm != null &&
+                            historical.Version == leaseToConfirm.Version &&
+                            historical.AccountKey.Equals(
+                                leaseToConfirm.AccountKey,
+                                StringComparison.Ordinal))
+                        {
+                            continue;
+                        }
+                        _ = _sessionAffinityStore.ReleaseFailed(historical);
+                    }
+
+                    var responseIds = responseIdObservation is
+                        { CanConfirm: true, ResponseId: { } successfulResponseId }
+                        ? new[] { successfulResponseId }
+                        : Array.Empty<string>();
+                    var affinityMutation = _sessionAffinityStore.ConfirmAndBindResponses(
+                        leaseToConfirm,
+                        responseIds,
+                        successfulAccountKey);
+                    if (!affinityMutation.Persisted)
+                    {
+                        ManagerLifecycleDiagnostics.Write(
+                            "pat-gateway-session-affinity-persist-failed",
+                            "response_completed=true; downstream_complete=true");
+                    }
+                }
+
+                // Advance the user-visible global rotation cursor only after the retry
+                // response has been copied to EOF and passed the Responses observer. A
+                // 200 response carrying response.failed, malformed JSON, or a truncated
+                // SSE stream must never commit a quota rotation. Use the credential that
+                // actually produced the remembered 429 (rather than the first sticky
+                // attempt), while still requiring it to be the current global route so a
+                // sticky-only account cannot move the global ring.
+                if (hadSuccessfulTransparentRetry &&
+                    responseCompletedSuccessfully &&
+                    globalRouteQuotaSeen &&
+                    PatGatewayRotationStore.TryNormalizeAccountKey(
+                        globalRouteSourceAccountKey,
+                        out var expectedGlobalSourceAccountKey) &&
+                    PatGatewayRotationStore.TryNormalizeAccountKey(
+                        credential.AccountKey,
+                        out var retryTargetAccountKey) &&
+                    !expectedGlobalSourceAccountKey.Equals(
+                        retryTargetAccountKey,
+                        StringComparison.Ordinal))
+                {
+                    await CommitTransparentRotationAsync(
+                        expectedGlobalSourceAccountKey,
+                        retryTargetAccountKey,
+                        requestCancellationToken);
+                }
             }
         }
         catch (Exception ex) when (
@@ -1768,6 +3275,19 @@ internal sealed class LocalPatGatewayHost
         }
         finally
         {
+            // This is intentionally unconditional. Confirmed leases no longer have a
+            // provisional owner, so ReleaseFailed is a no-op for successful requests;
+            // failed or superseded attempts restore their last durable binding. Keeping
+            // every version in the list also cleans an unmoved, unknown response-id alias.
+            for (var index = affinityLeases.Count - 1; index >= 0; index--)
+            {
+                _ = _sessionAffinityStore.ReleaseFailed(affinityLeases[index]);
+            }
+            // Buffered quota/error responses are never sent directly by the downstream
+            // response path.  Dispose any that remain after an early error, cancellation,
+            // or a successful request so a long-lived gateway cannot accumulate them.
+            lastTransient429Response?.Dispose();
+            lastQuotaResponse?.Dispose();
             try
             {
                 response.Close();
@@ -1784,7 +3304,7 @@ internal sealed class LocalPatGatewayHost
     {
         response.Headers[LocalPatGateway.RotationProtocolHeader] =
             LocalPatGateway.RotationProtocolValue;
-        var proxy = ResolveRequiredProxyUri();
+        var proxy = ResolveProxyForCredential(null).ProxyUri;
         var challenge = request.Headers[LocalPatGatewayControl.ChallengeHeader]?.Trim();
         if (!string.IsNullOrWhiteSpace(challenge))
         {
@@ -1815,10 +3335,16 @@ internal sealed class LocalPatGatewayHost
                     activeModelRequests = activity.ActiveModelRequests,
                     completedModelRequests = activity.CompletedModelRequests,
                     lastModelRequestAccountKey = activity.LastModelRequestAccountKey,
+                    lastSuccessfulModelRequestAccountKey =
+                        activity.LastSuccessfulModelRequestAccountKey,
                     lastQuotaLimitedAccountKey = activity.LastQuotaLimitedAccountKey,
                     lastQuotaLimitedSequence = activity.LastQuotaLimitedSequence,
                     lastModelRequestStartedAtUnixMs = activity.LastModelRequestStartedAtUtc?.ToUnixTimeMilliseconds(),
                     lastModelRequestCompletedAtUnixMs = activity.LastModelRequestCompletedAtUtc?.ToUnixTimeMilliseconds(),
+                    lastSuccessfulModelRequestCompletedAtUnixMs =
+                        activity.LastSuccessfulModelRequestCompletedAtUtc?.ToUnixTimeMilliseconds(),
+                    lastSuccessfulModelRequestStartedAtUnixMs =
+                        activity.LastSuccessfulModelRequestStartedAtUtc?.ToUnixTimeMilliseconds(),
                     lastQuotaLimitedAtUnixMs = activity.LastQuotaLimitedAtUtc?.ToUnixTimeMilliseconds()
                 },
                 rotation = BuildRotationResponse(rotation)
@@ -1829,6 +3355,13 @@ internal sealed class LocalPatGatewayHost
         HttpListenerRequest request,
         HttpListenerResponse response)
     {
+        // Control responses must advertise the same rotation contract as /healthz.
+        // ArmRotationAsync validates this header before accepting the returned route;
+        // without it the gateway can persist a valid route while the Manager reports a
+        // false "incompatible protocol" failure to the user.
+        response.Headers[LocalPatGateway.RotationProtocolHeader] =
+            LocalPatGateway.RotationProtocolValue;
+
         if (!request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
         {
             await WriteErrorAsync(
@@ -1891,7 +3424,11 @@ internal sealed class LocalPatGatewayHost
                 // route. Neither credential crosses the HTTP control plane.
                 _ = ResolveRotationCredential(source);
                 _ = ResolveRotationCredential(target);
-                rotation = _rotationStore.Arm(source, target, DateTimeOffset.UtcNow);
+                rotation = _rotationStore.Arm(
+                    source,
+                    target,
+                    DateTimeOffset.UtcNow,
+                    command.ReplaceExistingArmedTarget);
             }
         }
         catch (Exception ex) when (
@@ -1919,6 +3456,9 @@ internal sealed class LocalPatGatewayHost
         HttpListenerRequest request,
         HttpListenerResponse response)
     {
+        response.Headers[LocalPatGateway.RotationProtocolHeader] =
+            LocalPatGateway.RotationProtocolValue;
+
         if (!request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
         {
             await WriteErrorAsync(
@@ -1953,6 +3493,88 @@ internal sealed class LocalPatGatewayHost
             });
     }
 
+    private async Task HandleSessionAffinityInvalidateAsync(
+        HttpListenerRequest request,
+        HttpListenerResponse response)
+    {
+        response.Headers[LocalPatGateway.RotationProtocolHeader] =
+            LocalPatGateway.RotationProtocolValue;
+
+        if (!request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+        {
+            await WriteErrorAsync(
+                response,
+                HttpStatusCode.MethodNotAllowed,
+                "请使用 POST 清理账号的普通会话粘性。");
+            return;
+        }
+
+        byte[] payload;
+        try
+        {
+            payload = await ReadBoundedRequestBodyAsync(request, maximumBytes: 4096);
+        }
+        catch (InvalidDataException)
+        {
+            await WriteErrorAsync(
+                response,
+                HttpStatusCode.BadRequest,
+                "会话粘性清理请求体无效。");
+            return;
+        }
+        if (!LocalPatGatewayControl.ValidateRequest(
+                request,
+                _controlSecret,
+                BuildSessionAffinityInvalidationPurpose(payload)))
+        {
+            await WriteErrorAsync(
+                response,
+                HttpStatusCode.Unauthorized,
+                "Gateway control request was not authenticated.");
+            return;
+        }
+
+        SessionAffinityInvalidateRequest? command;
+        try
+        {
+            command = JsonSerializer.Deserialize<SessionAffinityInvalidateRequest>(payload);
+        }
+        catch (JsonException)
+        {
+            command = null;
+        }
+        if (command == null ||
+            !PatGatewayRotationStore.TryNormalizeAccountKey(
+                command.AccountKey,
+                out var accountKey))
+        {
+            await WriteErrorAsync(
+                response,
+                HttpStatusCode.BadRequest,
+                "会话粘性清理账号哈希无效。");
+            return;
+        }
+
+        var mutation = _sessionAffinityStore.InvalidateOrdinaryBindingsForAccount(accountKey);
+        if (!mutation.Persisted)
+        {
+            await WriteErrorAsync(
+                response,
+                HttpStatusCode.InternalServerError,
+                "普通会话粘性已从内存移除，但持久化清理失败。");
+            return;
+        }
+        await WriteJsonAsync(
+            response,
+            HttpStatusCode.OK,
+            new
+            {
+                status = "invalidated",
+                changed = mutation.Applied,
+                strictResponseBindingsPreserved = true
+            });
+    }
+
     private async Task<GatewayCredential> ApplyRotationAtRequestBoundaryAsync(
         GatewayCredential incoming,
         CancellationToken cancellationToken)
@@ -1965,7 +3587,7 @@ internal sealed class LocalPatGatewayHost
             {
                 lock (_rotationGate)
                 {
-                    var route = _rotationStore.Load();
+                    var route = DiscardStaleRotationRoute(_rotationStore.Load());
                     if (route.Status != PatGatewayRotationStatus.Armed ||
                         !IncomingMatchesRotationTransport(incoming, route))
                     {
@@ -1982,7 +3604,7 @@ internal sealed class LocalPatGatewayHost
                     // commit the winner, otherwise the two paths can deadlock indefinitely.
                     if (GetActivitySnapshot().ActiveModelRequests == 0)
                     {
-                        route = _rotationStore.Load();
+                        route = DiscardStaleRotationRoute(_rotationStore.Load());
                         if (route.Status != PatGatewayRotationStatus.Armed ||
                             !IncomingMatchesRotationTransport(incoming, route))
                         {
@@ -2034,6 +3656,139 @@ internal sealed class LocalPatGatewayHost
         return TokenHashesEqual(incoming.Token, transport.Token);
     }
 
+    private PatGatewayRotationSnapshot DiscardStaleRotationRoute(
+        PatGatewayRotationSnapshot route)
+    {
+        if (route.Status == PatGatewayRotationStatus.None ||
+            string.IsNullOrWhiteSpace(route.TargetAccountKey))
+        {
+            return route;
+        }
+
+        var invalidReason = "configuration_reload_failed";
+        try
+        {
+            var accounts = _accountStore.LoadAccounts();
+            var settings = _themeService.LoadSettings();
+            _ = AccountRotationConfiguration.Normalize(settings, accounts);
+            invalidReason = GetRotationRouteIneligibilityReason(
+                                route,
+                                settings,
+                                accounts,
+                                DateTimeOffset.UtcNow) ??
+                            string.Empty;
+            if (invalidReason.Length == 0)
+            {
+                return route;
+            }
+        }
+        catch (Exception ex) when (
+            ex is IOException or UnauthorizedAccessException or JsonException or
+            InvalidDataException or InvalidOperationException or NotSupportedException or
+            ArgumentException)
+        {
+            // A route whose configured target cannot be positively revalidated is less
+            // trustworthy than the credential carried by the live Codex request.
+        }
+
+        _rotationStore.Clear();
+        ManagerLifecycleDiagnostics.Write(
+            "pat-gateway-stale-route-cleared",
+            $"reason={invalidReason}; status={route.Status}; " +
+            $"transport={route.TransportAccountKey}; source={route.SourceAccountKey}; " +
+            $"target={route.TargetAccountKey}; downstream_bytes=0");
+        return PatGatewayRotationSnapshot.Empty;
+    }
+
+    private static bool IsRotationRouteEligible(
+        PatGatewayRotationSnapshot route,
+        AppSettings settings,
+        IReadOnlyList<AccountRecord> accounts,
+        DateTimeOffset nowUtc) =>
+        GetRotationRouteIneligibilityReason(route, settings, accounts, nowUtc) == null;
+
+    private static string? GetRotationRouteIneligibilityReason(
+        PatGatewayRotationSnapshot route,
+        AppSettings settings,
+        IReadOnlyList<AccountRecord> accounts,
+        DateTimeOffset nowUtc)
+    {
+        if (route.Status == PatGatewayRotationStatus.None)
+        {
+            return null;
+        }
+        if (!AccountRotationConfiguration.IsEnabled(settings))
+        {
+            return "rotation_disabled";
+        }
+        if (!PatGatewayRotationStore.TryNormalizeAccountKey(
+                route.SourceAccountKey,
+                out var sourceKey))
+        {
+            return "source_key_invalid";
+        }
+        if (!PatGatewayRotationStore.TryNormalizeAccountKey(
+                route.TargetAccountKey,
+                out var targetKey))
+        {
+            return "target_key_invalid";
+        }
+
+        var source = accounts.FirstOrDefault(account =>
+            QuotaAccountIdentity.CreateKey(account).Equals(sourceKey, StringComparison.Ordinal));
+        var target = accounts.FirstOrDefault(account =>
+            QuotaAccountIdentity.CreateKey(account).Equals(targetKey, StringComparison.Ordinal));
+        if (source == null)
+        {
+            return "source_account_missing";
+        }
+        if (target == null)
+        {
+            return "target_account_missing";
+        }
+        if (AccountRotationConfiguration.GetPool(settings, source) ==
+            AccountRotationPool.None)
+        {
+            return "source_not_in_rotation_pool";
+        }
+        if (AccountRotationConfiguration.GetPool(settings, target) ==
+            AccountRotationPool.None)
+        {
+            return "target_not_in_rotation_pool";
+        }
+
+        if (route.Status != PatGatewayRotationStatus.Armed)
+        {
+            return null;
+        }
+        if (route.ArmedAtUtc is not { } armedAtUtc ||
+            armedAtUtc > nowUtc.AddSeconds(5))
+        {
+            return "armed_timestamp_invalid";
+        }
+        if (nowUtc - armedAtUtc > ArmedRotationMaximumLifetime)
+        {
+            return "armed_route_timed_out";
+        }
+
+        // A manager-prepared route belongs to the quota window that armed it.  If that
+        // window already reset while Codex was idle, activating the route hours later is
+        // precisely the stale lkcau -> xikeucas/KK failure this guard prevents.  A manual
+        // route armed after that reset belongs to the new window and must remain eligible;
+        // otherwise an old persisted reset marker clears every force-switch at its first
+        // live request boundary.
+        if (settings.AccountRotationResetAtUtc.TryGetValue(sourceKey, out var resetAtUtc))
+        {
+            var usableAtUtc = resetAtUtc +
+                              AccountRotationConfiguration.PrimaryResetGracePeriod;
+            if (usableAtUtc <= nowUtc && armedAtUtc < usableAtUtc)
+            {
+                return "source_quota_window_reset_after_arm";
+            }
+        }
+        return null;
+    }
+
     private static GatewayCredential SelectRotationCredentialAtRequestBoundary(
         GatewayCredential incoming,
         PatGatewayRotationSnapshot route,
@@ -2063,13 +3818,19 @@ internal sealed class LocalPatGatewayHost
         return target;
     }
 
+    private static bool ShouldApplyRotationAtRequestBoundary(
+        bool isModelRequest,
+        bool isIndependentAccountProbe) =>
+        isModelRequest && !isIndependentAccountProbe;
+
     private bool TrySelectNextTransparentRotationCredential(
         GatewayCredential current,
         ISet<string> attemptedAccountKeys,
         bool allowCompatibleApi,
         out GatewayCredential? credential,
         out int candidateOrdinal,
-        out AccountRotationPool pool)
+        out AccountRotationPool pool,
+        bool allowBackupPool = true)
     {
         credential = null;
         candidateOrdinal = 0;
@@ -2088,6 +3849,10 @@ internal sealed class LocalPatGatewayHost
             accounts = _accountStore.LoadAccounts();
             settings = _themeService.LoadSettings();
             _ = AccountRotationConfiguration.Normalize(settings, accounts);
+            // AccountRotationConfiguration migrates pre-2.2.8 unconfirmed markers once.
+            // Keep the remaining reset times: they now represent confirmed evidence and,
+            // like sub2api's rate_limit_reset_at, must keep an exhausted B out of the ring
+            // until its reset instead of probing B and C on every later request.
         }
         catch (Exception ex) when (
             ex is IOException or UnauthorizedAccessException or JsonException or
@@ -2122,45 +3887,50 @@ internal sealed class LocalPatGatewayHost
         AccountRotationConfiguration.MarkUsed(settings, currentAccount);
         var now = DateTimeOffset.UtcNow;
         var unavailable = new HashSet<string>(attemptedAccountKeys, StringComparer.Ordinal);
-        foreach (var observed in _quotaLimitedAccountKeys)
+        foreach (var pair in _quotaLimitedAccounts.ToArray())
         {
-            var graceElapsed = settings.AccountRotationResetAtUtc.TryGetValue(
-                                   observed.Key,
-                                   out var resetAtUtc) &&
-                               resetAtUtc + AccountRotationConfiguration.PrimaryResetGracePeriod <= now;
-            if (!graceElapsed &&
-                now - observed.Value <= PatGatewayQuotaSignalStore.SignalLifetime)
+            if (!IsQuotaLimitObservationActive(pair.Value, now))
             {
-                unavailable.Add(observed.Key);
+                _quotaLimitedAccounts.TryRemove(pair.Key, out _);
+                continue;
             }
-            else
+            unavailable.Add(pair.Key);
+            if (pair.Value.ResetAtUtc is { } resetAtUtc)
             {
-                _quotaLimitedAccountKeys.TryRemove(observed.Key, out _);
+                settings.AccountRotationResetAtUtc[pair.Key] = resetAtUtc;
             }
         }
 
         while (true)
         {
-            var candidates = AccountRotationConfiguration.BuildCandidates(
-                settings,
-                accounts,
-                currentAccount,
-                unavailable,
-                now,
-                hasUsableCredential: static _ => true,
-                canSelectAccount: account => allowCompatibleApi || !account.IsCompatibleApi,
-                hardUnavailableAccountKeys: attemptedAccountKeys);
-            if (candidates.Count == 0)
+            if (!AccountRotationConfiguration.TrySelectNextCandidate(
+                    settings,
+                    accounts,
+                    currentAccount,
+                    unavailable,
+                    now,
+                    hasUsableCredential: static _ => true,
+                    out var candidate,
+                    out pool,
+                    canSelectAccount: account => allowCompatibleApi || !account.IsCompatibleApi,
+                    hardUnavailableAccountKeys: attemptedAccountKeys))
             {
                 return false;
             }
 
-            var candidate = candidates[0];
-            var candidateKey = QuotaAccountIdentity.CreateKey(candidate);
+            var selectedCandidate = candidate!;
+            var candidateKey = QuotaAccountIdentity.CreateKey(selectedCandidate);
+            pool = AccountRotationConfiguration.GetPool(settings, selectedCandidate);
+            if (!allowBackupPool && pool == AccountRotationPool.Backup)
+            {
+                // A bounded failover for an ambiguous/transient 429 may inspect other primary
+                // accounts, but it must never consume the emergency pool. Backup becomes
+                // eligible only after confirmed exhaustion/capacity handling reaches this path.
+                return false;
+            }
             unavailable.Add(candidateKey);
             attemptedAccountKeys.Add(candidateKey);
             candidateOrdinal = Math.Max(1, attemptedAccountKeys.Count);
-            pool = AccountRotationConfiguration.GetPool(settings, candidate);
             try
             {
                 credential = ResolveRotationCredential(candidateKey);
@@ -2177,6 +3947,30 @@ internal sealed class LocalPatGatewayHost
                     "local-credential-unavailable");
             }
         }
+    }
+
+    private static bool TrySelectGlobalCredentialAfterAffinityFailure(
+        GatewayCredential current,
+        GatewayCredential globalRouteCredential,
+        bool strictResponseAffinity,
+        PatGatewaySessionAffinityLease? affinityLease,
+        out GatewayCredential? fallback)
+    {
+        fallback = null;
+        if (strictResponseAffinity || affinityLease == null ||
+            !PatGatewayRotationStore.TryNormalizeAccountKey(
+                current.AccountKey,
+                out var currentAccountKey) ||
+            !PatGatewayRotationStore.TryNormalizeAccountKey(
+                globalRouteCredential.AccountKey,
+                out var globalAccountKey) ||
+            currentAccountKey.Equals(globalAccountKey, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        fallback = globalRouteCredential;
+        return true;
     }
 
     private async Task CommitTransparentRotationAsync(
@@ -2614,17 +4408,48 @@ internal sealed class LocalPatGatewayHost
             };
     }
 
-    private bool IsFingerprintForwardingEnabled(GatewayCredential credential)
+    private CodexFingerprintPlan ResolveCodexFingerprintPlan(
+        GatewayCredential credential,
+        HttpListenerRequest incoming)
     {
         if (string.IsNullOrWhiteSpace(credential.AccountKey))
         {
-            return false;
+            return CodexFingerprintConvergence.CreatePlan(
+                credential.AccountKey,
+                seed: null,
+                clientSessionId: null,
+                mode: CodexFingerprintMode.GatewayDefault);
         }
 
         var settings = _themeService.LoadSettings();
-        return settings.CodexFingerprintForwarding?.TryGetValue(
-                   credential.AccountKey,
-                   out var enabled) == true && enabled;
+        var mode = AccountRotationConfiguration.GetFingerprintMode(
+            settings,
+            credential.AccountKey);
+        var contentEncoding = incoming.Headers["Content-Encoding"]?.Trim();
+        if (CodexFingerprintConvergence.RequiresSeed(mode) &&
+            !string.IsNullOrWhiteSpace(contentEncoding) &&
+            !contentEncoding.Equals("identity", StringComparison.OrdinalIgnoreCase))
+        {
+            // Rewriting only the headers of a compressed body would expose two different
+            // identities. Fail closed to the historical gateway behavior for this attempt.
+            mode = CodexFingerprintMode.GatewayDefault;
+        }
+        var plan = CodexFingerprintConvergence.CreatePlan(
+            credential.AccountKey,
+            AccountRotationConfiguration.GetFingerprintSeed(settings, credential.AccountKey),
+            CodexFingerprintConvergence.ExtractClientSessionId(incoming.Headers),
+            mode);
+        if (CodexFingerprintConvergence.RequiresSeed(mode) && !plan.HasConvergedIdentifiers)
+        {
+            // Never silently turn a requested convergence mode into raw pass-through when
+            // its manager-owned seed is missing or invalid.
+            return CodexFingerprintConvergence.CreatePlan(
+                credential.AccountKey,
+                seed: null,
+                clientSessionId: null,
+                mode: CodexFingerprintMode.GatewayDefault);
+        }
+        return plan;
     }
 
     private static bool TokenHashesEqual(string first, string second)
@@ -2636,6 +4461,9 @@ internal sealed class LocalPatGatewayHost
 
     private static string BuildRotationArmPurpose(ReadOnlySpan<byte> payload) =>
         "rotation-arm\n" + Convert.ToHexString(SHA256.HashData(payload));
+
+    private static string BuildSessionAffinityInvalidationPurpose(ReadOnlySpan<byte> payload) =>
+        "session-affinity-invalidate\n" + Convert.ToHexString(SHA256.HashData(payload));
 
     private static async Task<byte[]> ReadBoundedRequestBodyAsync(
         HttpListenerRequest request,
@@ -2693,6 +4521,339 @@ internal sealed class LocalPatGatewayHost
         return path.EndsWith("/responses", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static bool IsIndependentAccountProbe(HttpListenerRequest request)
+    {
+        var purpose = request.Headers[LocalPatGateway.RequestPurposeHeader]?.Trim();
+        return string.Equals(
+            purpose,
+            LocalPatGateway.QuotaTestRequestPurpose,
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static async Task<byte[]> BufferUpstreamErrorResponseAsync(
+        HttpResponseMessage response,
+        CancellationToken cancellationToken)
+    {
+        var originalContent = response.Content;
+        var contentHeaders = originalContent.Headers
+            .Select(pair => new KeyValuePair<string, string[]>(pair.Key, pair.Value.ToArray()))
+            .ToArray();
+        var body = await originalContent.ReadAsByteArrayAsync(cancellationToken);
+        var replacement = new ByteArrayContent(body);
+        foreach (var pair in contentHeaders)
+        {
+            _ = replacement.Headers.TryAddWithoutValidation(pair.Key, pair.Value);
+        }
+        response.Content = replacement;
+        originalContent.Dispose();
+        return body.Length <= MaxUpstreamErrorBodyBytes
+            ? body
+            : body[..MaxUpstreamErrorBodyBytes];
+    }
+
+    private static Upstream429Classification ClassifyUpstream429(
+        HttpResponseMessage response,
+        byte[] responseBody,
+        DateTimeOffset observedAtUtc)
+    {
+        var hasExplicitRemainingQuota = false;
+        foreach (var prefix in new[] { "primary", "secondary" })
+        {
+            if (!TryReadFiniteHeaderDouble(
+                    response,
+                    $"x-codex-{prefix}-used-percent",
+                    out var usedPercent))
+            {
+                continue;
+            }
+            if (usedPercent < 100D)
+            {
+                hasExplicitRemainingQuota = true;
+                continue;
+            }
+
+            DateTimeOffset? resetAtUtc = null;
+            if (TryReadFiniteHeaderDouble(
+                    response,
+                    $"x-codex-{prefix}-reset-after-seconds",
+                    out var resetSeconds) &&
+                resetSeconds > 0D)
+            {
+                resetAtUtc = observedAtUtc.AddSeconds(
+                    Math.Min(resetSeconds, TimeSpan.FromDays(31).TotalSeconds));
+            }
+            return new Upstream429Classification(
+                true,
+                $"codex-{prefix}-100-percent",
+                resetAtUtc);
+        }
+
+        if (TryReadStructuredQuotaExhaustion(responseBody, observedAtUtc, out var bodyResetAtUtc))
+        {
+            return new Upstream429Classification(
+                false,
+                hasExplicitRemainingQuota
+                    ? "structured-usage-limit-with-explicit-remaining-quota"
+                    : "structured-usage-limit-pending-confirmation",
+                bodyResetAtUtc,
+                RequiresSameAccountConfirmation: !hasExplicitRemainingQuota);
+        }
+
+        return new Upstream429Classification(false, "unconfirmed-rate-limit", null);
+    }
+
+    private static bool IsQuotaOrCapacityUnavailable503(
+        HttpResponseMessage response,
+        byte[] responseBody)
+    {
+        // Do not rotate an official account on every infrastructure 503.  Only an
+        // explicit quota/capacity indication is strong enough for that path; compatible
+        // API credentials are handled by the caller as trusted relay pool failures.
+        foreach (var headerName in new[]
+                 {
+                     "x-codex-primary-used-percent",
+                     "x-codex-secondary-used-percent"
+                 })
+        {
+            if (TryReadFiniteHeaderDouble(response, headerName, out var usedPercent) &&
+                usedPercent >= 100D)
+            {
+                return true;
+            }
+        }
+
+        if (response.Headers.RetryAfter != null && responseBody.Length == 0)
+        {
+            // A provider that supplies Retry-After with an empty 503 body is commonly
+            // signalling a saturated route.  Keep this as a single request-scoped hint;
+            // no durable exhausted marker is written.
+            return true;
+        }
+
+        var text = Encoding.UTF8.GetString(responseBody).ToLowerInvariant();
+        return text.Contains("quota", StringComparison.Ordinal) ||
+               text.Contains("rate_limit", StringComparison.Ordinal) ||
+               text.Contains("rate limit", StringComparison.Ordinal) ||
+               text.Contains("usage_limit", StringComparison.Ordinal) ||
+               text.Contains("usage limit", StringComparison.Ordinal) ||
+               text.Contains("capacity", StringComparison.Ordinal) ||
+               text.Contains("overloaded", StringComparison.Ordinal) ||
+               text.Contains("exhaust", StringComparison.Ordinal) ||
+               text.Contains("insufficient", StringComparison.Ordinal) ||
+               text.Contains("暂时不可用", StringComparison.Ordinal) ||
+               text.Contains("额度", StringComparison.Ordinal);
+    }
+
+    private static string Build429ConfirmationSignature(
+        HttpResponseMessage response,
+        ReadOnlySpan<byte> responseBody)
+    {
+        var bodyHash = Convert.ToHexString(SHA256.HashData(responseBody));
+        var primary = response.Headers.TryGetValues(
+                "x-codex-primary-used-percent",
+                out var primaryValues)
+            ? primaryValues.FirstOrDefault() ?? string.Empty
+            : string.Empty;
+        var secondary = response.Headers.TryGetValues(
+                "x-codex-secondary-used-percent",
+                out var secondaryValues)
+            ? secondaryValues.FirstOrDefault() ?? string.Empty
+            : string.Empty;
+        // Retry-After commonly counts down or is regenerated between otherwise identical
+        // retries. It must not split one persistent 429 into unrelated confirmations.
+        return bodyHash + "|" + primary + "|" + secondary;
+    }
+
+    private static bool CanReplayUnconfirmed429AcrossAccounts(
+        bool requestHasEntityBody,
+        bool hasReplayableBody,
+        bool strictResponseAffinity,
+        bool allowCrossAccountReplay,
+        int candidateFailoverCount) =>
+        !strictResponseAffinity &&
+        allowCrossAccountReplay &&
+        (!requestHasEntityBody || hasReplayableBody) &&
+        candidateFailoverCount < Transient429CandidateFailoverLimit;
+
+    private static bool TryReadFiniteHeaderDouble(
+        HttpResponseMessage response,
+        string name,
+        out double value)
+    {
+        value = 0D;
+        if (!response.Headers.TryGetValues(name, out var values) &&
+            !response.Content.Headers.TryGetValues(name, out values))
+        {
+            return false;
+        }
+        return double.TryParse(
+                   values.FirstOrDefault()?.Trim(),
+                   System.Globalization.NumberStyles.Float,
+                   System.Globalization.CultureInfo.InvariantCulture,
+                   out value) &&
+               double.IsFinite(value);
+    }
+
+    private static bool TryReadStructuredQuotaExhaustion(
+        byte[] body,
+        DateTimeOffset observedAtUtc,
+        out DateTimeOffset? resetAtUtc)
+    {
+        resetAtUtc = null;
+        if (body.Length == 0)
+        {
+            return false;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(body);
+            var hasQuotaMarker = false;
+            DateTimeOffset? parsedResetAtUtc = null;
+            Visit(document.RootElement);
+            resetAtUtc = parsedResetAtUtc;
+            return hasQuotaMarker && parsedResetAtUtc.HasValue;
+
+            void Visit(JsonElement element)
+            {
+                if (element.ValueKind == JsonValueKind.Object)
+                {
+                    foreach (var property in element.EnumerateObject())
+                    {
+                        var normalizedName = property.Name.Trim().ToLowerInvariant();
+                        if ((normalizedName is "type" or "code" or "error_type" or "error_code") &&
+                            property.Value.ValueKind == JsonValueKind.String &&
+                            IsExplicitQuotaExhaustionMarker(property.Value.GetString()))
+                        {
+                            hasQuotaMarker = true;
+                        }
+                        else if (normalizedName is "resets_at" or "reset_at" or
+                                 "rate_limit_reset_at" or "resets_in_seconds" or
+                                 "reset_after_seconds" or "retry_after_seconds")
+                        {
+                            var parsed = Parse429ResetValue(
+                                normalizedName,
+                                property.Value,
+                                observedAtUtc);
+                            if (parsed.HasValue &&
+                                (!parsedResetAtUtc.HasValue ||
+                                 parsed.Value > parsedResetAtUtc.Value))
+                            {
+                                parsedResetAtUtc = parsed;
+                            }
+                        }
+                        Visit(property.Value);
+                    }
+                }
+                else if (element.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var item in element.EnumerateArray())
+                    {
+                        Visit(item);
+                    }
+                }
+            }
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsExplicitQuotaExhaustionMarker(string? value) =>
+        value?.Trim().ToLowerInvariant() is
+            "usage_limit_reached" or
+            "usage_limit_exceeded" or
+            "quota_exhausted" or
+            "quota_limit_reached" or
+            "insufficient_quota" or
+            "billing_hard_limit_reached";
+
+    private static DateTimeOffset? Parse429ResetValue(
+        string propertyName,
+        JsonElement value,
+        DateTimeOffset observedAtUtc)
+    {
+        var raw = value.ValueKind switch
+        {
+            JsonValueKind.Number when value.TryGetDouble(out var number) => number.ToString(
+                System.Globalization.CultureInfo.InvariantCulture),
+            JsonValueKind.String => value.GetString(),
+            _ => null
+        };
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return null;
+        }
+
+        if (propertyName is "resets_in_seconds" or "reset_after_seconds" or
+            "retry_after_seconds")
+        {
+            return double.TryParse(
+                       raw,
+                       System.Globalization.NumberStyles.Float,
+                       System.Globalization.CultureInfo.InvariantCulture,
+                       out var seconds) &&
+                   double.IsFinite(seconds) && seconds > 0D
+                ? observedAtUtc.AddSeconds(
+                    Math.Min(seconds, TimeSpan.FromDays(31).TotalSeconds))
+                : null;
+        }
+
+        if (long.TryParse(
+                raw,
+                System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var unixSeconds))
+        {
+            try
+            {
+                return DateTimeOffset.FromUnixTimeSeconds(unixSeconds);
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                return null;
+            }
+        }
+        return DateTimeOffset.TryParse(
+            raw,
+            System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.AssumeUniversal |
+            System.Globalization.DateTimeStyles.AdjustToUniversal,
+            out var parsed)
+            ? parsed
+            : null;
+    }
+
+    private static TimeSpan SelectTransient429RetryDelay(
+        HttpResponseMessage response,
+        int retryCount)
+    {
+        var delay = TimeSpan.FromMilliseconds(
+            Transient429DefaultRetryDelay.TotalMilliseconds * Math.Pow(2D, retryCount));
+        var now = DateTimeOffset.UtcNow;
+        if (response.Headers.RetryAfter?.Delta is { } delta && delta > TimeSpan.Zero)
+        {
+            delay = delta;
+        }
+        else if (response.Headers.RetryAfter?.Date is { } retryAt && retryAt > now)
+        {
+            delay = retryAt - now;
+        }
+        return delay > Transient429MaximumRetryDelay
+            ? Transient429MaximumRetryDelay
+            : delay < TimeSpan.Zero
+                ? TimeSpan.Zero
+                : delay;
+    }
+
+    private static bool IsQuotaLimitObservationActive(
+        QuotaLimitObservation observation,
+        DateTimeOffset nowUtc) =>
+        observation.ResetAtUtc is { } resetAtUtc
+            ? resetAtUtc + AccountRotationConfiguration.PrimaryResetGracePeriod > nowUtc
+            : observation.ObservedAtUtc + QuotaResetUnknownFallbackCooldown > nowUtc;
+
     private ModelRequestActivity BeginModelRequest(string? accountKey)
     {
         lock (_activityGate)
@@ -2712,6 +4873,40 @@ internal sealed class LocalPatGatewayHost
         }
     }
 
+    private void RecordSuccessfulModelRequest(
+        string? accountKey,
+        DateTimeOffset? startedAtUtc)
+    {
+        var normalized = NormalizeOptionalAccountKey(accountKey);
+        if (normalized == null)
+        {
+            return;
+        }
+
+        var completedAtUtc = DateTimeOffset.UtcNow;
+        lock (_activityGate)
+        {
+            _lastSuccessfulModelRequestAccountKey = normalized;
+            _lastSuccessfulModelRequestStartedAtUtc = startedAtUtc;
+            _lastSuccessfulModelRequestCompletedAtUtc = completedAtUtc;
+        }
+        try
+        {
+            _ = _successfulActivityStore.Record(
+                normalized,
+                startedAtUtc,
+                completedAtUtc);
+        }
+        catch (Exception ex) when (
+            ex is IOException or UnauthorizedAccessException or InvalidDataException or
+                InvalidOperationException or NotSupportedException or ArgumentException or
+                JsonException)
+        {
+            // The authenticated in-memory health marker remains available. A cache write
+            // failure must never turn a complete model response into a downstream error.
+        }
+    }
+
     private void EndModelRequest(string? accountKey)
     {
         lock (_activityGate)
@@ -2728,14 +4923,19 @@ internal sealed class LocalPatGatewayHost
         }
     }
 
-    private void RecordQuotaLimited(string? accountKey)
+    private void RecordQuotaLimited(
+        string? accountKey,
+        string reason,
+        DateTimeOffset? resetAtUtc)
     {
         var normalizedAccountKey = NormalizeOptionalAccountKey(accountKey);
         var observedAtUtc = DateTimeOffset.UtcNow;
         PatGatewayQuotaSignal? durableSignal = null;
         if (normalizedAccountKey != null)
         {
-            _quotaLimitedAccountKeys[normalizedAccountKey] = observedAtUtc;
+            _quotaLimitedAccounts[normalizedAccountKey] = new QuotaLimitObservation(
+                observedAtUtc,
+                resetAtUtc);
             try
             {
                 // Commit before forwarding the 429 response. If the gateway or Manager
@@ -2744,7 +4944,8 @@ internal sealed class LocalPatGatewayHost
                 // replaces the real upstream 429 with a local gateway error.
                 durableSignal = _quotaSignalStore.Record(
                     normalizedAccountKey,
-                    observedAtUtc);
+                    observedAtUtc,
+                    resetAtUtc);
             }
             catch (Exception ex) when (
                 ex is IOException or UnauthorizedAccessException or InvalidDataException or
@@ -2762,9 +4963,14 @@ internal sealed class LocalPatGatewayHost
             _lastQuotaLimitedSequence = durableSignal?.Sequence;
         }
         ManagerLifecycleDiagnostics.Write(
-            "pat-gateway-http-429-detected",
-            "downstream_bytes=0");
+            "pat-gateway-quota-exhaustion-confirmed",
+            $"reason={reason}; reset_known={resetAtUtc.HasValue}; downstream_bytes=0");
     }
+
+
+    private sealed record QuotaLimitObservation(
+        DateTimeOffset ObservedAtUtc,
+        DateTimeOffset? ResetAtUtc);
 
     private LocalPatGatewayActivitySnapshot GetActivitySnapshot()
     {
@@ -2782,7 +4988,11 @@ internal sealed class LocalPatGatewayHost
                 completedForLastAccount,
                 _lastModelRequestAccountKey,
                 _lastQuotaLimitedAccountKey,
-                _lastQuotaLimitedSequence);
+                _lastQuotaLimitedSequence,
+                RotationProtocol: null,
+                LastSuccessfulModelRequestAccountKey: _lastSuccessfulModelRequestAccountKey,
+                LastSuccessfulModelRequestCompletedAtUtc: _lastSuccessfulModelRequestCompletedAtUtc,
+                LastSuccessfulModelRequestStartedAtUtc: _lastSuccessfulModelRequestStartedAtUtc);
         }
     }
 
@@ -2795,11 +5005,13 @@ internal sealed class LocalPatGatewayHost
     {
         private LocalPatGatewayHost? _owner;
         private string? _accountKey;
+        internal DateTimeOffset StartedAtUtc { get; }
 
         internal ModelRequestActivity(LocalPatGatewayHost owner, string? accountKey)
         {
             _owner = owner;
             _accountKey = accountKey;
+            StartedAtUtc = DateTimeOffset.UtcNow;
         }
 
         internal void UpdateAccountKey(string? accountKey)
@@ -2818,9 +5030,12 @@ internal sealed class LocalPatGatewayHost
     private async Task<PatIdentity> GetIdentityAsync(
         HttpClient client,
         string token,
+        string proxyPoolKey,
         CancellationToken cancellationToken = default)
     {
-        var key = HashToken(token);
+        // Identity is an observation made through a particular egress. Never reuse a
+        // whoami result obtained through another account's fixed proxy node.
+        var key = HashToken(token) + "|" + proxyPoolKey;
         if (_identityCache.TryGetValue(key, out var cached) &&
             cached.ExpiresAtUtc > DateTimeOffset.UtcNow)
         {
@@ -2866,6 +5081,604 @@ internal sealed class LocalPatGatewayHost
         return identity;
     }
 
+    private bool IsSessionAffinityAccountEligible(
+        AppSettings settings,
+        string accountKey)
+    {
+        var accounts = _accountStore.LoadAccounts();
+        _ = AccountRotationConfiguration.Normalize(settings, accounts);
+        var matches = accounts
+            .Where(account => QuotaAccountIdentity.CreateKey(account).Equals(
+                accountKey,
+                StringComparison.Ordinal))
+            .Take(2)
+            .ToList();
+        var eligible = matches.Count == 1 &&
+                       AccountRotationConfiguration.GetPool(settings, matches[0]) !=
+                       AccountRotationPool.None;
+        if (!eligible)
+        {
+            // The Manager normally asks the v6 control endpoint to remove ordinary
+            // aliases when an account leaves a pool. If that request races a transient
+            // gateway failure, the Manager's disk fallback cannot mutate this process's
+            // in-memory store. Clean the stale ordinary aliases lazily at the same
+            // eligibility gate so a failed provisional move cannot restore the removed
+            // account as its DurableFallback. Response-id bindings remain untouched by
+            // InvalidateOrdinaryBindingsForAccount and therefore retain strict safety.
+            try
+            {
+                _ = _sessionAffinityStore.InvalidateOrdinaryBindingsForAccount(accountKey);
+            }
+            catch (Exception ex) when (
+                ex is IOException or UnauthorizedAccessException or InvalidDataException or
+                InvalidOperationException or NotSupportedException or ArgumentException or
+                JsonException)
+            {
+                // Affinity is an optimization. Eligibility remains fail-closed for this
+                // account even when best-effort cache cleanup cannot be persisted.
+            }
+        }
+        return eligible;
+    }
+
+    private static SessionAffinityRequest ExtractSessionAffinityRequest(
+        System.Collections.Specialized.NameValueCollection headers,
+        byte[]? requestBody,
+        string? contentEncoding)
+    {
+        ArgumentNullException.ThrowIfNull(headers);
+
+        static string? NormalizeValue(string? value)
+        {
+            var normalized = value?.Trim();
+            return string.IsNullOrWhiteSpace(normalized) ||
+                   normalized.Length > SessionAffinityMetadataMaxCharacters ||
+                   normalized.Any(char.IsControl)
+                ? null
+                : normalized;
+        }
+
+        static string? FirstHeaderValue(
+            System.Collections.Specialized.NameValueCollection source,
+            params string[] names)
+        {
+            foreach (var name in names)
+            {
+                var values = source.GetValues(name);
+                if (values == null)
+                {
+                    continue;
+                }
+                foreach (var value in values)
+                {
+                    if (NormalizeValue(value) is { } normalized)
+                    {
+                        return normalized;
+                    }
+                }
+            }
+            return null;
+        }
+
+        static string? MetadataSessionValue(string? raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw) ||
+                raw.Length > SessionAffinityMetadataMaxCharacters)
+            {
+                return null;
+            }
+            try
+            {
+                using var document = JsonDocument.Parse(raw);
+                if (document.RootElement.ValueKind != JsonValueKind.Object)
+                {
+                    return null;
+                }
+                foreach (var name in new[]
+                         { "session_id", "session", "conversation_id", "conversation" })
+                {
+                    if (document.RootElement.TryGetProperty(name, out var value) &&
+                        value.ValueKind == JsonValueKind.String &&
+                        NormalizeValue(value.GetString()) is { } normalized)
+                    {
+                        return normalized;
+                    }
+                }
+            }
+            catch (JsonException)
+            {
+                // Optional metadata is advisory. A malformed metadata header does not
+                // change the request body or create a routing alias.
+            }
+            return null;
+        }
+
+        var bodyPresent = requestBody is { Length: > 0 };
+        var normalizedEncoding = contentEncoding?.Trim() ?? "";
+        var bodyInspectable = bodyPresent &&
+                               (normalizedEncoding.Length == 0 ||
+                                normalizedEncoding.Equals("identity", StringComparison.OrdinalIgnoreCase));
+        var allowCrossAccountReplay = !bodyPresent;
+        var unsafeContinuation = false;
+        var opaqueBody = false;
+        string? previousResponseId = null;
+        string? bodyPromptCacheKey = null;
+        string? bodyContentSeed = null;
+
+        if (bodyPresent && bodyInspectable)
+        {
+            // Scan only top-level routing fields. Utf8JsonReader validates the whole
+            // document without materializing a second DOM, so large image/tool payloads
+            // remain inspectable within the existing 128 MiB replay buffer.
+            allowCrossAccountReplay = true;
+            try
+            {
+                var signals = InspectSessionAffinityJson(requestBody!);
+                previousResponseId = signals.PreviousResponseId;
+                bodyPromptCacheKey = signals.PromptCacheKey;
+                unsafeContinuation = signals.UnsafeContinuation;
+                allowCrossAccountReplay = !unsafeContinuation;
+
+                // Match sub2api's ordinary OpenAI fallback. Keep the more expensive
+                // content projection bounded; large bodies still get strict
+                // previous_response_id inspection and explicit session/cache routing.
+                if (requestBody!.Length <= SessionAffinityInspectableBodyMaxBytes)
+                {
+                    bodyContentSeed = OpenAIContentSessionSeed.Derive(requestBody);
+                }
+            }
+            catch (JsonException)
+            {
+                allowCrossAccountReplay = false;
+                unsafeContinuation = true;
+            }
+        }
+        else if (bodyPresent)
+        {
+            // Content-Encoding prevents inspection of a continuation field. The request
+            // boundary rejects this form when affinity is enabled; with affinity disabled
+            // the original compressed bytes are still forwarded unchanged.
+            allowCrossAccountReplay = false;
+            opaqueBody = true;
+        }
+
+        // Exact sub2api-compatible explicit-header priority. Only the first non-empty
+        // signal is used; thread/turn metadata is never bulk-claimed as parallel aliases.
+        static string? CompactSeed(string? raw)
+        {
+            var normalized = raw?.Trim();
+            if (string.IsNullOrWhiteSpace(normalized) || normalized.Any(char.IsControl))
+            {
+                return null;
+            }
+            if (normalized.Length <= SessionAffinityIdentifierMaxCharacters)
+            {
+                return normalized;
+            }
+            var digest = Convert.ToHexString(
+                SHA256.HashData(Encoding.UTF8.GetBytes(normalized)))
+                .ToLowerInvariant();
+            return "seed_sha256_" + digest;
+        }
+
+        var sessionSeed = FirstHeaderValue(
+            headers,
+            "session-id",
+            "session_id",
+            "conversation_id",
+            "X-Session-Affinity",
+            "X-Session-Id",
+            "X-OpenCode-Session",
+            "X-Conversation-ID",
+            // Legacy CAM/Codex spellings remain a final compatibility fallback.
+            "x-codex-session-id");
+        sessionSeed = CompactSeed(sessionSeed);
+        sessionSeed ??= CompactSeed(bodyPromptCacheKey);
+        if (sessionSeed == null)
+        {
+            sessionSeed = MetadataSessionValue(headers["x-codex-turn-metadata"]);
+        }
+        sessionSeed ??= CompactSeed(bodyContentSeed);
+
+        var keys = new List<PatGatewaySessionAffinityKey>(2);
+        if (previousResponseId != null)
+        {
+            // previous_response_id is an independent response-account layer. It is not
+            // folded into the ordinary session hash, matching sub2api's scheduler model.
+            keys.Add(PatGatewaySessionAffinityKey.Response(previousResponseId));
+        }
+        if (sessionSeed != null)
+        {
+            keys.Add(PatGatewaySessionAffinityKey.Session(sessionSeed));
+        }
+        return new SessionAffinityRequest(
+            keys,
+            previousResponseId,
+            allowCrossAccountReplay,
+            unsafeContinuation,
+            opaqueBody);
+    }
+
+    private static SessionAffinityBodySignals InspectSessionAffinityJson(
+        ReadOnlySpan<byte> requestBody)
+    {
+        var reader = new Utf8JsonReader(
+            requestBody,
+            new JsonReaderOptions
+            {
+                AllowTrailingCommas = false,
+                CommentHandling = JsonCommentHandling.Disallow,
+                MaxDepth = 128
+            });
+        if (!reader.Read())
+        {
+            throw new JsonException("The model request body is empty.");
+        }
+        if (reader.TokenType != JsonTokenType.StartObject)
+        {
+            if (reader.TokenType is JsonTokenType.StartArray)
+            {
+                reader.Skip();
+            }
+            if (reader.Read())
+            {
+                throw new JsonException("The model request body contains trailing JSON.");
+            }
+            return new SessionAffinityBodySignals(null, null, UnsafeContinuation: false);
+        }
+
+        var sawPreviousResponse = false;
+        var sawPromptCacheKey = false;
+        var unsafeContinuation = false;
+        string? previousResponseId = null;
+        string? promptCacheKey = null;
+        while (reader.Read())
+        {
+            if (reader.TokenType == JsonTokenType.EndObject)
+            {
+                if (reader.Read())
+                {
+                    throw new JsonException("The model request body contains trailing JSON.");
+                }
+                return new SessionAffinityBodySignals(
+                    previousResponseId,
+                    promptCacheKey,
+                    unsafeContinuation);
+            }
+            if (reader.TokenType != JsonTokenType.PropertyName)
+            {
+                throw new JsonException("The model request body is not a JSON object.");
+            }
+
+            var isPreviousResponse = reader.ValueTextEquals("previous_response_id"u8);
+            var isPromptCacheKey = reader.ValueTextEquals("prompt_cache_key"u8);
+            if (!reader.Read())
+            {
+                throw new JsonException("The model request body is truncated.");
+            }
+
+            if (isPreviousResponse)
+            {
+                if (sawPreviousResponse)
+                {
+                    // Duplicate continuation fields are ambiguous even when their
+                    // textual values happen to match.
+                    unsafeContinuation = true;
+                    previousResponseId = null;
+                }
+                else
+                {
+                    sawPreviousResponse = true;
+                    if (reader.TokenType == JsonTokenType.Null)
+                    {
+                        previousResponseId = null;
+                    }
+                    else if (reader.TokenType == JsonTokenType.String)
+                    {
+                        var candidate = reader.GetString()?.Trim() ?? "";
+                        if (candidate.Length == 0)
+                        {
+                            previousResponseId = null;
+                        }
+                        else if (OpenAIResponseIdObserver.IsValidResponseId(candidate))
+                        {
+                            previousResponseId = candidate;
+                        }
+                        else
+                        {
+                            unsafeContinuation = true;
+                            previousResponseId = null;
+                        }
+                    }
+                    else
+                    {
+                        unsafeContinuation = true;
+                        previousResponseId = null;
+                    }
+                }
+            }
+            else if (isPromptCacheKey &&
+                     !sawPromptCacheKey &&
+                     reader.TokenType == JsonTokenType.String)
+            {
+                sawPromptCacheKey = true;
+                promptCacheKey = reader.GetString()?.Trim();
+            }
+
+            if (reader.TokenType is JsonTokenType.StartObject or JsonTokenType.StartArray)
+            {
+                reader.Skip();
+            }
+        }
+
+        throw new JsonException("The model request body is truncated.");
+    }
+
+    // Retained temporarily as a migration reference for older portable configurations;
+    // all callers use the single-seed implementation above.
+    private static SessionAffinityRequest ExtractSessionAffinityRequestLegacy(
+        System.Collections.Specialized.NameValueCollection headers,
+        byte[]? requestBody,
+        string? contentEncoding)
+    {
+        var responses = new List<string>();
+        var sessions = new List<string>();
+        var threads = new List<string>();
+        var conversations = new List<string>();
+        var promptCaches = new List<string>();
+        var allowCrossAccountReplay = requestBody is null or { Length: 0 };
+
+        static void AddValue(List<string> target, string? value)
+        {
+            var normalized = value?.Trim();
+            if (string.IsNullOrWhiteSpace(normalized) ||
+                normalized.Length > SessionAffinityIdentifierMaxCharacters ||
+                target.Count >= SessionAffinityValuesPerKind ||
+                target.Contains(normalized, StringComparer.Ordinal))
+            {
+                return;
+            }
+            target.Add(normalized);
+        }
+
+        static void AddHeaderValues(
+            System.Collections.Specialized.NameValueCollection source,
+            List<string> target,
+            params string[] names)
+        {
+            foreach (var name in names)
+            {
+                var values = source.GetValues(name);
+                if (values == null)
+                {
+                    continue;
+                }
+                foreach (var value in values)
+                {
+                    AddValue(target, value);
+                }
+            }
+        }
+
+        static void ReadMetadataObject(
+            JsonElement metadata,
+            List<string> sessionValues,
+            List<string> threadValues,
+            List<string> conversationValues,
+            List<string> promptCacheValues)
+        {
+            if (metadata.ValueKind != JsonValueKind.Object)
+            {
+                return;
+            }
+            foreach (var property in metadata.EnumerateObject())
+            {
+                if (property.Value.ValueKind != JsonValueKind.String)
+                {
+                    continue;
+                }
+                var value = property.Value.GetString();
+                switch (property.Name.ToLowerInvariant())
+                {
+                    case "session":
+                    case "session_id":
+                    case "session-id":
+                        AddValue(sessionValues, value);
+                        break;
+                    case "thread":
+                    case "thread_id":
+                    case "thread-id":
+                        AddValue(threadValues, value);
+                        break;
+                    case "conversation":
+                    case "conversation_id":
+                    case "conversation-id":
+                        AddValue(conversationValues, value);
+                        break;
+                    case "prompt_cache_key":
+                        AddValue(promptCacheValues, value);
+                        break;
+                }
+            }
+        }
+
+        AddHeaderValues(
+            headers,
+            sessions,
+            "session-id",
+            "session_id",
+            "x-codex-session-id");
+        AddHeaderValues(
+            headers,
+            threads,
+            "thread-id",
+            "thread_id",
+            "x-codex-thread-id",
+            "x-codex-parent-thread-id");
+        AddHeaderValues(
+            headers,
+            conversations,
+            "conversation-id",
+            "conversation_id");
+        AddHeaderValues(
+            headers,
+            promptCaches,
+            "prompt-cache-key",
+            "prompt_cache_key");
+
+        var turnMetadataValues = headers.GetValues("x-codex-turn-metadata");
+        if (turnMetadataValues != null)
+        {
+            foreach (var rawMetadata in turnMetadataValues)
+            {
+                if (string.IsNullOrWhiteSpace(rawMetadata) ||
+                    rawMetadata.Length > SessionAffinityMetadataMaxCharacters)
+                {
+                    continue;
+                }
+                try
+                {
+                    using var metadataDocument = JsonDocument.Parse(rawMetadata);
+                    ReadMetadataObject(
+                        metadataDocument.RootElement,
+                        sessions,
+                        threads,
+                        conversations,
+                        promptCaches);
+                }
+                catch (JsonException)
+                {
+                    // Malformed optional metadata is not an affinity key. The original
+                    // request remains eligible for normal gateway forwarding.
+                }
+            }
+        }
+
+        var bodyCanBeInspected = requestBody is { Length: > 0 } &&
+                                 requestBody.Length <= SessionAffinityInspectableBodyMaxBytes &&
+                                 (string.IsNullOrWhiteSpace(contentEncoding) ||
+                                  contentEncoding.Trim().Equals(
+                                      "identity",
+                                      StringComparison.OrdinalIgnoreCase));
+        if (bodyCanBeInspected)
+        {
+            try
+            {
+                using var bodyDocument = JsonDocument.Parse(
+                    requestBody,
+                    new JsonDocumentOptions
+                    {
+                        AllowTrailingCommas = false,
+                        CommentHandling = JsonCommentHandling.Disallow,
+                        MaxDepth = 128
+                    });
+                if (bodyDocument.RootElement.ValueKind == JsonValueKind.Object)
+                {
+                    allowCrossAccountReplay = true;
+                    foreach (var property in bodyDocument.RootElement.EnumerateObject())
+                    {
+                        var name = property.Name.ToLowerInvariant();
+                        if (name == "previous_response_id" &&
+                            (property.Value.ValueKind != JsonValueKind.String ||
+                             !OpenAIResponseIdObserver.IsValidResponseId(
+                                 property.Value.GetString())))
+                        {
+                            allowCrossAccountReplay = false;
+                        }
+                        if (property.Value.ValueKind == JsonValueKind.String)
+                        {
+                            var value = property.Value.GetString();
+                            switch (name)
+                            {
+                                case "previous_response_id":
+                                    if (OpenAIResponseIdObserver.IsValidResponseId(value))
+                                    {
+                                        AddValue(responses, value);
+                                    }
+                                    break;
+                                case "session":
+                                case "session_id":
+                                    AddValue(sessions, value);
+                                    break;
+                                case "thread":
+                                case "thread_id":
+                                    AddValue(threads, value);
+                                    break;
+                                case "conversation":
+                                case "conversation_id":
+                                    AddValue(conversations, value);
+                                    break;
+                                case "prompt_cache_key":
+                                    AddValue(promptCaches, value);
+                                    break;
+                                case "client_metadata":
+                                case "metadata":
+                                    if (value is { Length: <= SessionAffinityMetadataMaxCharacters })
+                                    {
+                                        try
+                                        {
+                                            using var embeddedDocument = JsonDocument.Parse(value);
+                                            ReadMetadataObject(
+                                                embeddedDocument.RootElement,
+                                                sessions,
+                                                threads,
+                                                conversations,
+                                                promptCaches);
+                                        }
+                                        catch (JsonException)
+                                        {
+                                        }
+                                    }
+                                    break;
+                            }
+                        }
+                        else if (name is "client_metadata" or "metadata")
+                        {
+                            ReadMetadataObject(
+                                property.Value,
+                                sessions,
+                                threads,
+                                conversations,
+                                promptCaches);
+                        }
+                    }
+                }
+
+            }
+            catch (JsonException)
+            {
+                // Body parsing is advisory. The upstream still owns validation of the
+                // original request, while header aliases can continue to provide affinity.
+            }
+        }
+
+        var keys = new List<PatGatewaySessionAffinityKey>(
+            responses.Count + sessions.Count + threads.Count +
+            conversations.Count + promptCaches.Count);
+        // A duplicated/conflicting previous_response_id is ambiguous. Do not let either
+        // value acquire strict priority; lower-priority session aliases remain usable.
+        string? previousResponseId = null;
+        if (responses.Count == 1)
+        {
+            previousResponseId = responses[0];
+            keys.Add(PatGatewaySessionAffinityKey.Response(previousResponseId));
+        }
+        else if (responses.Count > 1)
+        {
+            allowCrossAccountReplay = false;
+        }
+        keys.AddRange(sessions.Select(PatGatewaySessionAffinityKey.Session));
+        keys.AddRange(threads.Select(PatGatewaySessionAffinityKey.Thread));
+        keys.AddRange(conversations.Select(PatGatewaySessionAffinityKey.Conversation));
+        keys.AddRange(promptCaches.Select(PatGatewaySessionAffinityKey.PromptCache));
+        return new SessionAffinityRequest(
+            keys,
+            previousResponseId,
+            allowCrossAccountReplay,
+            UnsafeContinuation: !allowCrossAccountReplay,
+            OpaqueBody: false);
+    }
+
     private static async Task<ReplayableModelRequestBody> ReadReplayableModelRequestBodyAsync(
         HttpListenerRequest incoming,
         CancellationToken cancellationToken)
@@ -2897,7 +5710,110 @@ internal sealed class LocalPatGatewayHost
             }
             await buffer.WriteAsync(chunk.AsMemory(0, read), cancellationToken);
         }
-        return new ReplayableModelRequestBody(buffer.ToArray());
+        var encoded = buffer.ToArray();
+        var contentEncoding = incoming.Headers["Content-Encoding"]?.Trim();
+        if (string.IsNullOrWhiteSpace(contentEncoding) ||
+            contentEncoding.Equals("identity", StringComparison.OrdinalIgnoreCase))
+        {
+            return new ReplayableModelRequestBody(encoded);
+        }
+
+        var decoded = DecodeRequestBody(encoded, contentEncoding);
+        ManagerLifecycleDiagnostics.Write(
+            "pat-gateway-request-body-decoded",
+            $"content_encoding={contentEncoding}; encoded_bytes={encoded.Length}; " +
+            $"decoded_bytes={decoded.Length}");
+        return new ReplayableModelRequestBody(
+            decoded,
+            WasContentDecoded: true,
+            OriginalContentEncoding: contentEncoding);
+    }
+
+    private static byte[] DecodeRequestBody(byte[] encoded, string contentEncoding)
+    {
+        var codings = contentEncoding
+            .Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+            .Select(value => value.Split(';', 2)[0].Trim().ToLowerInvariant())
+            .Where(value => value.Length > 0 && !value.Equals("identity", StringComparison.Ordinal))
+            .ToArray();
+        if (codings.Length == 0)
+        {
+            return encoded;
+        }
+
+        var current = encoded;
+        // Content codings are applied from left to right and therefore decoded in
+        // reverse order (RFC 9110, section 8.4).
+        for (var index = codings.Length - 1; index >= 0; index--)
+        {
+            current = DecodeSingleContentCoding(current, codings[index]);
+        }
+        return current;
+    }
+
+    private static byte[] DecodeSingleContentCoding(byte[] encoded, string coding)
+    {
+        if (coding == "zstd")
+        {
+            return DecodeZstdContentCoding(encoded);
+        }
+        if (coding is not ("gzip" or "x-gzip" or "deflate" or "br"))
+        {
+            throw new UnsupportedContentEncodingException(coding);
+        }
+
+        using var input = new MemoryStream(encoded, writable: false);
+        using Stream decoder = coding switch
+        {
+            "gzip" or "x-gzip" => new GZipStream(input, CompressionMode.Decompress),
+            "deflate" => new DeflateStream(input, CompressionMode.Decompress),
+            "br" => new BrotliStream(input, CompressionMode.Decompress),
+            _ => throw new UnsupportedContentEncodingException(coding)
+        };
+        using var output = new MemoryStream(Math.Min(encoded.Length * 2, 1024 * 1024));
+        var buffer = new byte[64 * 1024];
+        while (true)
+        {
+            var read = decoder.Read(buffer, 0, buffer.Length);
+            if (read == 0)
+            {
+                break;
+            }
+            if (output.Length > ReplayableModelRequestBodyMaxBytes - read)
+            {
+                throw new InvalidDataException("解压后的请求体超过 128 MiB 内存缓冲上限。");
+            }
+            output.Write(buffer, 0, read);
+        }
+        return output.ToArray();
+    }
+
+    private static byte[] DecodeZstdContentCoding(byte[] encoded)
+    {
+        try
+        {
+            using var decompressor = new ZstdSharp.Decompressor();
+            // The frame may omit its content size.  Unwrap still accepts a bounded
+            // destination in that case; the managed port throws when the output would
+            // exceed the supplied limit, so a malicious compressed body cannot bypass
+            // the same 128 MiB replay-buffer cap used by gzip/deflate/br.
+            var decoded = decompressor.Unwrap(
+                encoded,
+                ReplayableModelRequestBodyMaxBytes);
+            return decoded.ToArray();
+        }
+        catch (ZstdSharp.ZstdException ex)
+        {
+            throw new InvalidDataException(
+                "zstd 请求体无法解码：" + ex.Message,
+                ex);
+        }
+        catch (ArgumentException ex)
+        {
+            throw new InvalidDataException(
+                "zstd 请求体超过 128 MiB 解压上限。",
+                ex);
+        }
     }
 
     private static bool CanRewriteCompatibleApiRequestBody(
@@ -2909,7 +5825,8 @@ internal sealed class LocalPatGatewayHost
             return false;
         }
         var contentEncoding = incoming.Headers["Content-Encoding"]?.Trim();
-        return string.IsNullOrWhiteSpace(contentEncoding) ||
+        return body.WasContentDecoded ||
+               string.IsNullOrWhiteSpace(contentEncoding) ||
                contentEncoding.Equals("identity", StringComparison.OrdinalIgnoreCase);
     }
 
@@ -2976,7 +5893,7 @@ internal sealed class LocalPatGatewayHost
         PatIdentity? identity,
         byte[]? requestBody = null,
         bool requestBodyWasRewritten = false,
-        bool forwardClientMetadata = false)
+        CodexFingerprintPlan? fingerprintPlan = null)
     {
         var request = new HttpRequestMessage(new HttpMethod(incoming.HttpMethod), upstreamUri);
         if (incoming.HasEntityBody)
@@ -3003,7 +5920,9 @@ internal sealed class LocalPatGatewayHost
                 headerName.Equals("content-type", StringComparison.OrdinalIgnoreCase) ||
                 (requestBodyWasRewritten &&
                  headerName.Equals("content-encoding", StringComparison.OrdinalIgnoreCase)) ||
-                !ShouldForwardRequestHeader(headerName, forwardClientMetadata))
+                 !ShouldForwardRequestHeader(
+                     headerName,
+                     fingerprintPlan?.ShouldForwardClientMetadata == true))
             {
                 continue;
             }
@@ -3017,6 +5936,8 @@ internal sealed class LocalPatGatewayHost
                 request.Content?.Headers.TryAddWithoutValidation(headerName, values);
             }
         }
+
+        _ = CodexFingerprintConvergence.ApplyHeaders(request, fingerprintPlan);
 
         request.Headers.Remove("Authorization");
         request.Headers.TryAddWithoutValidation("Authorization", "Bearer " + credential.Token);
@@ -3125,9 +6046,10 @@ internal sealed class LocalPatGatewayHost
         return actual >= required;
     }
 
-    private static async Task CopyUpstreamResponseAsync(
+    private static async Task<OpenAIResponseIdObservation?> CopyUpstreamResponseAsync(
         HttpResponseMessage upstream,
         HttpListenerResponse downstream,
+        bool observeResponseId = false,
         CancellationToken cancellationToken = default)
     {
         downstream.StatusCode = (int)upstream.StatusCode;
@@ -3148,8 +6070,52 @@ internal sealed class LocalPatGatewayHost
         {
             downstream.SendChunked = true;
         }
-        await upstream.Content.CopyToAsync(downstream.OutputStream, cancellationToken);
+
+        OpenAIResponseIdObserver? observer = observeResponseId
+            ? new OpenAIResponseIdObserver(contentType)
+            : null;
+        await using var upstreamStream = await upstream.Content.ReadAsStreamAsync(
+            cancellationToken);
+        var buffer = new byte[64 * 1024];
+        while (true)
+        {
+            var read = await upstreamStream.ReadAsync(buffer, cancellationToken);
+            if (read == 0)
+            {
+                break;
+            }
+
+            if (observer != null)
+            {
+                try
+                {
+                    observer.Observe(buffer.AsSpan(0, read));
+                }
+                catch
+                {
+                    // Observation is advisory. It must never interrupt byte-for-byte
+                    // response forwarding, even if a future parser implementation fails.
+                    observer = null;
+                }
+            }
+            await downstream.OutputStream.WriteAsync(
+                buffer.AsMemory(0, read),
+                cancellationToken);
+        }
         await downstream.OutputStream.FlushAsync(cancellationToken);
+
+        if (observer == null)
+        {
+            return null;
+        }
+        try
+        {
+            return observer.Complete();
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static CancellationTokenSource? CreateRequestDeadline(HttpListenerRequest request)
@@ -3184,39 +6150,31 @@ internal sealed class LocalPatGatewayHost
         }
     }
 
-    private static HttpClient CreateUpstreamClient(Uri? proxyUri)
+    private HttpClient CreateUpstreamClient(ProxyResolution resolution, ProxyNodeRecord? node)
     {
-        var handler = new HttpClientHandler
+        if (resolution.ProxyUri == null)
         {
-            UseProxy = proxyUri != null,
-            Proxy = proxyUri == null ? null : new WebProxy(proxyUri),
-            UseCookies = false,
-            AllowAutoRedirect = false,
-            AutomaticDecompression = DecompressionMethods.All
-        };
-        return new HttpClient(handler)
-        {
-            Timeout = Timeout.InfiniteTimeSpan
-        };
+            return new HttpClient(new HttpClientHandler
+            {
+                UseProxy = false,
+                UseCookies = false,
+                AllowAutoRedirect = false,
+                AutomaticDecompression = DecompressionMethods.All
+            }) { Timeout = Timeout.InfiniteTimeSpan };
+        }
+        return ProxyHttpClientFactory.Create(resolution, node);
     }
 
-    private static Uri? ResolveRequiredProxyUri()
+    private ProxyResolution ResolveProxyForCredential(GatewayCredential? credential)
     {
-        var explicitProxy = Environment.GetEnvironmentVariable("CODEX_PAT_GATEWAY_PROXY");
-        var proxy = !string.IsNullOrWhiteSpace(explicitProxy)
-            ? CodexCliService.NormalizeProxyServer(explicitProxy)
-            : CodexCliService.GetConfiguredProxyUri();
-        if (!Uri.TryCreate(proxy, UriKind.Absolute, out var uri) ||
-            uri.Scheme is not ("http" or "https"))
+        var accountKey = credential?.AccountKey;
+        var resolution = _proxyResolver.Resolve(accountKey);
+        if (resolution.Success && resolution.ProxyUri is { } uri &&
+            LocalProxyDetector.IsLoopbackHost(uri.Host) && uri.Port == LocalPatGateway.Port)
         {
-            return null;
+            return ProxyResolution.Fail("代理配置指向本地 PAT 网关自身；为防止循环转发，请修改代理节点。");
         }
-        if (LocalProxyDetector.IsLoopbackHost(uri.Host) &&
-            uri.Port == LocalPatGateway.Port)
-        {
-            return null;
-        }
-        return uri;
+        return resolution;
     }
 
     private static GatewayCredential? ReadBearerCredential(HttpListenerRequest request)
@@ -3585,7 +6543,31 @@ internal sealed class LocalPatGatewayHost
 
     private sealed record PatIdentity(string AccountId, bool IsFedRamp);
     private sealed record IdentityCacheEntry(PatIdentity Identity, DateTimeOffset ExpiresAtUtc);
-    private sealed record ReplayableModelRequestBody(byte[] Bytes);
+    private sealed record ReplayableModelRequestBody(
+        byte[] Bytes,
+        bool WasContentDecoded = false,
+        string? OriginalContentEncoding = null);
+    private sealed record Upstream429Classification(
+        bool IsQuotaExhausted,
+        string Reason,
+        DateTimeOffset? ResetAtUtc,
+        bool RequiresSameAccountConfirmation = false);
+    private sealed record SessionAffinityBodySignals(
+        string? PreviousResponseId,
+        string? PromptCacheKey,
+        bool UnsafeContinuation);
+    private sealed record SessionAffinityRequest(
+        IReadOnlyList<PatGatewaySessionAffinityKey> Keys,
+        string? PreviousResponseId,
+        bool AllowCrossAccountReplay,
+        bool UnsafeContinuation,
+        bool OpaqueBody)
+    {
+        internal bool RequiresOriginalAccount =>
+            PreviousResponseId != null ||
+            UnsafeContinuation ||
+            OpaqueBody && Keys.Count > 0;
+    }
     private sealed record GatewayCredential(
         string Token,
         bool IsPersonalAccessToken,
@@ -3602,7 +6584,12 @@ internal sealed class LocalPatGatewayHost
         [property: System.Text.Json.Serialization.JsonPropertyName("sourceAccountKey")]
         string? SourceAccountKey,
         [property: System.Text.Json.Serialization.JsonPropertyName("targetAccountKey")]
-        string? TargetAccountKey);
+        string? TargetAccountKey,
+        [property: System.Text.Json.Serialization.JsonPropertyName("replaceExistingArmedTarget")]
+        bool ReplaceExistingArmedTarget = false);
+    private sealed record SessionAffinityInvalidateRequest(
+        [property: System.Text.Json.Serialization.JsonPropertyName("accountKey")]
+        string? AccountKey);
     private sealed record PatRejectionDetails(HttpStatusCode StatusCode, string Message);
 
     private sealed class PatRejectedException(
@@ -3611,5 +6598,10 @@ internal sealed class LocalPatGatewayHost
     {
         internal HttpStatusCode StatusCode { get; } = statusCode;
         internal bool IsInactiveWorkspaceMember { get; } = isInactiveWorkspaceMember;
+    }
+
+    private sealed class UnsupportedContentEncodingException(string coding)
+        : Exception("unsupported " + coding)
+    {
     }
 }

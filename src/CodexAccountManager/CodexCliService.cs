@@ -1252,6 +1252,9 @@ public sealed partial class CodexCliService
             LocalPatGateway.RequestTimeoutHeader,
             ((int)MinimalQuotaTestTimeout.TotalMilliseconds).ToString(
                 System.Globalization.CultureInfo.InvariantCulture));
+        request.Headers.TryAddWithoutValidation(
+            LocalPatGateway.RequestPurposeHeader,
+            LocalPatGateway.QuotaTestRequestPurpose);
         if (!string.IsNullOrWhiteSpace(accountId))
         {
             request.Headers.TryAddWithoutValidation("chatgpt-account-id", accountId);
@@ -1806,7 +1809,8 @@ public sealed partial class CodexCliService
         ThemeMode appearanceMode,
         string appearancePresetId = "manager",
         string? appearanceLabel = null,
-        bool routeOfficialOAuthThroughGateway = false)
+        bool routeOfficialOAuthThroughGateway = false,
+        bool forceClientRestart = false)
     {
         return await SwitchWindowsClientAccountCoreAsync(
             account,
@@ -1818,7 +1822,8 @@ public sealed partial class CodexCliService
             appearanceLabel,
             AccessTokenSharedProfileMode.ApiCompatible,
             chatGptFeatureAccount: null,
-            routeOfficialOAuthThroughGateway);
+            routeOfficialOAuthThroughGateway,
+            forceClientRestart);
     }
 
     public async Task<WindowsClientAccountProjection> SwitchWindowsClientAccountWithChatGptFeaturesAsync(
@@ -1848,7 +1853,8 @@ public sealed partial class CodexCliService
             appearanceLabel,
             AccessTokenSharedProfileMode.ChatGptDesktop,
             chatGptFeatureAccount,
-            routeOfficialOAuthThroughGateway: false);
+            routeOfficialOAuthThroughGateway: false,
+            forceClientRestart: false);
     }
 
     private async Task<WindowsClientAccountProjection> SwitchWindowsClientAccountCoreAsync(
@@ -1861,7 +1867,8 @@ public sealed partial class CodexCliService
         string? appearanceLabel,
         AccessTokenSharedProfileMode accessTokenMode,
         AccountRecord? chatGptFeatureAccount,
-        bool routeOfficialOAuthThroughGateway)
+        bool routeOfficialOAuthThroughGateway,
+        bool forceClientRestart)
     {
         if (!Directory.Exists(projectPath))
         {
@@ -1949,7 +1956,12 @@ public sealed partial class CodexCliService
                         "official-dual-profile-reused-with-runtime-drift",
                         "the verified model/OAuth owners were unchanged; existing Codex was preserved");
                 }
-                var switchRequired = RequiresWindowsClientShutdown(sharedProfileAlreadySelected);
+                // The visible "Codex 启动" action is also the user's recovery switch.  When
+                // requested, close the exact operation-start Codex process set even if the
+                // projected account already matches, then reopen it from the verified profile.
+                // Automatic/request-boundary rotation keeps the reuse behavior unchanged.
+                var switchRequired = forceClientRestart ||
+                                     RequiresWindowsClientShutdown(sharedProfileAlreadySelected);
                 var shutdownTargets = switchRequired
                     ? CaptureWindowsClientProcessSnapshots()
                     : Array.Empty<WindowsClientProcessSnapshot>();
@@ -1958,20 +1970,10 @@ public sealed partial class CodexCliService
                     : Array.Empty<int>();
                 WindowsClientSharedProfileSnapshot? previousSharedProfileSnapshot = null;
             WindowsClientAccountProjection projection;
-            if (sharedProfileAlreadySelected)
+            if (switchRequired)
             {
-                // Reusing the same account must never close a healthy Codex session. The target
-                // launcher can activate/open a task in the existing client without a restart.
-                projection = CreateReusedSharedProfileProjection(
-                    account,
-                    status,
-                    accessTokenMode,
-                    chatGptFeatureAccount);
-            }
-            else
-            {
-                // Only a real credential change is allowed to close the previous client. Work
-                // from the operation-start snapshot so a delayed shutdown cannot hit a newer PID.
+                // Work only from the operation-start snapshot so a delayed shutdown can never
+                // terminate a newer Codex process started by the user during this switch.
                 StopWindowsClientProcesses(shutdownTargets);
                 if (!WaitForWindowsClientProcessAndPortRelease(
                         shutdownTargets,
@@ -1982,13 +1984,23 @@ public sealed partial class CodexCliService
                         launchGeneration,
                         OfficialCodexRecoveryReleaseTimeout))
                 {
-                    // Do not rewrite the shared profile while an old renderer or CDP owner can
-                    // still read it. The global second gate also rejects a new official client
-                    // that was manually activated after the operation-start snapshot.
                     throw new TimeoutException(
                         "Codex did not remain fully closed, or a native bridge port did not release cleanly. " +
                         "Account credentials were not changed; close Codex completely and retry.");
                 }
+            }
+            if (sharedProfileAlreadySelected)
+            {
+                // The profile itself can still be reused after a forced recovery restart; no
+                // credential rewrite is needed when the account identity already matches.
+                projection = CreateReusedSharedProfileProjection(
+                    account,
+                    status,
+                    accessTokenMode,
+                    chatGptFeatureAccount);
+            }
+            else
+            {
                 if (IsExplicitChatGptFeatureSwitch(
                         mode,
                         accessTokenMode,
@@ -6027,6 +6039,20 @@ public sealed partial class CodexCliService
         }
     }
 
+    /// <summary>
+    /// Refreshes the PowerShell launcher and installer scripts used by the existing
+    /// Codex++ scheduled task without touching the task registration or any process.
+    ///
+    /// Older installations can retain a launcher generated by a previous version.
+    /// Keeping this operation separate from <see cref="RepairCodexPlusPlusScheduledTask"/>
+    /// lets the normal UI startup update the script in place without prompting for
+    /// elevation or restarting Codex/Account Manager.
+    /// </summary>
+    public void RefreshCodexPlusPlusTaskLauncherFiles()
+    {
+        EnsureCodexPlusPlusTaskFiles();
+    }
+
     internal static string BuildThreadDeepLink(string threadId)
     {
         if (!Guid.TryParse(threadId, out var parsedThreadId))
@@ -6309,6 +6335,22 @@ public sealed partial class CodexCliService
         {
             throw new InvalidOperationException(
                 "Windows process-parent capture could not identify the current self-test process.");
+        }
+        var protectedIds = SelectProtectedWindowsClientShutdownProcessIds(
+            new Dictionary<int, int>
+            {
+                [100] = 50,
+                [50] = 1,
+                [200] = 100,
+                [300] = 50
+            },
+            managerProcessId: 100);
+        if (!protectedIds.SetEquals(new[] { 1, 50, 100 }) ||
+            protectedIds.Contains(200) ||
+            protectedIds.Contains(300))
+        {
+            throw new InvalidOperationException(
+                "Exact Codex shutdown must protect the Manager's ancestor chain without excluding its separately verified desktop child.");
         }
 
         OfficialCodexLogReadiness.Validate();
@@ -7323,7 +7365,8 @@ public sealed partial class CodexCliService
                 {
                     ["processId"] = target.ProcessId,
                     ["startTimeUtcTicks"] = target.StartTimeUtcTicks,
-                    ["processName"] = target.ProcessName
+                    ["processName"] = target.ProcessName,
+                    ["executablePath"] = target.ExecutablePath
                 });
             }
         }
@@ -7333,6 +7376,7 @@ public sealed partial class CodexCliService
             ["requestId"] = requestId,
             ["createdAtUtc"] = createdAtUtc.ToString("O"),
             ["expiresAtUtc"] = createdAtUtc.Add(CodexPlusPlusTaskRequestLifetime).ToString("O"),
+            ["managerProcessId"] = Environment.ProcessId,
             ["switchRequired"] = switchRequired,
             ["shutdownTargets"] = serializedShutdownTargets,
             ["codexPlusPlusPath"] = codexPlusPlusPath,
@@ -7583,9 +7627,21 @@ function Assert-LaunchRequestCurrent([string]$ExpectedRequestId, [DateTimeOffset
 function Get-SnapshotProcess($Target) {
     try {
         $candidate = [System.Diagnostics.Process]::GetProcessById([int]$Target.processId)
+        $protectedNames = @('CodexAccountManager', 'WindowsTerminal', 'powershell', 'pwsh', 'cmd', 'conhost', 'OpenConsole')
+        $candidateName = [string]$candidate.ProcessName
+        $expectedPath = [string]$Target.executablePath
+        $actualPath = [string]$candidate.MainModule.FileName
         if ($candidate.HasExited -or
-            $candidate.ProcessName -ine [string]$Target.processName -or
-            $candidate.StartTime.ToUniversalTime().Ticks -ne [long]$Target.startTimeUtcTicks) {
+            [int]$candidate.Id -eq [int]$request.managerProcessId -or
+            $protectedNames -icontains $candidateName -or
+            $candidateName -ine [string]$Target.processName -or
+            $candidate.StartTime.ToUniversalTime().Ticks -ne [long]$Target.startTimeUtcTicks -or
+            [string]::IsNullOrWhiteSpace($expectedPath) -or
+            [string]::IsNullOrWhiteSpace($actualPath) -or
+            -not [string]::Equals(
+                [System.IO.Path]::GetFullPath($actualPath),
+                [System.IO.Path]::GetFullPath($expectedPath),
+                [StringComparison]::OrdinalIgnoreCase)) {
             $candidate.Dispose()
             return $null
         }
@@ -7823,6 +7879,9 @@ catch {
             !script.Contains("launch request was superseded by a newer generation", StringComparison.Ordinal) ||
             !script.Contains("[System.Diagnostics.Process]::GetProcessById([int]$Target.processId)", StringComparison.Ordinal) ||
             !script.Contains("$candidate.StartTime.ToUniversalTime().Ticks -ne [long]$Target.startTimeUtcTicks", StringComparison.Ordinal) ||
+            !script.Contains("$protectedNames -icontains $candidateName", StringComparison.Ordinal) ||
+            !script.Contains("[int]$candidate.Id -eq [int]$request.managerProcessId", StringComparison.Ordinal) ||
+            !script.Contains("[System.IO.Path]::GetFullPath($expectedPath)", StringComparison.Ordinal) ||
             !script.Contains("$switchRequired = [bool]$request.switchRequired", StringComparison.Ordinal) ||
             !script.Contains("$shutdownTargets = @($request.shutdownTargets)", StringComparison.Ordinal) ||
             script.Contains("Start-Sleep -Milliseconds 180", StringComparison.Ordinal) ||
@@ -12984,6 +13043,9 @@ catch {
             ? null
             : Path.GetDirectoryName(clientPath);
         var parentProcessIds = CaptureProcessParentIds();
+        var protectedProcessIds = SelectProtectedWindowsClientShutdownProcessIds(
+            parentProcessIds,
+            Environment.ProcessId);
 
         var snapshots = new List<WindowsClientProcessSnapshot>();
         foreach (var process in Process.GetProcesses())
@@ -12993,7 +13055,7 @@ catch {
                 try
                 {
                     var processName = process.ProcessName;
-                    if (process.Id == Environment.ProcessId ||
+                    if (protectedProcessIds.Contains(process.Id) ||
                         IsProtectedWindowsClientShutdownProcessName(processName) ||
                         (!IsCodexWindowsClientProcess(process, packageRoot) &&
                          !IsCodexPlusPlusLauncherProcess(process)) ||
@@ -13134,6 +13196,33 @@ catch {
         return parentProcessIds;
     }
 
+    private static IReadOnlySet<int> SelectProtectedWindowsClientShutdownProcessIds(
+        IReadOnlyDictionary<int, int> parentProcessIds,
+        int managerProcessId)
+    {
+        var protectedIds = new HashSet<int>();
+        if (managerProcessId <= 0)
+        {
+            return protectedIds;
+        }
+
+        // The Manager may itself have been launched from a Codex task. Protect its ancestor
+        // chain so closing that outer client cannot indirectly tear down the Manager. Direct
+        // Manager/gateway descendants are independently protected by executable name. A
+        // ChatGPT instance intentionally launched by this Manager remains a valid exact-PID
+        // shutdown target; killing that single child never uses process-tree semantics.
+        protectedIds.Add(managerProcessId);
+        var cursor = managerProcessId;
+        while (parentProcessIds.TryGetValue(cursor, out var parentId) &&
+               parentId > 0 &&
+               protectedIds.Add(parentId))
+        {
+            cursor = parentId;
+        }
+
+        return protectedIds;
+    }
+
     private static void StopWindowsClientProcesses(
         IReadOnlyList<WindowsClientProcessSnapshot> shutdownTargets)
     {
@@ -13148,9 +13237,12 @@ catch {
             : Path.GetDirectoryName(clientPath);
         var processes = new List<Process>();
         var rejectedTargetCount = 0;
+        var protectedProcessIds = SelectProtectedWindowsClientShutdownProcessIds(
+            CaptureProcessParentIds(),
+            Environment.ProcessId);
         foreach (var target in shutdownTargets)
         {
-            if (target.ProcessId == Environment.ProcessId)
+            if (protectedProcessIds.Contains(target.ProcessId))
             {
                 rejectedTargetCount++;
                 continue;
@@ -13159,6 +13251,10 @@ catch {
             if (TryOpenWindowsClientSnapshot(target, packageRoot, out var process))
             {
                 processes.Add(process!);
+                WriteCodexPlusPlusLaunchDiagnostic(
+                    "windows-client-exact-shutdown-target-verified",
+                    $"pid={target.ProcessId}; name={target.ProcessName}; " +
+                    $"start_ticks={target.StartTimeUtcTicks}; priority={target.ShutdownPriority}");
             }
             else
             {

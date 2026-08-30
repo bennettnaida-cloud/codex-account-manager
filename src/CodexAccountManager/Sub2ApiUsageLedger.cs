@@ -27,6 +27,7 @@ internal sealed class Sub2ApiUsageRecord
     public UsageEvent ToUsageEvent(string resolvedAccountName) => new()
     {
         AccountName = resolvedAccountName,
+        AccountKey = AccountKey,
         Model = Model,
         TimestampUtc = CompletedAtUtc.ToUniversalTime(),
         // A CSV recovery row represents real user traffic, not a synthetic quota probe.

@@ -125,8 +125,8 @@ internal sealed class QuotaSafetyMarginTracker
 
 internal static class PatAutoRotationPolicy
 {
-    // Retained only for loading pre-2.2.4 settings. Runtime decisions use a dynamic
-    // safety margin and no longer compare usage with a fixed 98% threshold.
+    // Retained only for loading pre-2.2.4 settings. 2.2.8 never rotates early at 98%
+    // or on a historical 429: only an official 100% observation is exhaustion here.
     internal const double DefaultUsedPercentThreshold = 98D;
     internal const int RequiredConsecutiveOfficialObservations = 2;
     internal static readonly TimeSpan MinimumOfficialObservationSpacing = TimeSpan.FromSeconds(5);
@@ -153,6 +153,48 @@ internal static class PatAutoRotationPolicy
             return info.Secondary;
         }
         return null;
+    }
+
+    internal static bool HasLocallyAvailableFiveHourQuota(
+        PersistedQuotaSnapshot snapshot,
+        PatGatewayQuotaSignal? latestConfirmedExhaustion,
+        DateTimeOffset nowUtc)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        var now = nowUtc.ToUniversalTime();
+        var window = new[] { snapshot.Primary, snapshot.Secondary }
+            .FirstOrDefault(candidate =>
+                AccountQuotaLimitType.ClassifyWindow(candidate?.WindowMinutes) ==
+                AccountQuotaWindowKind.FiveHour);
+        if (window == null)
+        {
+            return false;
+        }
+
+        if (latestConfirmedExhaustion?.ResetAtUtc is { } confirmedResetAtUtc &&
+            confirmedResetAtUtc.ToUniversalTime() +
+                AccountRotationConfiguration.PrimaryResetGracePeriod <= now)
+        {
+            return true;
+        }
+        if (window.ResetsAtUtc is { } resetAtUtc &&
+            resetAtUtc.ToUniversalTime() +
+                AccountRotationConfiguration.PrimaryResetGracePeriod <= now)
+        {
+            return true;
+        }
+        if (window.UsedPercent is not { } usedPercent ||
+            !double.IsFinite(usedPercent) ||
+            usedPercent >= 100D)
+        {
+            return false;
+        }
+
+        // A gateway-confirmed exhaustion observed after this local official snapshot wins.
+        // An account-local snapshot taken later proves that a new/current window is usable.
+        return latestConfirmedExhaustion == null ||
+               latestConfirmedExhaustion.ObservedAtUtc.ToUniversalTime() <
+               snapshot.ObservedAtUtc.ToUniversalTime();
     }
 
     internal static bool IsThresholdReached(
@@ -182,40 +224,26 @@ internal static class PatAutoRotationPolicy
                 false,
                 window.UsedPercent,
                 window.UsedPercent.HasValue ? Math.Max(0D, 100D - window.UsedPercent.Value) : null,
-                CalculateSafetyMargin(recentRequestUsedPercent),
+                0D,
                 NormalizeRecentRequestEstimate(recentRequestUsedPercent),
                 "reset-elapsed");
         }
 
-        var recentQuotaLimit = IsCurrentWindowQuotaLimitSignal(
-            window,
-            lastQuotaLimitedAtUtc,
-            normalizedNow);
+        _ = lastQuotaLimitedAtUtc;
         var usedPercent = window?.UsedPercent is { } rawUsed && double.IsFinite(rawUsed)
             ? Math.Clamp(rawUsed, 0D, 100D)
             : (double?)null;
         var estimate = NormalizeRecentRequestEstimate(recentRequestUsedPercent);
-        var margin = CalculateSafetyMargin(estimate);
+        const double margin = 0D;
         var remaining = usedPercent.HasValue
             ? Math.Max(0D, 100D - usedPercent.Value)
             : (double?)null;
 
-        if (recentQuotaLimit)
-        {
-            return new QuotaRotationDecision(
-                true,
-                true,
-                usedPercent,
-                remaining,
-                margin,
-                estimate,
-                "http-429");
-        }
         if (usedPercent >= 100D)
         {
             return new QuotaRotationDecision(
                 true,
-                true,
+                false,
                 usedPercent,
                 remaining,
                 margin,
@@ -223,15 +251,14 @@ internal static class PatAutoRotationPolicy
                 "official-100-percent");
         }
 
-        var shouldRotate = remaining.HasValue && remaining.Value <= margin;
         return new QuotaRotationDecision(
-            shouldRotate,
+            false,
             false,
             usedPercent,
             remaining,
             margin,
             estimate,
-            shouldRotate ? "dynamic-safety-margin" : "available");
+            "available");
     }
 
     internal static DateTimeOffset? SelectQuotaLimitedSignal(
@@ -396,20 +423,62 @@ internal static class PatAutoRotationPolicy
             recentRequestUsedPercent: null,
             lastQuotaLimitedAtUtc: now.AddHours(-2),
             now);
+        var exhaustedDecision = EvaluateQuotaSafety(
+            new UsageRateLimitWindow(100, 300, now.AddHours(2)),
+            recentRequestUsedPercent: 5D,
+            lastQuotaLimitedAtUtc: null,
+            now);
+        var localSnapshotKey = new string('D', 64);
+        var localAvailableSnapshot = new PersistedQuotaSnapshot(
+            localSnapshotKey,
+            now,
+            null,
+            null,
+            null,
+            new UsageRateLimitWindow(0, 300, now.AddHours(5)),
+            null,
+            null,
+            null,
+            null);
+        var newerConfirmedExhaustion = new PatGatewayQuotaSignal(
+            1,
+            localSnapshotKey,
+            now.AddSeconds(1),
+            now.AddHours(5));
+        var elapsedLocalSnapshot = localAvailableSnapshot with
+        {
+            ObservedAtUtc = now.AddHours(-6),
+            Primary = new UsageRateLimitWindow(100, 300, now.AddMinutes(-2))
+        };
         if (SelectFiveHourWindow(reversed)?.UsedPercent != 98 ||
-            !IsThresholdReached(SelectFiveHourWindow(reversed), 98, now) ||
+            IsThresholdReached(SelectFiveHourWindow(reversed), 98, now) ||
+            !IsThresholdReached(
+                new UsageRateLimitWindow(100, 300, now.AddHours(2)),
+                98,
+                now) ||
             IsThresholdReached(
                 new UsageRateLimitWindow(100, 300, now.AddSeconds(-1)),
                 98,
                 now) ||
-            !dynamicDecision.ShouldRotate ||
-            dynamicDecision.SafetyMarginPercent != 3.5D ||
+            dynamicDecision.ShouldRotate ||
+            dynamicDecision.SafetyMarginPercent != 0D ||
             availableDecision.ShouldRotate ||
-            !limitedDecision.IsImmediatelyExhausted ||
-            limitedDecision.Reason != "http-429" ||
-            !retainedWindowDecision.IsImmediatelyExhausted ||
-            retainedWindowDecision.Reason != "http-429" ||
+            limitedDecision.ShouldRotate ||
+            limitedDecision.IsImmediatelyExhausted ||
+            limitedDecision.Reason != "available" ||
+            retainedWindowDecision.ShouldRotate ||
+            retainedWindowDecision.IsImmediatelyExhausted ||
+            retainedWindowDecision.Reason != "available" ||
             retainedWithoutWindowDecision.ShouldRotate ||
+            !exhaustedDecision.ShouldRotate ||
+            exhaustedDecision.IsImmediatelyExhausted ||
+            exhaustedDecision.Reason != "official-100-percent" ||
+            !HasLocallyAvailableFiveHourQuota(localAvailableSnapshot, null, now) ||
+            HasLocallyAvailableFiveHourQuota(
+                localAvailableSnapshot,
+                newerConfirmedExhaustion,
+                now) ||
+            !HasLocallyAvailableFiveHourQuota(elapsedLocalSnapshot, null, now) ||
             IsGatewayQuiet(
                 new LocalPatGatewayActivitySnapshot(1, now, null, null),
                 now.AddSeconds(10)) ||

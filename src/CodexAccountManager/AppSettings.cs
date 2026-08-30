@@ -20,6 +20,11 @@ public sealed class AppSettings
     public int? PatGatewayProxyPort { get; set; }
     public bool PatGatewayProxyAutoDetect { get; set; } = true;
     public string? PatGatewayProxyScheme { get; set; } = "http";
+    // Optional local Xray/sing-box executable used to turn VLESS/VMess/Trojan/SS
+    // subscription nodes into loopback HTTP proxies.  When empty, the manager probes
+    // PATH, its bundled cores folder, and an already-running xray process; it never
+    // downloads a binary automatically.
+    public string? ProxyCorePath { get; set; }
     public bool PatGatewayEnabled { get; set; } = true;
     public bool PatAutoRotationEnabled { get; set; } = true;
     public double PatAutoRotationUsedPercentThreshold { get; set; } =
@@ -33,8 +38,23 @@ public sealed class AppSettings
     public string? AccountRotationBackupCursorAccountKey { get; set; }
     public Dictionary<string, DateTimeOffset> AccountRotationResetAtUtc { get; set; } =
         new(StringComparer.Ordinal);
+    // Nullable so 2.2.8 can distinguish a pre-confirmation settings file from a
+    // settings file that has already discarded the old "every 429 is exhaustion"
+    // reset markers.  New confirmed gateway/official observations repopulate the map.
+    public int? AccountRotationQuotaEvidenceVersion { get; set; }
     public Dictionary<string, bool> CodexFingerprintForwarding { get; set; } =
         new(StringComparer.Ordinal);
+    // Fingerprint convergence is an explicit per-account mode.  Keep the legacy
+    // boolean map above so older portable copies can still read/write the settings;
+    // entries in this map take precedence when present.
+    public Dictionary<string, string> CodexFingerprintModes { get; set; } =
+        new(StringComparer.Ordinal);
+    // Random, manager-owned seeds make converged identifiers stable for one account
+    // without deriving them from a token, account id, or other secret credential.
+    public Dictionary<string, string> CodexFingerprintSeeds { get; set; } =
+        new(StringComparer.Ordinal);
+    public bool AccountRotationSessionAffinityEnabled { get; set; } = true;
+    public int AccountRotationSessionAffinityTtlSeconds { get; set; } = 3600;
     public Dictionary<string, string> ChatGptFeatureAccountBindings { get; set; } =
         new(StringComparer.OrdinalIgnoreCase);
     public int? WindowLeft { get; set; }
@@ -124,6 +144,12 @@ public sealed class ThemePalette
 public sealed class ThemeService
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+    // The gateway and a newly opened Manager can briefly overlap while an update or
+    // account switch is being adopted.  Serialize the small atomic settings replace
+    // across those processes so a transient MoveFile sharing violation cannot bubble
+    // out of a WinForms event and make the UI look as if it crashed.
+    private static readonly Mutex SettingsWriteMutex =
+        new(false, "Local\\CodexAccountManager.SettingsWrite");
     private readonly string _settingsPath;
 
     public ThemeService(string rootPath)
@@ -154,13 +180,52 @@ public sealed class ThemeService
         ArgumentNullException.ThrowIfNull(settings);
         Directory.CreateDirectory(Path.GetDirectoryName(_settingsPath)!);
         var temporaryPath = _settingsPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        var mutexAcquired = false;
         try
         {
+            try
+            {
+                mutexAcquired = SettingsWriteMutex.WaitOne(TimeSpan.FromSeconds(5));
+            }
+            catch (AbandonedMutexException)
+            {
+                mutexAcquired = true;
+            }
+            if (!mutexAcquired)
+            {
+                throw new IOException("Account Manager 设置文件正由另一个实例更新，请稍后重试。");
+            }
+
             File.WriteAllText(
                 temporaryPath,
                 JsonSerializer.Serialize(settings, JsonOptions),
                 new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
-            File.Move(temporaryPath, _settingsPath, overwrite: true);
+            Exception? lastError = null;
+            for (var attempt = 0; attempt < 5; attempt++)
+            {
+                try
+                {
+                    File.Move(temporaryPath, _settingsPath, overwrite: true);
+                    lastError = null;
+                    break;
+                }
+                catch (Exception ex) when (
+                    ex is IOException or UnauthorizedAccessException)
+                {
+                    lastError = ex;
+                    if (attempt == 4)
+                    {
+                        break;
+                    }
+                    Thread.Sleep(40 * (attempt + 1));
+                }
+            }
+            if (lastError != null)
+            {
+                throw new IOException(
+                    "Account Manager 设置文件暂时被占用，稍后会自动重试。",
+                    lastError);
+            }
         }
         finally
         {
@@ -174,6 +239,17 @@ public sealed class ThemeService
             catch
             {
                 // A stale temporary settings file is ignored by readers.
+            }
+            if (mutexAcquired)
+            {
+                try
+                {
+                    SettingsWriteMutex.ReleaseMutex();
+                }
+                catch (ApplicationException)
+                {
+                    // The mutex can be abandoned while the process is shutting down.
+                }
             }
         }
     }

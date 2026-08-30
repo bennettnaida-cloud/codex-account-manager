@@ -51,7 +51,12 @@ $existingLauncher = Join-Path $out 'CodexAccountManager.exe'
 $previousHomeForGateway = $env:CODEX_ACCOUNT_MANAGER_HOME
 $env:CODEX_ACCOUNT_MANAGER_HOME = $root
 try {
-    if (Test-Path -LiteralPath $existingLauncher -PathType Leaf) {
+    # Port 8317 is shared by every installed/source copy. Do not even send a
+    # shutdown request unless process inspection proves that the listener belongs
+    # to this source tree; an unrelated production gateway may be using the port.
+    $currentProjectGatewayProcesses = @(Get-CurrentProjectGatewayProcesses)
+    if ($currentProjectGatewayProcesses.Count -gt 0 -and
+        (Test-Path -LiteralPath $existingLauncher -PathType Leaf)) {
         try {
             & $existingLauncher '--shutdown-local-pat-gateway' 2>$null | Out-Null
         }
@@ -115,6 +120,11 @@ if ($usingBundledDotnet) {
 if ($LASTEXITCODE -ne 0) {
     throw "dotnet publish failed with exit code $LASTEXITCODE"
 }
+
+# Keep the portable publish folder self-describing as well as the installed copy.
+# Older builds could leave a stale package-version.txt beside a newly published EXE,
+# which made the direct dist entry point report the previous release number.
+$buildVersion | Set-Content -LiteralPath (Join-Path $out 'package-version.txt') -Encoding ASCII
 
 $appExe = Join-Path $out 'CodexAccountManager.exe'
 try {

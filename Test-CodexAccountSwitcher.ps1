@@ -1,4 +1,4 @@
-﻿Set-StrictMode -Version Latest
+Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $PSDefaultParameterValues['Get-Content:Encoding'] = 'utf8'
 
@@ -113,6 +113,10 @@ $accountRotationSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAcc
 $accountRotationFormSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\Form1.AccountRotation.cs') -Raw -Encoding UTF8
 $patGatewayRotationStoreSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\PatGatewayRotationStore.cs') -Raw -Encoding UTF8
 $patGatewayQuotaSignalStoreSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\PatGatewayQuotaSignalStore.cs') -Raw -Encoding UTF8
+$patGatewaySessionAffinityStoreSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\PatGatewaySessionAffinityStore.cs') -Raw -Encoding UTF8
+$openAIResponseIdObserverSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\OpenAIResponseIdObserver.cs') -Raw -Encoding UTF8
+$codexFingerprintConvergenceSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\CodexFingerprintConvergence.cs') -Raw -Encoding UTF8
+$openAIContentSessionSeedSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\OpenAIContentSessionSeed.cs') -Raw -Encoding UTF8
 $gatewayQuotaSignalFormSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\Form1.GatewayQuotaSignals.cs') -Raw -Encoding UTF8
 $localProxyDetectorSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\LocalProxyDetector.cs') -Raw -Encoding UTF8
 $quotaSnapshotStoreSource = Get-Content -LiteralPath (Join-Path $root 'src\CodexAccountManager\QuotaSnapshotStore.cs') -Raw -Encoding UTF8
@@ -157,7 +161,7 @@ if ($appUpdateServiceSource -notmatch 'CodexAccountManager["'']\s*,\s*["'']versi
     $windowsInstallerSource -notmatch [regex]::Escape('--preserve-existing-pat-gateway') -or
     $windowsInstallerSource -notmatch [regex]::Escape('--refresh-native-fast-bridge-after-update') -or
     $formSource -notmatch 'restartOnProxyMismatch:\s*!_preserveExistingPatGatewayOnStartup' -or
-    $formSource -notmatch 'if\s*\(_preserveExistingPatGatewayOnStartup\)[\s\S]{0,500}return;[\s\S]{0,500}ShutdownOwnedGatewayAsync' -or
+    $formSource -notmatch 'if\s*\(_preserveExistingPatGatewayOnStartup\)[\s\S]{0,900}UpgradePatGatewayAtSafeBoundaryAsync' -or
     $formSource -notmatch 'TryRefreshNativeFastBridgeAfterUpdate') {
     throw 'Automatic updates must use versioned side-by-side installs and preserve the running PAT gateway on the first updated launch.'
 }
@@ -362,15 +366,23 @@ if (-not $accountRotationPoolButtonLabels.Success -or
     $accountRotationPoolButtonLabels.Value -notmatch 'AccountRotationPool\.Backup\s*=>\s*"放入使用轮换池"' -or
     -not $accountRotationRowLayout.Success -or
     $accountRotationRowLayout.Value -notmatch 'GetInteractivePoolToggleTarget\(pool\)' -or
-    $accountRotationRowLayout.Value -notmatch 'poolButton\.Click\s*\+=.*?ToggleAccountRotationPool\(account\)' -or
-    $accountRotationRowLayout.Value -notmatch '(?s)noneButton\.Click\s*\+=.*?SetAccountRotationPoolFromUi\(\s*account,\s*AccountRotationPool\.None\s*\)' -or
+     $accountRotationRowLayout.Value -notmatch '(?s)poolButton\.Click\s*\+=.*?ToggleAccountRotationPool(?:Async)?\(account\)' -or
+     $accountRotationRowLayout.Value -notmatch '(?s)noneButton\.Click\s*\+=.*?SetAccountRotationPoolFromUi(?:Async)?\(\s*account,\s*AccountRotationPool\.None\s*\)' -or
     -not $accountRotationSummaryLayout.Success -or
     $accountRotationSummaryLayout.Value -notmatch 'MeasureAccountRotationWrappedTextHeight' -or
     $accountRotationSummaryLayout.Value -notmatch 'Height\s*=\s*panelHeight' -or
     $accountRotationSummaryLayout.Value -notmatch 'Height\s*=\s*cursorSummaryHeight' -or
     [regex]::Matches($accountRotationSummaryLayout.Value, 'AutoEllipsis\s*=\s*false').Count -lt 2 -or
+    $accountRotationFormSource -notmatch 'GetAccountRotationQuotaUsage\(\)' -or
+    $accountRotationFormSource -notmatch 'BuildAccountRotationAccountDetail\(account,\s*quotaUsage\)' -or
+    $accountRotationFormSource -notmatch 'ApplyLiveRateLimitSnapshots\(report\)' -or
+    $accountRotationFormSource -notmatch 'GetQuotaWindow\(AccountQuotaWindowKind\.FiveHour\)' -or
+    $accountRotationFormSource -notmatch '5h 剩余' -or
+    $accountRotationFormSource -notmatch '5h 重置' -or
+    $accountRotationFormSource -notmatch '(?s)poolTransitionValid.*?AccountRotationPool\.Primary => primaryOccurrences == 1 && backupOccurrences == 0' -or
+    $accountRotationFormSource -notmatch '_accountRotationPrimaryReturnCheckedAtUtc\s*=\s*null' -or
     $accountRotationFormSource -notmatch '(?s)private static int MeasureAccountRotationWrappedTextHeight\(.*?TextFormatFlags\.WordBreak') {
-    throw 'Account-rotation rows must show destination actions, keep None independent, and wrap the complete rotation summary at high DPI.'
+    throw 'Account-rotation rows must show destination actions, keep None independent, share quota snapshots, and wrap the complete rotation summary at high DPI.'
 }
 $accountSwitchRowLayout = [regex]::Match(
     $formSource,
@@ -405,12 +417,22 @@ $statusTokenRowLayout = [regex]::Match(
 if (-not $statusTokenRowLayout.Success -or
     $statusTokenRowLayout.Value -notmatch 'new RoundedPanel' -or
     $statusTokenRowLayout.Value -notmatch 'CalculateStatusTokenRowGeometry\(width\)' -or
+    $statusTokenRowLayout.Value -notmatch 'Name\s*=\s*"AccountDisplayName"' -or
+    $statusTokenRowLayout.Value -notmatch 'MakeAccountStateBadge\(' -or
+    $statusTokenRowLayout.Value -notmatch 'geometry\.AccountStateBadge' -or
+    $statusTokenRowLayout.Value -notmatch 'primary\.BringToFront\(\)' -or
     $statusTokenRowLayout.Value -notmatch 'MakeStatusCheckButton\(' -or
     $statusTokenRowLayout.Value -notmatch 'MakeTokenUpdateButton\(' -or
     $statusTokenRowLayout.Value -notmatch 'CheckStatusAsync\(account\)' -or
     $statusTokenRowLayout.Value -notmatch 'UpdateTokenAsync\(account\)' -or
     $statusTokenRowLayout.Value -match 'CreateStatusRow\(account,\s*width\)|CreateTokenRow\(account,\s*width\)|statusRow\.Dock|tokenRow\.Dock') {
     throw 'Status and token management must be rendered as one account-scoped card with both actions.'
+}
+if ($formSource -notmatch '(?s)new Rectangle\(\s*side,\s*10,\s*innerWidth - gap - accountStateBadgeWidth,\s*38\)' -or
+    $formSource -notmatch '(?s)new Rectangle\(\s*side,\s*10,\s*Math\.Max\(120, accountStateBadgeLeft - side - gap\),\s*38\)' -or
+    $formSource -notmatch 'geometry\.Primary\.IntersectsWith\(geometry\.AccountStateBadge\)' -or
+    $formSource -notmatch 'geometry\.AccountStateBadge\.IntersectsWith\(geometry\.StatusBadge\)') {
+    throw 'Status credential cards must reserve a high-DPI-safe account-name line and a non-overlapping current-account badge.'
 }
 if ($formSource -notmatch 'Tag\s*=\s*"status-check"' -or
     $formSource -notmatch 'ApplyStatusCheckButtonStyle' -or
@@ -1295,7 +1317,7 @@ $prepareWindowsClientMatch = [regex]::Match(
     '(?s)public async Task<WindowsClientAccountProjection> PrepareWindowsClientAccountAsync\(.*?(?=\r?\n\s*public Task<WindowsClientAccountProjection> SwitchWindowsClientAccountAsync)')
 $directWindowsClientSwitchMatch = [regex]::Match(
     $cliServiceSource,
-    '(?s)public async Task<WindowsClientAccountProjection> SwitchWindowsClientAccountAsync\(\s*AccountRecord account,\s*string projectPath,\s*WindowsClientMode mode,\s*bool useDreamSkin,\s*ThemeMode appearanceMode,\s*string appearancePresetId = "manager",\s*string\? appearanceLabel = null,\s*bool routeOfficialOAuthThroughGateway = false\s*\).*?(?=\r?\n\s*public async Task<WindowsClientAccountProjection> SwitchWindowsClientAccountWithChatGptFeaturesAsync\()')
+    '(?s)public async Task<WindowsClientAccountProjection> SwitchWindowsClientAccountAsync\(\s*AccountRecord account,\s*string projectPath,\s*WindowsClientMode mode,\s*bool useDreamSkin,\s*ThemeMode appearanceMode,\s*string appearancePresetId = "manager",\s*string\? appearanceLabel = null,\s*bool routeOfficialOAuthThroughGateway = false,\s*bool forceClientRestart = false\s*\).*?(?=\r?\n\s*public async Task<WindowsClientAccountProjection> SwitchWindowsClientAccountWithChatGptFeaturesAsync\()')
 $featureWindowsClientSwitchMatch = [regex]::Match(
     $cliServiceSource,
     '(?s)public async Task<WindowsClientAccountProjection> SwitchWindowsClientAccountWithChatGptFeaturesAsync\(.*?(?=\r?\n\s*private async Task<WindowsClientAccountProjection> SwitchWindowsClientAccountCoreAsync\()')
@@ -1429,7 +1451,8 @@ $captureWindowsClientSnapshotsMethod = $captureWindowsClientSnapshotsMatch.Value
 $stopWindowsClientProcessesMethod = $stopWindowsClientProcessesMatch.Value
 $tryOpenWindowsClientSnapshotMethod = $tryOpenWindowsClientSnapshotMatch.Value
 $protectedWindowsClientShutdownNameMethod = $protectedWindowsClientShutdownNameMatch.Value
-if ($captureWindowsClientSnapshotsMethod -notmatch 'process\.Id == Environment\.ProcessId' -or
+if ($captureWindowsClientSnapshotsMethod -notmatch 'SelectProtectedWindowsClientShutdownProcessIds' -or
+    $captureWindowsClientSnapshotsMethod -notmatch 'protectedProcessIds\.Contains\(process\.Id\)' -or
     $captureWindowsClientSnapshotsMethod -notmatch 'IsProtectedWindowsClientShutdownProcessName\(processName\)' -or
     $captureWindowsClientSnapshotsMethod -notmatch 'TryGetProcessExecutablePath\(process, out var executablePath\)' -or
     $windowsClientProcessSnapshotRecordMatch.Value -notmatch 'string ExecutablePath' -or
@@ -1487,12 +1510,12 @@ if ($cliServiceSource -notmatch 'AccessTokenSwitchValidationCacheLifetime' -or
 if (([regex]::Matches(
         $directWindowsClientSwitchMethod,
         'SwitchWindowsClientAccountCoreAsync\s*\(')).Count -ne 1 -or
-    $directWindowsClientSwitchMethod -notmatch '(?s)return await SwitchWindowsClientAccountCoreAsync\(\s*account,\s*projectPath,\s*mode,\s*useDreamSkin,\s*appearanceMode,\s*appearancePresetId,\s*appearanceLabel,\s*AccessTokenSharedProfileMode\.ApiCompatible,\s*chatGptFeatureAccount:\s*null,\s*routeOfficialOAuthThroughGateway\s*\);' -or
+    $directWindowsClientSwitchMethod -notmatch '(?s)return await SwitchWindowsClientAccountCoreAsync\(\s*account,\s*projectPath,\s*mode,\s*useDreamSkin,\s*appearanceMode,\s*appearancePresetId,\s*appearanceLabel,\s*AccessTokenSharedProfileMode\.ApiCompatible,\s*chatGptFeatureAccount:\s*null,\s*routeOfficialOAuthThroughGateway,\s*forceClientRestart\s*\);' -or
     $directWindowsClientSwitchMethod -match 'AccessTokenSharedProfileMode\.ChatGptDesktop' -or
     ([regex]::Matches(
         $featureWindowsClientSwitchMethod,
         'SwitchWindowsClientAccountCoreAsync\s*\(')).Count -ne 1 -or
-    $featureWindowsClientSwitchMethod -notmatch '(?s)return await SwitchWindowsClientAccountCoreAsync\(\s*account,\s*projectPath,\s*WindowsClientMode\.OfficialCodex,\s*useDreamSkin,\s*appearanceMode,\s*appearancePresetId,\s*appearanceLabel,\s*AccessTokenSharedProfileMode\.ChatGptDesktop,\s*chatGptFeatureAccount,\s*routeOfficialOAuthThroughGateway:\s*false\s*\);' -or
+    $featureWindowsClientSwitchMethod -notmatch '(?s)return await SwitchWindowsClientAccountCoreAsync\(\s*account,\s*projectPath,\s*WindowsClientMode\.OfficialCodex,\s*useDreamSkin,\s*appearanceMode,\s*appearancePresetId,\s*appearanceLabel,\s*AccessTokenSharedProfileMode\.ChatGptDesktop,\s*chatGptFeatureAccount,\s*routeOfficialOAuthThroughGateway:\s*false,\s*forceClientRestart:\s*false\s*\);' -or
     $featureWindowsClientSwitchMethod -match 'AccessTokenSharedProfileMode\.ApiCompatible') {
     throw 'Normal PAT/API startup must pass ApiCompatible with no OAuth feature account, while the explicit dual-login entry must pass both the model and ChatGPT OAuth accounts.'
 }
@@ -1501,9 +1524,10 @@ if ($switchWindowsClientMethod -notmatch 'ValidateWindowsClientAccountAsync\(\s*
     $switchWindowsClientMethod -notmatch 'CreateReusedSharedProfileProjection' -or
     $switchWindowsClientMethod -notmatch 'if\s*\(sharedProfileAlreadySelected\)' -or
     $switchWindowsClientMethod -notmatch 'RequiresWindowsClientShutdown\(sharedProfileAlreadySelected\)' -or
-    $switchWindowsClientMethod -match 'if\s*\(sharedProfileAlreadySelected\)[\s\S]*?StopWindowsClientProcesses[\s\S]*?CreateReusedSharedProfileProjection' -or
-    $switchWindowsClientMethod -notmatch 'else[\s\S]*?StopWindowsClientProcesses\(shutdownTargets\)' -or
-    $switchWindowsClientMethod -notmatch '(?s)StopWindowsClientProcesses\(shutdownTargets\);\s*if \(!WaitForWindowsClientProcessAndPortRelease\(\s*shutdownTargets,\s*shutdownNativeFastPorts,\s*launchGeneration,.*?\)\).*?throw new TimeoutException\(.*?ProjectWindowsClientAccount\(' -or
+    $switchWindowsClientMethod -notmatch '(?s)var switchRequired\s*=\s*forceClientRestart\s*\|\|\s*RequiresWindowsClientShutdown\(sharedProfileAlreadySelected\)' -or
+    $switchWindowsClientMethod -notmatch '(?s)if \(switchRequired\).*?StopWindowsClientProcesses\(shutdownTargets\);.*?WaitForWindowsClientProcessAndPortRelease\(.*?if \(sharedProfileAlreadySelected\).*?CreateReusedSharedProfileProjection.*?else.*?ProjectWindowsClientAccount\(' -or
+    $formSource -notmatch '(?s)SwitchWindowsClientAccountAsync\(.*?forceClientRestart:\s*mode == WindowsClientMode\.OfficialCodex\s*&&\s*!automaticRotation' -or
+    $formSource -notmatch '(?s)if \(!await LocalPatGateway\.ClearRotationAsync\(\)\).*?本次没有关闭或重启 Codex' -or
     $switchWindowsClientMethod -notmatch 'projection\.ClientLaunchStarted\s*=\s*LaunchWindowsClient\(' -or
     $switchWindowsClientMethod -notmatch 'allowOfficialRendererPatch:\s*ShouldApplyOfficialRendererPatch\(' -or
     $switchWindowsClientMethod -notmatch 'projection\.ClientLaunchError' -or
@@ -1566,6 +1590,22 @@ if ($launchWindowsClientMethod -notmatch 'TryLaunchCodexPlusPlusViaScheduledTask
 }
 if ($launchWindowsClientMethod -notmatch '(?s)var sameAccountShutdownTargets = CaptureWindowsClientProcessSnapshots\(\);.*?WaitForWindowsClientProcessAndPortRelease\(\s*sameAccountShutdownTargets,.*?\)\s*\|\|\s*!WaitForOfficialCodexSwitchQuiescence\(\s*launchGeneration,') {
     throw 'An unhealthy same-account official client must pass the global quiescence gate before replacement activation.'
+}
+$manualGatewayRotationMatch = [regex]::Match(
+    $formSource,
+    '(?s)private async Task<bool\?> TryPrepareManualGatewayRotationAsync\(AccountRecord target\).*?(?=\r?\n\s*private async Task StartManualAccountRotationFromUiAsync)')
+if (-not $manualGatewayRotationMatch.Success -or
+    $manualGatewayRotationMatch.Value -notmatch '(?s)ReadActivitySnapshotAsync\(\).*?new PatGatewayRotationStore\(_store\.RootPath\)\.Load\(\).*?route = persistedRoute;' -or
+    $manualGatewayRotationMatch.Value -notmatch '(?s)CancelPendingPatAutoRotation\(resetState: false\).*?ArmedRotationMaximumLifetime.*?PatGatewayRotationStatus\.Armed => route\.SourceAccountKey.*?TryResolvePersistedPatGatewayLogicalAccount' -or
+    $manualGatewayRotationMatch.Value -notmatch '(?s)HasUsableAccountCredential\(target\).*?Codex 和网关保持运行' -or
+    $manualGatewayRotationMatch.Value -notmatch '(?s)replaceExistingArmedTarget: replacingPendingTarget.*?quota_bypass=true.*?codex_restart=false' -or
+    $manualGatewayRotationMatch.Value -notmatch '_codex\.IsOfficialWindowsClientRunning\(' -or
+    $manualGatewayRotationMatch.Value -notmatch '(?s)rememberedCurrent = GetCurrentAccountRecord\(\).*?route\.SourceAccountKey.*?LocalPatGateway\.ClearRotationAsync\(\)' -or
+    $manualGatewayRotationMatch.Value -notmatch '(?s)FindProjectedPatGatewayTransportAccount\(\).*?route\.TransportAccountKey.*?LocalPatGateway\.ClearRotationAsync\(\)' -or
+    $manualGatewayRotationMatch.Value -notmatch '(?s)StartManualGatewayRotationWaiter\(.*?var displayedSource = GetCurrentAccountRecord\(\).*?if \(displayedSource == null\).*?ResumeRecoveredGatewayRotationAsync' -or
+    $manualGatewayRotationMatch.Value -match '(?s)StartManualGatewayRotationWaiter\(.*?QueueHotRotatedOfficialAccountDisplay\(source' -or
+    $manualGatewayRotationMatch.Value -notmatch '(?s)normalizedSource\.Equals\(targetKey.*?TryRecoverPatAutoRotationLaunchContextAsync\(activity\).*?SetCurrentAccount\(target\.Name, false, persistSettings: true\)') {
+    throw 'Manual rotation must ignore quota state, reject expired routes, preserve the displayed/quota account until activation, and never restart Codex.'
 }
 $noRendererFastPathMatch = [regex]::Match(
     $launchWindowsClientMethod,
@@ -1678,8 +1718,13 @@ if ($recoveryActivationCallCount -ne 1 -or
 }
 if ($programSource -notmatch '(?s)args\.Contains\("--self-test".*?return RunSelfTest\(\);' -or
     $programSelfTestMethod -notmatch 'CodexCliService\.ValidateOfficialCodexLaunchRecovery\(\);' -or
-    $programSelfTestMethod -notmatch 'CodexCliService\.ValidateExplicitChatGptFeatureProjection\(\);') {
-    throw 'Program --self-test must execute the official Codex launch-recovery and explicit ChatGPT-feature projection validations.'
+    $programSelfTestMethod -notmatch 'CodexCliService\.ValidateExplicitChatGptFeatureProjection\(\);' -or
+    $programSelfTestMethod -notmatch 'LocalPatGatewayHost\.ValidateSessionAffinityRouting\(\);' -or
+    $programSelfTestMethod -notmatch 'CodexFingerprintConvergence\.Validate\(\);' -or
+    $programSelfTestMethod -notmatch 'OpenAIContentSessionSeed\.Validate\(\);' -or
+    $programSelfTestMethod -notmatch 'PatGatewaySessionAffinityStore\.Validate\(\);' -or
+    $programSelfTestMethod -notmatch 'OpenAIResponseIdObserver\.Validate\(\);') {
+    throw 'Program --self-test must execute launch recovery, fingerprint convergence, and session-affinity validations.'
 }
 $reviewedOfficialCodexPageUrls = @(
     'app://codex/',
@@ -2883,7 +2928,7 @@ if ($localPatGatewaySource -notmatch 'ProviderBaseUrl\s*=\s*"http://127\.0\.0\.1
     $localPatGatewaySource -notmatch 'chatgpt-account-id' -or
     $localPatGatewaySource -notmatch 'UseCookies\s*=\s*false' -or
     $localPatGatewaySource -notmatch 'RequiredCodexVersion' -or
-    $localPatGatewaySource -notmatch 'ResolveRequiredProxyUri' -or
+     ($localPatGatewaySource -notmatch 'ResolveRequiredProxyUri' -and $localPatGatewaySource -notmatch 'ResolveProxyForCredential') -or
     $localPatGatewaySource -notmatch 'proxyConfigured' -or
     $localPatGatewaySource -notmatch 'ReadBearerCredential' -or
     $localPatGatewaySource -notmatch 'IsPersonalAccessToken' -or
@@ -2909,6 +2954,12 @@ if ($localPatGatewaySource -notmatch 'ProviderBaseUrl\s*=\s*"http://127\.0\.0\.1
 $preparePatRotationMatch = [regex]::Match(
     $formSource,
     '(?s)private async Task PreparePatAutoRotationAsync\(.*?(?=\r?\n\s*private async Task<PatRotationCandidateQuotaStatus> ConfirmPatRotationCandidateQuotaAsync)')
+$preparePrimaryReturnMatch = [regex]::Match(
+    $formSource,
+    '(?s)private async Task PreparePrimaryPoolReturnAsync\(.*?(?=\r?\n\s*private void RefreshQuotaUsageIfNeeded)')
+$refreshPrimaryReturnMatch = [regex]::Match(
+    $formSource,
+    '(?s)private void RefreshAccountRotationPrimaryReturnIfNeeded\(\).*?(?=\r?\n\s*private bool TryResolvePersistedPatGatewayLogicalAccount)')
 $waitPatActivationMatch = [regex]::Match(
     $formSource,
     '(?s)private async Task<DateTimeOffset> WaitForPatGatewayRotationActivationAsync\(.*?(?=\r?\n\s*private void CompletePatGatewayRotation)')
@@ -2973,11 +3024,16 @@ if ($settingsSource -notmatch 'PatAutoRotationEnabled\s*\{\s*get;\s*set;\s*\}\s*
     $patAutoRotationSource -notmatch 'EvaluateQuotaSafety' -or
     $patAutoRotationSource -notmatch 'RecentRequestSafetyMultiplier' -or
     $patAutoRotationSource -notmatch 'official-100-percent' -or
-    $patAutoRotationSource -notmatch 'http-429' -or
+    $localPatGatewaySource -notmatch 'ClassifyUpstream429' -or
+    $localPatGatewaySource -notmatch 'StructuredQuota429ConfirmationCount\s*=\s*3' -or
     $patAutoRotationSource -notmatch 'QuotaSafetyMarginTracker' -or
     $accountRotationSource -notmatch 'PrimaryResetGracePeriod\s*=\s*TimeSpan\.FromMinutes\(1\)' -or
     $accountRotationSource -notmatch 'AccountRotationPrimaryCursorAccountKey' -or
     $accountRotationSource -notmatch 'AccountRotationBackupCursorAccountKey' -or
+    $settingsSource -notmatch 'AccountRotationSessionAffinityEnabled\s*\{\s*get;\s*set;\s*\}\s*=\s*true' -or
+    $settingsSource -notmatch 'AccountRotationSessionAffinityTtlSeconds\s*\{\s*get;\s*set;\s*\}\s*=\s*3600' -or
+    $settingsSource -notmatch 'CodexFingerprintModes' -or
+    $settingsSource -notmatch 'CodexFingerprintSeeds' -or
     $accountRotationSource -notmatch 'Never expose backup candidates while any primary candidate is still eligible' -or
     $programSource -notmatch 'PatAutoRotationPolicy\.Validate\(\)' -or
     $programSource -notmatch 'AccountRotationConfiguration\.Validate\(\)' -or
@@ -2988,16 +3044,29 @@ if ($settingsSource -notmatch 'PatAutoRotationEnabled\s*\{\s*get;\s*set;\s*\}\s*
 if ($installerDefaultsSource -notmatch '"PatGatewayEnabled"\s*:\s*true' -or
     $installerDefaultsSource -notmatch '"PatAutoRotationEnabled"\s*:\s*true' -or
     $installerDefaultsSource -notmatch '"PatAutoRotationUsedPercentThreshold"\s*:\s*98' -or
+    $installerDefaultsSource -notmatch '"AccountRotationSessionAffinityEnabled"\s*:\s*true' -or
+    $installerDefaultsSource -notmatch '"AccountRotationSessionAffinityTtlSeconds"\s*:\s*3600' -or
+    $installerDefaultsSource -notmatch '"CodexFingerprintModes"\s*:\s*\{\}' -or
+    $installerDefaultsSource -notmatch '"CodexFingerprintSeeds"\s*:\s*\{\}' -or
     $oneClickPackageSource -notmatch "'PatAutoRotationEnabled'" -or
     $oneClickPackageSource -notmatch "'PatAutoRotationUsedPercentThreshold'" -or
+    $oneClickPackageSource -notmatch "'AccountRotationSessionAffinityEnabled'" -or
+    $oneClickPackageSource -notmatch "'CodexFingerprintModes'" -or
+    $oneClickPackageSource -notmatch "'CodexFingerprintSeeds'" -or
     $oneClickPackageSource -notmatch 'patAutoRotationUsedPercentThreshold') {
     throw 'The clean one-click package must enable the PAT gateway and 98% automatic request-boundary rotation by default and validate those fields.'
 }
-if ($localPatGatewaySource -notmatch 'RotationProtocolValue\s*=\s*"request-boundary-v5"' -or
+if ($localPatGatewaySource -notmatch 'RotationProtocolValue\s*=\s*"request-boundary-v11"' -or
+    $localPatGatewaySource -notmatch 'SuccessfulActivityRotationProtocolValue\s*=\s*"request-boundary-v10"' -or
+    $localPatGatewaySource -notmatch 'SafeContentEncodingRotationProtocolValue\s*=\s*"request-boundary-v8"' -or
+    $localPatGatewaySource -notmatch 'ConfirmedQuotaRotationProtocolValue\s*=\s*"request-boundary-v7"' -or
+    $localPatGatewaySource -notmatch 'TransparentRotationProtocolValue\s*=\s*"request-boundary-v5"' -or
     $localPatGatewaySource -notmatch 'DurableRotationProtocolValue\s*=\s*"request-boundary-v4"' -or
     $localPatGatewaySource -notmatch 'CompatibleRotationProtocolValue\s*=\s*"request-boundary-v3"' -or
     $localPatGatewaySource -notmatch 'HasCompatibleLegacyRotationProtocolAsync' -or
     $localPatGatewaySource -notmatch 'HasCompatibleRotationProtocol' -or
+    $localPatGatewaySource -notmatch '(?s)ReadActivitySnapshotCoreAsync\(.*?CreateLoopbackControlClient\(\)' -or
+    $localPatGatewaySource -notmatch 'ReadGatewayControlErrorMessageAsync' -or
     $localPatGatewaySource -notmatch '(?s)internal int Run\(\).*?RunListenerAsync\(\)\.GetAwaiter\(\)\.GetResult\(\).*?mutex\.ReleaseMutex\(\)' -or
     $patGatewayRotationStoreSource -notmatch 'FileName\s*=\s*"account-auto-rotation-route-v2\.json"' -or
     $patGatewayRotationStoreSource -notmatch 'LegacyFileName\s*=\s*"pat-auto-rotation-route-v1\.json"' -or
@@ -3008,18 +3077,65 @@ if ($localPatGatewaySource -notmatch 'RotationProtocolValue\s*=\s*"request-bound
     $patGatewayRotationStoreSource -notmatch 'TransportAccountKey' -or
     $patGatewayRotationStoreSource -notmatch 'existing\.TargetAccountKey, source' -or
     $patGatewayRotationStoreSource -notmatch 'transport\s*=\s*existing\.TransportAccountKey' -or
+    $patGatewayRotationStoreSource -notmatch 'replaceExistingArmedTarget' -or
+    $patGatewayRotationStoreSource -notmatch 'A force switch did not atomically replace the pending target' -or
     $routeDocumentMatch.Value -match '(?i)token|email|accountName|apiKey|apiBaseUrl|apiModel|provider' -or
     $routeDocumentMatch.Value -notmatch 'TransportAccountKey' -or
     $routeDocumentMatch.Value -notmatch 'SourceAccountKey' -or
     $routeDocumentMatch.Value -notmatch 'TargetAccountKey' -or
     $routeDocumentMatch.Value -notmatch 'ArmedAtUtc' -or
     $routeDocumentMatch.Value -notmatch 'ActivatedAtUtc') {
-    throw 'The v2 route must migrate a live v1 chain atomically and persist only transport/source/target hashes and timestamps.'
+    throw 'The v9 gateway and v2 route must preserve v3-v8 hand-off compatibility and persist only transport/source/target hashes and timestamps.'
+}
+if ($codexFingerprintConvergenceSource -notmatch 'PassthroughValue\s*=\s*"off"' -or
+    $codexFingerprintConvergenceSource -notmatch 'sub2api:codex-install-id:v2:' -or
+    $codexFingerprintConvergenceSource -notmatch 'sub2api:codex-session-id:v2:' -or
+    $codexFingerprintConvergenceSource -notmatch 'sub2api:codex-thread-id:v2:' -or
+    $codexFingerprintConvergenceSource -notmatch 'CodexFingerprintMode\.Device' -or
+    $codexFingerprintConvergenceSource -notmatch 'CodexFingerprintMode\.Session' -or
+    $codexFingerprintConvergenceSource -notmatch 'CodexFingerprintMode\.Full' -or
+    $codexFingerprintConvergenceSource -notmatch 'RewriteRequestBody' -or
+    $codexFingerprintConvergenceSource -notmatch 'ApplyHeaders' -or
+    $openAIContentSessionSeedSource -notmatch 'Prefix\s*=\s*"compat_cs_"' -or
+    $openAIContentSessionSeedSource -notmatch 'Derive\(' -or
+    $accountRotationSource -notmatch 'FingerprintPassthroughValue\s*=\s*"off"' -or
+    $formSource -notmatch '指纹：不收敛（透传）' -or
+    $formSource -notmatch '指纹：设备收敛' -or
+    $formSource -notmatch '指纹：会话收敛' -or
+    $formSource -notmatch '指纹：完全收敛') {
+    throw 'Codex fingerprint convergence must expose gateway_default/off forwarding policy and exact device/session/full rewrite boundaries.'
+}
+if ($patGatewaySessionAffinityStoreSource -notmatch 'FileName\s*=\s*"pat-gateway-session-affinity-v1\.json"' -or
+    $patGatewaySessionAffinityStoreSource -notmatch 'BindingLifetime\s*=\s*TimeSpan\.FromHours\(1\)' -or
+    $patGatewaySessionAffinityStoreSource -notmatch 'HMACSHA256' -or
+    $patGatewaySessionAffinityStoreSource -notmatch 'ResolveOrClaim' -or
+    $patGatewaySessionAffinityStoreSource -notmatch 'ConfirmAndBindResponses' -or
+    $patGatewaySessionAffinityStoreSource -notmatch 'FileOptions\.WriteThrough' -or
+    $patGatewaySessionAffinityStoreSource -notmatch 'File\.Move\(temporaryPath, _path, overwrite: true\)' -or
+    $openAIResponseIdObserverSource -notmatch 'OpenAIResponseWireFormat\.ServerSentEvents' -or
+    $openAIResponseIdObserverSource -notmatch '\[DONE\]' -or
+    $openAIResponseIdObserverSource -notmatch 'CanConfirm' -or
+    $openAIResponseIdObserverSource -notmatch 'framed and payload event types independent' -or
+    $localPatGatewaySource -notmatch 'InspectSessionAffinityJson' -or
+    $localPatGatewaySource -notmatch 'OpaqueBody: true' -or
+    $localPatGatewaySource -notmatch 'UnsupportedMediaType' -or
+    $localPatGatewaySource -notmatch 'preserveAffinityBindingOnSuccess' -or
+    $patGatewaySessionAffinityStoreSource -notmatch 'Ambiguous' -or
+    $localPatGatewaySource -notmatch 'ExtractSessionAffinityRequest' -or
+    $localPatGatewaySource -notmatch 'strictResponseAffinity' -or
+    $localPatGatewaySource -notmatch 'CanConfirmSession' -or
+    $localPatGatewaySource -notmatch 'affinityRequest\?\.AllowCrossAccountReplay' -or
+    $localPatGatewaySource -notmatch '(?s)CopyUpstreamResponseAsync.*?ReadAsync\(buffer.*?observer\.Observe.*?OutputStream\.WriteAsync' -or
+    $accountRotationFormSource -notmatch 'AccountRotationSessionAffinityEnabled') {
+    throw 'Gateway v6 must use HMAC-persisted one-hour affinity, strict previous-response routing, safe replay gating, and streaming response-id observation.'
 }
 if ($localPatGatewaySource -notmatch 'RotationArmPath\s*=\s*"__rotation/arm"' -or
     $localPatGatewaySource -notmatch 'RotationClearPath\s*=\s*"__rotation/clear"' -or
     $localPatGatewaySource -notmatch 'BuildRotationArmPurpose\(payload\)' -or
     $localPatGatewaySource -notmatch 'LocalPatGatewayControl\.ValidateRequest' -or
+    $localPatGatewaySource -notmatch '(?s)private async Task HandleRotationArmAsync\(.*?response\.Headers\[LocalPatGateway\.RotationProtocolHeader\]\s*=\s*LocalPatGateway\.RotationProtocolValue;.*?private async Task HandleRotationClearAsync\(' -or
+    $localPatGatewaySource -notmatch '(?s)private async Task HandleRotationClearAsync\(.*?response\.Headers\[LocalPatGateway\.RotationProtocolHeader\]\s*=\s*LocalPatGateway\.RotationProtocolValue;.*?private async Task HandleSessionAffinityInvalidateAsync\(' -or
+    $localPatGatewaySource -notmatch '(?s)private async Task HandleSessionAffinityInvalidateAsync\(.*?response\.Headers\[LocalPatGateway\.RotationProtocolHeader\]\s*=\s*LocalPatGateway\.RotationProtocolValue;.*?private async Task<GatewayCredential> ApplyRotationAtRequestBoundaryAsync\(' -or
     $localPatGatewaySource -notmatch 'rotation\s*=\s*BuildRotationResponse\(rotation\)' -or
     $localPatGatewaySource -notmatch 'ApplyRotationAtRequestBoundaryAsync' -or
     $localPatGatewaySource -notmatch '_rotationActivationGate' -or
@@ -3035,11 +3151,11 @@ if ($localPatGatewaySource -notmatch 'RotationArmPath\s*=\s*"__rotation/arm"' -o
     $localPatGatewaySource -notmatch 'ReplayableModelRequestBodyMaxBytes' -or
     $localPatGatewaySource -notmatch 'hardUnavailableAccountKeys:\s*attemptedAccountKeys' -or
     $localPatGatewaySource -notmatch 'identity-network-failure' -or
-    $localPatGatewaySource -notmatch 'upstream-network-failure' -or
+    $localPatGatewaySource -notmatch '上游请求状态不确定' -or
     $localPatGatewaySource -notmatch '(?s)_rotationActivationGate\.Release\(\);.*?Task\.Delay\(TimeSpan\.FromMilliseconds\(25\)' -or
-    $localPatGatewaySource -notmatch '(?s)TrySelectNextTransparentRotationCredential.*?AccountRotationConfiguration\.BuildCandidates.*?ResolveRotationCredential' -or
+    $localPatGatewaySource -notmatch '(?s)TrySelectNextTransparentRotationCredential.*?_accountStore\.LoadAccounts\(\).*?_themeService\.LoadSettings\(\).*?AccountRotationConfiguration\.TrySelectNextCandidate.*?ResolveRotationCredential' -or
     $localPatGatewaySource -notmatch '(?s)CommitTransparentRotationAsync.*?_rotationStore\.Arm.*?_rotationStore\.Activate') {
-    throw 'The authenticated v5 gateway must buffer model bodies in memory, retry a pre-output 429 through the ordered rings, and commit only the successful logical route.'
+    throw 'The authenticated v6 gateway must buffer model bodies in memory, retry only safely replayable 429 requests through the ordered rings, and commit only the successful logical route.'
 }
 if ($patGatewayQuotaSignalStoreSource -notmatch 'FileName\s*=\s*"pat-gateway-quota-signals-v1\.json"' -or
     $patGatewayQuotaSignalStoreSource -notmatch 'FileOptions\.WriteThrough' -or
@@ -3099,9 +3215,23 @@ if (([regex]::Matches(
     ([regex]::Matches(
         $preparePatRotationMatch.Value,
         'CompletePatGatewayRotation\(')).Count -ne 1 -or
-    $preparePatRotationMatch.Value -notmatch 'AccountRotationConfiguration\.BuildCandidates' -or
+    $preparePatRotationMatch.Value -notmatch 'TrySelectLatestAccountRotationCandidate' -or
     $preparePatRotationMatch.Value -notmatch '(?s)if \(candidate\.IsCompatibleApi\).*?EnsureCompatibleApiRotationPreflightAsync.*?else.*?ConfirmPatRotationCandidateQuotaAsync.*?LocalPatGateway\.ArmRotationAsync.*?WaitForPatGatewayRotationActivationAsync.*?CompletePatGatewayRotation' -or
-    $preparePatRotationMatch.Value -notmatch '(?s)temporarilyUnavailable\.UnionWith\(attemptedPrimaryKeys\).*?AccountRotationConfiguration\.BuildCandidates.*?AccountRotationPool\.Backup.*?pendingCandidates\.Enqueue' -or
+    $preparePatRotationMatch.Value -notmatch '(?s)while \(true\).*?TrySelectLatestAccountRotationCandidate.*?attemptedAccountKeys\.Add\(targetKey\).*?ConfirmPatRotationCandidateQuotaAsync' -or
+    $preparePatRotationMatch.Value -notmatch '(?s)candidatePool == AccountRotationPool\.Backup\s*&&\s*hadUnconfirmedPrimaryCandidate' -or
+    $localPatGatewaySource -notmatch '(?s)TrySelectNextTransparentRotationCredential\(\s*credential,\s*attemptedAccountKeys,\s*allowCompatibleApiRetry,.*?allowBackupPool:\s*false' -or
+    $preparePatRotationMatch.Value -match 'BuildCandidates|pendingCandidates|Queue<AccountRecord>' -or
+    $formSource -notmatch '(?s)TrySelectLatestAccountRotationCandidate.*?_store\.LoadAccounts\(\).*?_themeService\.LoadSettings\(\).*?AccountRotationConfiguration\.TrySelectNextCandidate' -or
+    $formSource -notmatch '(?s)TrySelectLatestAccountRotationCandidate.*?_quotaSnapshotStore\.LoadForAccounts\(latestAccounts\).*?ReadLatestPerAccount\(nowUtc\).*?HasLocallyAvailableFiveHourQuota' -or
+    -not $refreshPrimaryReturnMatch.Success -or
+    $refreshPrimaryReturnMatch.Value -notmatch 'TryResolvePersistedPatGatewayLogicalAccount' -or
+    $refreshPrimaryReturnMatch.Value -match '_patAutoRotationGatewayTransportActive|_patAutoRotationLaunchContext' -or
+    -not $preparePrimaryReturnMatch.Success -or
+    $preparePrimaryReturnMatch.Value -notmatch '(?s)RecordPatRotationAccountAvailable\(candidate\).*?LocalPatGateway\.ArmRotationAsync' -or
+    $preparePrimaryReturnMatch.Value -match 'EnsureCompatibleApiRotationPreflightAsync|ConfirmPatRotationCandidateQuotaAsync' -or
+    $localPatGatewaySource -notmatch 'ShouldApplyRotationAtRequestBoundary' -or
+    $localPatGatewaySource -match 'if \(isModelRequest && !isIndependentAccountProbe && !credential\.IsCompatibleApi\)' -or
+    $localPatGatewaySource -notmatch 'replaceExistingArmedTarget' -or
     $cliServiceSource -notmatch '(?s)EnsureCompatibleApiRotationPreflightAsync\(.*?GetCompatibleApiRotationBaseUrlValidationError\(account\.ApiBaseUrl\).*?await EnsureCompatibleApiLaunchPreflightAsync\(account, cancellationToken\)' -or
     $cliServiceSource -notmatch '(?s)GetCompatibleApiRotationBaseUrlValidationError\(.*?baseUri\.Scheme\.Equals\("http".*?!LocalProxyDetector\.IsLoopbackHost\(baseUri\.Host\)' -or
     $cliServiceSource -notmatch '远程 API 轮换地址必须使用 HTTPS' -or
@@ -3149,6 +3279,7 @@ if ($recoverRotationContextMatch.Value -notmatch 'IsOfficialWindowsClientRunning
     $recoverRotationContextMatch.Value -notmatch 'FindRotationAccount\(rotation\.TargetAccountKey\)' -or
     $recoverRotationContextMatch.Value -notmatch 'IsSharedChatGptFeatureProfileAlreadySelected' -or
     $recoverRotationContextMatch.Value -notmatch 'IsSharedProfileAlreadySelected' -or
+    $recoverRotationContextMatch.Value -notmatch '(?s)FindProjectedPatGatewayTransportAccount\(\).*?rotation\.TransportAccountKey.*?LocalPatGateway\.ClearRotationAsync\(\).*?projectedRecoveryTransport\s*=\s*projectedTransport' -or
     $recoverRotationContextMatch.Value -notmatch '(?s)if \(!profileMatches\).*?return;.*?SetCurrentAccount\(logical\.Name, false, persistSettings:\s*true\)' -or
     $recoverRotationContextMatch.Value -notmatch 'new PatAutoRotationLaunchContext\(' -or
     $recoverRotationContextMatch.Value -notmatch '_launchedOfficialQuotaAccountKey\s*=\s*!logical\.IsCompatibleApi' -or
@@ -3157,8 +3288,8 @@ if ($recoverRotationContextMatch.Value -notmatch 'IsOfficialWindowsClientRunning
     $findRotationAccountMatch.Value -notmatch '\(account\.IsAccessToken\s*\|\|\s*account\.IsCompatibleApi\s*\|\|\s*account\.IsOfficialOAuth\)' -or
     $resumeRecoveredRotationMatch.Value -notmatch 'WaitForPatGatewayRotationActivationAsync' -or
     $resumeRecoveredRotationMatch.Value -notmatch 'CompletePatGatewayRotation' -or
-    ($recoverRotationContextMatch.Value + $resumeRecoveredRotationMatch.Value) -match 'LaunchAccountAsync|OpenOfficialCodexThreadAsync|LocalPatGateway\.ClearRotationAsync|ShutdownIfRunningAsync|StopWindowsClientProcesses|LaunchWindowsClient|Application\.Exit') {
-    throw 'After a side-by-side gateway handoff, the manager must recover the hashed transport/logical route and resume an armed PAT/OAuth/API switch without projecting credentials or restarting Codex.'
+    ($recoverRotationContextMatch.Value + $resumeRecoveredRotationMatch.Value) -match 'LaunchAccountAsync|OpenOfficialCodexThreadAsync|ShutdownIfRunningAsync|StopWindowsClientProcesses|LaunchWindowsClient|Application\.Exit') {
+    throw 'After a side-by-side gateway handoff, the manager must resume a matching route, retire a positively identified stale transport route, and never project credentials or restart Codex.'
 }
 if ($localProxyDetectorSource -notmatch 'DetectPortAsync' -or
     $localProxyDetectorSource -notmatch 'TcpListener\(IPAddress\.Loopback,\s*0\)' -or
@@ -3175,7 +3306,10 @@ if ($quotaSnapshotStoreSource -notmatch 'QuotaAccountIdentity\.CreateKey' -or
     $quotaSnapshotStoreSource -notmatch 'ValidateAccountIsolation' -or
     $formSource -notmatch 'HydratePersistedQuotaSnapshots' -or
     $formSource -notmatch '_quotaSnapshotStore\.Save' -or
-    $formSource -notmatch 'liveObservedAtUtc < usage\.RateLimitObservedAtUtc\.Value' -or
+    $formSource -notmatch 'liveObservedAtUtc >= usage\.RateLimitObservedAtUtc\.Value' -or
+    $formSource -notmatch 'currentResetAtUtc > liveObservedAtUtc' -or
+    $formSource -notmatch 'newResetAtUtc <= liveObservedAtUtc' -or
+    $formSource -notmatch 'A late shared-gateway log entry with an already-expired reset window must' -or
     $formSource -notmatch 'A newer official quota refresh must replace an older model-log snapshot across reset cycles' -or
     $programSource -notmatch 'Form1\.ValidateOfficialQuotaSnapshotPriority\(\)') {
     throw 'Official quota snapshots must be identity-scoped and newer official reset cycles must replace stale model-log percentages.'
@@ -3594,7 +3728,7 @@ if ($formSource -notmatch 'Task\.Run\(\(\) =>[\s\S]*?_usageTracker\.BuildReport\
     $formSource -notmatch 'var refresh = MakeHistoryActionButton\(' -or
     $formSource -notmatch 'var archive = MakeHistoryActionButton\(' -or
     $formSource -notmatch 'var delete = MakeHistoryActionButton\(\s*"删除",[\s\S]*?danger:\s*true\)' -or
-    $formSource -notmatch 'button\.Tag = danger \? "history-danger" : "history-tonal"' -or
+    $formSource -notmatch 'history-primary' -or
     $formSource -notmatch 'Equals\(button\.Tag, "history-tonal"\)[\s\S]*?ApplyHistoryActionButtonStyle\(button, danger:\s*false\)' -or
     $formSource -notmatch 'Equals\(button\.Tag, "history-danger"\)[\s\S]*?ApplyHistoryActionButtonStyle\(button, danger:\s*true\)' -or
     $formSource -notmatch 'var accent = danger \? _palette\.DangerColor : _palette\.PrimaryColor' -or
@@ -3729,8 +3863,8 @@ if ($formSource -notmatch 'BuildAccountGroups\(\s*visible(?:Accounts)?(?:,\s*(?:
     $formSource -notmatch 'visible\.FirstOrDefault\(IsCurrentAccount\)' -or
     $formSource -notmatch 'matchingProfiles' -or
     $formSource -notmatch '_codex\.IsSharedCredentialAlreadySelected\(account\)' -or
-    $formSource -notmatch 'var remembered = _accounts\.FirstOrDefault' -or
-    $formSource -notmatch 'SetCurrentAccount\(remembered\?\.Name, false(?:,\s*persistSettings:\s*persistSettings)?\)' -or
+     $formSource -notmatch 'var (?:remembered|rememberedLogical) = _accounts\.FirstOrDefault' -or
+     $formSource -notmatch 'SetCurrentAccount\((?:remembered|rememberedLogical)\?\.Name, false(?:,\s*persistSettings:\s*persistSettings)?\)' -or
     $formSource -notmatch 'var collapseRows = _collapsedAccountGroups\.Add\(stateKey\)' -or
     $formSource -notmatch 'row\.Visible = !collapseRows' -or
     $formSource -notmatch 'NativeWindowTheme\.SuspendRedraw\(_cardsPanel\)' -or

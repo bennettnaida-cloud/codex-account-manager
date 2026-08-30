@@ -111,6 +111,23 @@ static class Program
         Application.ThreadException += OnApplicationThreadException;
         AppDomain.CurrentDomain.UnhandledException += OnCurrentDomainUnhandledException;
         TaskScheduler.UnobservedTaskException += OnUnobservedTaskException;
+        // Refresh only the launcher files.  Do not repair/register the scheduled task here:
+        // that operation can require elevation and must never stop an already running
+        // Codex or gateway process.  The generated launcher validates PID, start time,
+        // executable path, and the manager PID before it can stop a prior client.
+        try
+        {
+            new CodexCliService().RefreshCodexPlusPlusTaskLauncherFiles();
+            ManagerLifecycleDiagnostics.Write("codex-plus-plus-launcher-files-refreshed");
+        }
+        catch (Exception ex)
+        {
+            // A read-only/locked LocalAppData directory must not prevent the manager UI
+            // from opening.  The next launch or an explicit repair can retry the refresh.
+            ManagerLifecycleDiagnostics.WriteException(
+                "codex-plus-plus-launcher-files-refresh-failed",
+                ex);
+        }
         ManagerLifecycleDiagnostics.Write(
             "manager-message-loop-started",
             $"preserve_gateway={preserveExistingPatGateway}; refresh_bridge={refreshNativeFastBridge}");
@@ -244,13 +261,8 @@ static class Program
         try
         {
             var store = new AccountStore();
+            ProxyNodeStore.Validate();
             var accounts = store.LoadAccounts();
-            if (accounts.Count == 0)
-            {
-                Console.Error.WriteLine("No accounts configured.");
-                return 2;
-            }
-
             foreach (var account in accounts)
             {
                 if (string.IsNullOrWhiteSpace(account.Name) || string.IsNullOrWhiteSpace(account.CodexHome))
@@ -263,11 +275,18 @@ static class Program
             CodexCliService.ValidateConfigProjectionDefaults();
             CodexCliService.ValidateLocalPatConfigMigration();
             LocalPatGatewayHost.ValidateRoutingAndCredentialClassification();
+            LocalPatGatewayHost.ValidateSessionAffinityRouting();
             LocalPatGatewayHost.ValidatePatRejectionMessaging();
+            Form1.ValidateGatewaySuccessfulActivityIsolation();
             PatAutoRotationPolicy.Validate();
             AccountRotationConfiguration.Validate();
+            CodexFingerprintConvergence.Validate();
+            OpenAIContentSessionSeed.Validate();
             PatGatewayRotationStore.Validate();
+            PatGatewaySuccessfulActivityStore.Validate();
             PatGatewayQuotaSignalStore.Validate();
+            PatGatewaySessionAffinityStore.Validate();
+            OpenAIResponseIdObserver.Validate();
             CodexTaskBoundaryMonitor.Validate();
             CodexCliService.ValidateDesktopSidebarProjection();
             CodexCliService.ValidateSharedProfileProjection();

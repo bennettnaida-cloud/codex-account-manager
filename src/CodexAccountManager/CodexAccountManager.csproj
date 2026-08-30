@@ -15,8 +15,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Content Include="..\..\assets\CodexAccountManager.ico" Link="assets\CodexAccountManager.ico" CopyToOutputDirectory="PreserveNewest" />
-    <Content Include="..\..\assets\CodexAccountManager.png" Link="assets\CodexAccountManager.png" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\assets\CodexAccountManager.ico" Link="assets\CodexAccountManager.ico" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+    <Content Include="..\..\assets\CodexAccountManager.png" Link="assets\CodexAccountManager.png" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
     <Content Include="..\..\assets\model-catalog.json" Link="assets\model-catalog.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
     <Content Include="..\..\tools\CodexDreamSkin\**\*">
       <Link>CodexDreamSkin\%(RecursiveDir)%(Filename)%(Extension)</Link>
@@ -29,6 +29,11 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite.Core" Version="10.0.9" />
     <PackageReference Include="SQLitePCLRaw.provider.winsqlite3" Version="3.0.3" />
+    <!-- Managed zstd decoder used to inspect/replay Codex model requests.  The
+         desktop client may send Content-Encoding: zstd; keeping the decoder
+         in-process avoids rejecting an otherwise valid request or depending on
+         an external DLL installed on C:. -->
+    <PackageReference Include="ZstdSharp.Port" Version="0.8.8" />
   </ItemGroup>
 
 </Project>

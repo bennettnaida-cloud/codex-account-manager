@@ -38,9 +38,10 @@ Codex Account Manager 是一个在本机运行的 Codex 多账号管理器。它
 - 通过管理器启动 PAT/API 账号时，在官方 Codex 内显示其原生 Standard/Fast 选择器并保留所选服务层级。
 - 聊天页先显示本地缓存，再通过当前 Codex app-server 在后台同步共享目录与短标题；支持打开、归档、取消归档和永久删除，Codex 暂不可用时仍可使用缓存。
 - 按账号读取官方额度窗口、重置时间、Credits 和可重置次数。
-- 提供使用池与备用池两级账号轮换；PAT、官方 ChatGPT OAuth 和兼容 API 可自定义参与状态与顺序。模型请求遇到 HTTP 429 时，网关会在尚未输出响应内容前按池顺序透明重试同一请求，不关闭 Codex；使用池全部不可用后才进入备用池。
+- 提供使用池与备用池两级账号轮换；PAT、官方 ChatGPT OAuth 和兼容 API 可自定义参与状态与顺序。开启会话粘性后，每个请求只按优先级选择一个普通粘性标识（显式 session/conversation、`prompt_cache_key`、turn metadata 或稳定内容摘要），并以默认 60 分钟的滑动有效期绑定到完整成功的账号。可安全重放的普通请求遇到 HTTP 429 时可按池顺序换号并在成功后改绑；`previous_response_id` 使用独立的已确认绑定，未知绑定、原账号不可用或 429 均不会跨账号重放。关闭普通会话粘性后，已确认的 `previous_response_id` 绑定仍保留严格账号约束。
 - 轮换位置与 5h 重置时间会持久化；使用池恢复后等待一分钟，再从下一次请求返回使用池。安全余量会根据最近请求消耗动态计算。
-- “状态与凭据”支持逐账号开启安全的客户端元数据透传；授权、Cookie、ChatGPT 账号、组织、项目和工作区身份头始终不会跨账号透传。
+- 对经本地网关转发的账号，可逐账号选择 `gateway_default / off / device / session / full`：`gateway_default` 沿用旧版客户端元数据过滤，`off` 转发网关允许的指纹字段但不收敛，`device` 只收敛 installation，`session` 还固定账号 session 并按客户端 session 派生 thread，`full` 将 thread/window 收敛到账号 session。可安全重写时，`device / session / full` 对请求头和 JSON 请求体使用同一计划；官方 OAuth 原生直连不受此设置影响。授权、Cookie 以及 ChatGPT/组织/项目/工作区身份头始终不会跨账号透传。
+- 会话与 response 粘性缓存只持久化 HMAC 摘要和账号哈希，不保存原始 session、conversation、prompt-cache 或 response ID。
 - 从本地 JSONL 与 SQLite 日志统计 Token、缓存写入和逐模型 API 等值成本。
 - 提供 1h、5h、今天、本周、本月趋势、模型分布和 CSV 导出。
 - 在系统配置中管理项目目录、启动目录、HTTP/SOCKS5 上游代理和自动检测；本地 PAT 网关默认随软件启动，也可手动打开或关闭。
