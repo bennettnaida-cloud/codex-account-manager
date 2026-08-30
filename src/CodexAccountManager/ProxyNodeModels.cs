@@ -302,6 +302,27 @@ public sealed class ProxyNodeStore
             var resolver = new AccountProxyResolver(root);
             var resolvedA = resolver.Resolve(key); var resolvedB = resolver.Resolve(AccountProxyResolver.AccountKeyFor(accountB));
             if (!resolvedA.Success || !resolvedB.Success || resolvedA.NodeId == resolvedB.NodeId || resolvedA.PoolKey == resolvedB.PoolKey) throw new InvalidOperationException("Per-account proxy routing was not isolated.");
+            store.SetBinding(new AccountProxyBinding
+            {
+                AccountKey = key,
+                Mode = ProxyBindingMode.FixedNode,
+                NodeId = preview.Nodes[0].NodeId,
+                FallbackPolicy = ProxyFallbackPolicy.InheritGlobal
+            });
+            var globalResolution = resolver.ResolveGlobal();
+            if (!globalResolution.Success || globalResolution.NodeId != null ||
+                !resolver.AllowsRuntimeGlobalFallback(key, preview.Nodes[0].NodeId) ||
+                resolver.AllowsRuntimeGlobalFallback(key, preview.Nodes[1].NodeId))
+                throw new InvalidOperationException("Account proxy runtime global fallback policy failed.");
+            store.SetBinding(new AccountProxyBinding
+            {
+                AccountKey = key,
+                Mode = ProxyBindingMode.FixedNode,
+                NodeId = preview.Nodes[0].NodeId,
+                FallbackPolicy = ProxyFallbackPolicy.FailClosed
+            });
+            if (resolver.AllowsRuntimeGlobalFallback(key, preview.Nodes[0].NodeId))
+                throw new InvalidOperationException("Fail-closed account proxy unexpectedly allowed runtime fallback.");
             store.RemoveBinding(key); if (!resolver.Resolve(key).Success || resolver.Resolve(key).NodeId != null) throw new InvalidOperationException("Unbound account did not inherit global proxy.");
         }
         finally { try { if (Directory.Exists(root)) Directory.Delete(root, true); } catch { } }
@@ -335,6 +356,10 @@ public sealed class AccountProxyResolver : IDisposable
             }
             if (binding.FallbackPolicy == ProxyFallbackPolicy.FailClosed) return ProxyResolution.Fail("账号绑定的代理节点不存在、已禁用或配置无效。");
         }
+        return ResolveGlobal();
+    }
+    public ProxyResolution ResolveGlobal()
+    {
         var settings = _theme.LoadSettings();
         var explicitProxy = Environment.GetEnvironmentVariable("CODEX_PAT_GATEWAY_PROXY");
         var global = !string.IsNullOrWhiteSpace(explicitProxy)
@@ -342,6 +367,17 @@ public sealed class AccountProxyResolver : IDisposable
             : (!string.IsNullOrWhiteSpace(settings.PatGatewayProxy) ? settings.PatGatewayProxy : CodexCliService.BuildPatGatewayProxyUri(settings));
         if (!Uri.TryCreate(global, UriKind.Absolute, out var globalUri) || globalUri.Scheme is not ("http" or "https")) return ProxyResolution.Fail("未配置可用的全局代理；为防止意外直连，网关已停止请求。");
         return new(true, globalUri, null, "global:" + globalUri.AbsoluteUri, "");
+    }
+    public bool AllowsRuntimeGlobalFallback(string? accountKey, string? failedNodeId)
+    {
+        if (string.IsNullOrWhiteSpace(accountKey) || string.IsNullOrWhiteSpace(failedNodeId)) return false;
+        var binding = _store.GetBinding(accountKey);
+        if (_store.BindingsLoadFailed && File.Exists(_store.BindingsPath)) return false;
+        return binding is
+        {
+            Mode: ProxyBindingMode.FixedNode,
+            FallbackPolicy: ProxyFallbackPolicy.InheritGlobal
+        } && binding.NodeId?.Equals(failedNodeId, StringComparison.OrdinalIgnoreCase) == true;
     }
     public ProxyNodeRecord? GetNode(string? nodeId) => string.IsNullOrWhiteSpace(nodeId)
         ? null

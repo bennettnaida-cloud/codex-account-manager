@@ -2234,6 +2234,7 @@ internal sealed class LocalPatGatewayHost
                 ? BeginModelRequest(credential.AccountKey)
                 : null;
             var attemptedAccountKeys = new HashSet<string>(StringComparer.Ordinal);
+            var runtimeGlobalProxyFallbackAccounts = new HashSet<string>(StringComparer.Ordinal);
             var allowCompatibleApiRetry = CanRewriteCompatibleApiRequestBody(
                 context.Request,
                 replayableBody);
@@ -2314,9 +2315,13 @@ internal sealed class LocalPatGatewayHost
 
                 var useDirectConnection = credential.IsCompatibleApi &&
                                           LocalProxyDetector.IsLoopbackHost(upstreamUri.Host);
+                var runtimeFallbackAccountKey = NormalizeOptionalAccountKey(credential.AccountKey);
                 var proxyResolution = useDirectConnection
                     ? new ProxyResolution(true, null, null, "direct", "")
-                    : ResolveProxyForCredential(credential);
+                    : runtimeFallbackAccountKey != null &&
+                      runtimeGlobalProxyFallbackAccounts.Contains(runtimeFallbackAccountKey)
+                        ? ResolveGlobalProxy()
+                        : ResolveProxyForCredential(credential);
                 var proxyUri = proxyResolution.ProxyUri;
                 if (!useDirectConnection && !proxyResolution.Success)
                 {
@@ -2408,6 +2413,15 @@ internal sealed class LocalPatGatewayHost
                         ex is HttpRequestException or TaskCanceledException or JsonException or
                         InvalidDataException)
                     {
+                        if (ex is HttpRequestException or TaskCanceledException &&
+                            TryActivateRuntimeGlobalProxyFallback(
+                                credential,
+                                proxyResolution,
+                                runtimeGlobalProxyFallbackAccounts,
+                                "identity-network-failure"))
+                        {
+                            continue;
+                        }
                         if (lastQuotaResponse != null)
                         {
                             if (!string.IsNullOrWhiteSpace(credential.AccountKey))
@@ -2670,6 +2684,14 @@ internal sealed class LocalPatGatewayHost
                 }
                 catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
                 {
+                    if (TryActivateRuntimeGlobalProxyFallback(
+                            credential,
+                            proxyResolution,
+                            runtimeGlobalProxyFallbackAccounts,
+                            "model-network-failure"))
+                    {
+                        continue;
+                    }
                     if (lastQuotaResponse != null)
                     {
                         // SendAsync does not prove that the request was not accepted by
@@ -6168,13 +6190,44 @@ internal sealed class LocalPatGatewayHost
     private ProxyResolution ResolveProxyForCredential(GatewayCredential? credential)
     {
         var accountKey = credential?.AccountKey;
-        var resolution = _proxyResolver.Resolve(accountKey);
+        return RejectGatewayLoop(_proxyResolver.Resolve(accountKey));
+    }
+
+    private ProxyResolution ResolveGlobalProxy()
+    {
+        return RejectGatewayLoop(_proxyResolver.ResolveGlobal());
+    }
+
+    private static ProxyResolution RejectGatewayLoop(ProxyResolution resolution)
+    {
         if (resolution.Success && resolution.ProxyUri is { } uri &&
             LocalProxyDetector.IsLoopbackHost(uri.Host) && uri.Port == LocalPatGateway.Port)
         {
             return ProxyResolution.Fail("代理配置指向本地 PAT 网关自身；为防止循环转发，请修改代理节点。");
         }
         return resolution;
+    }
+
+    private bool TryActivateRuntimeGlobalProxyFallback(
+        GatewayCredential credential,
+        ProxyResolution failedResolution,
+        HashSet<string> fallbackAccounts,
+        string reason)
+    {
+        var accountKey = NormalizeOptionalAccountKey(credential.AccountKey);
+        if (accountKey == null || failedResolution.NodeId == null ||
+            fallbackAccounts.Contains(accountKey) ||
+            !_proxyResolver.AllowsRuntimeGlobalFallback(accountKey, failedResolution.NodeId) ||
+            !ResolveGlobalProxy().Success)
+        {
+            return false;
+        }
+
+        fallbackAccounts.Add(accountKey);
+        ManagerLifecycleDiagnostics.Write(
+            "pat-gateway-account-proxy-fallback-activated",
+            $"reason={reason}; proxy=fixed-to-global; downstream_bytes=0");
+        return true;
     }
 
     private static GatewayCredential? ReadBearerCredential(HttpListenerRequest request)
