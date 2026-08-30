@@ -320,7 +320,9 @@ internal static class LocalPatGateway
                 rotationProtocol,
                 ReadAccountKey(activity, "lastSuccessfulModelRequestAccountKey"),
                 ReadUnixMilliseconds(activity, "lastSuccessfulModelRequestCompletedAtUnixMs"),
-                ReadUnixMilliseconds(activity, "lastSuccessfulModelRequestStartedAtUnixMs"));
+                ReadUnixMilliseconds(activity, "lastSuccessfulModelRequestStartedAtUnixMs"),
+                ReadOptionalString(activity, "lastSuccessfulModelRequestProxyNodeId"),
+                ReadOptionalNullableBoolean(activity, "lastSuccessfulModelRequestUsedGlobalProxy"));
         }
         catch (Exception ex) when (
             ex is HttpRequestException or
@@ -583,6 +585,36 @@ internal static class LocalPatGateway
             return null;
         }
         return normalized;
+    }
+
+    private static string? ReadOptionalString(JsonElement source, string propertyName)
+    {
+        if (!source.TryGetProperty(propertyName, out var value) ||
+            value.ValueKind != JsonValueKind.String ||
+            string.IsNullOrWhiteSpace(value.GetString()))
+        {
+            return null;
+        }
+        return value.GetString()!.Trim();
+    }
+
+    private static bool ReadOptionalBoolean(JsonElement source, string propertyName) =>
+        source.TryGetProperty(propertyName, out var value) &&
+        value.ValueKind == JsonValueKind.True;
+
+    private static bool? ReadOptionalNullableBoolean(JsonElement source, string propertyName)
+    {
+        if (!source.TryGetProperty(propertyName, out var value) ||
+            value.ValueKind == JsonValueKind.Null)
+        {
+            return null;
+        }
+        return value.ValueKind switch
+        {
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            _ => null
+        };
     }
 
     private static string BuildRotationArmPurpose(ReadOnlySpan<byte> payload) =>
@@ -948,7 +980,9 @@ internal sealed record LocalPatGatewayActivitySnapshot(
     string? RotationProtocol = null,
     string? LastSuccessfulModelRequestAccountKey = null,
     DateTimeOffset? LastSuccessfulModelRequestCompletedAtUtc = null,
-    DateTimeOffset? LastSuccessfulModelRequestStartedAtUtc = null);
+    DateTimeOffset? LastSuccessfulModelRequestStartedAtUtc = null,
+    string? LastSuccessfulModelRequestProxyNodeId = null,
+    bool? LastSuccessfulModelRequestUsedGlobalProxy = null);
 
 internal sealed class LocalPatGatewayHost
 {
@@ -967,6 +1001,10 @@ internal sealed class LocalPatGatewayHost
     private const string DefaultUserAgent =
         "codex_cli_rs/0.144.1 (Windows 10.0.0; x86_64) codex-account-manager";
     private static readonly TimeSpan IdentityCacheLifetime = TimeSpan.FromMinutes(30);
+    // A dead per-account node must not hold a whoami or response-header connection
+    // for the default HttpClient lifetime. This is only the pre-header attempt bound;
+    // once SSE headers arrive, the stream keeps using the caller's request deadline.
+    private static readonly TimeSpan UpstreamAttemptHeadersTimeout = TimeSpan.FromSeconds(6);
     private const int MaxUpstreamErrorBodyBytes = 16 * 1024;
     private const int Transient429SameAccountRetryLimit = 2;
     // A request may walk the latest configured ring after a transient 429, but a
@@ -1096,6 +1134,8 @@ internal sealed class LocalPatGatewayHost
     private DateTimeOffset? _lastModelRequestStartedAtUtc;
     private DateTimeOffset? _lastModelRequestCompletedAtUtc;
     private string? _lastSuccessfulModelRequestAccountKey;
+    private string? _lastSuccessfulModelRequestProxyNodeId;
+    private bool? _lastSuccessfulModelRequestUsedGlobalProxy;
     private DateTimeOffset? _lastSuccessfulModelRequestStartedAtUtc;
     private DateTimeOffset? _lastSuccessfulModelRequestCompletedAtUtc;
     private DateTimeOffset? _lastQuotaLimitedAtUtc;
@@ -2252,6 +2292,8 @@ internal sealed class LocalPatGatewayHost
             var hadSuccessfulTransparentRetry = false;
             var transient429CandidateFailoverCount = 0;
             var preserveAffinityBindingOnSuccess = false;
+            string? successfulProxyNodeId = null;
+            var successfulRequestUsedGlobalProxy = false;
 
             while (finalUpstreamResponse == null)
             {
@@ -2341,6 +2383,16 @@ internal sealed class LocalPatGatewayHost
                     return;
                 }
                 var clientKey = useDirectConnection ? "direct" : proxyResolution.PoolKey;
+                if (isModelRequest && !isIndependentAccountProbe)
+                {
+                    // Keep the route that actually reaches the successful response.
+                    // A retry can overwrite this from node A to node B or to global;
+                    // the health endpoint must never report the first failed attempt.
+                    successfulProxyNodeId = proxyResolution.NodeId;
+                    successfulRequestUsedGlobalProxy = !useDirectConnection &&
+                        proxyResolution.NodeId == null &&
+                        proxyResolution.PoolKey.StartsWith("global:", StringComparison.Ordinal);
+                }
                 var proxyNode = _proxyResolver.GetNode(proxyResolution.NodeId);
                 var client = _clients.GetOrAdd(
                     clientKey,
@@ -2413,7 +2465,8 @@ internal sealed class LocalPatGatewayHost
                         ex is HttpRequestException or TaskCanceledException or JsonException or
                         InvalidDataException)
                     {
-                        if (ex is HttpRequestException or TaskCanceledException &&
+                        if (!requestCancellationToken.IsCancellationRequested &&
+                            (ex is HttpRequestException or TaskCanceledException) &&
                             TryActivateRuntimeGlobalProxyFallback(
                                 credential,
                                 proxyResolution,
@@ -2677,14 +2730,18 @@ internal sealed class LocalPatGatewayHost
                 HttpResponseMessage attemptResponse;
                 try
                 {
+                    using var attemptDeadline = CancellationTokenSource.CreateLinkedTokenSource(
+                        requestCancellationToken);
+                    attemptDeadline.CancelAfter(UpstreamAttemptHeadersTimeout);
                     attemptResponse = await client.SendAsync(
                         upstreamRequest,
                         HttpCompletionOption.ResponseHeadersRead,
-                        requestCancellationToken);
+                        attemptDeadline.Token);
                 }
                 catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
                 {
-                    if (TryActivateRuntimeGlobalProxyFallback(
+                    if (!requestCancellationToken.IsCancellationRequested &&
+                        TryActivateRuntimeGlobalProxyFallback(
                             credential,
                             proxyResolution,
                             runtimeGlobalProxyFallbackAccounts,
@@ -3175,7 +3232,9 @@ internal sealed class LocalPatGatewayHost
                     // fields is still represented by the completed HTTP status above.
                     RecordSuccessfulModelRequest(
                         credential.AccountKey,
-                        modelRequestActivity?.StartedAtUtc);
+                        modelRequestActivity?.StartedAtUtc,
+                        successfulProxyNodeId,
+                        successfulRequestUsedGlobalProxy);
                 }
 
                 if (isModelRequest && !isIndependentAccountProbe && affinityRequest != null &&
@@ -3367,6 +3426,10 @@ internal sealed class LocalPatGatewayHost
                         activity.LastSuccessfulModelRequestCompletedAtUtc?.ToUnixTimeMilliseconds(),
                     lastSuccessfulModelRequestStartedAtUnixMs =
                         activity.LastSuccessfulModelRequestStartedAtUtc?.ToUnixTimeMilliseconds(),
+                    lastSuccessfulModelRequestProxyNodeId =
+                        activity.LastSuccessfulModelRequestProxyNodeId,
+                    lastSuccessfulModelRequestUsedGlobalProxy =
+                        activity.LastSuccessfulModelRequestUsedGlobalProxy,
                     lastQuotaLimitedAtUnixMs = activity.LastQuotaLimitedAtUtc?.ToUnixTimeMilliseconds()
                 },
                 rotation = BuildRotationResponse(rotation)
@@ -4897,7 +4960,9 @@ internal sealed class LocalPatGatewayHost
 
     private void RecordSuccessfulModelRequest(
         string? accountKey,
-        DateTimeOffset? startedAtUtc)
+        DateTimeOffset? startedAtUtc,
+        string? proxyNodeId,
+        bool usedGlobalProxy)
     {
         var normalized = NormalizeOptionalAccountKey(accountKey);
         if (normalized == null)
@@ -4909,6 +4974,10 @@ internal sealed class LocalPatGatewayHost
         lock (_activityGate)
         {
             _lastSuccessfulModelRequestAccountKey = normalized;
+            _lastSuccessfulModelRequestProxyNodeId = string.IsNullOrWhiteSpace(proxyNodeId)
+                ? null
+                : proxyNodeId;
+            _lastSuccessfulModelRequestUsedGlobalProxy = usedGlobalProxy;
             _lastSuccessfulModelRequestStartedAtUtc = startedAtUtc;
             _lastSuccessfulModelRequestCompletedAtUtc = completedAtUtc;
         }
@@ -5014,7 +5083,9 @@ internal sealed class LocalPatGatewayHost
                 RotationProtocol: null,
                 LastSuccessfulModelRequestAccountKey: _lastSuccessfulModelRequestAccountKey,
                 LastSuccessfulModelRequestCompletedAtUtc: _lastSuccessfulModelRequestCompletedAtUtc,
-                LastSuccessfulModelRequestStartedAtUtc: _lastSuccessfulModelRequestStartedAtUtc);
+                LastSuccessfulModelRequestStartedAtUtc: _lastSuccessfulModelRequestStartedAtUtc,
+                LastSuccessfulModelRequestProxyNodeId: _lastSuccessfulModelRequestProxyNodeId,
+                LastSuccessfulModelRequestUsedGlobalProxy: _lastSuccessfulModelRequestUsedGlobalProxy);
         }
     }
 
@@ -5070,7 +5141,9 @@ internal sealed class LocalPatGatewayHost
         request.Headers.TryAddWithoutValidation("originator", DefaultOriginator);
         request.Headers.TryAddWithoutValidation("User-Agent", DefaultUserAgent);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(TimeSpan.FromSeconds(20));
+        // Keep identity probing bounded so a dead fixed node can fall back to the
+        // configured global proxy promptly instead of waiting the old 20-second limit.
+        timeout.CancelAfter(TimeSpan.FromSeconds(6));
         using var response = await client.SendAsync(
             request,
             HttpCompletionOption.ResponseHeadersRead,
@@ -6217,13 +6290,21 @@ internal sealed class LocalPatGatewayHost
         var accountKey = NormalizeOptionalAccountKey(credential.AccountKey);
         if (accountKey == null || failedResolution.NodeId == null ||
             fallbackAccounts.Contains(accountKey) ||
-            !_proxyResolver.AllowsRuntimeGlobalFallback(accountKey, failedResolution.NodeId) ||
-            !ResolveGlobalProxy().Success)
+            !_proxyResolver.AllowsRuntimeGlobalFallback(accountKey, failedResolution.NodeId))
+        {
+            return false;
+        }
+
+        var globalResolution = ResolveGlobalProxy();
+        if (!globalResolution.Success)
         {
             return false;
         }
 
         fallbackAccounts.Add(accountKey);
+        _proxyResolver.MarkRuntimeFailure(
+            failedResolution.NodeId,
+            "运行时请求失败，已回退全局代理；旧出口 IP 仅作历史记录。");
         ManagerLifecycleDiagnostics.Write(
             "pat-gateway-account-proxy-fallback-activated",
             $"reason={reason}; proxy=fixed-to-global; downstream_bytes=0");

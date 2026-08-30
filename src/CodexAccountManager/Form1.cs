@@ -4306,7 +4306,7 @@ public partial class Form1 : Form
                 _proxySidebar.Margin = Padding.Empty;
                 _proxySidebar.AutoSize = false;
                 _proxySidebar.Width = Math.Max(320, workspaceWidth);
-                _proxySidebar.Height = Math.Max(820, _cardsPanel.ClientSize.Height - 4);
+                _proxySidebar.Height = Math.Max(620, _cardsPanel.ClientSize.Height - 4);
                 _proxySidebar.Visible = true;
                 _proxySidebar.SetAccounts(_accounts, _selectedAccountName);
                 _cardsPanel.Controls.Add(_proxySidebar);

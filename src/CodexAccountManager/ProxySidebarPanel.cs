@@ -172,7 +172,7 @@ internal sealed class ProxySidebarPanel : Panel
         _remove.Click += (_, _) => RemoveNode();
         _toggle.Click += (_, _) => ToggleNode();
         _import.Click += async (_, _) => await ImportNodesAsync();
-        _test.Click += async (_, _) => await RunTestGuardedAsync(TestSelectedAsync, "正在测试 ChatGPT…", TimeSpan.FromSeconds(14));
+        _test.Click += async (_, _) => await RunTestGuardedAsync(TestSelectedAsync, "正在测试 ChatGPT…", TimeSpan.FromSeconds(8));
         _continuous.Click += async (_, _) => await RunTestGuardedAsync(ContinuousTestAsync, "正在连续测速…", TimeSpan.FromSeconds(20));
         _testAll.Click += async (_, _) => await RunTestGuardedAsync(TestAllAsync, "正在一键测速全部节点…", TimeSpan.FromSeconds(90));
         _nodesCard.Controls.AddRange([_add, _edit, _remove, _toggle, _import, _test, _continuous, _testAll]);
@@ -306,15 +306,29 @@ internal sealed class ProxySidebarPanel : Panel
         _metricsCard.SetBounds(24, metricsTop, width, Math.Max(92, _nodesCard.ClientSize.Height - metricsTop - 20));
         _metrics.SetBounds(16, 10, Math.Max(120, _metricsCard.ClientSize.Width - 32), Math.Max(60, _metricsCard.ClientSize.Height - 20));
 
-        var protocolWidth = Math.Clamp(width / 9, 74, 100);
-        var latencyWidth = Math.Clamp(width / 8, 86, 120);
-        var exitIpWidth = Math.Clamp(width / 6, 118, 168);
-        var nameWidth = Math.Clamp(width / 5, 130, 210);
+        // Keep the human-readable node name prominent and make the technical endpoint
+        // compact.  Calculate against the actual ListView client width so the sum of
+        // columns never creates the horizontal scrollbar that used to appear on the
+        // right side of this workspace.
+        // Reserve the native vertical-scrollbar slot even before it becomes visible;
+        // otherwise adding the final rows can shrink ClientSize and reintroduce a
+        // horizontal scrollbar after the columns were measured.
+        var columnWidth = Math.Max(320, _nodes.ClientSize.Width - SystemInformation.VerticalScrollBarWidth - 4);
+        var protocolWidth = 72;
+        var latencyWidth = 92;
+        var exitIpWidth = 132;
+        var addressWidth = Math.Clamp((int)Math.Round(width * 0.16D), 140, 200);
+        var nameWidth = columnWidth - protocolWidth - latencyWidth - exitIpWidth - addressWidth - 4;
+        if (nameWidth < 260)
+        {
+            nameWidth = 260;
+            addressWidth = Math.Max(120, columnWidth - protocolWidth - latencyWidth - exitIpWidth - nameWidth - 4);
+        }
         _nodes.Columns[0].Width = nameWidth;
         _nodes.Columns[1].Width = protocolWidth;
         _nodes.Columns[3].Width = latencyWidth;
         _nodes.Columns[4].Width = exitIpWidth;
-        _nodes.Columns[2].Width = Math.Max(150, width - nameWidth - protocolWidth - latencyWidth - exitIpWidth - 8);
+        _nodes.Columns[2].Width = addressWidth;
     }
 
     public void ApplyPalette(ThemePalette palette)
@@ -357,6 +371,7 @@ internal sealed class ProxySidebarPanel : Panel
         _nodes.BackColor = palette.InputBackColor;
         _nodes.ForeColor = palette.TextColor;
         _nodes.Invalidate();
+        UpdateBoundNodeHighlight();
     }
 
     private static IEnumerable<Control> Descendants(Control parent)
@@ -388,7 +403,7 @@ internal sealed class ProxySidebarPanel : Panel
             var latency = node.Enabled && string.IsNullOrWhiteSpace(node.LastHealthError) && node.LastFirstResponseMilliseconds.HasValue
                 ? $"{node.LastFirstResponseMilliseconds.Value:0} ms"
                 : "-1";
-            var exitIp = string.IsNullOrWhiteSpace(node.LastExitIp) ? "未检测" : node.LastExitIp;
+            var exitIp = FormatExitIpForList(node);
             var item = new ListViewItem(node.Name) { Tag = node };
             item.SubItems.Add(CompactProtocol(node.Scheme));
             item.SubItems.Add(node.DisplayAddress);
@@ -398,11 +413,13 @@ internal sealed class ProxySidebarPanel : Panel
             if (selectedNodeId != null && node.NodeId.Equals(selectedNodeId, StringComparison.OrdinalIgnoreCase)) item.Selected = true;
         }
         _nodes.EndUpdate();
+        LayoutNodesCard();
         _node.Items.Clear();
         _node.Items.Add("（选择节点）");
         foreach (var node in nodes) _node.Items.Add(new NodeItem(node));
         if (_node.SelectedIndex < 0) _node.SelectedIndex = 0;
         UpdateNodeMetrics();
+        UpdateBoundNodeHighlight();
     }
     private static string CompactProtocol(string scheme) => scheme.ToLowerInvariant() switch
     {
@@ -423,8 +440,66 @@ internal sealed class ProxySidebarPanel : Panel
         _mode.SelectedIndex = binding?.Mode switch { ProxyBindingMode.FixedNode => 1, ProxyBindingMode.Disabled => 2, _ => 0 };
         _fallback.SelectedIndex = binding?.FallbackPolicy == ProxyFallbackPolicy.InheritGlobal ? 1 : 0;
         var idx = binding?.NodeId == null ? 0 : Enumerable.Range(1, Math.Max(0, _node.Items.Count - 1)).FirstOrDefault(i => (_node.Items[i] as NodeItem)?.Node.NodeId.Equals(binding.NodeId, StringComparison.OrdinalIgnoreCase) == true, 0);
-        _node.SelectedIndex = _node.Items.Count == 0 ? -1 : Math.Clamp(idx, 0, _node.Items.Count - 1); UpdateBindingEditor();
+        _node.SelectedIndex = _node.Items.Count == 0 ? -1 : Math.Clamp(idx, 0, _node.Items.Count - 1);
+        SelectBoundNode(binding?.Mode == ProxyBindingMode.FixedNode ? binding.NodeId : null);
+        UpdateBindingEditor();
     }
+
+    private void SelectBoundNode(string? nodeId)
+    {
+        if (!IsUsable) return;
+        _nodes.BeginUpdate();
+        try
+        {
+            foreach (ListViewItem item in _nodes.Items)
+            {
+                var matches = nodeId != null && item.Tag is ProxyNodeRecord node &&
+                              node.NodeId.Equals(nodeId, StringComparison.OrdinalIgnoreCase);
+                item.Selected = matches;
+                if (matches) item.EnsureVisible();
+            }
+        }
+        finally
+        {
+            _nodes.EndUpdate();
+        }
+        UpdateBoundNodeHighlight();
+    }
+
+    private void UpdateBoundNodeHighlight()
+    {
+        if (!IsUsable) return;
+        var account = SelectedAccount();
+        var binding = account == null ? null : _store.GetBinding(AccountProxyResolver.AccountKeyFor(account));
+        var boundNodeId = binding?.Mode == ProxyBindingMode.FixedNode ? binding.NodeId : null;
+        var highlightBack = _palette == null
+            ? Color.FromArgb(220, 237, 255)
+            : Color.FromArgb(218, _palette.PrimaryColor.R, _palette.PrimaryColor.G, _palette.PrimaryColor.B);
+        var highlightText = _palette == null ? Color.FromArgb(24, 83, 160) : _palette.PrimaryColor;
+        foreach (ListViewItem item in _nodes.Items)
+        {
+            var matches = boundNodeId != null && item.Tag is ProxyNodeRecord node &&
+                          node.NodeId.Equals(boundNodeId, StringComparison.OrdinalIgnoreCase);
+            item.BackColor = matches ? highlightBack : _nodes.BackColor;
+            item.ForeColor = matches ? highlightText : _nodes.ForeColor;
+            item.ToolTipText = matches && account != null
+                ? $"当前账号绑定节点：{account.Name}"
+                : string.Empty;
+        }
+        _nodes.Invalidate();
+    }
+
+    private static string FormatExitIpForList(ProxyNodeRecord node)
+    {
+        if (string.IsNullOrWhiteSpace(node.LastExitIp)) return "未检测";
+        return HasCurrentExitIp(node) ? node.LastExitIp : $"上次 {node.LastExitIp}";
+    }
+
+    private static bool HasCurrentExitIp(ProxyNodeRecord node) =>
+        node.LastHealthError == null &&
+        node.LastExitIpObservedAtUtc.HasValue &&
+        node.LastHealthTestAtUtc.HasValue &&
+        node.LastExitIpObservedAtUtc.Value >= node.LastHealthTestAtUtc.Value;
     private void UpdateBindingEditor()
     {
         if (!IsUsable) return;
@@ -437,7 +512,11 @@ internal sealed class ProxySidebarPanel : Panel
         if (!IsUsable) return;
         var node = SelectedNode();
         if (node == null) { SetMetrics("选择节点查看测速与出口 IP 状态。\n\n选中节点后可测试 TCP、TLS、HTTPS 首响应和出口 IP。"); return; }
-        var exit = string.IsNullOrWhiteSpace(node.LastExitIp) ? "未检测" : node.LastExitIp + (node.ExitIpChanged ? "（已变化）" : "");
+        var exit = string.IsNullOrWhiteSpace(node.LastExitIp)
+            ? "未检测"
+            : HasCurrentExitIp(node)
+                ? node.LastExitIp + (node.ExitIpChanged ? "（已变化）" : "")
+                : $"未确认（上次 {node.LastExitIp}）";
         var bound = _store.LoadBindings().Count(b => b.Mode == ProxyBindingMode.FixedNode && b.NodeId?.Equals(node.NodeId, StringComparison.OrdinalIgnoreCase) == true);
         var names = _currentAccounts.Where(account => _store.GetBinding(AccountProxyResolver.AccountKeyFor(account)) is { Mode: ProxyBindingMode.FixedNode } binding && binding.NodeId?.Equals(node.NodeId, StringComparison.OrdinalIgnoreCase) == true).Select(account => account.Name).ToArray();
         SetMetrics($"{node.DisplayUrl}\nTCP：{Format(node.LastTcpMilliseconds)} · TLS：{Format(node.LastTlsMilliseconds)} · 首响应：{Format(node.LastFirstResponseMilliseconds)}\n出口 IP：{exit} · 已绑定账号：{bound}\n{(names.Length == 0 ? "暂无账号绑定" : string.Join("、", names))}");
@@ -600,7 +679,7 @@ internal sealed class ProxySidebarPanel : Panel
         _testAll.Enabled = false;
         var waitingHint = timeout.TotalSeconds >= 60
             ? "正在并发连接已启用节点，请稍候（会显示实时进度）…"
-            : "正在连接节点，请稍候（单节点最长约 14 秒）…";
+            : "正在连接节点，请稍候（单节点最长约 8 秒）…";
         SetMetrics(startingText + "\n\n" + waitingHint);
         ReportStatus(startingText);
         try
@@ -675,12 +754,12 @@ internal sealed class ProxySidebarPanel : Panel
             node.LastFirstResponseMilliseconds = null;
             node.LastHealthError = string.IsNullOrWhiteSpace(reason) ? "最近一次测试失败。" : reason;
             _store.SetNode(node);
-            SetListStatus(node, "节点异常");
+            SetListStatus(node);
         }
         catch { /* a failed probe must never become a second UI error */ }
     }
 
-    private void SetListStatus(ProxyNodeRecord node, string status)
+    private void SetListStatus(ProxyNodeRecord node)
     {
         if (!IsUsable) return;
         try
@@ -689,7 +768,11 @@ internal sealed class ProxySidebarPanel : Panel
             {
                 if (item.Tag is ProxyNodeRecord listed && listed.NodeId.Equals(node.NodeId, StringComparison.OrdinalIgnoreCase))
                 {
-                    if (item.SubItems.Count > 3) item.SubItems[3].Text = status;
+                    // The fourth column is latency, not a free-form status field. Keep
+                    // failures as -1 and show the diagnostic in the metrics card so a
+                    // stale value such as “节点异常” cannot be mistaken for latency.
+                    if (item.SubItems.Count > 3) item.SubItems[3].Text = "-1";
+                    if (item.SubItems.Count > 4) item.SubItems[4].Text = FormatExitIpForList(node);
                     break;
                 }
             }
@@ -726,7 +809,7 @@ internal sealed class ProxySidebarPanel : Panel
 
             var firstWatch = Stopwatch.StartNew();
             using var client = ProxyHttpClientFactory.Create(resolution, node);
-            client.Timeout = TimeSpan.FromSeconds(8);
+            client.Timeout = TimeSpan.FromSeconds(4);
             using var response = await client.GetAsync("https://chatgpt.com/backend-api/models", HttpCompletionOption.ResponseHeadersRead, cancellationToken);
             var firstResponseMs = firstWatch.Elapsed.TotalMilliseconds;
             var bodyWatch = Stopwatch.StartNew();
@@ -751,6 +834,7 @@ internal sealed class ProxySidebarPanel : Panel
             {
                 node.ExitIpChanged = node.LastExitIp != null && !node.LastExitIp.Equals(exitIp, StringComparison.Ordinal);
                 node.LastExitIp = exitIp;
+                node.LastExitIpObservedAtUtc = node.LastHealthTestAtUtc;
             }
             node.LastHealthError = null;
             _store.SetNode(node);
@@ -982,6 +1066,7 @@ internal sealed class ProxySidebarPanel : Panel
                 node.ExitIpChanged = node.LastExitIp != null &&
                     !node.LastExitIp.Equals(result.ExitIp, StringComparison.Ordinal);
                 node.LastExitIp = result.ExitIp;
+                node.LastExitIpObservedAtUtc = now;
             }
         }
         _store.SaveNodes(nodes);

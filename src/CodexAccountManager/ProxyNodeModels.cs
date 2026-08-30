@@ -32,6 +32,9 @@ public sealed class ProxyNodeRecord
     [JsonPropertyName("lastTlsMilliseconds")] public double? LastTlsMilliseconds { get; set; }
     [JsonPropertyName("lastFirstResponseMilliseconds")] public double? LastFirstResponseMilliseconds { get; set; }
     [JsonPropertyName("lastExitIp")] public string? LastExitIp { get; set; }
+    // The last IP is retained for change detection, while this timestamp lets the UI
+    // distinguish a current observation from a stale value after a failed probe.
+    [JsonPropertyName("lastExitIpObservedAtUtc")] public DateTimeOffset? LastExitIpObservedAtUtc { get; set; }
     [JsonPropertyName("exitIpChanged")] public bool ExitIpChanged { get; set; }
     // Human-readable, non-sensitive probe result used by the node list. It never
     // contains credentials or the full native subscription URI.
@@ -168,6 +171,23 @@ public sealed class ProxyNodeStore
         var list = LoadNodes();
         list.RemoveAll(x => x.NodeId.Equals(node.NodeId, StringComparison.OrdinalIgnoreCase));
         list.Add(node);
+        SaveNodes(list);
+    }
+    internal void MarkRuntimeFailure(string nodeId, string reason)
+    {
+        if (string.IsNullOrWhiteSpace(nodeId)) return;
+        var list = LoadNodes();
+        var node = list.FirstOrDefault(x => x.NodeId.Equals(nodeId, StringComparison.OrdinalIgnoreCase));
+        if (node == null) return;
+        node.LastHealthTestAtUtc = DateTimeOffset.UtcNow;
+        node.LastTcpMilliseconds = null;
+        node.LastTlsMilliseconds = null;
+        node.LastFirstResponseMilliseconds = null;
+        node.LastHealthError = string.IsNullOrWhiteSpace(reason)
+            ? "运行时请求失败。"
+            : reason;
+        // Keep LastExitIp for historical change detection, but LastHealthError makes
+        // the sidebar render it as “上次 …” rather than claiming it is current.
         SaveNodes(list);
     }
     public void RemoveNode(string nodeId)
@@ -323,6 +343,16 @@ public sealed class ProxyNodeStore
             });
             if (resolver.AllowsRuntimeGlobalFallback(key, preview.Nodes[0].NodeId))
                 throw new InvalidOperationException("Fail-closed account proxy unexpectedly allowed runtime fallback.");
+            var runtimeNode = preview.Nodes[0];
+            runtimeNode.LastExitIp = "198.51.100.10";
+            runtimeNode.LastExitIpObservedAtUtc = DateTimeOffset.UtcNow.AddMinutes(-1);
+            runtimeNode.LastHealthTestAtUtc = runtimeNode.LastExitIpObservedAtUtc;
+            store.SetNode(runtimeNode);
+            resolver.MarkRuntimeFailure(runtimeNode.NodeId, "运行时请求失败，已回退全局代理。");
+            var failedNode = store.LoadNodes().First(node => node.NodeId.Equals(runtimeNode.NodeId, StringComparison.OrdinalIgnoreCase));
+            if (failedNode.LastHealthError == null || failedNode.LastExitIp != "198.51.100.10" ||
+                failedNode.LastFirstResponseMilliseconds != null)
+                throw new InvalidOperationException("Runtime proxy failure did not preserve historical IP safely.");
             store.RemoveBinding(key); if (!resolver.Resolve(key).Success || resolver.Resolve(key).NodeId != null) throw new InvalidOperationException("Unbound account did not inherit global proxy.");
         }
         finally { try { if (Directory.Exists(root)) Directory.Delete(root, true); } catch { } }
@@ -382,6 +412,10 @@ public sealed class AccountProxyResolver : IDisposable
     public ProxyNodeRecord? GetNode(string? nodeId) => string.IsNullOrWhiteSpace(nodeId)
         ? null
         : _store.LoadNodes().FirstOrDefault(n => n.NodeId.Equals(nodeId, StringComparison.OrdinalIgnoreCase));
+    public void MarkRuntimeFailure(string? nodeId, string reason)
+    {
+        if (!string.IsNullOrWhiteSpace(nodeId)) _store.MarkRuntimeFailure(nodeId, reason);
+    }
     public ProxyResolution ResolveByNode(ProxyNodeRecord node) => node.Enabled && node.TryValidate(out _)
         ? Build(node)
         : ProxyResolution.Fail("代理节点已禁用或配置无效。");
