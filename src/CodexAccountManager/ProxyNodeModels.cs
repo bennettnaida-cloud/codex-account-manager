@@ -38,6 +38,9 @@ public sealed class ProxyNodeRecord
     [JsonPropertyName("lastHealthError")] public string? LastHealthError { get; set; }
 
     [JsonIgnore] public string DisplayUrl => $"{Scheme}://{Address}:{Port}";
+    /// <summary>Compact endpoint for the node grid; never includes a scheme or credentials.</summary>
+    [JsonIgnore] public string DisplayAddress =>
+        Uri.CheckHostName(Address) == UriHostNameType.IPv6 ? $"[{Address}]:{Port}" : $"{Address}:{Port}";
     [JsonIgnore] public bool HasPassword => !string.IsNullOrWhiteSpace(EncryptedPassword);
     [JsonIgnore] public string? Password { get; set; }
     [JsonIgnore] public bool IsNativeProtocol => Scheme.Equals("vless", StringComparison.OrdinalIgnoreCase) ||

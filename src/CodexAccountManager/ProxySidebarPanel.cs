@@ -154,7 +154,7 @@ internal sealed class ProxySidebarPanel : Panel
         _nodes.Columns.Add("节点名称");
         _nodes.Columns.Add("协议");
         _nodes.Columns.Add("地址");
-        _nodes.Columns.Add("状态");
+        _nodes.Columns.Add("延迟");
         _nodes.Columns.Add("出口 IP");
         _nodes.SelectedIndexChanged += (_, _) => UpdateNodeMetrics();
         _nodesCard.Controls.Add(_nodes);
@@ -173,7 +173,7 @@ internal sealed class ProxySidebarPanel : Panel
         _toggle.Click += (_, _) => ToggleNode();
         _import.Click += async (_, _) => await ImportNodesAsync();
         _test.Click += async (_, _) => await RunTestGuardedAsync(TestSelectedAsync, "正在测试 ChatGPT…", TimeSpan.FromSeconds(14));
-        _continuous.Click += async (_, _) => await RunTestGuardedAsync(ContinuousTestAsync, "正在连续测速…", TimeSpan.FromSeconds(48));
+        _continuous.Click += async (_, _) => await RunTestGuardedAsync(ContinuousTestAsync, "正在连续测速…", TimeSpan.FromSeconds(20));
         _testAll.Click += async (_, _) => await RunTestGuardedAsync(TestAllAsync, "正在一键测速全部节点…", TimeSpan.FromSeconds(90));
         _nodesCard.Controls.AddRange([_add, _edit, _remove, _toggle, _import, _test, _continuous, _testAll]);
 
@@ -307,14 +307,14 @@ internal sealed class ProxySidebarPanel : Panel
         _metrics.SetBounds(16, 10, Math.Max(120, _metricsCard.ClientSize.Width - 32), Math.Max(60, _metricsCard.ClientSize.Height - 20));
 
         var protocolWidth = Math.Clamp(width / 9, 74, 100);
-        var statusWidth = Math.Clamp(width / 8, 86, 120);
+        var latencyWidth = Math.Clamp(width / 8, 86, 120);
         var exitIpWidth = Math.Clamp(width / 6, 118, 168);
         var nameWidth = Math.Clamp(width / 5, 130, 210);
         _nodes.Columns[0].Width = nameWidth;
         _nodes.Columns[1].Width = protocolWidth;
-        _nodes.Columns[3].Width = statusWidth;
+        _nodes.Columns[3].Width = latencyWidth;
         _nodes.Columns[4].Width = exitIpWidth;
-        _nodes.Columns[2].Width = Math.Max(150, width - nameWidth - protocolWidth - statusWidth - exitIpWidth - 8);
+        _nodes.Columns[2].Width = Math.Max(150, width - nameWidth - protocolWidth - latencyWidth - exitIpWidth - 8);
     }
 
     public void ApplyPalette(ThemePalette palette)
@@ -385,12 +385,14 @@ internal sealed class ProxySidebarPanel : Panel
         _nodes.Items.Clear();
         foreach (var node in nodes)
         {
-            var status = !node.Enabled ? "已禁用" : node.ExitIpChanged ? "IP 已变化" : !string.IsNullOrWhiteSpace(node.LastHealthError) ? "节点异常" : node.IsNativeProtocol ? "需本地核心" : "已启用";
+            var latency = node.Enabled && string.IsNullOrWhiteSpace(node.LastHealthError) && node.LastFirstResponseMilliseconds.HasValue
+                ? $"{node.LastFirstResponseMilliseconds.Value:0} ms"
+                : "-1";
             var exitIp = string.IsNullOrWhiteSpace(node.LastExitIp) ? "未检测" : node.LastExitIp;
             var item = new ListViewItem(node.Name) { Tag = node };
-            item.SubItems.Add(node.Scheme.ToUpperInvariant());
-            item.SubItems.Add(node.DisplayUrl);
-            item.SubItems.Add(status);
+            item.SubItems.Add(CompactProtocol(node.Scheme));
+            item.SubItems.Add(node.DisplayAddress);
+            item.SubItems.Add(latency);
             item.SubItems.Add(exitIp);
             _nodes.Items.Add(item);
             if (selectedNodeId != null && node.NodeId.Equals(selectedNodeId, StringComparison.OrdinalIgnoreCase)) item.Selected = true;
@@ -402,6 +404,16 @@ internal sealed class ProxySidebarPanel : Panel
         if (_node.SelectedIndex < 0) _node.SelectedIndex = 0;
         UpdateNodeMetrics();
     }
+    private static string CompactProtocol(string scheme) => scheme.ToLowerInvariant() switch
+    {
+        "https" => "TLS",
+        "socks5" => "S5",
+        "vless" => "VL",
+        "vmess" => "VM",
+        "trojan" => "TR",
+        "ss" or "shadowsocks" => "SS",
+        _ => "HTTP"
+    };
     private AccountRecord? SelectedAccount() => _currentAccounts.FirstOrDefault(a => a.Name.Equals(_account.SelectedItem?.ToString(), StringComparison.OrdinalIgnoreCase));
     private ProxyNodeRecord? SelectedNode() => _nodes.SelectedItems.Count == 0 ? null : _nodes.SelectedItems[0].Tag as ProxyNodeRecord;
     private void LoadBinding()
@@ -429,7 +441,7 @@ internal sealed class ProxySidebarPanel : Panel
         var bound = _store.LoadBindings().Count(b => b.Mode == ProxyBindingMode.FixedNode && b.NodeId?.Equals(node.NodeId, StringComparison.OrdinalIgnoreCase) == true);
         var names = _currentAccounts.Where(account => _store.GetBinding(AccountProxyResolver.AccountKeyFor(account)) is { Mode: ProxyBindingMode.FixedNode } binding && binding.NodeId?.Equals(node.NodeId, StringComparison.OrdinalIgnoreCase) == true).Select(account => account.Name).ToArray();
         SetMetrics($"{node.DisplayUrl}\nTCP：{Format(node.LastTcpMilliseconds)} · TLS：{Format(node.LastTlsMilliseconds)} · 首响应：{Format(node.LastFirstResponseMilliseconds)}\n出口 IP：{exit} · 已绑定账号：{bound}\n{(names.Length == 0 ? "暂无账号绑定" : string.Join("、", names))}");
-        static string Format(double? value) => value.HasValue ? $"{value.Value:0} ms" : "—";
+        static string Format(double? value) => value.HasValue ? $"{value.Value:0} ms" : "-1";
     }
     private void SaveBinding()
     {
@@ -658,6 +670,9 @@ internal sealed class ProxySidebarPanel : Panel
         try
         {
             node.LastHealthTestAtUtc = DateTimeOffset.UtcNow;
+            node.LastTcpMilliseconds = null;
+            node.LastTlsMilliseconds = null;
+            node.LastFirstResponseMilliseconds = null;
             node.LastHealthError = string.IsNullOrWhiteSpace(reason) ? "最近一次测试失败。" : reason;
             _store.SetNode(node);
             SetListStatus(node, "节点异常");
@@ -760,15 +775,16 @@ internal sealed class ProxySidebarPanel : Panel
 
     private async Task ContinuousTestAsync(CancellationToken cancellationToken)
     {
+        const int sampleCount = 3;
         var node = SelectedNode();
         if (node == null)
         {
-            SetMetrics("请先在右侧列表选择一个代理节点。\n\n连续测速会采集 7 次真实 HTTPS 首响应并计算 P50/P90。");
+            SetMetrics($"请先在右侧列表选择一个代理节点。\n\n连续测速会采集 {sampleCount} 次真实 HTTPS 首响应并计算 P50/P90。");
             ReportStatus("未选择代理节点。");
             return;
         }
         var started = Stopwatch.StartNew();
-        SetMetrics($"正在连续测速：{node.Name}\n已完成 0/7 · TCP、HTTPS 首响应采样中…");
+        SetMetrics($"正在连续测速：{node.Name}\n已完成 0/{sampleCount} · TCP、HTTPS 首响应采样中…");
         var resolution = await Task.Run(() => _resolver.ResolveByNode(node), cancellationToken);
         if (!resolution.Success || resolution.ProxyUri == null)
         {
@@ -781,8 +797,8 @@ internal sealed class ProxySidebarPanel : Panel
         var samples = new List<double>();
         var tcpSamples = new List<double>();
         using var client = ProxyHttpClientFactory.Create(resolution, node);
-        client.Timeout = TimeSpan.FromSeconds(8);
-        for (var i = 0; i < 7; i++)
+        client.Timeout = TimeSpan.FromSeconds(3);
+        for (var i = 0; i < sampleCount; i++)
         {
             try
             {
@@ -795,13 +811,13 @@ internal sealed class ProxySidebarPanel : Panel
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
             catch { /* retain successful samples when one probe is transiently unavailable */ }
-            SetMetrics($"正在连续测速：{node.Name}\n已完成 {i + 1}/7 · 成功 HTTPS 样本 {samples.Count} · TCP 样本 {tcpSamples.Count}…");
-            await Task.Delay(120, cancellationToken);
+            SetMetrics($"正在连续测速：{node.Name}\n已完成 {i + 1}/{sampleCount} · 成功 HTTPS 样本 {samples.Count} · TCP 样本 {tcpSamples.Count}…");
+            await Task.Delay(80, cancellationToken);
         }
         if (samples.Count == 0)
         {
             RecordTestFailure(node);
-            SetMetrics($"连续测速失败：7 次均未获得 HTTPS 首响应。\n已耗时 {started.ElapsedMilliseconds} ms。\n请检查节点是否可用或先更换节点。");
+            SetMetrics($"连续测速失败：{sampleCount} 次均未获得 HTTPS 首响应。\n已耗时 {started.ElapsedMilliseconds} ms。\n请检查节点是否可用或先更换节点。");
             ReportStatus("连续测速完成：没有成功样本；未影响账号轮换。");
             return;
         }
@@ -811,9 +827,10 @@ internal sealed class ProxySidebarPanel : Panel
         node.LastTcpMilliseconds = tcpSamples.Count == 0 ? null : Percentile(tcpSamples, .50);
         node.LastTlsMilliseconds = node.LastTcpMilliseconds.HasValue ? Math.Max(0, node.LastFirstResponseMilliseconds.Value - node.LastTcpMilliseconds.Value) : null;
         node.LastHealthTestAtUtc = DateTimeOffset.UtcNow;
+        node.LastHealthError = null;
         _store.SetNode(node);
         UpdateNodeMetrics();
-        SetMetrics(_metrics.Text + $"\n连续 HTTPS 首响应：{samples.Count}/7\nP50：{Percentile(samples, .50):0} ms · P90：{Percentile(samples, .90):0} ms\nTCP P50：{(tcpSamples.Count == 0 ? "—" : Percentile(tcpSamples, .50).ToString("0") + " ms")} · 总耗时：{started.ElapsedMilliseconds} ms\n测试目标：chatgpt.com/backend-api/models");
+        SetMetrics(_metrics.Text + $"\n连续 HTTPS 首响应：{samples.Count}/{sampleCount}\nP50：{Percentile(samples, .50):0} ms · P90：{Percentile(samples, .90):0} ms\nTCP P50：{(tcpSamples.Count == 0 ? "-1" : Percentile(tcpSamples, .50).ToString("0") + " ms")} · 总耗时：{started.ElapsedMilliseconds} ms\n测试目标：chatgpt.com/backend-api/models");
         ReportStatus("连续测速完成；P50/P90 现在统计真实 HTTPS 首响应，不再只是 TCP 粗测。");
     }
 
@@ -949,6 +966,9 @@ internal sealed class ProxySidebarPanel : Panel
             node.LastHealthTestAtUtc = now;
             if (!result.Success)
             {
+                node.LastTcpMilliseconds = null;
+                node.LastTlsMilliseconds = null;
+                node.LastFirstResponseMilliseconds = null;
                 node.LastHealthError = string.IsNullOrWhiteSpace(result.Error) ? "节点不可用。" : result.Error;
                 continue;
             }
