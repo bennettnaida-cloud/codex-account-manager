@@ -282,7 +282,8 @@ public sealed class SharedHistoryService
     internal IReadOnlyList<UnifiedThreadRecord> ReconcileWithCodex(
         string codexHome,
         IReadOnlyList<UnifiedThreadRecord> indexedThreads,
-        IReadOnlyList<CodexThreadSummary> codexThreads)
+        IReadOnlyList<CodexThreadSummary> codexThreads,
+        bool preserveIndexedMissingThreads = true)
     {
         var deletedThreadIds = LoadDeletedThreadIds(codexHome);
         var indexedById = indexedThreads.ToDictionary(
@@ -325,9 +326,14 @@ public sealed class SharedHistoryService
 
         // The live Codex list can be temporarily incomplete. Keep normal records
         // already read from the local index unless they were explicitly deleted.
-        result.AddRange(indexedThreads.Where(thread =>
-            !reconciledThreadIds.Contains(thread.Id) &&
-            !deletedThreadIds.Contains(thread.Id)));
+        // Authoritative app-server callers disable this compatibility merge so a
+        // deleted record cannot be resurrected from stale SQLite metadata.
+        if (preserveIndexedMissingThreads)
+        {
+            result.AddRange(indexedThreads.Where(thread =>
+                !reconciledThreadIds.Contains(thread.Id) &&
+                !deletedThreadIds.Contains(thread.Id)));
+        }
 
         return result
             .OrderByDescending(thread => thread.UpdatedAt)
@@ -716,6 +722,24 @@ public sealed class SharedHistoryService
                 reconciled.Any(thread => thread.Id == deletedThread.Id))
             {
                 throw new InvalidOperationException("Codex authoritative history reconciliation failed.");
+            }
+
+            var authoritativeOnly = service.ReconcileWithCodex(
+                root,
+                [records[0], retainedThread, deletedThread],
+                [new CodexThreadSummary(
+                    records[0].Id,
+                    "Codex display name",
+                    "Current preview",
+                    @"C:\current",
+                    "current-provider",
+                    DateTimeOffset.FromUnixTimeSeconds(1783685901),
+                    false)],
+                preserveIndexedMissingThreads: false);
+            if (authoritativeOnly.Count != 1 || authoritativeOnly[0].Id != records[0].Id)
+            {
+                throw new InvalidOperationException(
+                    "Authoritative Codex history must not resurrect missing indexed threads.");
             }
 
             ValidateThreadArtifactDeletion(root);

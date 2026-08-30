@@ -796,6 +796,7 @@ public sealed partial class CodexCliService
         string threadId,
         string? sectionId,
         string codexHome,
+        string? beforeThreadId = null,
         CancellationToken cancellationToken = default)
     {
         ValidateThreadId(threadId);
@@ -807,6 +808,7 @@ public sealed partial class CodexCliService
                     threadId,
                     sectionId,
                     codexHome,
+                    beforeThreadId,
                     cancellationToken);
                 return true;
             },

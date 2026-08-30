@@ -34,7 +34,10 @@ public partial class Form1
             AccentColor = _palette.SecondaryAccentColor,
             AccentWidth = 3,
             ShadowColor = Color.FromArgb(26, _palette.ShadowColor),
-            Margin = new Padding(0, 0, CardGap, CardGap),
+            // Keep the card inside the flow viewport.  The previous right margin
+            // was counted as child width and caused the workspace's horizontal
+            // scrollbar, hiding the lower edge of the pricing grid.
+            Margin = new Padding(0, 0, 0, CardGap),
             Padding = new Padding(22)
         };
 

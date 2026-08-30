@@ -231,7 +231,10 @@ internal sealed class ProxySidebarPanel : Panel
         {
             var bindingWidth = Math.Clamp((int)Math.Round(availableWidth * 0.36D), 390, 520);
             var nodesWidth = Math.Max(420, availableWidth - bindingWidth - gap);
-            var cardHeight = Math.Max(720, ClientSize.Height - Padding.Vertical - 4);
+            // Leave enough room for the node table, action rows and the metrics
+            // card even on a compact window.  The parent workspace can scroll
+            // vertically; clipping the metrics card is much harder to diagnose.
+            var cardHeight = Math.Max(760, ClientSize.Height - Padding.Vertical - 4);
             _bindingCard.SetBounds(left, top, bindingWidth, cardHeight);
             _nodesCard.SetBounds(left + bindingWidth + gap, top, nodesWidth, cardHeight);
             AutoScrollMinSize = new Size(0, cardHeight + Padding.Vertical);
@@ -239,7 +242,7 @@ internal sealed class ProxySidebarPanel : Panel
         else
         {
             var bindingHeight = 640;
-            var nodesHeight = 700;
+            var nodesHeight = 760;
             _bindingCard.SetBounds(left, top, availableWidth, bindingHeight);
             _nodesCard.SetBounds(left, top + bindingHeight + gap, availableWidth, nodesHeight);
             AutoScrollMinSize = new Size(0, bindingHeight + nodesHeight + gap + Padding.Vertical);
@@ -303,8 +306,13 @@ internal sealed class ProxySidebarPanel : Panel
         _testAll.SetBounds(_continuous.Right + firstGap, secondTop, allWidth, 44);
 
         var metricsTop = secondTop + 58;
-        _metricsCard.SetBounds(24, metricsTop, width, Math.Max(92, _nodesCard.ClientSize.Height - metricsTop - 20));
-        _metrics.SetBounds(16, 10, Math.Max(120, _metricsCard.ClientSize.Width - 32), Math.Max(60, _metricsCard.ClientSize.Height - 20));
+        var metricsHeight = Math.Max(128, _nodesCard.ClientSize.Height - metricsTop - 20);
+        _metricsCard.SetBounds(24, metricsTop, width, metricsHeight);
+        _metrics.SetBounds(
+            16,
+            10,
+            Math.Max(120, _metricsCard.ClientSize.Width - 32),
+            Math.Max(88, _metricsCard.ClientSize.Height - 20));
 
         // Keep the human-readable node name prominent and make the technical endpoint
         // compact.  Calculate against the actual ListView client width so the sum of

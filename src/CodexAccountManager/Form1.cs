@@ -2923,7 +2923,8 @@ public partial class Form1 : Form
                     _sharedHistory.ReconcileWithCodex(
                         sharedHome,
                         indexedSnapshot.Threads,
-                        codexSnapshot.Threads),
+                        codexSnapshot.Threads,
+                        preserveIndexedMissingThreads: false),
                     codexSnapshot.Sections,
                     invalidationVersion,
                     SyncedWithCodex: true);
@@ -2971,7 +2972,11 @@ public partial class Form1 : Form
                 {
                     var codexSnapshot = await codexTask.WaitAsync(TimeSpan.FromSeconds(2));
                     return new UnifiedHistoryLoadResult(
-                        _sharedHistory.ReconcileWithCodex(sharedHome, [], codexSnapshot.Threads),
+                        _sharedHistory.ReconcileWithCodex(
+                            sharedHome,
+                            [],
+                            codexSnapshot.Threads,
+                            preserveIndexedMissingThreads: false),
                         codexSnapshot.Sections,
                         invalidationVersion,
                         SyncedWithCodex: true);
@@ -3042,7 +3047,8 @@ public partial class Form1 : Form
             _unifiedHistoryCache = _sharedHistory.ReconcileWithCodex(
                 sharedHome,
                 indexedSnapshot.Threads,
-                codexSnapshot.Threads);
+                codexSnapshot.Threads,
+                preserveIndexedMissingThreads: false);
             _unifiedHistorySections = codexSnapshot.Sections;
             _unifiedHistoryCacheVersion = invalidationVersion;
             _unifiedHistorySyncedWithCodex = true;
@@ -4306,7 +4312,10 @@ public partial class Form1 : Form
                 _proxySidebar.Margin = Padding.Empty;
                 _proxySidebar.AutoSize = false;
                 _proxySidebar.Width = Math.Max(320, workspaceWidth);
-                _proxySidebar.Height = Math.Max(620, _cardsPanel.ClientSize.Height - 4);
+                // Proxy metrics and test diagnostics need a little tail room even
+                // when the main window is short; the workspace itself remains
+                // vertically scrollable instead of cropping the bottom card.
+                _proxySidebar.Height = Math.Max(760, _cardsPanel.ClientSize.Height - 4);
                 _proxySidebar.Visible = true;
                 _proxySidebar.SetAccounts(_accounts, _selectedAccountName);
                 _cardsPanel.Controls.Add(_proxySidebar);
@@ -5371,16 +5380,14 @@ public partial class Form1 : Form
                 string.Empty);
         }
 
-        var pinnedThreads = visibleThreads
+        var pinnedThreads = OrderUnifiedHistoryThreads(visibleThreads
             .Where(thread => !thread.Archived &&
                              thread.SectionId.Equals(
                                  CodexAppServerClient.PinnedSectionId,
-                                 StringComparison.OrdinalIgnoreCase))
-            .ToList();
-        var unclassifiedThreads = visibleThreads
-            .Where(thread => !thread.Archived && string.IsNullOrWhiteSpace(thread.SectionId))
-            .ToList();
-        var archivedThreads = visibleThreads.Where(thread => thread.Archived).ToList();
+                                 StringComparison.OrdinalIgnoreCase)));
+        var unclassifiedThreads = OrderUnifiedHistoryThreads(visibleThreads
+            .Where(thread => !thread.Archived && string.IsNullOrWhiteSpace(thread.SectionId)));
+        var archivedThreads = OrderUnifiedHistoryThreads(visibleThreads.Where(thread => thread.Archived));
 
         var groups = new List<UnifiedHistoryGroup>();
         if (pinnedThreads.Count > 0)
@@ -5396,10 +5403,9 @@ public partial class Form1 : Form
         foreach (var section in customSections.Values
                      .OrderBy(section => section.Name, StringComparer.CurrentCultureIgnoreCase))
         {
-            var sectionThreads = visibleThreads
+            var sectionThreads = OrderUnifiedHistoryThreads(visibleThreads
                 .Where(thread => !thread.Archived &&
-                                 thread.SectionId.Equals(section.Id, StringComparison.OrdinalIgnoreCase))
-                .ToList();
+                                 thread.SectionId.Equals(section.Id, StringComparison.OrdinalIgnoreCase)));
             if (searching && sectionThreads.Count == 0)
             {
                 continue;
@@ -5432,6 +5438,45 @@ public partial class Form1 : Form
                 IsArchived: true));
         }
         return groups;
+    }
+
+    private static List<UnifiedThreadRecord> OrderUnifiedHistoryThreads(
+        IEnumerable<UnifiedThreadRecord> threads) =>
+        threads
+            .OrderByDescending(thread => thread.UpdatedAt)
+            .ThenByDescending(thread => thread.Id, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+    internal static void ValidateUnifiedHistoryOrdering()
+    {
+        var newest = new UnifiedThreadRecord(
+            "019f4be7-aa6e-72b2-84bf-4e35b9c5f281",
+            "newest",
+            "",
+            "",
+            "",
+            "",
+            DateTimeOffset.FromUnixTimeSeconds(3),
+            false,
+            true);
+        var oldest = newest with
+        {
+            Id = "019f4be7-aa6e-72b2-84bf-4e35b9c5f280",
+            Title = "oldest",
+            UpdatedAt = DateTimeOffset.FromUnixTimeSeconds(1)
+        };
+        var middle = newest with
+        {
+            Id = "019f4be7-aa6e-72b2-84bf-4e35b9c5f282",
+            Title = "middle",
+            UpdatedAt = DateTimeOffset.FromUnixTimeSeconds(2)
+        };
+        var ordered = OrderUnifiedHistoryThreads([oldest, middle, newest]);
+        if (ordered is not [{ Id: var first }, { Id: var second }, { Id: var third }] ||
+            first != newest.Id || second != middle.Id || third != oldest.Id)
+        {
+            throw new InvalidOperationException("Unified history groups must be ordered by latest update first.");
+        }
     }
 
     private static bool IsUnifiedHistoryGroupCollapsed(
@@ -6204,7 +6249,12 @@ public partial class Form1 : Form
         var sharedHome = CodexCliService.GetDefaultCodexHome();
         await RunBusyAsync(async () =>
         {
-            await _codex.MoveThreadToSectionAsync(thread.Id, sectionId, sharedHome);
+            var beforeThreadId = FindUnifiedHistoryInsertionBeforeThreadId(thread, sectionId);
+            await _codex.MoveThreadToSectionAsync(
+                thread.Id,
+                sectionId,
+                sharedHome,
+                beforeThreadId);
             ResetUnifiedHistoryGroupPagination();
             InvalidateUnifiedHistoryCache(clearCachedData: false);
             await RefreshUnifiedHistoryAsync(force: true, _workspaceLoadGeneration);
@@ -6212,6 +6262,42 @@ public partial class Form1 : Form
                 $"已将“{thread.Title}”移动到“{targetName}”。目录数据已通过 Codex 官方接口保存；" +
                 "桌面侧栏仅在 Codex 的“分区”功能开放时显示。";
         });
+    }
+
+    private string? FindUnifiedHistoryInsertionBeforeThreadId(
+        UnifiedThreadRecord thread,
+        string? targetSectionId)
+    {
+        if (_unifiedHistoryCache == null)
+        {
+            return null;
+        }
+
+        var candidates = _unifiedHistoryCache
+            .Where(candidate =>
+                !candidate.Archived &&
+                !candidate.Id.Equals(thread.Id, StringComparison.OrdinalIgnoreCase) &&
+                (string.IsNullOrWhiteSpace(targetSectionId)
+                    ? string.IsNullOrWhiteSpace(candidate.SectionId)
+                    : candidate.SectionId.Equals(targetSectionId, StringComparison.OrdinalIgnoreCase)))
+            .OrderByDescending(candidate => candidate.UpdatedAt)
+            .ThenByDescending(candidate => candidate.Id, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        // thread/section/move inserts before this ID.  The first item older than
+        // the moved thread therefore keeps the target section in update-time order.
+        foreach (var candidate in candidates)
+        {
+            if (candidate.UpdatedAt < thread.UpdatedAt ||
+                (candidate.UpdatedAt == thread.UpdatedAt &&
+                 StringComparer.OrdinalIgnoreCase.Compare(candidate.Id, thread.Id) < 0))
+            {
+                return candidate.Id;
+            }
+        }
+
+        // No older item means the moved thread belongs at the end of the section.
+        return null;
     }
 
     private async Task ToggleUnifiedThreadArchiveAsync(UnifiedThreadRecord thread)
@@ -6308,15 +6394,46 @@ public partial class Form1 : Form
 
     private async Task<bool> TryDeleteThreadFromHomeAsync(string threadId, string codexHome)
     {
+        Exception? deleteError = null;
         try
         {
             await _codex.DeleteThreadAsync(threadId, codexHome);
-            return true;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            return await Task.Run(() => _sharedHistory.TryDeleteThreadArtifacts(codexHome, threadId));
+            // The app-server mutation may have succeeded before its response was
+            // interrupted.  Always run the local artifact cleanup below; otherwise
+            // stale SQLite metadata can make a deleted task reappear in “最近”。
+            deleteError = ex;
         }
+
+        // Codex can briefly hold state_5.sqlite while committing thread/delete.
+        // Retry the compatibility cleanup a few times without blocking the UI.
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            var cleaned = await Task.Run(() => _sharedHistory.TryDeleteThreadArtifacts(codexHome, threadId));
+            if (cleaned)
+            {
+                return true;
+            }
+
+            // If the metadata is already gone, cleanup is idempotently complete even
+            // when there were no rollout files left to remove.
+            var stillPresent = await Task.Run(() => _sharedHistory.ContainsThread(codexHome, threadId));
+            if (!stillPresent)
+            {
+                return true;
+            }
+
+            if (attempt < 2)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(120 * (attempt + 1)));
+            }
+        }
+
+        return deleteError == null
+            ? false
+            : await Task.Run(() => !_sharedHistory.ContainsThread(codexHome, threadId));
     }
 
     private async Task CleanupDeletedThreadArtifactsAsync()
@@ -7774,7 +7891,10 @@ public partial class Form1 : Form
             AccentColor = _palette.AccentColor,
             AccentWidth = 3,
             ShadowColor = Color.FromArgb(26, _palette.ShadowColor),
-            Margin = new Padding(0, 0, CardGap, CardGap),
+            // The flow panel already reserves the vertical gap between cards.  A
+            // right margin here becomes part of the child width and creates an
+            // unnecessary outer horizontal scrollbar on the system-config page.
+            Margin = new Padding(0, 0, 0, CardGap),
             Padding = new Padding(22)
         };
 

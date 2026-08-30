@@ -248,6 +248,7 @@ internal sealed class CodexAppServerClient
         string threadId,
         string? sectionId,
         string codexHome,
+        string? beforeThreadId = null,
         CancellationToken cancellationToken = default)
     {
         ValidateThreadId(threadId);
@@ -255,18 +256,27 @@ internal sealed class CodexAppServerClient
         {
             ValidateMutableSectionId(sectionId);
         }
+        if (!string.IsNullOrWhiteSpace(beforeThreadId))
+        {
+            ValidateThreadId(beforeThreadId);
+        }
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(OperationTimeout);
         await using var session = await AppServerSession.StartThreadSectionAsync(codexHome, timeout.Token);
+        var parameters = new JsonObject
+        {
+            ["threadId"] = threadId,
+            ["sectionId"] = string.IsNullOrWhiteSpace(sectionId) ? null : sectionId,
+            ["beforeThreadId"] = null
+        };
+        if (!string.IsNullOrWhiteSpace(beforeThreadId))
+        {
+            parameters["beforeThreadId"] = beforeThreadId;
+        }
         await session.RequestAsync(
             "thread/section/move",
-            new JsonObject
-            {
-                ["threadId"] = threadId,
-                ["sectionId"] = string.IsNullOrWhiteSpace(sectionId) ? null : sectionId,
-                ["beforeThreadId"] = null
-            },
+            parameters,
             timeout.Token);
     }
 

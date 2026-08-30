@@ -324,6 +324,7 @@ static class Program
             Form1.ValidateOfficialQuotaSnapshotPriority();
             Form1.ValidateQuotaRuntimeAccountIsolation();
             Form1.ValidateUnifiedHistorySearch();
+            Form1.ValidateUnifiedHistoryOrdering();
             Form1.ValidateTokenRowGeometry();
             Form1.ValidateStableWorkspaceGutter();
             Form1.ValidateResponsiveAccountCardLayouts();
