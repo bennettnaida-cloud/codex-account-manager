@@ -4043,12 +4043,13 @@ public sealed partial class CodexCliService
                 hasExistingOfficialWindow,
                 allowOfficialRendererPatch))
         {
-            // A same-profile dual-login/OAuth click is an activation request, never a
-            // recovery transaction. Runtime health can be transiently false while a turn
-            // is busy, IPC is back-pressured, or the app-server is rotating state. Closing
-            // that visible verified Codex window would kill the in-flight task. Preserve it
+            // A same-profile click is an activation request, never a recovery transaction.
+            // Runtime health can be transiently false while a turn is busy, IPC is
+            // back-pressured, or the app-server is rotating state. Closing that visible
+            // verified Codex window would kill the in-flight task. Preserve it
             // unconditionally; a best-effort deep link may focus/open the requested project
-            // but its failure must not mutate the existing process tree.
+            // but its failure must not mutate the existing process tree. The optional native
+            // Fast bridge is additive and must never turn a same-account click into a restart.
             try
             {
                 Process.Start(new ProcessStartInfo(BuildNewThreadDeepLink(projectPath))
@@ -4064,7 +4065,7 @@ public sealed partial class CodexCliService
             }
             WriteCodexPlusPlusLaunchDiagnostic(
                 "official-same-profile-window-preserved",
-                "renderer patch and runtime-health shutdown were disabled for the existing dual-login/OAuth window");
+                "renderer patch and runtime-health shutdown were disabled for the existing same-profile window");
             return true;
         }
 
@@ -4085,29 +4086,18 @@ public sealed partial class CodexCliService
                 return true;
             }
 
-            // This branch is reached only from an explicit "start account" operation. A
-            // healthy same-account client is preserved when its listener, owning packaged
-            // process, browser identity and reviewed app://codex target all validate live.
-            // Otherwise Electron cannot enable CDP after startup, so one controlled restart is
-            // required to make the native Standard/Fast picker available. A merely visible or
-            // spoofed shell is never reused.
-            var sameAccountShutdownTargets = CaptureWindowsClientProcessSnapshots();
-            var sameAccountNativeFastPorts = CaptureOfficialNativeFastPortsOwnedBy(
-                sameAccountShutdownTargets);
-            StopWindowsClientProcesses(sameAccountShutdownTargets);
-            if (!WaitForWindowsClientProcessAndPortRelease(
-                    sameAccountShutdownTargets,
-                    sameAccountNativeFastPorts,
-                    launchGeneration,
-                    OfficialCodexRecoveryReleaseTimeout) ||
-                !WaitForOfficialCodexSwitchQuiescence(
-                    launchGeneration,
-                    OfficialCodexRecoveryReleaseTimeout))
+            // A same-account client with a visible window is kept even when its optional bridge
+            // cannot be attached. Only a real profile switch (switchRequired=true) may stop it.
+            // This avoids disconnecting the desktop client merely because Electron did not expose
+            // CDP on a previous launch.
+            Process.Start(new ProcessStartInfo(BuildNewThreadDeepLink(projectPath))
             {
-                throw new TimeoutException(
-                    "The existing Codex process did not remain globally closed, or its native bridge port did not release cleanly; " +
-                    "a replacement official client was not activated.");
-            }
+                UseShellExecute = true
+            });
+            WriteCodexPlusPlusLaunchDiagnostic(
+                "official-same-profile-window-preserved",
+                "existing official window was kept because the optional native Fast bridge was unavailable");
+            return true;
         }
 
         return mode switch
@@ -4140,8 +4130,7 @@ public sealed partial class CodexCliService
         return !switchRequired &&
                mode == WindowsClientMode.OfficialCodex &&
                !useDreamSkin &&
-               hasExistingOfficialWindow &&
-               !allowOfficialRendererPatch;
+               hasExistingOfficialWindow;
     }
 
     private static OfficialCodexStartupReadinessPolicy SelectOfficialCodexStartupReadinessPolicy(
@@ -4443,6 +4432,20 @@ public sealed partial class CodexCliService
             WriteCodexPlusPlusLaunchDiagnostic(
                 "official-primary-page-not-ready",
                 $"stage=before-patch; outcome={initialReadiness}; pid={activationIdentity.ProcessId}");
+            if (ShouldDeferOfficialCodexReadinessFailure(
+                    initialReadiness,
+                    IsWindowsClientActivationIdentityAlive(activationIdentity)))
+            {
+                OpenNewTaskAfterOfficialCodexLaunchInBackground(
+                    projectPath,
+                    DateTime.UtcNow,
+                    activationIdentity,
+                    launchGeneration);
+                WriteCodexPlusPlusLaunchDiagnostic(
+                    "official-readiness-timeout-preserved",
+                    $"stage=before-patch; outcome={initialReadiness}; restart_on_ready_timeout=false");
+                return OfficialCodexLaunchAttemptOutcome.ReadyWithoutRendererPatch;
+            }
             return OfficialCodexLaunchAttemptOutcome.RecoverableFailure;
         }
 
@@ -4538,6 +4541,20 @@ public sealed partial class CodexCliService
                 "official-post-patch-page-not-ready",
                 $"outcome={postPatchReadiness}; attach={nativeFastAttachOutcome}; " +
                 $"pid={activationIdentity.ProcessId}; port={nativeFastPort.Value}");
+            if (ShouldDeferOfficialCodexReadinessFailure(
+                    postPatchReadiness,
+                    IsWindowsClientActivationIdentityAlive(activationIdentity)))
+            {
+                OpenNewTaskAfterOfficialCodexLaunchInBackground(
+                    projectPath,
+                    DateTime.UtcNow,
+                    activationIdentity,
+                    launchGeneration);
+                WriteCodexPlusPlusLaunchDiagnostic(
+                    "official-readiness-timeout-preserved",
+                    $"stage=after-patch; outcome={postPatchReadiness}; restart_on_ready_timeout=false");
+                return OfficialCodexLaunchAttemptOutcome.ReadyWithoutRendererPatch;
+            }
             return OfficialCodexLaunchAttemptOutcome.RecoverableFailure;
         }
 
@@ -6179,6 +6196,15 @@ public sealed partial class CodexCliService
         };
     }
 
+    private static bool ShouldDeferOfficialCodexReadinessFailure(
+        OfficialCodexMainPageWaitOutcome outcome,
+        bool activationIdentityAlive)
+    {
+        return activationIdentityAlive &&
+               (outcome == OfficialCodexMainPageWaitOutcome.TimedOut ||
+                outcome == OfficialCodexMainPageWaitOutcome.ProbeUnavailable);
+    }
+
     internal static ProcessStartInfo BuildOfficialCodexActivationStartInfo(string projectPath)
     {
         return new ProcessStartInfo(BuildNewThreadDeepLink(projectPath))
@@ -6413,6 +6439,12 @@ public sealed partial class CodexCliService
                 useDreamSkin: false,
                 hasExistingOfficialWindow: true,
                 allowOfficialRendererPatch: false) ||
+            !ShouldPreserveExistingOfficialWindow(
+                switchRequired: false,
+                mode: WindowsClientMode.OfficialCodex,
+                useDreamSkin: false,
+                hasExistingOfficialWindow: true,
+                allowOfficialRendererPatch: true) ||
             ShouldPreserveExistingOfficialWindow(
                 switchRequired: true,
                 mode: WindowsClientMode.OfficialCodex,
@@ -6431,15 +6463,21 @@ public sealed partial class CodexCliService
                 useDreamSkin: false,
                 hasExistingOfficialWindow: false,
                 allowOfficialRendererPatch: false) ||
-            ShouldPreserveExistingOfficialWindow(
-                switchRequired: false,
-                mode: WindowsClientMode.OfficialCodex,
-                useDreamSkin: false,
-                hasExistingOfficialWindow: true,
-                allowOfficialRendererPatch: true))
+            !ShouldDeferOfficialCodexReadinessFailure(
+                OfficialCodexMainPageWaitOutcome.TimedOut,
+                activationIdentityAlive: true) ||
+            !ShouldDeferOfficialCodexReadinessFailure(
+                OfficialCodexMainPageWaitOutcome.ProbeUnavailable,
+                activationIdentityAlive: true) ||
+            ShouldDeferOfficialCodexReadinessFailure(
+                OfficialCodexMainPageWaitOutcome.PersistedAtomSyncFailed,
+                activationIdentityAlive: true) ||
+            ShouldDeferOfficialCodexReadinessFailure(
+                OfficialCodexMainPageWaitOutcome.TimedOut,
+                activationIdentityAlive: false))
         {
             throw new InvalidOperationException(
-                "Only an existing same-profile dual-login/OAuth official window may bypass runtime-health replacement.");
+                "Only an existing same-profile official window may bypass runtime-health replacement, and only a live timeout may be deferred.");
         }
         if (!NativeFastPatchOutcomeRequiresReloadReadiness(
                 NativeFastPatchWaitOutcome.Patched) ||

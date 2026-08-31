@@ -1588,8 +1588,9 @@ if ($launchWindowsClientMethod -notmatch 'TryLaunchCodexPlusPlusViaScheduledTask
     $launchWindowsClientMethod -match 'StartCodexPlusPlusElevated|Verb\s*=\s*"runas"|new\s+ProcessStartInfo\("powershell\.exe"\)') {
     throw 'The normal Start path must accept Codex++ quickly, finish fresh-window/bridge readiness in the background, enable fast startup, capture launcher errors, and avoid an implicit elevated PowerShell fallback.'
 }
-if ($launchWindowsClientMethod -notmatch '(?s)var sameAccountShutdownTargets = CaptureWindowsClientProcessSnapshots\(\);.*?WaitForWindowsClientProcessAndPortRelease\(\s*sameAccountShutdownTargets,.*?\)\s*\|\|\s*!WaitForOfficialCodexSwitchQuiescence\(\s*launchGeneration,') {
-    throw 'An unhealthy same-account official client must pass the global quiescence gate before replacement activation.'
+if ($launchWindowsClientMethod -notmatch 'official-same-profile-window-preserved' -or
+    $launchWindowsClientMethod -match 'sameAccountShutdownTargets|WaitForWindowsClientProcessAndPortRelease\(\s*sameAccountShutdownTargets') {
+    throw 'A same-account official client must be preserved when the optional native Fast bridge is unavailable.'
 }
 $manualGatewayRotationMatch = [regex]::Match(
     $formSource,
@@ -1616,8 +1617,8 @@ if (-not $noRendererFastPathMatch.Success -or
     $noRendererFastPathMatch.Value -notmatch 'BuildNewThreadDeepLink\(projectPath\)') {
     throw 'Dual-login and pure OAuth same-profile launches must preserve an existing official window even while runtime health is transient, without probing the renderer bridge or stopping Codex.'
 }
-if ($cliServiceSource -notmatch '(?s)private static bool ShouldPreserveExistingOfficialWindow\(.*?return !switchRequired &&.*?mode == WindowsClientMode\.OfficialCodex &&.*?!useDreamSkin &&.*?hasExistingOfficialWindow &&.*?!allowOfficialRendererPatch;') {
-    throw 'The existing dual-login/OAuth window-preservation decision must remain independent of transient runtime health.'
+if ($cliServiceSource -notmatch '(?s)private static bool ShouldPreserveExistingOfficialWindow\(.*?return !switchRequired &&.*?mode == WindowsClientMode\.OfficialCodex &&.*?!useDreamSkin &&.*?hasExistingOfficialWindow;') {
+    throw 'The existing same-profile official window-preservation decision must remain independent of transient runtime health and optional renderer patch support.'
 }
 if ($updateNativeFastRefreshMethod -notmatch 'allowRendererReload:\s*false' -or
     $updateNativeFastRefreshMethod -match 'allowRendererReload:\s*true') {
