@@ -398,6 +398,7 @@ public partial class Form1 : Form
     private bool _automaticUpdateCheckStarted;
     private AppUpdateInfo? _availableUpdate;
     private bool _deletedThreadCleanupStarted;
+    private int _deletedDesktopSidebarPruneScheduled;
     private bool _threadSectionOrderNormalizationStarted;
     private bool _patGatewayRuntimeRunning;
     private bool _patGatewayActionRunning;
@@ -6371,11 +6372,24 @@ public partial class Form1 : Form
 
             if (!_formClosed && !IsDisposed)
             {
+                var desktopSidebarRefreshPending = _codex.IsOfficialWindowsClientRunning();
+                if (desktopSidebarRefreshPending)
+                {
+                    ScheduleDeletedDesktopSidebarPruneAfterClientExit();
+                }
+                else
+                {
+                    await Task.Run(() => _codex.TryPruneDeletedDesktopSidebarState());
+                }
                 InvalidateUnifiedHistoryCache(clearCachedData: false);
                 await RefreshUnifiedHistoryAsync(force: true, _workspaceLoadGeneration);
-                _statusBox.Text = cleanupPending
-                    ? $"已从聊天记录删除：{thread.Title}；被 Codex 占用的本地文件将在下次启动时重试清理。"
-                    : $"已永久删除聊天记录：{thread.Title}";
+                _statusBox.Text = desktopSidebarRefreshPending
+                    ? cleanupPending
+                        ? $"已删除聊天记录：{thread.Title}；关闭官方 Codex 后会自动清除“最近”缓存，并重试被占用文件。"
+                        : $"已永久删除聊天记录：{thread.Title}；关闭官方 Codex 后会自动清除左侧“最近”缓存。"
+                    : cleanupPending
+                        ? $"已从聊天记录删除：{thread.Title}；被 Codex 占用的本地文件将在下次启动时重试清理。"
+                        : $"已永久删除聊天记录：{thread.Title}";
             }
         }
         catch (Exception ex)
@@ -6477,8 +6491,48 @@ public partial class Form1 : Form
         // Codex keeps a separate desktop sidebar cache.  Prune deleted-task tombstones
         // before the client is launched, but never write that file while the official
         // Codex process is alive because it owns the same state.
-        await Task.Run(() => _codex.TryPruneDeletedDesktopSidebarState());
+        if (_codex.IsOfficialWindowsClientRunning())
+        {
+            ScheduleDeletedDesktopSidebarPruneAfterClientExit();
+        }
+        else
+        {
+            await Task.Run(() => _codex.TryPruneDeletedDesktopSidebarState());
+        }
         await NormalizeUnifiedHistorySectionOrderAsync();
+    }
+
+    private void ScheduleDeletedDesktopSidebarPruneAfterClientExit()
+    {
+        if (_formClosed ||
+            Interlocked.Exchange(ref _deletedDesktopSidebarPruneScheduled, 1) != 0)
+        {
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                // Never mutate the official desktop cache while Codex owns it. Keep the cleanup
+                // armed for the lifetime of this manager window; as soon as Codex exits, perform
+                // the atomic tombstone projection before the next launch can read stale entries.
+                while (!_formClosed)
+                {
+                    if (!_codex.IsOfficialWindowsClientRunning())
+                    {
+                        _codex.TryPruneDeletedDesktopSidebarState();
+                        return;
+                    }
+
+                    await Task.Delay(TimeSpan.FromSeconds(2));
+                }
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _deletedDesktopSidebarPruneScheduled, 0);
+            }
+        });
     }
 
     private async Task NormalizeUnifiedHistorySectionOrderAsync()

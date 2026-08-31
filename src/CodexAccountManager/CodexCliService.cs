@@ -2151,6 +2151,12 @@ public sealed partial class CodexCliService
                         "Codex did not remain fully closed, or a native bridge port did not release cleanly. " +
                         "Account credentials were not changed; close Codex completely and retry.");
                 }
+
+                // A stopped official client no longer owns its persisted sidebar cache. Prune
+                // deletion tombstones before projecting/launching the next account so deleted
+                // tasks cannot remain in "最近" merely because the manager recorded the deletion
+                // while Codex was still open.
+                TryPruneDeletedDesktopSidebarState();
             }
             if (sharedProfileAlreadySelected)
             {
@@ -2343,8 +2349,11 @@ public sealed partial class CodexCliService
         AccountRecord? chatGptFeatureAccount)
     {
         ArgumentNullException.ThrowIfNull(modelAccount);
-        return accessTokenMode == AccessTokenSharedProfileMode.ApiCompatible &&
-               chatGptFeatureAccount == null &&
+        // The ordinary "Codex 启动" path must remain a clean official-client launch.
+        // The reviewed Fast picker patch is needed only by the explicit PAT/API +
+        // ChatGPT dual-login entry exposed as "语音 / 手机" in the manager.
+        return accessTokenMode == AccessTokenSharedProfileMode.ChatGptDesktop &&
+               chatGptFeatureAccount?.IsOfficialOAuth == true &&
                (modelAccount.IsAccessToken || modelAccount.IsCompatibleApi);
     }
 
@@ -2564,6 +2573,7 @@ public sealed partial class CodexCliService
                         launchGeneration,
                         displayGeneration: displayGeneration);
                 }
+
             }
             catch (Exception ex)
             {
@@ -4002,7 +4012,7 @@ public sealed partial class CodexCliService
             appearanceMode: ThemeMode.System,
             appearancePresetId: "manager",
             appearanceLabel: null,
-            allowOfficialRendererPatch: true);
+            allowOfficialRendererPatch: false);
     }
 
     private bool LaunchWindowsClient(
@@ -4048,8 +4058,9 @@ public sealed partial class CodexCliService
             // back-pressured, or the app-server is rotating state. Closing that visible
             // verified Codex window would kill the in-flight task. Preserve it
             // unconditionally; a best-effort deep link may focus/open the requested project
-            // but its failure must not mutate the existing process tree. The optional native
-            // Fast bridge is additive and must never turn a same-account click into a restart.
+            // but its failure must not mutate the existing process tree. A direct Codex launch
+            // never applies the Fast renderer patch; an already-open dual-login window is also
+            // preserved instead of being reloaded merely to add that optional control.
             try
             {
                 Process.Start(new ProcessStartInfo(BuildNewThreadDeepLink(projectPath))
@@ -4066,37 +4077,6 @@ public sealed partial class CodexCliService
             WriteCodexPlusPlusLaunchDiagnostic(
                 "official-same-profile-window-preserved",
                 "renderer patch and runtime-health shutdown were disabled for the existing same-profile window");
-            return true;
-        }
-
-        if (!switchRequired &&
-            mode == WindowsClientMode.OfficialCodex &&
-            !useDreamSkin &&
-            hasExistingOfficialWindow)
-        {
-            var existingOfficialClientHealthy =
-                IsWindowsClientRuntimeHealthySince(DateTime.MinValue);
-            if (existingOfficialClientHealthy &&
-                TryAttachNativeFastBridgeToExistingOfficialCodex())
-            {
-                Process.Start(new ProcessStartInfo(BuildNewThreadDeepLink(projectPath))
-                {
-                    UseShellExecute = true
-                });
-                return true;
-            }
-
-            // A same-account client with a visible window is kept even when its optional bridge
-            // cannot be attached. Only a real profile switch (switchRequired=true) may stop it.
-            // This avoids disconnecting the desktop client merely because Electron did not expose
-            // CDP on a previous launch.
-            Process.Start(new ProcessStartInfo(BuildNewThreadDeepLink(projectPath))
-            {
-                UseShellExecute = true
-            });
-            WriteCodexPlusPlusLaunchDiagnostic(
-                "official-same-profile-window-preserved",
-                "existing official window was kept because the optional native Fast bridge was unavailable");
             return true;
         }
 
@@ -4137,9 +4117,9 @@ public sealed partial class CodexCliService
         bool allowRendererPatch)
     {
         // A controlled renderer reload needs a synchronous routes + IPC contract because the
-        // manager itself caused that reload. Official OAuth and explicit dual-login launches do
-        // not patch/reload the renderer; a delayed log line there must never become permission to
-        // kill a visible client and restart it. Their readiness is observed in the background.
+        // manager itself caused that reload. Ordinary Codex launches do not patch/reload the
+        // renderer; a delayed log line there must never become permission to kill a visible
+        // client and restart it. Their readiness is observed in the background.
         return allowRendererPatch
             ? OfficialCodexStartupReadinessPolicy.VerifySynchronouslyForRendererPatch
             : OfficialCodexStartupReadinessPolicy.PreserveActivationAndObserveInBackground;
@@ -4280,10 +4260,11 @@ public sealed partial class CodexCliService
                 appearancePresetId,
                 appearanceLabel,
                 projectPath);
-            if (!TryAttachNativeFastBridgeToExistingOfficialCodex(
-                    DreamSkinCdpPortCandidates(),
-                    out var dreamSkinFastReady) ||
-                !dreamSkinFastReady)
+            if (allowRendererPatch &&
+                (!TryAttachNativeFastBridgeToExistingOfficialCodex(
+                        DreamSkinCdpPortCandidates(),
+                        out var dreamSkinFastReady) ||
+                 !dreamSkinFastReady))
             {
                 WriteCodexPlusPlusLaunchDiagnostic(
                     "dream-skin-native-fast-unavailable",
@@ -4346,7 +4327,7 @@ public sealed partial class CodexCliService
             OfficialCodexStartupReadinessPolicy.PreserveActivationAndObserveInBackground)
         {
             // The COM activation already returned an immutable PID/start-time identity. For
-            // OAuth/dual-login this is the commit point: do not reinterpret a slow renderer log
+            // a clean ordinary Codex launch this is the commit point: do not reinterpret a slow renderer log
             // or busy IPC queue as a crash and destructively recycle the process. The existing
             // background observer will deliver the optional project deep link only after the
             // runtime becomes healthy, and will merely log a timeout without stopping Codex.
@@ -4453,9 +4434,9 @@ public sealed partial class CodexCliService
         {
             if (nativeFastPort.HasValue && !allowRendererPatch)
             {
-                // ChatGPT OAuth already supplies the feature identity used by the dual-login
-                // entry. Keep the verified CDP owner for optional account-label injection, but
-                // do not reload a healthy renderer merely to apply the PAT/API Fast picker.
+                // The ordinary Codex entry deliberately keeps the signed client renderer
+                // unchanged. Keep the verified CDP owner for optional account-label injection,
+                // but do not reload it merely to add the PAT/API Fast picker.
                 WriteCodexPlusPlusLaunchDiagnostic(
                     "official-renderer-patch-not-required",
                     $"pid={activationIdentity.ProcessId}; port={nativeFastPort.Value}; primary-ready=true");
@@ -6412,16 +6393,20 @@ public sealed partial class CodexCliService
         var patAccount = new AccountRecord { AuthKind = AccountAuthKind.AccessToken };
         var apiAccount = new AccountRecord { AuthKind = AccountAuthKind.CompatibleApi };
         var oauthAccount = new AccountRecord { AuthKind = AccountAuthKind.OfficialOAuth };
-        if (!ShouldApplyOfficialRendererPatch(
+        if (ShouldApplyOfficialRendererPatch(
                 patAccount,
-                AccessTokenSharedProfileMode.ApiCompatible,
-                chatGptFeatureAccount: null) ||
-            !ShouldApplyOfficialRendererPatch(
-                apiAccount,
                 AccessTokenSharedProfileMode.ApiCompatible,
                 chatGptFeatureAccount: null) ||
             ShouldApplyOfficialRendererPatch(
+                apiAccount,
+                AccessTokenSharedProfileMode.ApiCompatible,
+                chatGptFeatureAccount: null) ||
+            !ShouldApplyOfficialRendererPatch(
                 patAccount,
+                AccessTokenSharedProfileMode.ChatGptDesktop,
+                oauthAccount) ||
+            !ShouldApplyOfficialRendererPatch(
+                apiAccount,
                 AccessTokenSharedProfileMode.ChatGptDesktop,
                 oauthAccount) ||
             ShouldApplyOfficialRendererPatch(
@@ -6430,8 +6415,8 @@ public sealed partial class CodexCliService
                 chatGptFeatureAccount: null))
         {
             throw new InvalidOperationException(
-                "Dual-login and official OAuth launches must preserve the primary renderer, " +
-                "while pure PAT/API launches may still request the optional Fast patch.");
+                "Ordinary Codex and official OAuth launches must preserve the primary renderer, " +
+                "while only explicit PAT/API + ChatGPT dual-login may request the Fast patch.");
         }
         if (!ShouldPreserveExistingOfficialWindow(
                 switchRequired: false,

@@ -1610,12 +1610,12 @@ if (-not $manualGatewayRotationMatch.Success -or
 }
 $noRendererFastPathMatch = [regex]::Match(
     $launchWindowsClientMethod,
-    '(?s)if \(ShouldPreserveExistingOfficialWindow\(.*?allowOfficialRendererPatch\)\)\s*\{.*?official-same-profile-window-preserved.*?return true;\s*\}.*?var existingOfficialClientHealthy\s*=\s*\r?\n?\s*IsWindowsClientRuntimeHealthySince\(DateTime\.MinValue\);')
+    '(?s)if \(ShouldPreserveExistingOfficialWindow\(.*?allowOfficialRendererPatch\)\)\s*\{.*?official-same-profile-window-preserved.*?return true;\s*\}')
 if (-not $noRendererFastPathMatch.Success -or
     $noRendererFastPathMatch.Value -match 'StopWindowsClientProcesses' -or
     $noRendererFastPathMatch.Value -match 'TryAttachNativeFastBridgeToExistingOfficialCodex.*?official-same-profile-window-preserved|IsWindowsClientRuntimeHealthySince.*?official-same-profile-window-preserved' -or
     $noRendererFastPathMatch.Value -notmatch 'BuildNewThreadDeepLink\(projectPath\)') {
-    throw 'Dual-login and pure OAuth same-profile launches must preserve an existing official window even while runtime health is transient, without probing the renderer bridge or stopping Codex.'
+    throw 'Same-profile official launches must preserve an existing window even while runtime health is transient, without probing the renderer bridge or stopping Codex.'
 }
 if ($cliServiceSource -notmatch '(?s)private static bool ShouldPreserveExistingOfficialWindow\(.*?return !switchRequired &&.*?mode == WindowsClientMode\.OfficialCodex &&.*?!useDreamSkin &&.*?hasExistingOfficialWindow;') {
     throw 'The existing same-profile official window-preservation decision must remain independent of transient runtime health and optional renderer patch support.'
@@ -1675,7 +1675,7 @@ if ($postPatchReadinessIndex -le $rendererPatchIndex -or
 }
 if ($completeOfficialCodexLaunchAttemptMethod -notmatch 'if \(!nativeFastPort\.HasValue \|\| !allowRendererPatch\)' -or
     $completeOfficialCodexLaunchAttemptMethod -notmatch 'official-renderer-patch-not-required' -or
-    $cliServiceSource -notmatch '(?s)private static bool ShouldApplyOfficialRendererPatch\(.*?AccessTokenSharedProfileMode\.ApiCompatible.*?chatGptFeatureAccount == null.*?modelAccount\.IsAccessToken \|\| modelAccount\.IsCompatibleApi' -or
+    $cliServiceSource -notmatch '(?s)private static bool ShouldApplyOfficialRendererPatch\(.*?AccessTokenSharedProfileMode\.ChatGptDesktop.*?chatGptFeatureAccount\?\.IsOfficialOAuth == true.*?modelAccount\.IsAccessToken \|\| modelAccount\.IsCompatibleApi' -or
     $nativeFastAttachMethod -notmatch 'WaitForRendererPatchOutcome' -or
     $nativeFastAttachMethod -notmatch 'NativeFastPatchWaitOutcome\.SkippedWithoutReload' -or
     $nativeFastAttachMethod -notmatch 'NativeFastPatchWaitOutcome\.TimedOutWithoutReload' -or
@@ -3392,6 +3392,8 @@ if ($formSource -notmatch 'WorkspaceView\.UnifiedHistory' -or
     $formSource -notmatch 'OpenUnifiedThreadAsync' -or
     $formSource -notmatch 'ToggleUnifiedThreadArchiveAsync' -or
     $formSource -notmatch 'DeleteUnifiedThreadAsync' -or
+    $formSource -notmatch 'ScheduleDeletedDesktopSidebarPruneAfterClientExit' -or
+    $formSource -notmatch '关闭官方 Codex 后会自动清除' -or
     $formSource -notmatch 'AutoScaleMode\s*=\s*AutoScaleMode\.Dpi' -or
     $historyServiceSource -notmatch 'state_5\.sqlite' -or
     $historyServiceSource -notmatch 'RecordDeletedThread' -or
