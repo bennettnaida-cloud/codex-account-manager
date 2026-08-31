@@ -66,6 +66,10 @@ public sealed partial class CodexCliService
     private const string CockpitAuthFileName = ".cockpit_codex_auth.json";
     private const string ConfigFileName = "config.toml";
     private const string GlobalStateFileName = ".codex-global-state.json";
+    // Older Codex desktop builds still consult this JSONL index when rebuilding the
+    // left-hand "Recent" list.  It is separate from state_5.sqlite and the global
+    // Electron sidebar state, so deleting a thread must prune it as well.
+    private const string SessionIndexFileName = "session_index.jsonl";
     private const string DesktopSelectionFileName = ".codex-account-manager-desktop-selection.json";
     // This sidecar identifies the account whose credentials currently own the shared
     // desktop profile.  It contains no credential material and is separate from the
@@ -310,34 +314,175 @@ public sealed partial class CodexCliService
         {
             var codexHome = GetDefaultCodexHome();
             var deletedThreadIds = SharedHistoryService.LoadDeletedThreadIds(codexHome);
-            if (deletedThreadIds.Count == 0)
+            string? backupDirectory = null;
+            var changed = false;
+
+            // The Electron state file contains ordering and title caches.  Only touch it
+            // when there are deletion tombstones; otherwise a normal startup remains a
+            // read-only maintenance pass.
+            if (deletedThreadIds.Count > 0)
             {
-                return false;
+                var statePath = Path.Combine(codexHome, GlobalStateFileName);
+                if (File.Exists(statePath))
+                {
+                    var current = File.ReadAllText(statePath);
+                    var projected = ProjectDesktopSidebarStateText(current, deletedThreadIds);
+                    if (!string.Equals(current, projected, StringComparison.Ordinal))
+                    {
+                        backupDirectory ??= CreateBackupDirectory(codexHome);
+                        BackupFileIfPresent(statePath, backupDirectory);
+                        WriteTextAtomically(statePath, projected);
+                        changed = true;
+                    }
+                }
             }
 
-            var statePath = Path.Combine(codexHome, GlobalStateFileName);
-            if (!File.Exists(statePath))
+            // Codex 2.x also rebuilds its sidebar from session_index.jsonl.  Pruning only
+            // the Electron state above therefore allowed deleted titles to reappear after a
+            // clean restart.  Remove tombstoned IDs and entries no longer present in the
+            // authoritative state database while the official client is stopped.
+            if (TryPruneDesktopSessionIndex(codexHome, deletedThreadIds, ref backupDirectory))
             {
-                return false;
+                changed = true;
             }
 
-            var current = File.ReadAllText(statePath);
-            var projected = ProjectDesktopSidebarStateText(current, deletedThreadIds);
-            if (string.Equals(current, projected, StringComparison.Ordinal))
-            {
-                return false;
-            }
-
-            var backupDirectory = CreateBackupDirectory(codexHome);
-            BackupFileIfPresent(statePath, backupDirectory);
-            WriteTextAtomically(statePath, projected);
-            return true;
+            return changed;
         }
         catch
         {
             // Sidebar cleanup is best-effort.  A locked/corrupt desktop cache must never
             // prevent the account manager or PAT gateway from starting.
             return false;
+        }
+    }
+
+    private static bool TryPruneDesktopSessionIndex(
+        string codexHome,
+        IReadOnlySet<string> deletedThreadIds,
+        ref string? backupDirectory)
+    {
+        var indexPath = Path.Combine(Path.GetFullPath(codexHome), SessionIndexFileName);
+        if (!File.Exists(indexPath))
+        {
+            return false;
+        }
+
+        var liveThreadIds = TryLoadStateDatabaseThreadIds(codexHome);
+        var current = File.ReadAllText(indexPath);
+        var normalized = current.Replace("\r\n", "\n", StringComparison.Ordinal);
+        var lines = normalized.Split('\n');
+        var kept = new List<string>(lines.Length);
+        var changed = false;
+
+        foreach (var line in lines)
+        {
+            if (TryReadSessionIndexThreadId(line, out var threadId) &&
+                (deletedThreadIds.Contains(threadId) ||
+                 (liveThreadIds is { Count: > 0 } && !liveThreadIds.Contains(threadId))))
+            {
+                changed = true;
+                continue;
+            }
+
+            kept.Add(line);
+        }
+
+        if (!changed)
+        {
+            return false;
+        }
+
+        var projected = string.Join("\n", kept);
+        if (current.Contains("\r\n", StringComparison.Ordinal))
+        {
+            projected = projected.Replace("\n", "\r\n", StringComparison.Ordinal);
+        }
+
+        backupDirectory ??= CreateBackupDirectory(codexHome);
+        BackupFileIfPresent(indexPath, backupDirectory);
+        WriteTextAtomically(indexPath, projected);
+        return true;
+    }
+
+    private static bool TryReadSessionIndexThreadId(string line, out string threadId)
+    {
+        threadId = string.Empty;
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(line);
+            if (document.RootElement.ValueKind != JsonValueKind.Object ||
+                !document.RootElement.TryGetProperty("id", out var idValue) ||
+                idValue.ValueKind != JsonValueKind.String)
+            {
+                return false;
+            }
+
+            var value = idValue.GetString();
+            if (!Guid.TryParse(value, out _))
+            {
+                return false;
+            }
+
+            threadId = value!;
+            return true;
+        }
+        catch (JsonException)
+        {
+            // Preserve malformed/legacy lines rather than risking data loss during cleanup.
+            return false;
+        }
+    }
+
+    private static HashSet<string>? TryLoadStateDatabaseThreadIds(string codexHome)
+    {
+        var databasePath = Path.Combine(Path.GetFullPath(codexHome), "state_5.sqlite");
+        if (!File.Exists(databasePath))
+        {
+            return null;
+        }
+
+        try
+        {
+            EnsureSqliteProvider();
+            using var connection = new SqliteConnection(
+                new SqliteConnectionStringBuilder
+                {
+                    DataSource = databasePath,
+                    Mode = SqliteOpenMode.ReadOnly,
+                    Cache = SqliteCacheMode.Private,
+                    Pooling = false,
+                    DefaultTimeout = 2
+                }.ToString());
+            connection.Open();
+            using var command = connection.CreateCommand();
+            command.CommandText = "SELECT id FROM threads;";
+            using var reader = command.ExecuteReader();
+            var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            while (reader.Read())
+            {
+                var id = reader.IsDBNull(0) ? string.Empty : reader.GetString(0);
+                if (Guid.TryParse(id, out _))
+                {
+                    result.Add(id);
+                }
+            }
+
+            // An empty but valid database can be a first-run/migration state.  Returning null
+            // avoids deleting every legacy index entry while it is being populated.
+            return result.Count == 0 ? null : result;
+        }
+        catch (Exception ex) when (
+            ex is SqliteException or
+            IOException or
+            UnauthorizedAccessException or
+            InvalidOperationException)
+        {
+            return null;
         }
     }
 
@@ -11079,6 +11224,49 @@ catch {
         {
             throw new InvalidOperationException(
                 "Codex desktop deleted-task sidebar cache pruning failed.");
+        }
+
+        var sessionIndexRoot = Path.Combine(
+            Path.GetTempPath(),
+            "codex-account-manager-sidebar-self-test-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(sessionIndexRoot);
+        try
+        {
+            var sessionIndexPath = Path.Combine(sessionIndexRoot, SessionIndexFileName);
+            File.WriteAllText(
+                sessionIndexPath,
+                $$"""
+                {"id":"{{deletedThreadId}}","thread_name":"deleted"}
+                {"id":"{{liveThreadId}}","thread_name":"live"}
+                """);
+            string? sessionIndexBackup = null;
+            if (!TryPruneDesktopSessionIndex(
+                    sessionIndexRoot,
+                    new HashSet<string>(StringComparer.OrdinalIgnoreCase) { deletedThreadId },
+                    ref sessionIndexBackup))
+            {
+                throw new InvalidOperationException(
+                    "Codex desktop session index pruning did not report a change.");
+            }
+
+            var projectedIndex = File.ReadAllText(sessionIndexPath);
+            if (projectedIndex.Contains(deletedThreadId, StringComparison.OrdinalIgnoreCase) ||
+                !projectedIndex.Contains(liveThreadId, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    "Codex desktop session index pruning left an incorrect thread entry.");
+            }
+        }
+        finally
+        {
+            try
+            {
+                Directory.Delete(sessionIndexRoot, recursive: true);
+            }
+            catch
+            {
+                // Self-test cleanup is best-effort and must not mask the assertion above.
+            }
         }
 
         const string threadId = "019f4be7-aa6e-72b2-84bf-4e35b9c5f25f";

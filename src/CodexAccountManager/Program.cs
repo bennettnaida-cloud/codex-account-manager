@@ -73,6 +73,10 @@ static class Program
         {
             return RunSelfTest();
         }
+        if (args.Contains("--prune-deleted-desktop-state", StringComparer.OrdinalIgnoreCase))
+        {
+            return RunDeletedDesktopStatePrune();
+        }
         if (args.Contains("--dual-login-recovery-self-test", StringComparer.OrdinalIgnoreCase))
         {
             return RunDualLoginRecoverySelfTest();
@@ -221,6 +225,23 @@ static class Program
             "unobserved-task-exception-contained",
             eventArgs.Exception);
         eventArgs.SetObserved();
+    }
+
+    private static int RunDeletedDesktopStatePrune()
+    {
+        try
+        {
+            var changed = new CodexCliService().TryPruneDeletedDesktopSidebarState();
+            Console.WriteLine(changed
+                ? "Deleted Codex desktop sidebar entries were pruned."
+                : "Codex desktop sidebar was not changed (the client may still be running or no stale entries were found).");
+            return changed ? 0 : 3;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(CodexCliService.MaskSensitiveText(ex.Message));
+            return 1;
+        }
     }
 
     private static int RunLocalPatConfigMigration()
