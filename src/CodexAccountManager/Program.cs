@@ -415,20 +415,20 @@ static class Program
             SharedHistoryMerger.ValidateHistoryFileMerge();
             SharedHistoryMerger.ValidateDeletedThreadTombstones();
             // GitHub's clean Windows runners do not have the Microsoft Store
-            // Codex desktop package installed. Keep the integration check strict
-            // for normal local self-tests, while allowing the release workflow to
-            // validate the rest of the package without pretending that package is
-            // present.
+            // Codex desktop package or its runtime logs installed. Keep the
+            // integration and persisted-log readiness checks strict for normal
+            // local self-tests, while allowing the release workflow to validate
+            // the rest of the package without pretending that package is present.
             if (!IsWindowsClientSelfTestSkipped())
             {
                 CodexCliService.ValidateWindowsClientResolution();
+                CodexCliService.ValidateOfficialCodexLaunchRecovery();
             }
             else
             {
                 Console.WriteLine("Windows Codex desktop client self-test skipped by build environment.");
             }
             CodexCliService.ValidateOfficialCodexActivation();
-            CodexCliService.ValidateOfficialCodexLaunchRecovery();
             CodexDreamSkinService.ValidateBundledRuntime();
             CodexNativeFastBridge.ValidatePatchContract();
 
