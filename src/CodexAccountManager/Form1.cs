@@ -6474,6 +6474,10 @@ public partial class Form1 : Form
     private async Task RunStartupHistoryMaintenanceAsync()
     {
         await CleanupDeletedThreadArtifactsAsync();
+        // Codex keeps a separate desktop sidebar cache.  Prune deleted-task tombstones
+        // before the client is launched, but never write that file while the official
+        // Codex process is alive because it owns the same state.
+        await Task.Run(() => _codex.TryPruneDeletedDesktopSidebarState());
         await NormalizeUnifiedHistorySectionOrderAsync();
     }
 
@@ -16277,8 +16281,12 @@ public partial class Form1 : Form
                     GetCodexAppearanceRuntimePresetId(startupAppearance),
                     GetCodexAppearanceLabelById(_appSettings.CodexAppearancePresetId),
                     routeOfficialOAuthThroughGateway,
-                    forceClientRestart: mode == WindowsClientMode.OfficialCodex &&
-                                        !automaticRotation)
+                    // Do not restart an already projected official client merely because the
+                    // user pressed the visible “Codex 启动” button again.  A restart is only
+                    // required when the shared account profile actually changes; forcing it for
+                    // every click caused an unnecessary Codex/Manager disconnect and could make
+                    // the user lose the current window while the credentials were unchanged.
+                    forceClientRestart: false)
                 : await _codex.SwitchWindowsClientAccountWithChatGptFeaturesAsync(
                     account,
                     chatGptFeatureAccount,

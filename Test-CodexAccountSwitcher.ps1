@@ -1526,7 +1526,7 @@ if ($switchWindowsClientMethod -notmatch 'ValidateWindowsClientAccountAsync\(\s*
     $switchWindowsClientMethod -notmatch 'RequiresWindowsClientShutdown\(sharedProfileAlreadySelected\)' -or
     $switchWindowsClientMethod -notmatch '(?s)var switchRequired\s*=\s*forceClientRestart\s*\|\|\s*RequiresWindowsClientShutdown\(sharedProfileAlreadySelected\)' -or
     $switchWindowsClientMethod -notmatch '(?s)if \(switchRequired\).*?StopWindowsClientProcesses\(shutdownTargets\);.*?WaitForWindowsClientProcessAndPortRelease\(.*?if \(sharedProfileAlreadySelected\).*?CreateReusedSharedProfileProjection.*?else.*?ProjectWindowsClientAccount\(' -or
-    $formSource -notmatch '(?s)SwitchWindowsClientAccountAsync\(.*?forceClientRestart:\s*mode == WindowsClientMode\.OfficialCodex\s*&&\s*!automaticRotation' -or
+    $formSource -notmatch '(?s)SwitchWindowsClientAccountAsync\(.*?forceClientRestart:\s*false' -or
     $formSource -notmatch '(?s)if \(!await LocalPatGateway\.ClearRotationAsync\(\)\).*?本次没有关闭或重启 Codex' -or
     $switchWindowsClientMethod -notmatch 'projection\.ClientLaunchStarted\s*=\s*LaunchWindowsClient\(' -or
     $switchWindowsClientMethod -notmatch 'allowOfficialRendererPatch:\s*ShouldApplyOfficialRendererPatch\(' -or

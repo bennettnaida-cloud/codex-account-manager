@@ -294,6 +294,53 @@ public sealed partial class CodexCliService
         return false;
     }
 
+    /// <summary>
+    /// Removes Account Manager deletion-tombstone IDs from the official Codex desktop
+    /// sidebar cache.  The file is only touched while the official client is not running;
+    /// a live client owns the same state and could overwrite a concurrent write.
+    /// </summary>
+    public bool TryPruneDeletedDesktopSidebarState()
+    {
+        if (IsOfficialWindowsClientRunning())
+        {
+            return false;
+        }
+
+        try
+        {
+            var codexHome = GetDefaultCodexHome();
+            var deletedThreadIds = SharedHistoryService.LoadDeletedThreadIds(codexHome);
+            if (deletedThreadIds.Count == 0)
+            {
+                return false;
+            }
+
+            var statePath = Path.Combine(codexHome, GlobalStateFileName);
+            if (!File.Exists(statePath))
+            {
+                return false;
+            }
+
+            var current = File.ReadAllText(statePath);
+            var projected = ProjectDesktopSidebarStateText(current, deletedThreadIds);
+            if (string.Equals(current, projected, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            var backupDirectory = CreateBackupDirectory(codexHome);
+            BackupFileIfPresent(statePath, backupDirectory);
+            WriteTextAtomically(statePath, projected);
+            return true;
+        }
+        catch
+        {
+            // Sidebar cleanup is best-effort.  A locked/corrupt desktop cache must never
+            // prevent the account manager or PAT gateway from starting.
+            return false;
+        }
+    }
+
     public void CaptureActiveServiceTier()
     {
         PersistSharedServiceTierToSelectedAccount();
@@ -2073,10 +2120,9 @@ public sealed partial class CodexCliService
                         "official-dual-profile-reused-with-runtime-drift",
                         "the verified model/OAuth owners were unchanged; existing Codex was preserved");
                 }
-                // The visible "Codex 启动" action is also the user's recovery switch.  When
-                // requested, close the exact operation-start Codex process set even if the
-                // projected account already matches, then reopen it from the verified profile.
-                // Automatic/request-boundary rotation keeps the reuse behavior unchanged.
+                // An explicit recovery caller may request a restart even if the projected
+                // account already matches. Ordinary launches and request-boundary rotation
+                // keep the healthy process alive when the shared profile can be reused.
                 var switchRequired = forceClientRestart ||
                                      RequiresWindowsClientShutdown(sharedProfileAlreadySelected);
                 var shutdownTargets = switchRequired
@@ -8968,7 +9014,12 @@ catch {
         projection.GlobalStatePath = statePath;
         projection.GlobalStateExisted = File.Exists(statePath);
         var current = projection.GlobalStateExisted ? File.ReadAllText(statePath) : "{}";
-        var projected = ProjectDesktopSidebarStateText(current);
+        // The desktop client keeps its own sidebar ordering/title caches in the global state
+        // file.  Removing a thread from state_5.sqlite alone is not enough: a stale cached ID
+        // can be rendered back into “最近” after the client restarts.  Prune only IDs recorded by
+        // Account Manager's deletion tombstone; unrelated client metadata is preserved.
+        var deletedThreadIds = SharedHistoryService.LoadDeletedThreadIds(projection.DefaultCodexHome);
+        var projected = ProjectDesktopSidebarStateText(current, deletedThreadIds);
         if (string.Equals(current, projected, StringComparison.Ordinal))
         {
             return;
@@ -8979,7 +9030,9 @@ catch {
         projection.SidebarStateWasNormalized = true;
     }
 
-    internal static string ProjectDesktopSidebarStateText(string current)
+    internal static string ProjectDesktopSidebarStateText(
+        string current,
+        IReadOnlySet<string>? deletedThreadIds = null)
     {
         var root = JsonNode.Parse(string.IsNullOrWhiteSpace(current) ? "{}" : current) as JsonObject
             ?? throw new InvalidOperationException("Invalid Codex desktop state JSON.");
@@ -8999,7 +9052,116 @@ catch {
         preferences["mode"] = "list";
         preferences["initialized"] = true;
 
+        if (deletedThreadIds is { Count: > 0 })
+        {
+            PruneDeletedDesktopThreadReferences(root, deletedThreadIds);
+        }
+
         return root.ToJsonString(new JsonSerializerOptions { WriteIndented = false });
+    }
+
+    private static void PruneDeletedDesktopThreadReferences(
+        JsonObject root,
+        IReadOnlySet<string> deletedThreadIds)
+    {
+        var persisted = root["electron-persisted-atom-state"] as JsonObject;
+        if (persisted == null)
+        {
+            return;
+        }
+
+        RemoveDeletedThreadArrayEntries(
+            persisted["unified-sidebar-chat-order-v1"] as JsonArray,
+            deletedThreadIds);
+
+        if (persisted["codex-sidebar-chat-order-v1"] is JsonObject codexOrder)
+        {
+            RemoveDeletedThreadArrayEntries(codexOrder["threadIds"] as JsonArray, deletedThreadIds);
+        }
+
+        if (root["projectless-thread-ids"] is JsonArray projectless)
+        {
+            RemoveDeletedThreadArrayEntries(projectless, deletedThreadIds);
+        }
+
+        // Custom sections store their visible order as section.itemKeys.  Keep the section
+        // itself, but remove deleted thread keys so an old task cannot be resurrected there.
+        if (persisted["sidebar-custom-sections-v3"] is JsonObject profiles)
+        {
+            foreach (var profile in profiles)
+            {
+                if (profile.Value is not JsonObject profileState ||
+                    profileState["sections"] is not JsonArray sections)
+                {
+                    continue;
+                }
+
+                foreach (var section in sections)
+                {
+                    if (section is JsonObject sectionState)
+                    {
+                        RemoveDeletedThreadArrayEntries(
+                            sectionState["itemKeys"] as JsonArray,
+                            deletedThreadIds);
+                    }
+                }
+            }
+        }
+
+        // Titles in this map are keyed by thread ID and are consulted when the sidebar does not
+        // yet have a fresh server row.  Removing those exact keys prevents a deleted title from
+        // being displayed while the client is reconciling its database.
+        if (persisted["thread-descriptions-v1"] is JsonObject descriptions)
+        {
+            RemoveDeletedThreadObjectKeys(descriptions, deletedThreadIds);
+        }
+    }
+
+    private static void RemoveDeletedThreadArrayEntries(
+        JsonArray? array,
+        IReadOnlySet<string> deletedThreadIds)
+    {
+        if (array == null)
+        {
+            return;
+        }
+
+        for (var index = array.Count - 1; index >= 0; index--)
+        {
+            if (array[index] is JsonValue value &&
+                value.TryGetValue<string>(out var text) &&
+                ContainsDeletedThreadId(text, deletedThreadIds))
+            {
+                array.RemoveAt(index);
+            }
+        }
+    }
+
+    private static void RemoveDeletedThreadObjectKeys(
+        JsonObject obj,
+        IReadOnlySet<string> deletedThreadIds)
+    {
+        foreach (var property in obj.ToList())
+        {
+            if (deletedThreadIds.Contains(property.Key))
+            {
+                obj.Remove(property.Key);
+            }
+        }
+    }
+
+    private static bool ContainsDeletedThreadId(
+        string? value,
+        IReadOnlySet<string> deletedThreadIds)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        return deletedThreadIds.Any(id =>
+            !string.IsNullOrWhiteSpace(id) &&
+            value.Contains(id, StringComparison.OrdinalIgnoreCase));
     }
 
     private static void RestoreDesktopSidebarState(WindowsClientAccountProjection projection)
@@ -10848,6 +11010,52 @@ catch {
             preferences["initialized"]?.GetValue<bool>() != true)
         {
             throw new InvalidOperationException("Codex desktop sidebar projection failed.");
+        }
+
+        const string deletedThreadId = "019f4be7-aa6e-72b0-84bf-4e35b9c5f25f";
+        const string liveThreadId = "019f4be7-aa6e-72b1-84bf-4e35b9c5f25f";
+        var stateWithDeletedReferences = $$"""
+            {
+              "keep": "value",
+              "projectless-thread-ids": ["{{deletedThreadId}}", "{{liveThreadId}}"],
+              "electron-persisted-atom-state": {
+                "codex-sidebar-chat-order-v1": {
+                  "threadIds": ["{{deletedThreadId}}", "{{liveThreadId}}"]
+                },
+                "unified-sidebar-chat-order-v1": [
+                  "codex:thread:local:{{deletedThreadId}}",
+                  "codex:thread:local:{{liveThreadId}}"
+                ],
+                "sidebar-custom-sections-v3": {
+                  "profile": {
+                    "sections": [
+                      {
+                        "itemKeys": [
+                          "codex:thread:local:{{deletedThreadId}}",
+                          "codex:thread:local:{{liveThreadId}}"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                "thread-descriptions-v1": {
+                  "{{deletedThreadId}}": { "title": "deleted" },
+                  "{{liveThreadId}}": { "title": "live" }
+                }
+              }
+            }
+            """;
+        var deletedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            deletedThreadId
+        };
+        var prunedState = ProjectDesktopSidebarStateText(stateWithDeletedReferences, deletedIds);
+        if (prunedState.Contains(deletedThreadId, StringComparison.OrdinalIgnoreCase) ||
+            !prunedState.Contains(liveThreadId, StringComparison.OrdinalIgnoreCase) ||
+            !prunedState.Contains("\"keep\":\"value\"", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "Codex desktop deleted-task sidebar cache pruning failed.");
         }
 
         const string threadId = "019f4be7-aa6e-72b2-84bf-4e35b9c5f25f";
