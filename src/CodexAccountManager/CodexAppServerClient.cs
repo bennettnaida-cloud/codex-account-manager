@@ -280,6 +280,49 @@ internal sealed class CodexAppServerClient
             timeout.Token);
     }
 
+    public async Task ReorderThreadSectionAsync(
+        string sectionId,
+        IReadOnlyList<string> orderedThreadIds,
+        string codexHome,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateMutableSectionId(sectionId);
+        if (orderedThreadIds.Count < 2)
+        {
+            return;
+        }
+
+        var uniqueThreadIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var threadId in orderedThreadIds)
+        {
+            ValidateThreadId(threadId);
+            if (!uniqueThreadIds.Add(threadId))
+            {
+                throw new ArgumentException("聊天目录排序中存在重复任务。", nameof(orderedThreadIds));
+            }
+        }
+
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(orderedThreadIds.Count * 2, 20, 120)));
+        await using var session = await AppServerSession.StartThreadSectionAsync(codexHome, timeout.Token);
+
+        // Build the requested order from the tail.  Moving the last item to the end,
+        // then inserting each predecessor before its successor is deterministic even
+        // when the section currently has an arbitrary manual order.
+        for (var index = orderedThreadIds.Count - 1; index >= 0; index--)
+        {
+            var parameters = new JsonObject
+            {
+                ["threadId"] = orderedThreadIds[index],
+                ["sectionId"] = sectionId,
+                ["beforeThreadId"] = index + 1 < orderedThreadIds.Count
+                    ? orderedThreadIds[index + 1]
+                    : null
+            };
+            await session.RequestAsync("thread/section/move", parameters, timeout.Token);
+        }
+    }
+
     internal static void ValidateThreadSectionProtocol()
     {
         var section = ParseThreadSection(JsonNode.Parse(

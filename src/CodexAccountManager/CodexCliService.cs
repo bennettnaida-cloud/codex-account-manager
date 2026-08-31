@@ -815,6 +815,121 @@ public sealed partial class CodexCliService
             cancellationToken);
     }
 
+    internal async Task<int> NormalizeThreadSectionOrderAsync(
+        string codexHome,
+        CancellationToken cancellationToken = default)
+    {
+        var threads = await Task.Run(
+            () => _threadSectionSafety.Load(codexHome),
+            cancellationToken);
+        var currentOrderBySection = _threadSectionSafety.LoadThreadSectionOrder(codexHome);
+        if (currentOrderBySection.Count == 0)
+        {
+            return 0;
+        }
+
+        var reorderPlans = BuildThreadSectionReorderPlans(threads, currentOrderBySection);
+        if (reorderPlans.Count == 0)
+        {
+            return 0;
+        }
+
+        return await ExecuteThreadSectionMutationAsync(
+            codexHome,
+            async () =>
+            {
+                foreach (var plan in reorderPlans)
+                {
+                    await _appServer.ReorderThreadSectionAsync(
+                        plan.SectionId,
+                        plan.ThreadIds,
+                        codexHome,
+                        cancellationToken);
+                }
+                return reorderPlans.Count;
+            },
+            cancellationToken);
+    }
+
+    private static List<(string SectionId, IReadOnlyList<string> ThreadIds)>
+        BuildThreadSectionReorderPlans(
+            IReadOnlyList<UnifiedThreadRecord> threads,
+            IReadOnlyDictionary<string, List<string>> currentOrderBySection)
+    {
+        var reorderPlans = new List<(string SectionId, IReadOnlyList<string> ThreadIds)>();
+        foreach (var sectionGroup in threads
+                     .Where(thread =>
+                         !thread.Archived &&
+                         !string.IsNullOrWhiteSpace(thread.SectionId) &&
+                         !thread.SectionId.Equals(
+                             CodexAppServerClient.PinnedSectionId,
+                             StringComparison.OrdinalIgnoreCase))
+                     .GroupBy(thread => thread.SectionId, StringComparer.OrdinalIgnoreCase))
+        {
+            var desiredOrder = sectionGroup
+                .OrderByDescending(thread => thread.UpdatedAt)
+                .ThenByDescending(thread => thread.Id, StringComparer.OrdinalIgnoreCase)
+                .Select(thread => thread.Id)
+                .ToList();
+            if (desiredOrder.Count < 2 ||
+                !currentOrderBySection.TryGetValue(sectionGroup.Key, out var currentOrder) ||
+                currentOrder.Count != desiredOrder.Count ||
+                !currentOrder.ToHashSet(StringComparer.OrdinalIgnoreCase)
+                    .SetEquals(desiredOrder) ||
+                currentOrder.SequenceEqual(desiredOrder, StringComparer.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            reorderPlans.Add((sectionGroup.Key, desiredOrder));
+        }
+        return reorderPlans;
+    }
+
+    internal static void ValidateThreadSectionOrderNormalization()
+    {
+        const string sectionId = "01a02005-6112-7c52-a91e-3a8d5e3b8339";
+        var older = new UnifiedThreadRecord(
+            "019f4be7-aa6e-72b2-84bf-4e35b9c5f290",
+            "older",
+            "",
+            "",
+            "",
+            "",
+            DateTimeOffset.FromUnixTimeSeconds(1),
+            false,
+            true,
+            sectionId,
+            "section");
+        var newer = older with
+        {
+            Id = "019f4be7-aa6e-72b2-84bf-4e35b9c5f291",
+            Title = "newer",
+            UpdatedAt = DateTimeOffset.FromUnixTimeSeconds(2)
+        };
+        var plans = BuildThreadSectionReorderPlans(
+            [older, newer],
+            new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase)
+            {
+                [sectionId] = [older.Id, newer.Id]
+            });
+        if (plans is not [{ SectionId: sectionId, ThreadIds: var ordered }] ||
+            ordered is not ["019f4be7-aa6e-72b2-84bf-4e35b9c5f291", "019f4be7-aa6e-72b2-84bf-4e35b9c5f290"])
+        {
+            throw new InvalidOperationException("Thread-section reorder planning is not recency ordered.");
+        }
+
+        var alreadyOrdered = BuildThreadSectionReorderPlans(
+            [older, newer],
+            new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase)
+            {
+                [sectionId] = [newer.Id, older.Id]
+            });
+        if (alreadyOrdered.Count != 0)
+        {
+            throw new InvalidOperationException("Already ordered thread sections must not be rewritten.");
+        }
+    }
+
     private async Task<T> ExecuteThreadSectionMutationAsync<T>(
         string codexHome,
         Func<Task<T>> mutation,

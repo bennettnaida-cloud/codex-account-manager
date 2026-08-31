@@ -190,6 +190,68 @@ public sealed class SharedHistoryService
         return result;
     }
 
+    internal IReadOnlyDictionary<string, List<string>> LoadThreadSectionOrder(string codexHome)
+    {
+        var databasePath = Path.Combine(Path.GetFullPath(codexHome), "state_5.sqlite");
+        if (!File.Exists(databasePath))
+        {
+            return new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        CodexCliService.EnsureSqliteProvider();
+        using var connection = OpenDatabase(databasePath, SqliteOpenMode.ReadOnly);
+        if (!TableExists(connection, "threads"))
+        {
+            return new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        var columns = ReadColumns(connection, "threads");
+        if (!columns.Contains("id") ||
+            !columns.Contains("thread_section_id") ||
+            !columns.Contains("section_position"))
+        {
+            return new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        var archivedFilter = columns.Contains("archived")
+            ? "COALESCE(archived, 0) = 0"
+            : "1 = 1";
+        using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            SELECT id, thread_section_id
+            FROM threads
+            WHERE {archivedFilter}
+              AND COALESCE(thread_section_id, '') <> ''
+            ORDER BY thread_section_id COLLATE NOCASE,
+                     CASE WHEN section_position IS NULL THEN 1 ELSE 0 END,
+                     section_position ASC,
+                     rowid ASC;
+            """;
+
+        var deletedThreadIds = LoadDeletedThreadIds(codexHome);
+        var result = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var threadId = ReadText(reader, 0);
+            var sectionId = ReadText(reader, 1);
+            if (!Guid.TryParse(threadId, out _) ||
+                !Guid.TryParse(sectionId, out _) ||
+                deletedThreadIds.Contains(threadId))
+            {
+                continue;
+            }
+
+            if (!result.TryGetValue(sectionId, out var threadIds))
+            {
+                threadIds = [];
+                result[sectionId] = threadIds;
+            }
+            threadIds.Add(threadId);
+        }
+        return result;
+    }
+
     public string CreateThreadSectionSafetyBackup(string codexHome)
     {
         var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(codexHome));
@@ -561,7 +623,8 @@ public sealed class SharedHistoryService
                         archived INTEGER,
                         has_user_event INTEGER,
                         updated_at_ms INTEGER,
-                        thread_section_id TEXT
+                        thread_section_id TEXT,
+                        section_position INTEGER
                     );
                     CREATE TABLE thread_sections (
                         id TEXT PRIMARY KEY,
@@ -586,7 +649,8 @@ public sealed class SharedHistoryService
                         0,
                         1,
                         1783684901000,
-                        '01a02005-6112-7c52-a91e-3a8d5e3b8339'
+                        '01a02005-6112-7c52-a91e-3a8d5e3b8339',
+                        1000000
                     );
                     INSERT INTO threads VALUES (
                         '019f4be7-aa6e-72b2-84bf-4e35b9c5f260',
@@ -601,6 +665,7 @@ public sealed class SharedHistoryService
                         0,
                         0,
                         1783684902000,
+                        NULL,
                         NULL
                     );
                     """;
@@ -622,6 +687,12 @@ public sealed class SharedHistoryService
             if (sections is not [{ Id: "01a02005-6112-7c52-a91e-3a8d5e3b8339", Name: "Test section" }])
             {
                 throw new InvalidOperationException("Unified shared history section reader validation failed.");
+            }
+            var sectionOrder = service.LoadThreadSectionOrder(root);
+            if (!sectionOrder.TryGetValue(sections[0].Id, out var orderedThreadIds) ||
+                orderedThreadIds is not ["019f4be7-aa6e-72b2-84bf-4e35b9c5f25f"])
+            {
+                throw new InvalidOperationException("Unified shared history section order reader validation failed.");
             }
 
             var activeMemberRejected = false;

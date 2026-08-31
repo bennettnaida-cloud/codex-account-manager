@@ -91,6 +91,10 @@ static class Program
         {
             return RunHistorySyncProbe();
         }
+        if (args.Contains("--normalize-thread-section-order", StringComparer.OrdinalIgnoreCase))
+        {
+            return RunThreadSectionOrderNormalization();
+        }
         if (args.Contains("--reset-credits-read", StringComparer.OrdinalIgnoreCase))
         {
             return RunResetCreditsRead(args);
@@ -256,6 +260,24 @@ static class Program
         }
     }
 
+    private static int RunThreadSectionOrderNormalization()
+    {
+        try
+        {
+            var changedSections = new CodexCliService()
+                .NormalizeThreadSectionOrderAsync(CodexCliService.GetDefaultCodexHome())
+                .GetAwaiter()
+                .GetResult();
+            Console.WriteLine($"Codex thread-section order normalized. Sections={changedSections}");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(ex.Message);
+            return 1;
+        }
+    }
+
     private static int RunSelfTest()
     {
         try
@@ -355,6 +377,7 @@ static class Program
             }
             SharedHistoryService.ValidateReader();
             CodexCliService.ValidateThreadSectionMutationSafety();
+            CodexCliService.ValidateThreadSectionOrderNormalization();
             CodexAppServerClient.ValidateAccountIdentityProtocol();
             CodexAppServerClient.ValidateThreadSectionProtocol();
             ThreadSectionNameDialog.ValidateValidation();

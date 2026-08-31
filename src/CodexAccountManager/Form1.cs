@@ -398,6 +398,7 @@ public partial class Form1 : Form
     private bool _automaticUpdateCheckStarted;
     private AppUpdateInfo? _availableUpdate;
     private bool _deletedThreadCleanupStarted;
+    private bool _threadSectionOrderNormalizationStarted;
     private bool _patGatewayRuntimeRunning;
     private bool _patGatewayActionRunning;
     private readonly HashSet<string> _patAutoRotationUnavailableAccountKeys =
@@ -499,7 +500,7 @@ public partial class Form1 : Form
             {
                 _ = Task.Run(CodexCliService.TryRefreshNativeFastBridgeAfterUpdate);
             }
-            _ = CleanupDeletedThreadArtifactsAsync();
+            _ = RunStartupHistoryMaintenanceAsync();
             _ = CheckForUpdatesAsync(manual: false);
         };
     }
@@ -6468,6 +6469,41 @@ public partial class Form1 : Form
                 }
             }
         });
+    }
+
+    private async Task RunStartupHistoryMaintenanceAsync()
+    {
+        await CleanupDeletedThreadArtifactsAsync();
+        await NormalizeUnifiedHistorySectionOrderAsync();
+    }
+
+    private async Task NormalizeUnifiedHistorySectionOrderAsync()
+    {
+        if (_threadSectionOrderNormalizationStarted || _formClosed)
+        {
+            return;
+        }
+
+        _threadSectionOrderNormalizationStarted = true;
+        try
+        {
+            var changedSections = await _codex.NormalizeThreadSectionOrderAsync(
+                CodexCliService.GetDefaultCodexHome());
+            if (changedSections > 0 && !_formClosed && !IsDisposed)
+            {
+                _statusBox.Text = $"已按最近更新时间整理 {changedSections} 个聊天目录。";
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Chat history remains usable when the installed Codex runtime does not
+            // expose section reordering. Surface a concise diagnostic without making
+            // an optional startup repair block account management.
+            if (!_formClosed && !IsDisposed)
+            {
+                _statusBox.Text = $"聊天目录自动排序暂不可用：{ex.Message}";
+            }
+        }
     }
 
     private void RemoveUnifiedThreadFromCachedView(string threadId)
