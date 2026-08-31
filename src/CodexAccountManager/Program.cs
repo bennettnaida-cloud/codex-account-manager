@@ -5,6 +5,32 @@ static class Program
     [STAThread]
     static int Main(string[] args)
     {
+        var managerRootIndex = Array.FindIndex(
+            args,
+            argument => argument.Equals("--manager-root", StringComparison.OrdinalIgnoreCase));
+        if (managerRootIndex >= 0)
+        {
+            if (managerRootIndex + 1 >= args.Length ||
+                string.IsNullOrWhiteSpace(args[managerRootIndex + 1]) ||
+                args[managerRootIndex + 1].StartsWith("-", StringComparison.Ordinal))
+            {
+                Console.Error.WriteLine("--manager-root requires a directory path.");
+                return 2;
+            }
+
+            try
+            {
+                Environment.SetEnvironmentVariable(
+                    "CODEX_ACCOUNT_MANAGER_HOME",
+                    Path.GetFullPath(args[managerRootIndex + 1]));
+            }
+            catch (Exception ex) when (ex is ArgumentException or NotSupportedException)
+            {
+                Console.Error.WriteLine("--manager-root is not a valid directory path.");
+                return 2;
+            }
+        }
+
         if (args.Contains(LocalPatGateway.ProcessArgument, StringComparer.OrdinalIgnoreCase))
         {
             return LocalPatGateway.RunProcess(args);

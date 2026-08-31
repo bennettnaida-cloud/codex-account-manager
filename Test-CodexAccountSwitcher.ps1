@@ -1716,7 +1716,9 @@ if ($recoveryActivationCallCount -ne 1 -or
         'TryRecoverOfficialCodexLaunchWithoutRendererPatch\s*\(')).Count -ne 1) {
     throw 'Official Codex recovery must perform one non-recursive package activation without CDP or a renderer patch.'
 }
-if ($programSource -notmatch '(?s)args\.Contains\("--self-test".*?return RunSelfTest\(\);' -or
+if ($programSource -notmatch '(?s)Array\.FindIndex\(\s*args,\s*argument => argument\.Equals\("--manager-root"' -or
+    $programSource -notmatch 'CODEX_ACCOUNT_MANAGER_HOME' -or
+    $programSource -notmatch '(?s)args\.Contains\("--self-test".*?return RunSelfTest\(\);' -or
     $programSelfTestMethod -notmatch 'CodexCliService\.ValidateOfficialCodexLaunchRecovery\(\);' -or
     $programSelfTestMethod -notmatch 'CodexCliService\.ValidateExplicitChatGptFeatureProjection\(\);' -or
     $programSelfTestMethod -notmatch 'LocalPatGatewayHost\.ValidateSessionAffinityRouting\(\);' -or
