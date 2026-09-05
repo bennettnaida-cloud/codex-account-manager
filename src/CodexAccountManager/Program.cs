@@ -75,7 +75,15 @@ static class Program
         }
         if (args.Contains("--prune-deleted-desktop-state", StringComparer.OrdinalIgnoreCase))
         {
-            return RunDeletedDesktopStatePrune();
+            return RunDeletedDesktopStatePrune(
+                args.Contains(
+                    "--allow-live-codex",
+                    StringComparer.OrdinalIgnoreCase));
+        }
+        if (args.Contains("--repair-rollout-history", StringComparer.OrdinalIgnoreCase))
+        {
+            return RunRolloutHistoryRepair(
+                args.Contains("--allow-ordinal-rewrite", StringComparer.OrdinalIgnoreCase));
         }
         if (args.Contains("--dual-login-recovery-self-test", StringComparer.OrdinalIgnoreCase))
         {
@@ -125,6 +133,17 @@ static class Program
         {
             return RunThreadSectionOrderNormalization();
         }
+        if (args.Contains("--sync-chat-sections", StringComparer.OrdinalIgnoreCase))
+        {
+            return RunChatSectionSynchronization();
+        }
+        var moveThreadSectionIndex = Array.FindIndex(
+            args,
+            argument => argument.Equals("--move-thread-section", StringComparison.OrdinalIgnoreCase));
+        if (moveThreadSectionIndex >= 0)
+        {
+            return RunMoveThreadSection(args, moveThreadSectionIndex);
+        }
         if (args.Contains("--reset-credits-read", StringComparer.OrdinalIgnoreCase))
         {
             return RunResetCreditsRead(args);
@@ -133,6 +152,38 @@ static class Program
         {
             return RunCodexPlusPlusTaskRepair();
         }
+
+        // Only the GUI branch is single-instance. Gateway, helper and self-test
+        // arguments have all returned above and must remain runnable as child processes.
+        Mutex? guiMutex = null;
+        var guiMutexAcquired = false;
+        try
+        {
+            var managerRoot = new AccountStore().RootPath;
+            var mutexName = "Local\\CodexAccountManager.Gui." +
+                            ReleaseConfiguration.Version + "." +
+                            Convert.ToHexString(
+                                System.Security.Cryptography.SHA256.HashData(
+                                    System.Text.Encoding.UTF8.GetBytes(managerRoot)))
+                                [..16];
+            guiMutex = new Mutex(false, mutexName);
+            try
+            {
+                guiMutexAcquired = guiMutex.WaitOne(0);
+            }
+            catch (AbandonedMutexException)
+            {
+                guiMutexAcquired = true;
+            }
+            if (!guiMutexAcquired)
+            {
+                MessageBox.Show(
+                    "同一版本、同一数据目录的 Codex Account Manager 已经在运行。\n请先关闭已有管理器窗口，再启动此版本。",
+                    "Codex Account Manager",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+                return 0;
+            }
 
         var preserveExistingPatGateway = args.Contains(
             AppUpdateService.PreserveExistingGatewayArgument,
@@ -174,6 +225,22 @@ static class Program
             ManagerLifecycleDiagnostics.Write("manager-message-loop-ended");
         }
         return 0;
+        }
+        finally
+        {
+            if (guiMutexAcquired)
+            {
+                try
+                {
+                    guiMutex?.ReleaseMutex();
+                }
+                catch (ApplicationException)
+                {
+                    // The process may be exiting after an abandoned mutex.
+                }
+            }
+            guiMutex?.Dispose();
+        }
     }
 
     private static void OnApplicationThreadException(
@@ -227,15 +294,38 @@ static class Program
         eventArgs.SetObserved();
     }
 
-    private static int RunDeletedDesktopStatePrune()
+    private static int RunDeletedDesktopStatePrune(bool allowWhileOfficialClientRunning)
     {
         try
         {
-            var changed = new CodexCliService().TryPruneDeletedDesktopSidebarState();
+            var changed = new CodexCliService().TryPruneDeletedDesktopSidebarState(
+                allowWhileOfficialClientRunning);
             Console.WriteLine(changed
                 ? "Deleted Codex desktop sidebar entries were pruned."
-                : "Codex desktop sidebar was not changed (the client may still be running or no stale entries were found).");
+                : allowWhileOfficialClientRunning
+                    ? "Codex desktop sidebar was not changed (no stale entries were found or the cache is currently locked)."
+                    : "Codex desktop sidebar was not changed (the client may still be running or no stale entries were found).");
             return changed ? 0 : 3;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(CodexCliService.MaskSensitiveText(ex.Message));
+            return 1;
+        }
+    }
+
+    private static int RunRolloutHistoryRepair(bool allowOrdinalRewrite)
+    {
+        try
+        {
+            var result = CodexRolloutHistoryRepairService.TryRepairLaggingPaginatedRollouts(
+                CodexCliService.GetDefaultCodexHome(),
+                allowOrdinalRewrite);
+            Console.WriteLine(
+                $"Codex rollout history repair: candidates={result.CandidateFiles}; " +
+                $"scanned={result.ScannedFiles}; repaired_files={result.RepairedFiles}; " +
+                $"repaired_records={result.RepairedRecords}; scanned_bytes={result.ScannedBytes}.");
+            return 0;
         }
         catch (Exception ex)
         {
@@ -316,6 +406,79 @@ static class Program
                 .GetAwaiter()
                 .GetResult();
             Console.WriteLine($"Codex thread-section order normalized. Sections={changedSections}");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(ex.Message);
+            return 1;
+        }
+    }
+
+    private static int RunChatSectionSynchronization()
+    {
+        try
+        {
+            var store = new AccountStore();
+            var accounts = store.LoadAccounts();
+            var result = ChatSectionSynchronizationService.Synchronize(
+                accounts,
+                CodexCliService.GetDefaultCodexHome(),
+                managerRoot: store.RootPath);
+            Console.WriteLine(
+                $"Chat sections synchronized. OAuthAccounts={result.OAuthAccounts}; " +
+                $"Profiles={result.UpdatedProfiles}; Sections={result.AddedSections}; " +
+                $"Items={result.AddedItems}; Changed={result.Changed}; " +
+                $"Backup={result.BackupPath ?? "none"}");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(ex.Message);
+            return 1;
+        }
+    }
+
+    private static int RunMoveThreadSection(string[] args, int switchIndex)
+    {
+        if (switchIndex + 2 >= args.Length ||
+            string.IsNullOrWhiteSpace(args[switchIndex + 1]) ||
+            args[switchIndex + 1].StartsWith("-", StringComparison.Ordinal) ||
+            string.IsNullOrWhiteSpace(args[switchIndex + 2]) ||
+            args[switchIndex + 2].StartsWith("-", StringComparison.Ordinal))
+        {
+            Console.Error.WriteLine(
+                "--move-thread-section requires a thread ID and a section ID.\n" +
+                "Example: --move-thread-section <thread-id> <section-id>");
+            return 2;
+        }
+
+        try
+        {
+            var threadId = args[switchIndex + 1];
+            var sectionId = args[switchIndex + 2];
+            if (!Guid.TryParse(threadId, out _) || !Guid.TryParse(sectionId, out _))
+            {
+                Console.Error.WriteLine("thread ID and section ID must be GUIDs.");
+                return 2;
+            }
+
+            var codexHome = CodexCliService.GetDefaultCodexHome();
+            new CodexCliService()
+                .MoveThreadToSectionAsync(threadId, sectionId, codexHome)
+                .GetAwaiter()
+                .GetResult();
+
+            var moved = new SharedHistoryService()
+                .Load(codexHome, 10000)
+                .FirstOrDefault(thread => thread.Id.Equals(threadId, StringComparison.OrdinalIgnoreCase));
+            if (moved == null || !moved.SectionId.Equals(sectionId, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"Codex 返回成功，但数据库中的对话归属仍为“{moved?.SectionName ?? "未分类"}”。");
+            }
+
+            Console.WriteLine($"Thread {threadId} moved to section {sectionId}.");
             return 0;
         }
         catch (Exception ex)
@@ -430,11 +593,13 @@ static class Program
             ThreadSectionNameDialog.ValidateValidation();
             ThreadSectionNameDialog.ValidateLayout();
             SharedThreadTranscriptService.ValidateReader();
+            CodexRolloutHistoryRepairService.Validate();
             ThreadPreviewDialog.ValidateFormatting();
             BufferedFlowLayoutPanel.ValidateNestedViewportRedraw();
             NativeWindowTheme.ValidateRedrawPolicy();
             SharedHistoryMerger.ValidateHistoryFileMerge();
             SharedHistoryMerger.ValidateDeletedThreadTombstones();
+            ChatSectionSynchronizationService.Validate();
             // GitHub's clean Windows runners do not have the Microsoft Store
             // Codex desktop package or its runtime logs installed. Keep the
             // integration and persisted-log readiness checks strict for normal

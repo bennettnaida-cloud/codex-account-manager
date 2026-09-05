@@ -6,8 +6,27 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$appExe = Join-Path $root 'dist\CodexAccountManager\CodexAccountManager.exe'
-$dreamSkinRuntime = Join-Path $root 'dist\CodexAccountManager\CodexDreamSkin'
+$currentVersion = (Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw).Trim()
+$versionedRoot = Join-Path $root 'dist'
+$discoveredAppPaths = @(
+    Get-ChildItem -LiteralPath $versionedRoot -Directory -Filter ("CodexAccountManager-" + $currentVersion + "*") -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'CodexAccountManager.exe') -PathType Leaf } |
+        Sort-Object LastWriteTime -Descending |
+        ForEach-Object { Join-Path $_.FullName 'CodexAccountManager.exe' }
+)
+$preferredAppPaths = @(
+    $discoveredAppPaths
+    (Join-Path $root 'dist\CodexAccountManager-2.3.2-hotfix\CodexAccountManager.exe')
+    (Join-Path $root 'dist\CodexAccountManager-2.3.2-fixed\CodexAccountManager.exe')
+    (Join-Path $root 'dist\CodexAccountManager\CodexAccountManager.exe')
+)
+$appExe = $preferredAppPaths |
+    Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+    Select-Object -First 1
+if ([string]::IsNullOrWhiteSpace($appExe)) {
+    $appExe = $preferredAppPaths[0]
+}
+$dreamSkinRuntime = Join-Path (Split-Path -Parent $appExe) 'CodexDreamSkin'
 $assetsRoot = Join-Path $root 'assets'
 $defaultsRoot = Join-Path $root 'packaging\defaults'
 $codexRuntime = Join-Path $root '.tools\codex-cli\node_modules'

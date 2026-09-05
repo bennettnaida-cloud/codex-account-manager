@@ -35,8 +35,13 @@ internal sealed record PatGatewayRotationSnapshot(
 /// </summary>
 internal sealed class PatGatewayRotationStore
 {
-    internal const string FileName = "account-auto-rotation-route-v2.json";
-    private const string LegacyFileName = "pat-auto-rotation-route-v1.json";
+    // Every release uses a port-scoped route file. The 2.2.25/2.3.9 gateways can remain installed
+    // (and, during an interrupted update, even remain alive on 8317) without being
+    // able to arm/clear the 2.3.12 route behind our back.
+    internal const string FileName =
+        "account-auto-rotation-route-v2-" + ReleaseConfiguration.GatewayPortText + ".json";
+    private const string LegacyFileName =
+        "pat-auto-rotation-route-v1-" + ReleaseConfiguration.GatewayPortText + ".json";
     private const int SchemaVersion = 2;
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -46,6 +51,10 @@ internal sealed class PatGatewayRotationStore
 
     private readonly string _path;
     private readonly string _legacyPath;
+    private readonly object _gate = new();
+    private PatGatewayRotationSnapshot _lastKnownSnapshot = PatGatewayRotationSnapshot.Empty;
+    private bool _hasLastKnownSnapshot;
+    private int _consecutiveLoadFailures;
 
     internal PatGatewayRotationStore(string managerRoot)
     {
@@ -60,26 +69,63 @@ internal sealed class PatGatewayRotationStore
 
     internal PatGatewayRotationSnapshot Load()
     {
-        try
+        lock (_gate)
         {
-            if (File.Exists(_path))
+            Exception? lastError = null;
+            for (var attempt = 0; attempt < AtomicFilePersistence.DefaultAttempts; attempt++)
             {
-                return LoadDocument(_path, SchemaVersion);
+                try
+                {
+                    var snapshot = LoadOnce();
+                    _lastKnownSnapshot = snapshot;
+                    _hasLastKnownSnapshot = true;
+                    _consecutiveLoadFailures = 0;
+                    return snapshot;
+                }
+                catch (Exception ex) when (
+                    ex is IOException or UnauthorizedAccessException or JsonException or
+                    NotSupportedException)
+                {
+                    lastError = ex;
+                    _consecutiveLoadFailures++;
+                    if (attempt + 1 < AtomicFilePersistence.DefaultAttempts)
+                    {
+                        Thread.Sleep(25 * (attempt + 1));
+                    }
+                }
             }
-            if (!File.Exists(_legacyPath))
+
+            ManagerLifecycleDiagnostics.WriteException(
+                "pat-gateway-rotation-route-read-failed",
+                lastError ?? new IOException("Unknown route read failure."),
+                $"failures={_consecutiveLoadFailures}; cached={_hasLastKnownSnapshot}; " +
+                $"status={_lastKnownSnapshot.Status}; " +
+                $"transport={_lastKnownSnapshot.TransportAccountKey ?? "none"}; " +
+                $"effective={_lastKnownSnapshot.TargetAccountKey ?? _lastKnownSnapshot.SourceAccountKey ?? "none"}");
+            if (_hasLastKnownSnapshot)
             {
-                return PatGatewayRotationSnapshot.Empty;
+                return _lastKnownSnapshot;
             }
-            return LoadLegacyAndMigrate();
+
+            throw new IOException(
+                "PAT rotation route remained unreadable after bounded retries.",
+                lastError);
         }
-        catch (Exception ex) when (
-            ex is IOException or
-            UnauthorizedAccessException or
-            JsonException or
-            NotSupportedException)
+    }
+
+    private PatGatewayRotationSnapshot LoadOnce()
+    {
+        if (File.Exists(_path))
         {
+            return LoadDocument(_path, SchemaVersion);
+        }
+        if (!File.Exists(_legacyPath))
+        {
+            // A route is valid only for the listener/desktop-base-URL pair that
+            // created it. Never import another port's route into this release.
             return PatGatewayRotationSnapshot.Empty;
         }
+        return LoadLegacyAndMigrate();
     }
 
     private PatGatewayRotationSnapshot LoadLegacyAndMigrate()
@@ -156,7 +202,8 @@ internal sealed class PatGatewayRotationStore
         string sourceAccountKey,
         string targetAccountKey,
         DateTimeOffset armedAtUtc,
-        bool replaceExistingArmedTarget = false)
+        bool replaceExistingArmedTarget = false,
+        string? transportAccountKey = null)
     {
         if (!TryNormalizeAccountKey(sourceAccountKey, out var source) ||
             !TryNormalizeAccountKey(targetAccountKey, out var target) ||
@@ -164,11 +211,19 @@ internal sealed class PatGatewayRotationStore
         {
             throw new InvalidDataException("Rotation account hashes are invalid.");
         }
+        var hasExplicitTransport = TryNormalizeAccountKey(
+            transportAccountKey,
+            out var explicitTransport);
 
         var existing = Load();
         if (existing.Status == PatGatewayRotationStatus.Armed &&
             string.Equals(existing.SourceAccountKey, source, StringComparison.Ordinal) &&
-            string.Equals(existing.TargetAccountKey, target, StringComparison.Ordinal))
+            string.Equals(existing.TargetAccountKey, target, StringComparison.Ordinal) &&
+            (!hasExplicitTransport ||
+             string.Equals(
+                 existing.TransportAccountKey,
+                 explicitTransport,
+                 StringComparison.Ordinal)))
         {
             return existing;
         }
@@ -181,9 +236,12 @@ internal sealed class PatGatewayRotationStore
             // A user-requested force switch may supersede an automatic/manual target that
             // has not crossed a request boundary yet. Preserve the stable desktop transport
             // and atomically replace only the logical target in the same route document.
+            var replacementTransport = hasExplicitTransport
+                ? explicitTransport
+                : armedTransport;
             var replacement = new PatGatewayRotationSnapshot(
                 PatGatewayRotationStatus.Armed,
-                armedTransport,
+                replacementTransport,
                 source,
                 target,
                 armedAtUtc.ToUniversalTime(),
@@ -200,6 +258,14 @@ internal sealed class PatGatewayRotationStore
             // The desktop client continues sending the first PAT in a chain. Keep that
             // transport identity while changing only the logical source and next target.
             transport = existing.TransportAccountKey;
+        }
+        else if (existing.Status == PatGatewayRotationStatus.None &&
+                 hasExplicitTransport)
+        {
+            // A compatible-API account is a logical target, not the bearer that the
+            // desktop Codex process sends to this listener.  The Manager supplies the
+            // still-live OAuth/PAT transport identity when no active route can carry it.
+            transport = explicitTransport;
         }
         else if (existing.Status == PatGatewayRotationStatus.None)
         {
@@ -245,19 +311,25 @@ internal sealed class PatGatewayRotationStore
 
     internal void Clear()
     {
-        try
+        lock (_gate)
         {
-            foreach (var path in new[] { _path, _legacyPath })
+            try
             {
-                if (File.Exists(path))
+                foreach (var path in new[] { _path, _legacyPath })
                 {
-                    File.Delete(path);
+                    if (File.Exists(path))
+                    {
+                        File.Delete(path);
+                    }
                 }
             }
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            throw new IOException("Unable to clear the PAT rotation route.", ex);
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                throw new IOException("Unable to clear the PAT rotation route.", ex);
+            }
+            _lastKnownSnapshot = PatGatewayRotationSnapshot.Empty;
+            _hasLastKnownSnapshot = true;
+            _consecutiveLoadFailures = 0;
         }
     }
 
@@ -279,6 +351,29 @@ internal sealed class PatGatewayRotationStore
         try
         {
             var store = new PatGatewayRotationStore(root);
+            Directory.CreateDirectory(System.IO.Path.GetDirectoryName(store.Path)!);
+            File.WriteAllText(
+                System.IO.Path.Combine(
+                    System.IO.Path.GetDirectoryName(store.Path)!,
+                    "account-auto-rotation-route-v2.json"),
+                JsonSerializer.Serialize(
+                    new RouteDocument
+                    {
+                        SchemaVersion = SchemaVersion,
+                        Status = "active",
+                        TransportAccountKey = c,
+                        SourceAccountKey = c,
+                        TargetAccountKey = b,
+                        ArmedAtUtc = DateTimeOffset.UtcNow,
+                        ActivatedAtUtc = DateTimeOffset.UtcNow
+                    },
+                    JsonOptions),
+                new UTF8Encoding(false));
+            if (store.Load().Status != PatGatewayRotationStatus.None)
+            {
+                throw new InvalidOperationException(
+                    "A new port-scoped gateway imported a stale shared rotation route.");
+            }
             var armed = store.Arm(a, b, DateTimeOffset.UtcNow);
             var forced = store.Arm(
                 a,
@@ -293,6 +388,31 @@ internal sealed class PatGatewayRotationStore
                 throw new InvalidOperationException(
                     "A force switch did not atomically replace the pending target.");
             }
+            var repairedTransport = store.Arm(
+                a,
+                c,
+                DateTimeOffset.UtcNow.AddMilliseconds(600),
+                replaceExistingArmedTarget: true,
+                transportAccountKey: new string('D', 64));
+            if (repairedTransport.TransportAccountKey != new string('D', 64) ||
+                repairedTransport.SourceAccountKey != a ||
+                repairedTransport.TargetAccountKey != c)
+            {
+                throw new InvalidOperationException(
+                    "A force switch did not repair a stale pending transport identity.");
+            }
+            store.Clear();
+            var explicitTransport = store.Arm(
+                a,
+                b,
+                DateTimeOffset.UtcNow,
+                transportAccountKey: new string('D', 64));
+            if (explicitTransport.TransportAccountKey != new string('D', 64))
+            {
+                throw new InvalidOperationException(
+                    "A compatible logical source did not preserve its explicit desktop transport.");
+            }
+            store.Clear();
             armed = store.Arm(
                 a,
                 b,
@@ -311,6 +431,21 @@ internal sealed class PatGatewayRotationStore
             {
                 throw new InvalidOperationException(
                     "Gateway rotation persistence or chain semantics failed.");
+            }
+
+            using (var locked = new FileStream(
+                       store.Path,
+                       FileMode.Open,
+                       FileAccess.Read,
+                       FileShare.None))
+            {
+                var cachedDuringTransientFailure = store.Load();
+                if (cachedDuringTransientFailure.Status != PatGatewayRotationStatus.Armed ||
+                    cachedDuringTransientFailure.TargetAccountKey != c)
+                {
+                    throw new InvalidOperationException(
+                        "A transient route read failure discarded the last validated armed route.");
+                }
             }
 
             store.Clear();
@@ -380,39 +515,26 @@ internal sealed class PatGatewayRotationStore
 
     private void Save(PatGatewayRotationSnapshot snapshot)
     {
-        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(_path)!);
-        var document = new RouteDocument
+        lock (_gate)
         {
-            SchemaVersion = SchemaVersion,
-            Status = snapshot.Status == PatGatewayRotationStatus.Active ? "active" : "armed",
-            TransportAccountKey = snapshot.TransportAccountKey,
-            SourceAccountKey = snapshot.SourceAccountKey,
-            TargetAccountKey = snapshot.TargetAccountKey,
-            ArmedAtUtc = snapshot.ArmedAtUtc ?? DateTimeOffset.UtcNow,
-            ActivatedAtUtc = snapshot.ActivatedAtUtc
-        };
-        var temporaryPath = _path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-        try
-        {
-            File.WriteAllText(
-                temporaryPath,
+            Directory.CreateDirectory(System.IO.Path.GetDirectoryName(_path)!);
+            var document = new RouteDocument
+            {
+                SchemaVersion = SchemaVersion,
+                Status = snapshot.Status == PatGatewayRotationStatus.Active ? "active" : "armed",
+                TransportAccountKey = snapshot.TransportAccountKey,
+                SourceAccountKey = snapshot.SourceAccountKey,
+                TargetAccountKey = snapshot.TargetAccountKey,
+                ArmedAtUtc = snapshot.ArmedAtUtc ?? DateTimeOffset.UtcNow,
+                ActivatedAtUtc = snapshot.ActivatedAtUtc
+            };
+            AtomicFilePersistence.WriteAllText(
+                _path,
                 JsonSerializer.Serialize(document, JsonOptions),
                 new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
-            File.Move(temporaryPath, _path, overwrite: true);
-        }
-        finally
-        {
-            try
-            {
-                if (File.Exists(temporaryPath))
-                {
-                    File.Delete(temporaryPath);
-                }
-            }
-            catch
-            {
-                // A same-directory temporary file contains hashes only and is harmless.
-            }
+            _lastKnownSnapshot = snapshot;
+            _hasLastKnownSnapshot = true;
+            _consecutiveLoadFailures = 0;
         }
     }
 

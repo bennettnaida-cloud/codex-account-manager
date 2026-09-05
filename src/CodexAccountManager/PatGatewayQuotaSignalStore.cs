@@ -17,7 +17,8 @@ internal sealed record PatGatewayQuotaSignal(
 /// </summary>
 internal sealed class PatGatewayQuotaSignalStore
 {
-    internal const string FileName = "pat-gateway-quota-signals-v1.json";
+    internal const string FileName =
+        "pat-gateway-quota-signals-v1-" + ReleaseConfiguration.GatewayPortText + ".json";
     // Without an official reset window, policy accepts a 429 for only this short
     // interval.  The file retains it longer so a restarted Manager can match it to a
     // known five-hour window and prove that the corresponding reset has not happened.
@@ -192,12 +193,9 @@ internal sealed class PatGatewayQuotaSignalStore
                 return new SignalFile();
             }
 
-            using var input = new FileStream(
-                _path,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.ReadWrite | FileShare.Delete);
-            var file = JsonSerializer.Deserialize<SignalFile>(input, JsonOptions);
+            var file = JsonSerializer.Deserialize<SignalFile>(
+                AtomicFilePersistence.ReadAllTextWithRetry(_path),
+                JsonOptions);
             if (file == null || file.SchemaVersion != CurrentSchemaVersion)
             {
                 return new SignalFile();
@@ -249,37 +247,9 @@ internal sealed class PatGatewayQuotaSignalStore
     {
         file.SchemaVersion = CurrentSchemaVersion;
         Directory.CreateDirectory(System.IO.Path.GetDirectoryName(_path)!);
-        var temporaryPath = _path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-        try
-        {
-            var payload = JsonSerializer.SerializeToUtf8Bytes(file, JsonOptions);
-            using (var output = new FileStream(
-                       temporaryPath,
-                       FileMode.CreateNew,
-                       FileAccess.Write,
-                       FileShare.None,
-                       bufferSize: 4096,
-                       FileOptions.WriteThrough))
-            {
-                output.Write(payload);
-                output.Flush(flushToDisk: true);
-            }
-            File.Move(temporaryPath, _path, overwrite: true);
-        }
-        finally
-        {
-            try
-            {
-                if (File.Exists(temporaryPath))
-                {
-                    File.Delete(temporaryPath);
-                }
-            }
-            catch
-            {
-                // A same-directory temporary file contains only hashes and timestamps.
-            }
-        }
+        AtomicFilePersistence.WriteAllText(
+            _path,
+            JsonSerializer.Serialize(file, JsonOptions));
     }
 
     internal static void Validate()

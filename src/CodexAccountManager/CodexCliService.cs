@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.ComponentModel;
+using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.ExceptionServices;
@@ -70,6 +71,10 @@ public sealed partial class CodexCliService
     // left-hand "Recent" list.  It is separate from state_5.sqlite and the global
     // Electron sidebar state, so deleting a thread must prune it as well.
     private const string SessionIndexFileName = "session_index.jsonl";
+    // The current Windows desktop keeps another materialized sidebar catalog in this
+    // SQLite database.  It can outlive the authoritative state_5.sqlite row after a
+    // thread is deleted, which leaves a stale title in the client's "最近" list.
+    private const string DesktopCatalogDatabaseRelativePath = "sqlite\\codex-dev.db";
     private const string DesktopSelectionFileName = ".codex-account-manager-desktop-selection.json";
     // This sidecar identifies the account whose credentials currently own the shared
     // desktop profile.  It contains no credential material and is separate from the
@@ -242,6 +247,37 @@ public sealed partial class CodexCliService
             Path.Combine(GetDefaultCodexHome(), AuthFileName));
     }
 
+    public bool IsSharedActiveAccount(AccountRecord account)
+    {
+        ArgumentNullException.ThrowIfNull(account);
+        try
+        {
+            var profileHome = Path.GetFullPath(GetDefaultCodexHome());
+            var accountHome = Path.GetFullPath(account.CodexHome);
+            return TryReadActiveAccountState(
+                       profileHome,
+                       out var activeAccountKey,
+                       out var activeAccountHome,
+                       out var activeMode) &&
+                   activeAccountKey.Equals(
+                       GetDesktopAccountKey(account),
+                       StringComparison.OrdinalIgnoreCase) &&
+                   PathsEqual(activeAccountHome, accountHome) &&
+                   IsActiveAccountCredentialCurrent(
+                       profileHome,
+                       activeAccountKey,
+                       activeAccountHome,
+                       activeMode);
+        }
+        catch (Exception ex) when (
+            ex is IOException or UnauthorizedAccessException or JsonException or
+            InvalidDataException or FormatException or ArgumentException or
+            NotSupportedException)
+        {
+            return false;
+        }
+    }
+
     public bool IsSharedProfileAlreadySelected(
         AccountRecord account,
         bool routeOfficialOAuthThroughGateway = false)
@@ -254,6 +290,106 @@ public sealed partial class CodexCliService
             AccessTokenSharedProfileMode.ApiCompatible,
             chatGptFeatureAccount: null,
             routeOfficialOAuthThroughGateway);
+    }
+
+    public bool TryRouteSelectedCompatibleApiThroughGateway(AccountRecord account)
+    {
+        ArgumentNullException.ThrowIfNull(account);
+        return account.IsCompatibleApi && TryRouteSelectedAccountThroughGateway(account);
+    }
+
+    public bool TryRouteSelectedAccountThroughGateway(AccountRecord account)
+    {
+        ArgumentNullException.ThrowIfNull(account);
+        if (!account.IsCompatibleApi && !account.IsOfficialOAuth && !account.IsAccessToken)
+        {
+            return false;
+        }
+        var accountKind = account.IsCompatibleApi
+            ? "compatible-api"
+            : account.IsOfficialOAuth
+                ? "official-oauth"
+                : "access-token";
+
+        try
+        {
+            var profileHome = Path.GetFullPath(GetDefaultCodexHome());
+            var accountHome = Path.GetFullPath(account.CodexHome);
+            var sourceConfigPath = Path.Combine(accountHome, ConfigFileName);
+            var sharedConfigPath = Path.Combine(profileHome, ConfigFileName);
+            if (!File.Exists(sourceConfigPath) || !File.Exists(sharedConfigPath))
+            {
+                return false;
+            }
+
+            // The persisted Manager label is intentionally not consulted here. During a
+            // blue/green port hand-off it can still name the old logical API target while
+            // auth.json and the independent desktop marker prove which bearer the live
+            // Codex process is actually sending.
+            if (!IsSharedActiveAccount(account) && !IsSharedCredentialAlreadySelected(account))
+            {
+                return false;
+            }
+
+            var current = File.ReadAllText(sharedConfigPath);
+            string? token = null;
+            var projected = account.IsCompatibleApi
+                ? ProjectCompatibleApiConfigText(
+                    current,
+                    account,
+                    requiresOpenAiAuth: true,
+                    providerBearerToken: token = ReadAccessTokenCredential(
+                        Path.Combine(accountHome, AuthFileName)),
+                    forceFileAuthStore: true,
+                    serviceTier: ReadDesktopServiceTier(current),
+                    routeThroughGateway: true)
+                : account.IsOfficialOAuth
+                    ? ProjectOfficialOAuthConfigText(
+                        current,
+                        ReadAccountServiceTier(accountHome),
+                        routeThroughGateway: true)
+                    : ProjectWindowsClientConfigText(
+                        current,
+                        requiresOpenAiAuth: true,
+                        desktopProviderName: account.Name,
+                        providerBearerToken: token = ReadAccessTokenCredential(
+                            Path.Combine(accountHome, AuthFileName)),
+                        forceFileAuthStore: true,
+                        serviceTier: ReadDesktopServiceTier(current));
+            projected = PreserveSharedMcpServerSections(current, projected);
+            if (!string.Equals(current, projected, StringComparison.Ordinal))
+            {
+                WriteTextAtomically(sharedConfigPath, projected);
+            }
+
+            var routed = File.ReadAllText(sharedConfigPath);
+            var ready = account.IsOfficialOAuth
+                ? routed.Contains(
+                    "base_url = " + TomlString(LocalPatGateway.ProviderBaseUrl),
+                    StringComparison.Ordinal)
+                : IsManagedDesktopModelCredentialBoundToAccount(
+                    account,
+                    sharedConfigPath,
+                    routeThroughGateway: true);
+            if (ready)
+            {
+                WriteCodexPlusPlusLaunchDiagnostic(
+                    "selected-live-gateway-route-projected",
+                    $"account={GetDesktopAccountKey(account)}; type={accountKind}; " +
+                    $"port={LocalPatGateway.Port}; codex_restart=false");
+            }
+            return ready;
+        }
+        catch (Exception ex) when (
+            ex is IOException or UnauthorizedAccessException or JsonException or
+            InvalidDataException or FormatException or ArgumentException or
+            NotSupportedException)
+        {
+            WriteCodexPlusPlusLaunchDiagnostic(
+                "selected-live-gateway-route-projection-failed",
+                $"type={accountKind}; error={ex.GetType().Name}");
+            return false;
+        }
     }
 
     public bool IsSharedChatGptFeatureProfileAlreadySelected(
@@ -300,12 +436,15 @@ public sealed partial class CodexCliService
 
     /// <summary>
     /// Removes Account Manager deletion-tombstone IDs from the official Codex desktop
-    /// sidebar cache.  The file is only touched while the official client is not running;
-    /// a live client owns the same state and could overwrite a concurrent write.
+    /// sidebar cache.  By default the file is only touched while the official client is
+    /// stopped because a live client owns the same state and could overwrite a concurrent
+    /// write.  A deletion operation may explicitly allow a live, atomic projection so a
+    /// stale sidebar row is removed immediately; the normal post-exit retry remains armed
+    /// in case Codex rewrites the cache while it is running.
     /// </summary>
-    public bool TryPruneDeletedDesktopSidebarState()
+    public bool TryPruneDeletedDesktopSidebarState(bool allowWhileOfficialClientRunning = false)
     {
-        if (IsOfficialWindowsClientRunning())
+        if (!allowWhileOfficialClientRunning && IsOfficialWindowsClientRunning())
         {
             return false;
         }
@@ -342,6 +481,15 @@ public sealed partial class CodexCliService
             // clean restart.  Remove tombstoned IDs and entries no longer present in the
             // authoritative state database while the official client is stopped.
             if (TryPruneDesktopSessionIndex(codexHome, deletedThreadIds, ref backupDirectory))
+            {
+                changed = true;
+            }
+
+            // Newer Codex desktop builds materialize the sidebar in sqlite/codex-dev.db.
+            // That catalog is independent from state_5.sqlite and session_index.jsonl;
+            // remove tombstoned rows there as well so a deleted task cannot remain as a
+            // clickable index after the client rebuilds its sidebar.
+            if (TryPruneDesktopThreadCatalog(codexHome, deletedThreadIds, ref backupDirectory))
             {
                 changed = true;
             }
@@ -402,6 +550,155 @@ public sealed partial class CodexCliService
         BackupFileIfPresent(indexPath, backupDirectory);
         WriteTextAtomically(indexPath, projected);
         return true;
+    }
+
+    private static bool TryPruneDesktopThreadCatalog(
+        string codexHome,
+        IReadOnlySet<string> deletedThreadIds,
+        ref string? backupDirectory)
+    {
+        if (deletedThreadIds.Count == 0)
+        {
+            return false;
+        }
+
+        var databasePath = Path.Combine(
+            Path.GetFullPath(codexHome),
+            DesktopCatalogDatabaseRelativePath);
+        if (!File.Exists(databasePath))
+        {
+            return false;
+        }
+
+        try
+        {
+            var builder = new SqliteConnectionStringBuilder
+            {
+                DataSource = databasePath,
+                Mode = SqliteOpenMode.ReadWrite,
+                Cache = SqliteCacheMode.Private,
+                Pooling = false,
+                DefaultTimeout = 3
+            };
+            using var connection = new SqliteConnection(builder.ToString());
+            connection.Open();
+
+            // WAL mode permits readers while Codex is running, but a concurrent writer
+            // can still hold the catalog briefly.  Let the cleanup wait a bounded period
+            // and leave the post-exit retry armed if the lock persists.
+            using (var busyTimeout = connection.CreateCommand())
+            {
+                busyTimeout.CommandText = "PRAGMA busy_timeout = 3000;";
+                busyTimeout.ExecuteNonQuery();
+            }
+
+            var tables = new[] { "local_thread_catalog", "thread_timeline_ledger" }
+                .Where(table => SqliteTableExists(connection, table))
+                .ToArray();
+            if (tables.Length == 0)
+            {
+                return false;
+            }
+
+            var parameterNames = deletedThreadIds
+                .Select((_, index) => "$deleted" + index.ToString(CultureInfo.InvariantCulture))
+                .ToArray();
+            // Keep a recoverable copy before the first DELETE.  The copy is harmless when
+            // no matching rows exist and ensures a failed/reviewed cleanup never loses the
+            // previous catalog contents.
+            backupDirectory ??= CreateBackupDirectory(codexHome);
+            BackupFileIfPresent(databasePath, backupDirectory);
+            var transaction = connection.BeginTransaction();
+            try
+            {
+                var changed = false;
+                foreach (var table in tables)
+                {
+                    if (!SqliteTableHasColumn(connection, transaction, table, "thread_id"))
+                    {
+                        continue;
+                    }
+
+                    using var command = connection.CreateCommand();
+                    command.Transaction = transaction;
+                    command.CommandText =
+                        $"DELETE FROM \"{table}\" WHERE thread_id COLLATE NOCASE IN (" +
+                        string.Join(",", parameterNames) + ");";
+                    var index = 0;
+                    foreach (var id in deletedThreadIds)
+                    {
+                        command.Parameters.AddWithValue(
+                            parameterNames[index++],
+                            id);
+                    }
+
+                    if (command.ExecuteNonQuery() > 0)
+                    {
+                        changed = true;
+                    }
+                }
+
+                transaction.Commit();
+                return changed;
+            }
+            catch
+            {
+                try
+                {
+                    transaction.Rollback();
+                }
+                catch
+                {
+                }
+
+                throw;
+            }
+            finally
+            {
+                transaction.Dispose();
+            }
+        }
+        catch (Exception ex) when (
+            ex is SqliteException or IOException or UnauthorizedAccessException or
+            InvalidOperationException)
+        {
+            ManagerLifecycleDiagnostics.WriteException(
+                "desktop-thread-catalog-prune-failed",
+                ex,
+                $"database={databasePath}");
+            return false;
+        }
+    }
+
+    private static bool SqliteTableExists(SqliteConnection connection, string table)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = $name LIMIT 1;";
+        command.Parameters.AddWithValue("$name", table);
+        return command.ExecuteScalar() != null;
+    }
+
+    private static bool SqliteTableHasColumn(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string table,
+        string column)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = $"PRAGMA table_info(\"{table}\");";
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            if (reader.FieldCount > 1 &&
+                string.Equals(reader.GetString(1), column, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static bool TryReadSessionIndexThreadId(string line, out string threadId)
@@ -1564,6 +1861,14 @@ public sealed partial class CodexCliService
         request.Headers.TryAddWithoutValidation(
             LocalPatGateway.RequestPurposeHeader,
             LocalPatGateway.QuotaTestRequestPurpose);
+        var probeChallenge = LocalPatGatewayControl.CreateChallenge();
+        request.Headers.TryAddWithoutValidation(LocalPatGatewayControl.ChallengeHeader, probeChallenge);
+        request.Headers.TryAddWithoutValidation(
+            LocalPatGatewayControl.ProofHeader,
+            LocalPatGatewayControl.CreateProof(
+                LocalPatGatewayControl.LoadOrCreateSecret(),
+                probeChallenge,
+                LocalPatGateway.QuotaTestProofPurpose(credential)));
         if (!string.IsNullOrWhiteSpace(accountId))
         {
             request.Headers.TryAddWithoutValidation("chatgpt-account-id", accountId);
@@ -2142,7 +2447,8 @@ public sealed partial class CodexCliService
         bool useDreamSkin,
         ThemeMode appearanceMode,
         string appearancePresetId = "manager",
-        string? appearanceLabel = null)
+        string? appearanceLabel = null,
+        bool forceClientRestart = false)
     {
         ArgumentNullException.ThrowIfNull(account);
         ArgumentNullException.ThrowIfNull(chatGptFeatureAccount);
@@ -2163,7 +2469,7 @@ public sealed partial class CodexCliService
             AccessTokenSharedProfileMode.ChatGptDesktop,
             chatGptFeatureAccount,
             routeOfficialOAuthThroughGateway: false,
-            forceClientRestart: false);
+            forceClientRestart);
     }
 
     private async Task<WindowsClientAccountProjection> SwitchWindowsClientAccountCoreAsync(
@@ -2301,6 +2607,9 @@ public sealed partial class CodexCliService
                 // deletion tombstones before projecting/launching the next account so deleted
                 // tasks cannot remain in "最近" merely because the manager recorded the deletion
                 // while Codex was still open.
+                CodexRolloutHistoryRepairService.TryRepairLaggingPaginatedRollouts(
+                    GetDefaultCodexHome(),
+                    allowOrdinalRewrite: true);
                 TryPruneDeletedDesktopSidebarState();
             }
             if (sharedProfileAlreadySelected)
@@ -2402,6 +2711,20 @@ public sealed partial class CodexCliService
             }
 
             projection.ClientMode = mode;
+            if (accessTokenMode == AccessTokenSharedProfileMode.ChatGptDesktop &&
+                !account.IsOfficialOAuth &&
+                chatGptFeatureAccount != null &&
+                !CanIdentifySharedChatGptFeatureProfileWithoutNetwork(
+                    account,
+                    chatGptFeatureAccount))
+            {
+                projection.ClientLaunchStarted = false;
+                projection.CodexPlusPlusLaunchStarted = false;
+                projection.ClientLaunchError =
+                    "双登录模型凭据二次校验失败：共享配置中的 provider、base_url、model 或 PAT Bearer 与所选账号不一致；" +
+                    "已阻止启动并恢复切换前状态。";
+            }
+            else
             try
             {
                 projection.ClientLaunchStarted = LaunchWindowsClient(
@@ -3195,10 +3518,11 @@ public sealed partial class CodexCliService
                         sharedConfig,
                         account,
                         requiresOpenAiAuth: true,
-                            providerBearerToken: ReadAccessTokenCredential(
-                                Path.Combine(account.CodexHome, AuthFileName)),
+                        providerBearerToken: ReadAccessTokenCredential(
+                            Path.Combine(account.CodexHome, AuthFileName)),
                         forceFileAuthStore: true,
-                        serviceTier: targetServiceTier)
+                        serviceTier: targetServiceTier,
+                        routeThroughGateway: routeOfficialOAuthThroughGateway)
                     : ProjectWindowsClientConfigText(
                         sharedConfig,
                         requiresOpenAiAuth: true,
@@ -3213,7 +3537,8 @@ public sealed partial class CodexCliService
                         account,
                         requiresOpenAiAuth: true,
                         forceFileAuthStore: true,
-                        serviceTier: targetServiceTier)
+                        serviceTier: targetServiceTier,
+                        routeThroughGateway: routeOfficialOAuthThroughGateway)
                     : ProjectWindowsClientConfigText(
                         sharedConfig,
                         requiresOpenAiAuth: true,
@@ -3316,7 +3641,8 @@ public sealed partial class CodexCliService
 
     private static bool IsManagedDesktopModelCredentialBoundToAccount(
         AccountRecord account,
-        string sharedConfigPath)
+        string sharedConfigPath,
+        bool routeThroughGateway = false)
     {
         try
         {
@@ -3332,6 +3658,9 @@ public sealed partial class CodexCliService
             var providerId = account.IsCompatibleApi
                 ? AccountStore.CompatibleApiProviderId
                 : AccountStore.AccessTokenProviderId;
+            var expectedModel = account.IsCompatibleApi
+                ? account.ApiModel.Trim()
+                : AccessTokenModel;
             if (!TomlTopLevelRawValueMatches(
                     configLines,
                     "model_provider",
@@ -3340,6 +3669,13 @@ public sealed partial class CodexCliService
                     configLines,
                     "cli_auth_credentials_store",
                     "\"file\""))
+            {
+                return false;
+            }
+            if (!TomlTopLevelRawValueMatches(
+                    configLines,
+                    "model",
+                    TomlString(expectedModel)))
             {
                 return false;
             }
@@ -3361,12 +3697,25 @@ public sealed partial class CodexCliService
             var sourceToken = ReadAccessTokenCredential(
                 Path.Combine(account.CodexHome, AuthFileName));
             var expectedBaseUrl = account.IsCompatibleApi
-                ? account.ApiBaseUrl.TrimEnd('/')
+                ? routeThroughGateway
+                    ? LocalPatGateway.ProviderBaseUrl
+                    : account.ApiBaseUrl.TrimEnd('/')
                 : AccountStore.AccessTokenBaseUrl;
             var expectedWireApi = account.IsCompatibleApi
                 ? account.ApiWireApi
                 : "responses";
+            var expectedProviderName = account.IsCompatibleApi
+                ? (string.IsNullOrWhiteSpace(account.ApiProviderName)
+                    ? "OpenAI"
+                    : account.ApiProviderName.Trim())
+                : account.Name.Trim();
             return TomlSectionRawValueMatches(
+                       configLines,
+                       sectionStart,
+                       sectionEnd,
+                       "name",
+                       TomlString(expectedProviderName)) &&
+                   TomlSectionRawValueMatches(
                        configLines,
                        sectionStart,
                        sectionEnd,
@@ -3614,7 +3963,12 @@ public sealed partial class CodexCliService
         return account.IsOfficialOAuth
             ? ProjectOfficialOAuthAccount(account, status, routeOfficialOAuthThroughGateway)
             : account.IsCompatibleApi
-            ? ProjectCompatibleApiAccount(account, status, accessTokenMode, chatGptFeatureAccount)
+            ? ProjectCompatibleApiAccount(
+                account,
+                status,
+                accessTokenMode,
+                chatGptFeatureAccount,
+                routeOfficialOAuthThroughGateway)
             : ProjectAccessTokenAccount(account, status, accessTokenMode, chatGptFeatureAccount);
     }
 
@@ -3631,9 +3985,15 @@ public sealed partial class CodexCliService
         AccountRecord account,
         LoginStatus status,
         AccessTokenSharedProfileMode mode = AccessTokenSharedProfileMode.ApiCompatible,
-        AccountRecord? chatGptFeatureAccount = null)
+        AccountRecord? chatGptFeatureAccount = null,
+        bool routeThroughGateway = false)
     {
-        return ProjectSharedAccountProfile(account, status, mode, chatGptFeatureAccount);
+        return ProjectSharedAccountProfile(
+            account,
+            status,
+            mode,
+            chatGptFeatureAccount,
+            routeThroughGateway);
     }
 
     private static bool CanReuseOfficialOAuthSharedProfile(
@@ -3853,7 +4213,8 @@ public sealed partial class CodexCliService
         AccountRecord account,
         LoginStatus status,
         AccessTokenSharedProfileMode accessTokenMode,
-        AccountRecord? chatGptFeatureAccount = null)
+        AccountRecord? chatGptFeatureAccount = null,
+        bool routeThroughGateway = false)
     {
         var accountHome = Path.GetFullPath(account.CodexHome);
         var profileHome = Path.GetFullPath(GetDefaultCodexHome());
@@ -3938,7 +4299,8 @@ public sealed partial class CodexCliService
                         ? ReadAccessTokenCredential(sourceAuthPath)
                         : null,
                     forceFileAuthStore: true,
-                    serviceTier: ReadDesktopServiceTier(sourceConfig));
+                    serviceTier: ReadDesktopServiceTier(sourceConfig),
+                    routeThroughGateway: routeThroughGateway);
                 var currentConfig = File.Exists(configPath) ? File.ReadAllText(configPath) : "";
                 projectedConfig = PreserveSharedMcpServerSections(currentConfig, projectedConfig);
                 if (!string.Equals(currentConfig, projectedConfig, StringComparison.Ordinal))
@@ -8359,9 +8721,9 @@ catch {
             port != 10808 ||
             scheme != "http" ||
             !IsLoopbackProxyUri(proxyUri) ||
-            !IsLoopbackProxyUri("http://localhost.:8317") ||
-            !IsLoopbackProxyUri("http://[::1]:8317") ||
-            !IsLoopbackProxyUri("http://[::ffff:127.0.0.1]:8317") ||
+            !IsLoopbackProxyUri("http://localhost.:8321") ||
+            !IsLoopbackProxyUri("http://[::1]:8321") ||
+            !IsLoopbackProxyUri("http://[::ffff:127.0.0.1]:8321") ||
             IsLoopbackProxyUri("http://192.0.2.1:10808") ||
             LocalProxyDetector.BuildCandidatePorts(LocalPatGateway.Port)
                 .Contains(LocalPatGateway.Port))
@@ -9283,6 +9645,15 @@ catch {
         {
             RemoveDeletedThreadObjectKeys(descriptions, deletedThreadIds);
         }
+
+        // Newer desktop builds keep additional thread references in maps such as
+        // `thread-reference-capability:<id>`, `thread-client-id-v1:local%3A<id>`,
+        // per-thread permission profiles, and project assignments.  These keys are not
+        // stable across Codex releases, so only pruning the handful of known arrays/maps
+        // leaves a tombstoned task visible in “最近” (and clicking it then reports
+        // “no rollout found”).  Walk the complete JSON tree and remove any property or
+        // scalar that contains a tombstoned ID; unrelated state is preserved.
+        PruneDeletedThreadReferencesRecursively(root, deletedThreadIds);
     }
 
     private static void RemoveDeletedThreadArrayEntries(
@@ -9311,10 +9682,56 @@ catch {
     {
         foreach (var property in obj.ToList())
         {
-            if (deletedThreadIds.Contains(property.Key))
+            if (ContainsDeletedThreadId(property.Key, deletedThreadIds))
             {
                 obj.Remove(property.Key);
             }
+        }
+    }
+
+    private static void PruneDeletedThreadReferencesRecursively(
+        JsonNode node,
+        IReadOnlySet<string> deletedThreadIds)
+    {
+        switch (node)
+        {
+            case JsonObject obj:
+                foreach (var property in obj.ToList())
+                {
+                    if (ContainsDeletedThreadId(property.Key, deletedThreadIds) ||
+                        property.Value is JsonValue value &&
+                        value.TryGetValue<string>(out var text) &&
+                        ContainsDeletedThreadId(text, deletedThreadIds))
+                    {
+                        obj.Remove(property.Key);
+                        continue;
+                    }
+
+                    if (property.Value != null)
+                    {
+                        PruneDeletedThreadReferencesRecursively(property.Value, deletedThreadIds);
+                    }
+                }
+                break;
+
+            case JsonArray array:
+                for (var index = array.Count - 1; index >= 0; index--)
+                {
+                    var child = array[index];
+                    if (child is JsonValue value &&
+                        value.TryGetValue<string>(out var text) &&
+                        ContainsDeletedThreadId(text, deletedThreadIds))
+                    {
+                        array.RemoveAt(index);
+                        continue;
+                    }
+
+                    if (child != null)
+                    {
+                        PruneDeletedThreadReferencesRecursively(child, deletedThreadIds);
+                    }
+                }
+                break;
         }
     }
 
@@ -10517,6 +10934,33 @@ catch {
             DesktopSelectionModeDirectCompatibleApi;
     }
 
+    /// <summary>
+    /// Returns true only while the shared desktop profile explicitly describes a
+    /// ChatGPT-plus-PAT/API session.  The gateway uses this marker to reject an OAuth
+    /// bearer accidentally sent for a model request, while still allowing OAuth for
+    /// identity, voice and phone flows.
+    /// </summary>
+    internal static bool IsSharedDualLoginModeConfigured()
+    {
+        try
+        {
+            var profileHome = Path.GetFullPath(GetDefaultCodexHome());
+            return TryReadActiveAccountState(
+                       profileHome,
+                       out _,
+                       out _,
+                       out var mode) &&
+                   mode is DesktopSelectionModeChatGptAccessToken or
+                       DesktopSelectionModeChatGptCompatibleApi;
+        }
+        catch (Exception ex) when (
+            ex is IOException or UnauthorizedAccessException or JsonException or
+            ArgumentException or NotSupportedException)
+        {
+            return false;
+        }
+    }
+
     private static void WriteActiveAccountState(
         string profileHome,
         AccountRecord account,
@@ -10980,6 +11424,28 @@ catch {
             throw new InvalidOperationException("Compatible API projection did not preserve its display name, unrelated providers, or fail-fast retry policy.");
         }
 
+        var routedApiConfig = ProjectCompatibleApiConfigText(
+            apiConfig,
+            apiAccount,
+            requiresOpenAiAuth: true,
+            providerBearerToken: "configured-compatible-api-test-token",
+            forceFileAuthStore: true,
+            routeThroughGateway: true);
+        if (!routedApiConfig.Contains(
+                "base_url = " + TomlString(LocalPatGateway.ProviderBaseUrl),
+                StringComparison.Ordinal) ||
+            routedApiConfig.Contains(
+                "base_url = \"https://example.invalid\"",
+                StringComparison.Ordinal) ||
+            !routedApiConfig.Contains(
+                "experimental_bearer_token = \"configured-compatible-api-test-token\"",
+                StringComparison.Ordinal) ||
+            !routedApiConfig.Contains("requires_openai_auth = true", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "Rotation-enabled compatible API projection did not use the authenticated local gateway.");
+        }
+
         var officialPriorityConfig = ProjectOfficialOAuthConfigText(apiConfig);
         var tokenPriorityRoundTrip = ProjectWindowsClientConfigText(officialPriorityConfig);
         var apiPriorityRoundTrip = ProjectCompatibleApiConfigText(tokenPriorityRoundTrip, apiAccount);
@@ -11033,7 +11499,7 @@ catch {
             "model_reasoning_effort = \"xhigh\"\n" +
             "network_access = \"enabled\"\n\n" +
             "[model_providers.OpenAI]\n" +
-            "base_url = \"http://127.0.0.1:8317\"\n";
+            "base_url = \"http://127.0.0.1:8330\"\n";
         var sanitizedProjectConfig = RemoveProjectModelOverrides(projectConfig);
         if (sanitizedProjectConfig.Contains("gpt-5.5", StringComparison.Ordinal) ||
             sanitizedProjectConfig.Contains("model_providers", StringComparison.Ordinal) ||
@@ -11209,6 +11675,13 @@ catch {
                 "thread-descriptions-v1": {
                   "{{deletedThreadId}}": { "title": "deleted" },
                   "{{liveThreadId}}": { "title": "live" }
+                },
+                "thread-reference-capability:{{deletedThreadId}}": true,
+                "thread-client-id-v1:local%3A{{deletedThreadId}}": "client-new-thread:deleted",
+                "thread-reference-capability:{{liveThreadId}}": true,
+                "permission-profiles": {
+                  "{{deletedThreadId}}": { "approvalPolicy": "never" },
+                  "{{liveThreadId}}": { "approvalPolicy": "never" }
                 }
               }
             }
@@ -12018,6 +12491,20 @@ catch {
             {
                 throw new InvalidOperationException(
                     "Dual-login display discovery accepted a mismatched model bearer.");
+            }
+            var missingBearerConfig = Regex.Replace(
+                tokenConfig,
+                "(?m)^experimental_bearer_token\\s*=.*(?:\\r?\\n|$)",
+                string.Empty);
+            File.WriteAllText(sharedConfigPath, missingBearerConfig);
+            if (CanIdentifySharedChatGptFeatureProfileWithoutNetwork(tokenAccount, oauthA) ||
+                CanReuseChatGptFeatureProfileForLaunchWithoutNetwork(
+                    tokenAccount,
+                    Path.Combine(tokenHome, ConfigFileName),
+                    oauthA))
+            {
+                throw new InvalidOperationException(
+                    "Dual-login display discovery accepted a missing model bearer.");
             }
             File.WriteAllText(sharedConfigPath, tokenConfig);
 
@@ -13187,7 +13674,8 @@ catch {
         bool requiresOpenAiAuth = false,
         string? providerBearerToken = null,
         bool forceFileAuthStore = false,
-        string? serviceTier = null)
+        string? serviceTier = null,
+        bool routeThroughGateway = false)
     {
         var desktopServiceTier = serviceTier == null
             ? ReadDesktopServiceTier(currentConfig)
@@ -13275,7 +13763,10 @@ catch {
 
         output.Add(providerHeader);
         output.Add("name = " + TomlString(providerName));
-        output.Add("base_url = " + TomlString(account.ApiBaseUrl.TrimEnd('/')));
+        output.Add("base_url = " + TomlString(
+            routeThroughGateway
+                ? LocalPatGateway.ProviderBaseUrl
+                : account.ApiBaseUrl.TrimEnd('/')));
         output.Add("wire_api = " + TomlString(account.ApiWireApi));
         if (!string.IsNullOrWhiteSpace(providerBearerToken))
         {

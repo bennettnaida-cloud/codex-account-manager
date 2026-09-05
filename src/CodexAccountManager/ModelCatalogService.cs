@@ -12,6 +12,7 @@ internal sealed class ModelCatalogDocument
     public string DefaultReasoningEffort { get; set; } = "medium";
     public string CatalogSource { get; set; } = string.Empty;
     public string VerifiedAtUtc { get; set; } = string.Empty;
+    public bool AutomaticPriceUpdatesEnabled { get; set; } = true;
     public List<string> Sources { get; set; } = [];
     public List<ModelCatalogPrice> Models { get; set; } = [];
 }
@@ -99,55 +100,21 @@ internal static partial class ModelCatalogService
         string? proxyUri,
         CancellationToken cancellationToken = default)
     {
-        var previous = Clone(Current);
+        var original = Current;
+        var previous = Clone(original);
         using var client = CreateClient(proxyUri);
-        var indexText = await DownloadOfficialTextAsync(client, ModelsUrl, cancellationToken)
+        var pricingText = await DownloadOfficialTextAsync(client, PricingUrl, cancellationToken)
             .ConfigureAwait(false);
-        var models = new List<ModelCatalogPrice>();
-        foreach (var modelId in DiscoverTrackedModelIds(indexText, previous))
-        {
-            var configured = previous.Models.FirstOrDefault(model =>
-                                 model.Id.Equals(modelId, StringComparison.OrdinalIgnoreCase)) ??
-                             new ModelCatalogPrice
-                             {
-                                 Id = modelId,
-                                 CacheWriteMultiplier = 1D,
-                                 UsesLongContextPricing = false
-                             };
-            var pageUrl = $"{ModelsUrl}/{Uri.EscapeDataString(modelId)}";
-            var pageText = await DownloadOfficialTextAsync(client, pageUrl, cancellationToken)
-                .ConfigureAwait(false);
-            models.Add(ParseOfficialPrice(pageText, configured));
-        }
-
-        var defaultId = DetectDefaultModelId(indexText, models) ??
-            throw new InvalidOperationException("官网模型目录中未找到明确的 Default 模型，已拒绝更新本地目录。");
-        var defaultPrice = models.FirstOrDefault(model => ModelMatches(model, defaultId));
-        if (defaultPrice is null)
-        {
-            var pageUrl = $"{ModelsUrl}/{Uri.EscapeDataString(defaultId)}";
-            var pageText = await DownloadOfficialTextAsync(client, pageUrl, cancellationToken)
-                .ConfigureAwait(false);
-            defaultPrice = ParseOfficialPrice(pageText, new ModelCatalogPrice { Id = defaultId });
-            models.Add(defaultPrice);
-        }
-
-        var defaultModel = defaultPrice.Aliases.FirstOrDefault(alias =>
-            alias.Count(character => character == '-') == 1) ?? defaultPrice.Id;
-        var current = new ModelCatalogDocument
-        {
-            SchemaVersion = 1,
-            DefaultModel = defaultModel,
-            DefaultReasoningEffort = previous.DefaultReasoningEffort,
-            CatalogSource = "official",
-            VerifiedAtUtc = DateTimeOffset.UtcNow.ToString("O"),
-            Sources = [ModelsUrl, CompareUrl],
-            Models = OrderModelsForDisplay(models).ToList()
-        };
-        Validate(current);
+        var current = ParseStandardPricingCatalog(pricingText, previous);
         var changes = DescribeChanges(previous, current);
-        SaveOverride(current);
-        lock (Sync) _current = current;
+        lock (Sync)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!ReferenceEquals(_current, original))
+                throw new InvalidOperationException("检查期间价格设置已改变，请重新检查，已保留刚才的设置。");
+            SaveOverride(current);
+            _current = current;
+        }
         return new ModelCatalogCheckResult(previous, current, changes);
     }
 
@@ -214,8 +181,8 @@ internal static partial class ModelCatalogService
             if (File.Exists(_overridePath!) ||
                 Current.CatalogSource.Equals("manual", StringComparison.OrdinalIgnoreCase) ||
                 CanonicalDefaultModel != "gpt-5.6-sol" ||
-                !Current.Models.Take(3).Select(model => model.Id).SequenceEqual(
-                    ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+                !Current.Models.Take(4).Select(model => model.Id).SequenceEqual(
+                    ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
                     StringComparer.OrdinalIgnoreCase))
             {
                 throw new InvalidOperationException("Bundled model-catalog restore self-test failed.");
@@ -276,6 +243,7 @@ internal static partial class ModelCatalogService
             }
 
             const string discoveryIndex = """
+                [GPT-6 Astra](/api/docs/models/gpt-6-astra.md)
                 [GPT-5.6 Sol](/api/docs/models/gpt-5.6-sol.md)
                 [GPT-5.5](/api/docs/models/gpt-5.5.md)
                 [GPT-5.4 mini](/api/docs/models/gpt-5.4-mini.md)
@@ -285,7 +253,8 @@ internal static partial class ModelCatalogService
             {
                 Models = [parsedOfficial]
             });
-            if (!discovered.Contains("gpt-5.6-sol", StringComparer.OrdinalIgnoreCase) ||
+            if (!discovered.Contains("gpt-6-astra", StringComparer.OrdinalIgnoreCase) ||
+                !discovered.Contains("gpt-5.6-sol", StringComparer.OrdinalIgnoreCase) ||
                 !discovered.Contains("gpt-5.5", StringComparer.OrdinalIgnoreCase) ||
                 !discovered.Contains("gpt-5.4-mini", StringComparer.OrdinalIgnoreCase) ||
                 discovered.Contains("gpt-5.3-codex", StringComparer.OrdinalIgnoreCase) ||
@@ -294,6 +263,7 @@ internal static partial class ModelCatalogService
                 throw new InvalidOperationException("Official tracked-model discovery self-test failed.");
             }
 
+            ValidateStandardPricingRefresh();
             using var validProxyClient = CreateClient("http://127.0.0.1:10808");
             try
             {
@@ -465,7 +435,7 @@ internal static partial class ModelCatalogService
         var discovered = previous.Models.Select(model => model.Id).ToList();
         foreach (Match match in Regex.Matches(
                      indexSource,
-                     @"(?i)/api/docs/models/(gpt-(\d+(?:\.\d+)*)(?:-(?:sol|terra|luna|mini|nano|pro))?)(?:\.md)?(?=[)\s?#])"))
+                     @"(?i)/api/docs/models/(gpt-(\d+(?:\.\d+)*)(?:-(?:astra|sol|terra|luna|mini|nano|pro))?)(?:\.md)?(?=[)\s?#])"))
         {
             var versionText = match.Groups[2].Value.Contains('.', StringComparison.Ordinal)
                 ? match.Groups[2].Value
@@ -547,6 +517,8 @@ internal static partial class ModelCatalogService
                         : "bundled";
                 }
                 Validate(catalog);
+                if (path.Equals(_overridePath, StringComparison.OrdinalIgnoreCase))
+                    MergeMissingBundledModels(catalog, candidates.Skip(1));
                 catalog.Models = OrderModelsForDisplay(catalog.Models).ToList();
                 return catalog;
             }

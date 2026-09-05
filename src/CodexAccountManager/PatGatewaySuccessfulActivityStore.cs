@@ -16,7 +16,8 @@ internal sealed record PatGatewaySuccessfulActivity(
 /// </summary>
 internal sealed class PatGatewaySuccessfulActivityStore
 {
-    internal const string FileName = "pat-gateway-successful-activity-v1.json";
+    internal const string FileName =
+        "pat-gateway-successful-activity-v1-" + ReleaseConfiguration.GatewayPortText + ".json";
     private const int SchemaVersion = 1;
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -84,12 +85,9 @@ internal sealed class PatGatewaySuccessfulActivityStore
                 return null;
             }
 
-            using var stream = new FileStream(
-                _path,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.ReadWrite | FileShare.Delete);
-            var document = JsonSerializer.Deserialize<ActivityDocument>(stream, JsonOptions);
+            var document = JsonSerializer.Deserialize<ActivityDocument>(
+                AtomicFilePersistence.ReadAllTextWithRetry(_path),
+                JsonOptions);
             if (document == null ||
                 document.SchemaVersion != SchemaVersion ||
                 document.Sequence <= 0 ||
@@ -126,29 +124,9 @@ internal sealed class PatGatewaySuccessfulActivityStore
             StartedAtUtc = activity.StartedAtUtc,
             CompletedAtUtc = activity.CompletedAtUtc
         };
-        var temporaryPath = _path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-        try
-        {
-            File.WriteAllText(
-                temporaryPath,
-                JsonSerializer.Serialize(document, JsonOptions),
-                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
-            File.Move(temporaryPath, _path, overwrite: true);
-        }
-        finally
-        {
-            try
-            {
-                if (File.Exists(temporaryPath))
-                {
-                    File.Delete(temporaryPath);
-                }
-            }
-            catch
-            {
-                // The temporary document contains hashes and timestamps only.
-            }
-        }
+        AtomicFilePersistence.WriteAllText(
+            _path,
+            JsonSerializer.Serialize(document, JsonOptions));
     }
 
     internal static void Validate()

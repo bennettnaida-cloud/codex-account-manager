@@ -18,13 +18,13 @@ $usingBundledDotnet = [string]::Equals(
     [IO.Path]::GetFullPath($bundledDotnet),
     [StringComparison]::OrdinalIgnoreCase)
 $project = Join-Path $root 'src\CodexAccountManager\CodexAccountManager.csproj'
-$out = Join-Path $root 'dist\CodexAccountManager'
 $buildVersion = if ([string]::IsNullOrWhiteSpace($env:CAM_VERSION)) {
-    Get-Date -Format 'yyyy.MM.dd'
+    (Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw).Trim()
 }
 else {
     $env:CAM_VERSION.Trim()
 }
+$out = Join-Path $root ("dist\CodexAccountManager-" + $buildVersion)
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("codex-account-manager-build-" + [guid]::NewGuid().ToString('N'))
 $oldAccountManagerHome = $env:CODEX_ACCOUNT_MANAGER_HOME
 $oldDotnetRoot = $env:DOTNET_ROOT
@@ -43,51 +43,10 @@ function Get-CurrentProjectGatewayProcesses {
     }
 }
 
-# Release the optional local PAT gateway before publishing. A running single-file
-# process can keep the previous executable locked on Windows. Ask the existing
-# manager to authenticate the shutdown request; this also works with the previous
-# build, whose shutdown endpoint did not require authentication.
+# Publishing is staged beside the live package. Never stop the optional PAT gateway:
+# the user's 2.2.25 installation may still own port 8317, while this 2.3.x build
+# uses its dedicated versioned listener. The running gateway must remain available.
 $existingLauncher = Join-Path $out 'CodexAccountManager.exe'
-$previousHomeForGateway = $env:CODEX_ACCOUNT_MANAGER_HOME
-$env:CODEX_ACCOUNT_MANAGER_HOME = $root
-try {
-    # Port 8317 is shared by every installed/source copy. Do not even send a
-    # shutdown request unless process inspection proves that the listener belongs
-    # to this source tree; an unrelated production gateway may be using the port.
-    $currentProjectGatewayProcesses = @(Get-CurrentProjectGatewayProcesses)
-    if ($currentProjectGatewayProcesses.Count -gt 0 -and
-        (Test-Path -LiteralPath $existingLauncher -PathType Leaf)) {
-        try {
-            & $existingLauncher '--shutdown-local-pat-gateway' 2>$null | Out-Null
-        }
-        catch {
-            # The gateway is optional and may not be running.
-        }
-    }
-}
-finally {
-    $env:CODEX_ACCOUNT_MANAGER_HOME = $previousHomeForGateway
-}
-
-$gatewayDeadline = [DateTime]::UtcNow.AddSeconds(5)
-while ([DateTime]::UtcNow -lt $gatewayDeadline) {
-    if (@(Get-CurrentProjectGatewayProcesses).Count -eq 0) {
-        break
-    }
-    Start-Sleep -Milliseconds 150
-}
-if (@(Get-CurrentProjectGatewayProcesses).Count -gt 0) {
-    # A gateway started with a different CODEX_ACCOUNT_MANAGER_HOME has a different
-    # control-secret path and does not lock this source tree's output. Stop only the
-    # exact current-project gateway before replacing its executable.
-    foreach ($gatewayProcess in @(Get-CurrentProjectGatewayProcesses)) {
-        Stop-Process -Id ([int]$gatewayProcess.ProcessId) -Force -ErrorAction SilentlyContinue
-    }
-    Start-Sleep -Milliseconds 250
-}
-if (@(Get-CurrentProjectGatewayProcesses).Count -gt 0) {
-    throw 'The current project local PAT gateway is still running. Close it before publishing so the executable can be replaced safely.'
-}
 
 if (-not (Test-Path -LiteralPath $dotnet -PathType Leaf)) {
     throw "Missing dotnet SDK: $dotnet"
@@ -178,10 +137,23 @@ if (Test-Path -LiteralPath $desktopShortcutPath -PathType Leaf) {
     else {
         [IO.Path]::GetFullPath($desktopShortcut.TargetPath)
     }
-    if ($shortcutTarget.StartsWith($sourceRootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+    $launcherScript = Join-Path $root 'Start-CodexAccountManager.ps1'
+    $sourceOwnedShortcut =
+        $shortcutTarget.StartsWith($sourceRootPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+        $desktopShortcut.Arguments.IndexOf($launcherScript, [StringComparison]::OrdinalIgnoreCase) -ge 0
+    if ($sourceOwnedShortcut) {
+        # Launch the published WinForms executable directly.  The previous
+        # shortcut target was powershell.exe, which opened a visible Windows
+        # Terminal tab on every click and added an unnecessary script startup
+        # hop.  Pass the shared manager root explicitly so the shortcut keeps
+        # using the same account data as the launcher script.
+        $dataRoot = Join-Path (Split-Path -Parent $root) 'codex-account-manager'
+        if (-not (Test-Path -LiteralPath (Join-Path $dataRoot 'accounts.json') -PathType Leaf)) {
+            $dataRoot = $root
+        }
         $desktopShortcut.TargetPath = $appExe
-        $desktopShortcut.WorkingDirectory = $root
-        $desktopShortcut.Arguments = ''
+        $desktopShortcut.WorkingDirectory = $out
+        $desktopShortcut.Arguments = '--manager-root "' + $dataRoot + '"'
         $desktopShortcut.IconLocation = $appExe + ',0'
         $desktopShortcut.Save()
     }

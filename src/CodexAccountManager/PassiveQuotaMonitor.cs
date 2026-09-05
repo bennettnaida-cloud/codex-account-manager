@@ -2223,10 +2223,12 @@ public static class PassiveQuotaMonitor
             var isLongContext = item.InputTokens > UsageBucket.LongContextInputThreshold;
             var (inputRate, cachedInputRate, outputRate) = (item.Model, isLongContext) switch
             {
-                ("gpt-5.6-sol", false) or ("gpt-5.5", false) => (5D, 0.5D, 30D),
+                ("gpt-5.6-sol", false) => (4D, 0.4D, 20D),
+                ("gpt-5.5", false) => (5D, 0.5D, 30D),
                 ("gpt-5.6-terra", false) => (2D, 0.2D, 12D),
                 ("gpt-5.6-luna", false) => (0.2D, 0.02D, 1.2D),
-                ("gpt-5.6-sol", true) or ("gpt-5.5", true) => (10D, 1D, 45D),
+                ("gpt-5.6-sol", true) => (8D, 0.8D, 30D),
+                ("gpt-5.5", true) => (10D, 1D, 45D),
                 ("gpt-5.6-terra", true) => (4D, 0.4D, 18D),
                 ("gpt-5.6-luna", true) => (0.4D, 0.04D, 1.8D),
                 _ => throw new InvalidOperationException("Equivalent-capacity fixture has an unknown model.")
@@ -2282,7 +2284,7 @@ public static class PassiveQuotaMonitor
             "short regular input",
             5D,
             [
-                EstimateCapacity(models[0], 10_000, 0, 0),
+                EstimateCapacity(models[0], 12_500, 0, 0),
                 EstimateCapacity(models[1], 25_000, 0, 0),
                 EstimateCapacity(models[2], 250_000, 0, 0),
                 EstimateCapacity(models[3], 10_000, 0, 0)
@@ -2291,7 +2293,7 @@ public static class PassiveQuotaMonitor
             "short cached input",
             0.5D,
             [
-                EstimateCapacity(models[0], 10_000, 10_000, 0),
+                EstimateCapacity(models[0], 12_500, 12_500, 0),
                 EstimateCapacity(models[1], 25_000, 25_000, 0),
                 EstimateCapacity(models[2], 250_000, 250_000, 0),
                 EstimateCapacity(models[3], 10_000, 10_000, 0)
@@ -2300,7 +2302,7 @@ public static class PassiveQuotaMonitor
             "short output",
             300D,
             [
-                EstimateCapacity(models[0], 0, 0, 100_000),
+                EstimateCapacity(models[0], 0, 0, 150_000),
                 EstimateCapacity(models[1], 0, 0, 250_000),
                 EstimateCapacity(models[2], 0, 0, 2_500_000),
                 EstimateCapacity(models[3], 0, 0, 100_000)
@@ -2309,7 +2311,7 @@ public static class PassiveQuotaMonitor
             "long input",
             300D,
             [
-                EstimateCapacity(models[0], 300_000, 0, 0),
+                EstimateCapacity(models[0], 375_000, 0, 0),
                 EstimateCapacity(models[1], 750_000, 0, 0),
                 EstimateCapacity(models[2], 7_500_000, 0, 0),
                 EstimateCapacity(models[3], 300_000, 0, 0)

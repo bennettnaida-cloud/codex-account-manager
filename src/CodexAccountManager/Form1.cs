@@ -308,6 +308,8 @@ public partial class Form1 : Form
     private readonly System.Windows.Forms.Timer _quotaRefreshTimer = new();
     private readonly System.Windows.Forms.Timer _layoutRefreshTimer = new() { Interval = 120 };
     private FileSystemWatcher? _usageLogWatcher;
+    private FileSystemWatcher? _chatSectionStateWatcher;
+    private FileSystemWatcher? _chatSectionIdentityWatcher;
     private int _usageLogDirty = 1;
     private bool _usageLogWatcherReady;
     private readonly ThemeService _themeService;
@@ -320,6 +322,11 @@ public partial class Form1 : Form
     private readonly QuotaSafetyMarginTracker _quotaSafetyMarginTracker = new();
     private readonly bool _preserveExistingPatGatewayOnStartup;
     private readonly bool _refreshNativeFastBridgeOnStartup;
+    // The side-by-side updater writes this marker before asking the old UI to exit.
+    // Seeing it means a newer manager has already adopted the shared gateway; the old
+    // process must leave that listener alive for the hand-off instead of shutting it down.
+    private const string GatewayHandoffMarkerFileName =
+        ".codex-account-manager-gateway-handoff-v1";
     private readonly Dictionary<string, ResetCreditViewState> _resetCreditState =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, LiveRateLimitSnapshot> _liveRateLimitCache =
@@ -399,6 +406,9 @@ public partial class Form1 : Form
     private AppUpdateInfo? _availableUpdate;
     private bool _deletedThreadCleanupStarted;
     private int _deletedDesktopSidebarPruneScheduled;
+    private int _rolloutHistoryRepairMonitorScheduled;
+    private int _chatSectionSyncScheduled;
+    private int _chatSectionSyncRequiresClientRestart;
     private bool _threadSectionOrderNormalizationStarted;
     private bool _patGatewayRuntimeRunning;
     private bool _patGatewayActionRunning;
@@ -423,6 +433,7 @@ public partial class Form1 : Form
     private int _bulkQuotaTestCompleted;
     private int _bulkQuotaTestTotal;
     private string _patGatewayRuntimeStatus = "等待启动";
+    private bool _patGatewayShutdownOnCloseStarted;
     private CancellationTokenSource? _proxyDetectionCancellation;
     private ModernInputShell? _searchShell;
     private ModernInputShell? _projectPathShell;
@@ -480,6 +491,7 @@ public partial class Form1 : Form
         ApplyTheme();
         LoadAccounts();
         ConfigureQuotaAutoRefresh();
+        ConfigureAutomaticModelCatalogRefresh();
         Shown += (_, _) =>
         {
             ShowPendingUpdateFailure();
@@ -496,6 +508,7 @@ public partial class Form1 : Form
                 _ = RefreshQuotaUsageAsync(force: false, _workspaceLoadGeneration);
             }
             _ = InitializePatGatewayOnStartupAsync();
+            StartChatSectionSynchronizationWatcher();
             _codex.QueueCurrentOfficialAccountDisplay(_accounts);
             if (_refreshNativeFastBridgeOnStartup)
             {
@@ -604,6 +617,60 @@ public partial class Form1 : Form
         _appSettings.WindowWidth = (int)Math.Round(bounds.Width / dpiScale);
         _appSettings.WindowHeight = (int)Math.Round(bounds.Height / dpiScale);
         _themeService.SaveSettings(_appSettings);
+    }
+
+    private void ShutdownOwnedPatGatewayOnManagerExit()
+    {
+        if (_patGatewayShutdownOnCloseStarted)
+        {
+            return;
+        }
+
+        _patGatewayShutdownOnCloseStarted = true;
+        var handoffMarkerPath = Path.Combine(
+            Path.GetFullPath(_store.RootPath),
+            GatewayHandoffMarkerFileName);
+        if (File.Exists(handoffMarkerPath))
+        {
+            // A newer side-by-side Manager has already started and adopted this
+            // gateway.  Consuming the marker here keeps the shared listener alive
+            // while this old UI exits, so in-flight Codex requests never lose their
+            // route during an update.
+            try
+            {
+                File.Delete(handoffMarkerPath);
+            }
+            catch (Exception ex)
+            {
+                ManagerLifecycleDiagnostics.WriteException(
+                    "pat-gateway-handoff-marker-delete-failed",
+                    ex);
+            }
+
+            ManagerLifecycleDiagnostics.Write(
+                "pat-gateway-shutdown-skipped-for-side-by-side-handoff");
+            return;
+        }
+        try
+        {
+            // FormClosing is raised on the UI thread.  The gateway helper performs its
+            // HTTP control call on a worker thread and has a short bounded timeout, so
+            // closing the Manager does not deadlock or leave an orphaned release-scoped listener.
+            var stopped = LocalPatGateway.ShutdownOwnedGatewayForProcessExit(
+                TimeSpan.FromSeconds(4));
+            ManagerLifecycleDiagnostics.Write(
+                "pat-gateway-shutdown-on-manager-exit",
+                $"stopped={stopped}; port={LocalPatGateway.Port}");
+        }
+        catch (Exception ex)
+        {
+            // A gateway that is already gone is equivalent to a successful shutdown.
+            // Keep the close path best-effort and never prevent the Manager window from
+            // exiting because a stale listener failed to answer its control request.
+            ManagerLifecycleDiagnostics.WriteException(
+                "pat-gateway-shutdown-on-manager-exit-failed",
+                ex);
+        }
     }
 
     private string? ResolveApplicationIconPath()
@@ -1009,6 +1076,7 @@ public partial class Form1 : Form
             ManagerLifecycleDiagnostics.Write(
                 "manager-form-closing",
                 $"reason={eventArgs.CloseReason}");
+            ShutdownOwnedPatGatewayOnManagerExit();
             // Closing is a best-effort persistence point.  A second Manager/update helper
             // may still hold the settings file for a few milliseconds; never let that
             // sharing violation abort the close sequence or take the visible Manager down
@@ -1061,6 +1129,10 @@ public partial class Form1 : Form
             _quotaRefreshTimer.Dispose();
             _layoutRefreshTimer.Dispose();
             _usageLogWatcher?.Dispose();
+            _chatSectionStateWatcher?.Dispose();
+            _chatSectionStateWatcher = null;
+            _chatSectionIdentityWatcher?.Dispose();
+            _chatSectionIdentityWatcher = null;
             _toolTip.Dispose();
             ClearWorkspaceViewCache();
         };
@@ -2011,9 +2083,42 @@ public partial class Form1 : Form
                     continue;
                 }
 
+                var currentRoute = new PatGatewayRotationStore(_store.RootPath).Load();
+                var transportAccountKey = ResolvePatGatewayTransportAccountKey(sourceKey);
+                if (currentRoute.Status == PatGatewayRotationStatus.None)
+                {
+                    await LocalPatGateway.EnsureRunningAsync(
+                        cancellation.Token,
+                        restartOnProxyMismatch: false);
+                    var activeSource = FindSharedActiveRotationAccount();
+                    if (activeSource != null &&
+                        !QuotaAccountIdentity.CreateKey(activeSource).Equals(
+                            sourceKey,
+                            StringComparison.Ordinal))
+                    {
+                        // The UI cache can lag behind a port hand-off. Reconcile it to the
+                        // credential marker and let the next monitor tick evaluate that real
+                        // source rather than arming a route against a stale API label.
+                        SetCurrentAccount(activeSource.Name, false, persistSettings: true);
+                        RenderCards();
+                        return;
+                    }
+                    if (_codex.TryRouteSelectedAccountThroughGateway(source))
+                    {
+                        transportAccountKey = sourceKey;
+                    }
+                }
+                if (transportAccountKey == null)
+                {
+                    _statusBox.Text =
+                        "当前轮换源账号的活动凭据与共享配置不一致；" +
+                        "为避免错号，暂未返回使用轮换池，Codex 和网关保持运行。";
+                    return;
+                }
                 var armed = await LocalPatGateway.ArmRotationAsync(
                     sourceKey,
                     targetKey,
+                    transportAccountKey: transportAccountKey,
                     cancellationToken: cancellation.Token);
                 if (armed.Status != PatGatewayRotationStatus.Armed ||
                     !string.Equals(armed.SourceAccountKey, sourceKey, StringComparison.Ordinal) ||
@@ -4041,6 +4146,42 @@ public partial class Form1 : Form
                 accountConfigFailures.Add(account.Name);
             }
         }
+        try
+        {
+            // Synchronize the local presentation cache after every account reload. OAuth
+            // identities and PAT whoami identities share the same stable ChatGPT bucket;
+            // PAT credentials themselves never enter the sidebar state.
+            var sectionSync = ChatSectionSynchronizationService.Synchronize(
+                _accounts,
+                CodexCliService.GetDefaultCodexHome(),
+                _currentAccountName,
+                _store.RootPath);
+            // A Manager opened on top of an already-running Codex cannot know which
+            // revision of the main-process sidebar cache that client loaded. Arm one
+            // explicit-launch reload; a fresh Manager-first launch does not take this path.
+            if (_chatSectionStateWatcher == null && _codex.IsOfficialWindowsClientRunning())
+            {
+                Interlocked.Exchange(ref _chatSectionSyncRequiresClientRestart, 1);
+            }
+            if (sectionSync.Changed)
+            {
+                if (_codex.IsOfficialWindowsClientRunning())
+                {
+                    Interlocked.Exchange(ref _chatSectionSyncRequiresClientRestart, 1);
+                }
+                ManagerLifecycleDiagnostics.Write(
+                    "chat-sections-synchronized",
+                    $"oauth_accounts={sectionSync.OAuthAccounts}; profiles={sectionSync.UpdatedProfiles}; " +
+                    $"sections={sectionSync.AddedSections}; items={sectionSync.AddedItems}; " +
+                    $"template={sectionSync.TemplateAccountId}; backup={sectionSync.BackupPath}");
+            }
+        }
+        catch (Exception ex)
+        {
+            // A locked or concurrently-updated Codex global state file must never
+            // prevent the Manager from loading accounts or starting the gateway.
+            ManagerLifecycleDiagnostics.WriteException("chat-section-sync-unhandled", ex);
+        }
         InvalidateQuotaUsageCache(clearCachedData: true);
         HydratePersistedQuotaSnapshots();
         try
@@ -4078,6 +4219,144 @@ public partial class Form1 : Form
             _statusBox.Text =
                 "以下账号未能更新本地登录配置，请检查其 config.toml 写入权限：" +
                 string.Join("、", accountConfigFailures);
+        }
+    }
+
+    private void StartChatSectionSynchronizationWatcher()
+    {
+        if (_chatSectionStateWatcher != null || _formClosed || IsDisposed)
+        {
+            return;
+        }
+
+        try
+        {
+            var codexHome = Path.GetFullPath(CodexCliService.GetDefaultCodexHome());
+            Directory.CreateDirectory(codexHome);
+            var watcher = new FileSystemWatcher(codexHome, ".codex-global-state.json")
+            {
+                NotifyFilter = NotifyFilters.LastWrite |
+                               NotifyFilters.Size |
+                               NotifyFilters.FileName,
+                IncludeSubdirectories = false,
+                EnableRaisingEvents = false
+            };
+            FileSystemEventHandler onChanged = (_, _) => ScheduleChatSectionSynchronization();
+            RenamedEventHandler onRenamed = (_, _) => ScheduleChatSectionSynchronization();
+            watcher.Changed += onChanged;
+            watcher.Created += onChanged;
+            watcher.Deleted += onChanged;
+            watcher.Renamed += onRenamed;
+            watcher.EnableRaisingEvents = true;
+            _chatSectionStateWatcher = watcher;
+            var cacheDirectory = Path.Combine(Path.GetFullPath(_store.RootPath), ".cache");
+            Directory.CreateDirectory(cacheDirectory);
+            var identityWatcher = new FileSystemWatcher(
+                cacheDirectory,
+                PatGatewayAccountIdentityStore.FileName)
+            {
+                NotifyFilter = NotifyFilters.LastWrite |
+                               NotifyFilters.Size |
+                               NotifyFilters.FileName,
+                IncludeSubdirectories = false,
+                EnableRaisingEvents = false
+            };
+            identityWatcher.Changed += onChanged;
+            identityWatcher.Created += onChanged;
+            identityWatcher.Deleted += onChanged;
+            identityWatcher.Renamed += onRenamed;
+            identityWatcher.EnableRaisingEvents = true;
+            _chatSectionIdentityWatcher = identityWatcher;
+            ManagerLifecycleDiagnostics.Write(
+                "chat-section-sync-watcher-started",
+                $"path={Path.Combine(codexHome, ".codex-global-state.json")}; " +
+                $"identity_path={Path.Combine(cacheDirectory, PatGatewayAccountIdentityStore.FileName)}");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            ManagerLifecycleDiagnostics.WriteException(
+                "chat-section-sync-watcher-start-failed",
+                ex);
+        }
+    }
+
+    private void ScheduleChatSectionSynchronization()
+    {
+        if (InvokeRequired)
+        {
+            try
+            {
+                BeginInvoke(new Action(ScheduleChatSectionSynchronization));
+            }
+            catch (InvalidOperationException)
+            {
+                // The form may be closing while FileSystemWatcher delivers its event.
+            }
+            return;
+        }
+        if (_formClosed ||
+            IsDisposed ||
+            Interlocked.Exchange(ref _chatSectionSyncScheduled, 1) != 0)
+        {
+            return;
+        }
+
+        var accounts = _accounts.ToList();
+        var preferredAccountName = _currentAccountName;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                // Let the desktop client finish materializing its new identity bucket
+                // before the manager applies the shared template.
+                await Task.Delay(900).ConfigureAwait(false);
+                var result = ChatSectionSynchronizationService.Synchronize(
+                    accounts,
+                    CodexCliService.GetDefaultCodexHome(),
+                    preferredAccountName,
+                    _store.RootPath);
+                if (result.Changed)
+                {
+                    if (_codex.IsOfficialWindowsClientRunning())
+                    {
+                        Interlocked.Exchange(ref _chatSectionSyncRequiresClientRestart, 1);
+                    }
+                    ManagerLifecycleDiagnostics.Write(
+                        "chat-sections-synchronized-after-account-switch",
+                        $"oauth_accounts={result.OAuthAccounts}; profiles={result.UpdatedProfiles}; " +
+                        $"sections={result.AddedSections}; items={result.AddedItems}");
+                }
+            }
+            catch (Exception ex)
+            {
+                ManagerLifecycleDiagnostics.WriteException(
+                    "chat-section-sync-after-account-switch-failed",
+                    ex);
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _chatSectionSyncScheduled, 0);
+            }
+        });
+    }
+
+    private async Task SynchronizeChatSectionsAfterOfficialMutationAsync(string operation)
+    {
+        var accounts = _accounts.ToList();
+        var preferredAccountName = _currentAccountName;
+        var result = await Task.Run(() => ChatSectionSynchronizationService.Synchronize(
+            accounts,
+            CodexCliService.GetDefaultCodexHome(),
+            preferredAccountName,
+            _store.RootPath));
+        ManagerLifecycleDiagnostics.Write(
+            "chat-sections-synchronized-after-official-mutation",
+            $"operation={operation}; changed={result.Changed}; " +
+            $"profiles={result.UpdatedProfiles}; sections={result.AddedSections}; " +
+            $"items={result.AddedItems}");
+        if (result.Changed && _codex.IsOfficialWindowsClientRunning())
+        {
+            Interlocked.Exchange(ref _chatSectionSyncRequiresClientRestart, 1);
         }
     }
 
@@ -6135,6 +6414,7 @@ public partial class Form1 : Form
         await RunBusyAsync(async () =>
         {
             var section = await _codex.CreateThreadSectionAsync(dialog.SectionName, sharedHome);
+            await SynchronizeChatSectionsAfterOfficialMutationAsync("create-section");
             _expandedUnifiedHistoryGroups.Remove("section:" + section.Id);
             ResetUnifiedHistoryGroupPagination();
             InvalidateUnifiedHistoryCache(clearCachedData: false);
@@ -6172,6 +6452,7 @@ public partial class Form1 : Form
                 section.Id,
                 dialog.SectionName,
                 sharedHome);
+            await SynchronizeChatSectionsAfterOfficialMutationAsync("rename-section");
             InvalidateUnifiedHistoryCache(clearCachedData: false);
             await RefreshUnifiedHistoryAsync(force: true, _workspaceLoadGeneration);
             _statusBox.Text =
@@ -6216,6 +6497,7 @@ public partial class Form1 : Form
         await RunBusyAsync(async () =>
         {
             await _codex.DeleteThreadSectionAsync(section.Id, sharedHome);
+            await SynchronizeChatSectionsAfterOfficialMutationAsync("delete-section");
             _expandedUnifiedHistoryGroups.Remove("section:" + section.Id);
             _unifiedHistoryGroupVisibleLimits.Remove("section:" + section.Id);
             InvalidateUnifiedHistoryCache(clearCachedData: false);
@@ -6257,6 +6539,28 @@ public partial class Form1 : Form
                 sectionId,
                 sharedHome,
                 beforeThreadId);
+
+            // The app-server acknowledges the RPC before every Codex build has flushed its
+            // SQLite transaction.  Verify the authoritative row before projecting the result
+            // into OAuth sidebar caches; otherwise a stale cache can appear correct briefly
+            // and then move the task back to its previous directory on restart.
+            var moved = await Task.Run(
+                () => _sharedHistory
+                    .Load(sharedHome, 10000)
+                    .FirstOrDefault(candidate => candidate.Id.Equals(
+                        thread.Id,
+                        StringComparison.OrdinalIgnoreCase)));
+            var expectedSectionId = sectionId ?? string.Empty;
+            var actualSectionId = moved?.SectionId ?? string.Empty;
+            if (moved == null ||
+                !actualSectionId.Equals(expectedSectionId, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"Codex 已返回分类成功，但本地数据库仍显示为“{moved?.SectionName ?? "未分类"}”。" +
+                    "未刷新侧栏缓存，请稍后重试；原分类数据未被覆盖。");
+            }
+
+            await SynchronizeChatSectionsAfterOfficialMutationAsync("move-thread");
             ResetUnifiedHistoryGroupPagination();
             InvalidateUnifiedHistoryCache(clearCachedData: false);
             await RefreshUnifiedHistoryAsync(force: true, _workspaceLoadGeneration);
@@ -6373,20 +6677,23 @@ public partial class Form1 : Form
             if (!_formClosed && !IsDisposed)
             {
                 var desktopSidebarRefreshPending = _codex.IsOfficialWindowsClientRunning();
+                // The manager used to defer all sidebar-cache writes until Codex exited.  That
+                // left a deleted row visible in the running client, where clicking it produced
+                // “no rollout found”.  Project the tombstone atomically now as well; if Codex
+                // rewrites the file or keeps it locked, the post-exit retry below repairs it.
+                var desktopSidebarPruned = await Task.Run(() =>
+                    _codex.TryPruneDeletedDesktopSidebarState(
+                        allowWhileOfficialClientRunning: desktopSidebarRefreshPending));
                 if (desktopSidebarRefreshPending)
                 {
                     ScheduleDeletedDesktopSidebarPruneAfterClientExit();
                 }
-                else
-                {
-                    await Task.Run(() => _codex.TryPruneDeletedDesktopSidebarState());
-                }
                 InvalidateUnifiedHistoryCache(clearCachedData: false);
                 await RefreshUnifiedHistoryAsync(force: true, _workspaceLoadGeneration);
                 _statusBox.Text = desktopSidebarRefreshPending
-                    ? cleanupPending
-                        ? $"已删除聊天记录：{thread.Title}；关闭官方 Codex 后会自动清除“最近”缓存，并重试被占用文件。"
-                        : $"已永久删除聊天记录：{thread.Title}；关闭官方 Codex 后会自动清除左侧“最近”缓存。"
+                    ? desktopSidebarPruned
+                        ? $"已永久删除聊天记录：{thread.Title}；已清除磁盘侧栏缓存，Codex 关闭后会再校验一次。"
+                        : $"已删除聊天记录：{thread.Title}；Codex 当前占用侧栏缓存，关闭后会自动重试清理。"
                     : cleanupPending
                         ? $"已从聊天记录删除：{thread.Title}；被 Codex 占用的本地文件将在下次启动时重试清理。"
                         : $"已永久删除聊天记录：{thread.Title}";
@@ -6488,18 +6795,72 @@ public partial class Form1 : Form
     private async Task RunStartupHistoryMaintenanceAsync()
     {
         await CleanupDeletedThreadArtifactsAsync();
-        // Codex keeps a separate desktop sidebar cache.  Prune deleted-task tombstones
-        // before the client is launched, but never write that file while the official
-        // Codex process is alive because it owns the same state.
-        if (_codex.IsOfficialWindowsClientRunning())
+        var officialClientRunning = _codex.IsOfficialWindowsClientRunning();
+        var rolloutRepair = await Task.Run(() =>
+            CodexRolloutHistoryRepairService.TryRepairLaggingPaginatedRollouts(
+                CodexCliService.GetDefaultCodexHome(),
+                allowOrdinalRewrite: !officialClientRunning));
+        if (rolloutRepair.RepairedRecords > 0)
+        {
+            ManagerLifecycleDiagnostics.Write(
+                "codex-rollout-history-repaired",
+                $"files={rolloutRepair.RepairedFiles}; records={rolloutRepair.RepairedRecords}; " +
+                $"scanned_bytes={rolloutRepair.ScannedBytes}");
+        }
+        ScheduleRolloutHistoryRepairMonitor();
+        // Codex keeps a separate desktop sidebar cache.  Project the tombstones once
+        // immediately so a Manager restart repairs a stale row even when the official
+        // client was left running, then keep the post-exit retry armed because Codex may
+        // rewrite its cache while it is alive.
+        await Task.Run(() => _codex.TryPruneDeletedDesktopSidebarState(
+            allowWhileOfficialClientRunning: officialClientRunning));
+        if (officialClientRunning)
         {
             ScheduleDeletedDesktopSidebarPruneAfterClientExit();
         }
-        else
-        {
-            await Task.Run(() => _codex.TryPruneDeletedDesktopSidebarState());
-        }
         await NormalizeUnifiedHistorySectionOrderAsync();
+    }
+
+    private void ScheduleRolloutHistoryRepairMonitor()
+    {
+        if (_formClosed ||
+            Interlocked.Exchange(ref _rolloutHistoryRepairMonitorScheduled, 1) != 0)
+        {
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                // Codex can append the malformed permission-profile record at any turn
+                // boundary. Repair only bytes beyond the official projection cursor;
+                // the service remembers the last scanned length, so an idle manager does
+                // not repeatedly rescan large conversations.
+                while (!_formClosed)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(3));
+                    if (_formClosed)
+                    {
+                        break;
+                    }
+
+                    var result = CodexRolloutHistoryRepairService
+                        .TryRepairLaggingPaginatedRollouts(CodexCliService.GetDefaultCodexHome());
+                    if (result.RepairedRecords > 0)
+                    {
+                        ManagerLifecycleDiagnostics.Write(
+                            "codex-rollout-history-repaired",
+                            $"files={result.RepairedFiles}; records={result.RepairedRecords}; " +
+                            $"scanned_bytes={result.ScannedBytes}");
+                    }
+                }
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _rolloutHistoryRepairMonitorScheduled, 0);
+            }
+        });
     }
 
     private void ScheduleDeletedDesktopSidebarPruneAfterClientExit()
@@ -6521,6 +6882,9 @@ public partial class Form1 : Form
                 {
                     if (!_codex.IsOfficialWindowsClientRunning())
                     {
+                        CodexRolloutHistoryRepairService.TryRepairLaggingPaginatedRollouts(
+                            CodexCliService.GetDefaultCodexHome(),
+                            allowOrdinalRewrite: true);
                         _codex.TryPruneDeletedDesktopSidebarState();
                         return;
                     }
@@ -8744,6 +9108,11 @@ public partial class Form1 : Form
             {
                 _ = RefreshQuotaUsageAsync(force: true, _workspaceLoadGeneration);
             }
+            // The official Codex client can rewrite its identity-specific sidebar
+            // bucket shortly after a credential switch. Re-apply the shared category
+            // template after that write settles, so switching to an OAuth account
+            // cannot silently recreate an empty “最近” bucket.
+            ScheduleChatSectionSynchronization();
         }
 
         if (render)
@@ -13673,8 +14042,8 @@ public partial class Form1 : Form
         var compatibleCsvTerraCost = EstimateUsageEventCost(
             sub2ApiCsvTerraFixture,
             compatibleApiFallback);
-        const double expectedShort = 2.1888D;
-        const double expectedLong = 19.728D;
+        const double expectedShort = 1.8048D;
+        const double expectedLong = 16.388D;
         var resetUsage = new AccountUsageSummary
         {
             RateLimitUsedPercent = 10D,
@@ -13982,15 +14351,15 @@ public partial class Form1 : Form
             shortUsage.CacheWriteUnknownEvents != 0 ||
             Math.Abs(shortEstimate - expectedShort) > 0.000_001D ||
             Math.Abs(longEstimate - expectedLong) > 0.000_001D ||
-            Math.Abs(officialShortByModel["gpt-5.6-sol"] - 1.52D) > 0.000_001D ||
+            Math.Abs(officialShortByModel["gpt-5.6-sol"] - 1.136D) > 0.000_001D ||
             Math.Abs(officialShortByModel["gpt-5.6-terra"] - 0.608D) > 0.000_001D ||
             Math.Abs(officialShortByModel["gpt-5.6-luna"] - 0.0608D) > 0.000_001D ||
             Math.Abs(officialShortByModel["gpt-5.5"] - 1.42D) > 0.000_001D ||
-            Math.Abs(officialLongByModel["gpt-5.6-sol"] - 13.7D) > 0.000_001D ||
+            Math.Abs(officialLongByModel["gpt-5.6-sol"] - 10.36D) > 0.000_001D ||
             Math.Abs(officialLongByModel["gpt-5.6-terra"] - 5.48D) > 0.000_001D ||
             Math.Abs(officialLongByModel["gpt-5.6-luna"] - 0.548D) > 0.000_001D ||
             Math.Abs(officialLongByModel["gpt-5.5"] - 12.7D) > 0.000_001D ||
-            Math.Abs(compatibleLongByModel["gpt-5.6-sol"] - 13.7D) > 0.000_001D ||
+            Math.Abs(compatibleLongByModel["gpt-5.6-sol"] - 10.36D) > 0.000_001D ||
             Math.Abs(compatibleLongByModel["gpt-5.6-terra"] - 5.48D) > 0.000_001D ||
             Math.Abs(compatibleLongByModel["gpt-5.6-luna"] - 0.548D) > 0.000_001D ||
             Math.Abs(compatibleLongByModel["gpt-5.5"] - 12.7D) > 0.000_001D ||
@@ -13998,28 +14367,27 @@ public partial class Form1 : Form
             Math.Abs(compatibleMiniCost - 0.213D) > 0.000_001D ||
             Math.Abs(officialCsvTerraCost - 0.219_204_8D) > 0.000_001D ||
             Math.Abs(compatibleCsvTerraCost - 0.219_204_8D) > 0.000_001D ||
-            Math.Abs((officialShortByModel["gpt-5.6-terra"] * 2.5D) - officialShortByModel["gpt-5.6-sol"]) > 0.000_001D ||
-            Math.Abs((officialShortByModel["gpt-5.6-luna"] * 25D) - officialShortByModel["gpt-5.6-sol"]) > 0.000_001D ||
+            Math.Abs((officialShortByModel["gpt-5.6-luna"] * 10D) - officialShortByModel["gpt-5.6-terra"]) > 0.000_001D ||
             Math.Abs(EstimateTotalCost(gpt55ShortUsage, fallback) - 1.42D) > 0.000_001D ||
             Math.Abs(EstimateTotalCost(gpt55LongUsage, fallback) - 12.7D) > 0.000_001D ||
             accessTokenFallback.DisplayName != "gpt-5.6-sol Access Token 官网单价" ||
             accessTokenFallback.PricingPolicy != UsagePricingPolicy.AccessTokenSub2ApiParity ||
             !accessTokenFallback.UsesLongContextPricing ||
-            Math.Abs(accessTokenFallback.GetCacheWriteRate(false) - 6.25D) > 0.000_001D ||
-            Math.Abs(accessTokenFallback.GetInputRate(true) - 10D) > 0.000_001D ||
-            Math.Abs(accessTokenFallback.GetCachedInputRate(true) - 1D) > 0.000_001D ||
-            Math.Abs(accessTokenFallback.GetOutputRate(true) - 45D) > 0.000_001D ||
-            Math.Abs(accessTokenFallback.GetCacheWriteRate(true) - 12.5D) > 0.000_001D ||
+            Math.Abs(accessTokenFallback.GetCacheWriteRate(false) - 5D) > 0.000_001D ||
+            Math.Abs(accessTokenFallback.GetInputRate(true) - 8D) > 0.000_001D ||
+            Math.Abs(accessTokenFallback.GetCachedInputRate(true) - 0.8D) > 0.000_001D ||
+            Math.Abs(accessTokenFallback.GetOutputRate(true) - 30D) > 0.000_001D ||
+            Math.Abs(accessTokenFallback.GetCacheWriteRate(true) - 10D) > 0.000_001D ||
             compatibleApiFallback.DisplayName != "gpt-5.6-sol 兼容 API 官网单价" ||
             compatibleApiFallback.PricingPolicy != UsagePricingPolicy.CompatibleApiProvider ||
             !compatibleApiFallback.UsesLongContextPricing ||
-            Math.Abs(compatibleApiFallback.GetInputRate(true) - 10D) > 0.000_001D ||
-            Math.Abs(compatibleApiFallback.GetCachedInputRate(true) - 1D) > 0.000_001D ||
-            Math.Abs(compatibleApiFallback.GetOutputRate(true) - 45D) > 0.000_001D ||
-            Math.Abs(compatibleApiFallback.GetCacheWriteRate(true) - 12.5D) > 0.000_001D ||
+            Math.Abs(compatibleApiFallback.GetInputRate(true) - 8D) > 0.000_001D ||
+            Math.Abs(compatibleApiFallback.GetCachedInputRate(true) - 0.8D) > 0.000_001D ||
+            Math.Abs(compatibleApiFallback.GetOutputRate(true) - 30D) > 0.000_001D ||
+            Math.Abs(compatibleApiFallback.GetCacheWriteRate(true) - 10D) > 0.000_001D ||
             spacedCompatibleSolProfile.DisplayName != compatibleApiFallback.DisplayName ||
             spacedCompatibleSolProfile.PricingPolicy != UsagePricingPolicy.CompatibleApiProvider ||
-            Math.Abs(EstimateTotalCost(unknownModelUsage, accessTokenFallback) - 1.42D) > 0.000_001D ||
+            Math.Abs(EstimateTotalCost(unknownModelUsage, accessTokenFallback) - 1.056D) > 0.000_001D ||
             unknownCacheWriteUsage.CacheWriteKnownEvents != 0 ||
             unknownCacheWriteUsage.CacheWriteUnknownEvents != 1 ||
             unknownCacheWriteUsage.CacheWriteUnknownInputTokens != 160_000L ||
@@ -16279,7 +16647,7 @@ public partial class Form1 : Form
             : "官方 Codex（PAT/API + ChatGPT 双登录）";
         var routeOfficialOAuthThroughGateway =
             mode == WindowsClientMode.OfficialCodex &&
-            account.IsOfficialOAuth &&
+            (account.IsOfficialOAuth || account.IsCompatibleApi) &&
             AccountRotationConfiguration.IsEnabled(_appSettings) &&
             AccountRotationConfiguration.GetPool(_appSettings, account) !=
                 AccountRotationPool.None;
@@ -16325,6 +16693,9 @@ public partial class Form1 : Form
             var startupAppearance = GetCodexAppearanceOptionById(_appSettings.CodexAppearancePresetId);
             var useDreamSkinAtStartup = _appSettings.UseCodexDreamSkin &&
                                         !IsOfficialCodexAppearance(startupAppearance);
+            var forceClientRestartForSidebarSync =
+                !automaticRotation &&
+                Volatile.Read(ref _chatSectionSyncRequiresClientRestart) != 0;
             projection = chatGptFeatureAccount == null
                 ? await _codex.SwitchWindowsClientAccountAsync(
                     account,
@@ -16335,12 +16706,10 @@ public partial class Form1 : Form
                     GetCodexAppearanceRuntimePresetId(startupAppearance),
                     GetCodexAppearanceLabelById(_appSettings.CodexAppearancePresetId),
                     routeOfficialOAuthThroughGateway,
-                    // Do not restart an already projected official client merely because the
-                    // user pressed the visible “Codex 启动” button again.  A restart is only
-                    // required when the shared account profile actually changes; forcing it for
-                    // every click caused an unnecessary Codex/Manager disconnect and could make
-                    // the user lose the current window while the credentials were unchanged.
-                    forceClientRestart: false)
+                    // Codex's main process keeps the sidebar atom in memory. If synchronization
+                    // changed it while Codex was already running, the next explicit launch must
+                    // reload that process once. Request-boundary rotation stays seamless.
+                    forceClientRestart: forceClientRestartForSidebarSync)
                 : await _codex.SwitchWindowsClientAccountWithChatGptFeaturesAsync(
                     account,
                     chatGptFeatureAccount,
@@ -16348,7 +16717,8 @@ public partial class Form1 : Form
                     useDreamSkinAtStartup,
                     GetCodexAppearanceRuntimeMode(startupAppearance),
                     GetCodexAppearanceRuntimePresetId(startupAppearance),
-                    GetCodexAppearanceLabelById(_appSettings.CodexAppearancePresetId));
+                    GetCodexAppearanceLabelById(_appSettings.CodexAppearancePresetId),
+                    forceClientRestart: forceClientRestartForSidebarSync);
             _statusCache[account.Name] = projection.Status;
             if (!projection.FailedLaunchProfileRestored)
             {
@@ -16409,6 +16779,10 @@ public partial class Form1 : Form
             ResetCardsScrollPosition();
             if (projection.ClientLaunchStarted)
             {
+                if (forceClientRestartForSidebarSync)
+                {
+                    Interlocked.Exchange(ref _chatSectionSyncRequiresClientRestart, 0);
+                }
                 ConfigurePatAutoRotationLaunchContext(
                     account,
                     mode,
@@ -16495,7 +16869,9 @@ public partial class Form1 : Form
             }
 
             var projectedTransport = FindProjectedPatGatewayTransportAccount();
-            var rememberedCurrent = GetCurrentAccountRecord();
+            var rememberedCurrent = route?.Status == PatGatewayRotationStatus.Armed
+                ? GetCurrentAccountRecord()
+                : FindSharedActiveRotationAccount() ?? GetCurrentAccountRecord();
             if (route is { Status: PatGatewayRotationStatus.Armed } &&
                 rememberedCurrent != null &&
                 PatGatewayRotationStore.TryNormalizeAccountKey(
@@ -16536,13 +16912,27 @@ public partial class Form1 : Form
                 }
                 route = null;
             }
+            var armedSource = route?.Status == PatGatewayRotationStatus.Armed
+                ? FindRotationAccount(route.SourceAccountKey)
+                : null;
+            var expectedRouteTransportKey = route?.Status switch
+            {
+                PatGatewayRotationStatus.Armed when armedSource is { IsCompatibleApi: false } =>
+                    route.SourceAccountKey,
+                PatGatewayRotationStatus.Armed when projectedTransport != null =>
+                    QuotaAccountIdentity.CreateKey(projectedTransport),
+                PatGatewayRotationStatus.Active => route.TransportAccountKey,
+                _ => null
+            };
             if (route is { Status: not PatGatewayRotationStatus.None } &&
-                projectedTransport != null &&
+                PatGatewayRotationStore.TryNormalizeAccountKey(
+                    expectedRouteTransportKey,
+                    out var expectedRouteTransport) &&
                 (!PatGatewayRotationStore.TryNormalizeAccountKey(
                      route.TransportAccountKey,
                      out var routeTransportKey) ||
                  !routeTransportKey.Equals(
-                     QuotaAccountIdentity.CreateKey(projectedTransport),
+                     expectedRouteTransport,
                      StringComparison.Ordinal)))
             {
                 // A route recovered from the last successful request is unusable when the
@@ -16579,7 +16969,6 @@ public partial class Form1 : Form
 
             string? persistedLogicalSourceKey = null;
             if (route is not { Status: not PatGatewayRotationStatus.None } &&
-                projectedTransport == null &&
                 TryResolvePersistedPatGatewayLogicalAccount(
                     allowArmedSource: true,
                     out _,
@@ -16595,11 +16984,12 @@ public partial class Form1 : Form
             {
                 PatGatewayRotationStatus.Armed => route.SourceAccountKey,
                 PatGatewayRotationStatus.Active => route.TargetAccountKey,
-                _ => projectedTransport == null
-                    ? persistedLogicalSourceKey ?? (activity == null
-                        ? null
-                        : SelectSuccessfulActivityMarker(activity).AccountKey)
-                    : QuotaAccountIdentity.CreateKey(projectedTransport)
+                _ => projectedTransport != null
+                    ? QuotaAccountIdentity.CreateKey(projectedTransport)
+                    : persistedLogicalSourceKey ??
+                      (activity == null
+                          ? null
+                          : SelectSuccessfulActivityMarker(activity).AccountKey)
             };
             if (!PatGatewayRotationStore.TryNormalizeAccountKey(sourceKey, out _) &&
                 TryResolvePersistedPatGatewayLogicalAccount(
@@ -16653,9 +17043,30 @@ public partial class Form1 : Form
                 return false;
             }
 
+            string? transportAccountKey;
+            if (route?.Status is PatGatewayRotationStatus.Armed or
+                PatGatewayRotationStatus.Active)
+            {
+                transportAccountKey = route.TransportAccountKey;
+            }
+            else if (_codex.TryRouteSelectedAccountThroughGateway(source))
+            {
+                // The exact active marker/auth pair identifies the bearer that the live
+                // Codex process sends. Reproject only config.toml to the new listener; do
+                // not close or restart Codex during a version/port hand-off.
+                transportAccountKey = normalizedSource;
+            }
+            else
+            {
+                _statusBox.Text =
+                    "当前账号的活动凭据与共享配置不一致；" +
+                    "未挂起可能错号的路线，Codex 和网关保持运行。";
+                return false;
+            }
             var armed = await LocalPatGateway.ArmRotationAsync(
                 normalizedSource,
                 targetKey,
+                transportAccountKey: transportAccountKey,
                 replaceExistingArmedTarget: replacingPendingTarget);
             if (armed.Status != PatGatewayRotationStatus.Armed ||
                 !string.Equals(armed.SourceAccountKey, normalizedSource, StringComparison.Ordinal) ||
@@ -16701,8 +17112,32 @@ public partial class Form1 : Form
 
     private AccountRecord? FindProjectedPatGatewayTransportAccount()
     {
+        // The active-account marker is independent of the provider URL, so it remains
+        // authoritative while a running client still points at the preceding version's
+        // listener. This is the key evidence used for a blue/green version-port hand-off.
+        if (FindSharedActiveRotationAccount() is { } active)
+        {
+            return active;
+        }
+
+        // The current logical account is the strongest local evidence for the bearer
+        // emitted by the already-running Codex process.  The previous implementation
+        // walked the pool from the first row and could select an unrelated PAT/OAuth
+        // account (for example lkcau) while 158 was actually running.  Such a route is
+        // accepted by the control plane but can never match the incoming token, so the
+        // visible “主动切换” appears to do nothing forever.
+        var selected = GetCurrentAccountRecord();
+        if (selected != null &&
+            (selected.IsAccessToken || selected.IsOfficialOAuth || selected.IsCompatibleApi) &&
+            AccountRotationConfiguration.GetPool(_appSettings, selected) !=
+                AccountRotationPool.None &&
+            TryResolvePatAutoRotationSharedProfile(selected, out _))
+        {
+            return selected;
+        }
+
         foreach (var account in _accounts.Where(account =>
-                     (account.IsAccessToken || account.IsOfficialOAuth) &&
+                     (account.IsAccessToken || account.IsOfficialOAuth || account.IsCompatibleApi) &&
                      AccountRotationConfiguration.GetPool(_appSettings, account) !=
                          AccountRotationPool.None))
         {
@@ -16711,6 +17146,50 @@ public partial class Form1 : Form
                 return account;
             }
         }
+        return null;
+    }
+
+    private AccountRecord? FindSharedActiveRotationAccount()
+    {
+        foreach (var account in _accounts.Where(account =>
+                     (account.IsAccessToken || account.IsOfficialOAuth || account.IsCompatibleApi) &&
+                     AccountRotationConfiguration.GetPool(_appSettings, account) !=
+                         AccountRotationPool.None))
+        {
+            if (_codex.IsSharedActiveAccount(account))
+            {
+                return account;
+            }
+        }
+        return null;
+    }
+
+    private string? ResolvePatGatewayTransportAccountKey(string logicalSourceKey)
+    {
+        var route = new PatGatewayRotationStore(_store.RootPath).Load();
+        if (route.Status == PatGatewayRotationStatus.Active &&
+            string.Equals(route.TargetAccountKey, logicalSourceKey, StringComparison.Ordinal) &&
+            PatGatewayRotationStore.TryNormalizeAccountKey(
+                route.TransportAccountKey,
+                out var activeTransport))
+        {
+            return activeTransport;
+        }
+
+        var logical = FindRotationAccount(logicalSourceKey);
+        if (logical is { IsCompatibleApi: false })
+        {
+            // With no active API hop, the non-compatible logical source is the bearer
+            // account itself.  Do not replace this with the first pool account whose
+            // projected files happen to look reusable.
+            return logicalSourceKey;
+        }
+
+        if (FindProjectedPatGatewayTransportAccount() is { } projected)
+        {
+            return QuotaAccountIdentity.CreateKey(projected);
+        }
+
         return null;
     }
 
@@ -16759,15 +17238,23 @@ public partial class Form1 : Form
 
         try
         {
-            var result = await TryPrepareManualGatewayRotationAsync(target);
-            if (result == true)
+            // Show a synchronous acknowledgement before the control-plane health read and
+            // route arm.  Those calls are intentionally bounded, but without this refresh a
+            // slow loopback/proxy check made the button look dead for several seconds.
+            _statusBox.Text = $"正在准备无缝切换到 {target.Name}…";
+            _statusBox.Refresh();
+            await RunBusyAsync(async () =>
             {
-                // The request-boundary monitor will update the current-account label after
-                // the first completed response.  Re-render now so the button state and
-                // status text reflect the armed operation without pretending activation
-                // happened before a model request actually crossed the boundary.
-                RerenderAccountRotationWorkspacePreservingScroll();
-            }
+                var result = await TryPrepareManualGatewayRotationAsync(target);
+                if (result == true)
+                {
+                    // The request-boundary monitor will update the current-account label after
+                    // the first completed response.  Re-render now so the button state and
+                    // status text reflect the armed operation without pretending activation
+                    // happened before a model request actually crossed the boundary.
+                    RerenderAccountRotationWorkspacePreservingScroll();
+                }
+            }, showErrors: false);
         }
         catch (Exception ex)
         {
@@ -16798,15 +17285,15 @@ public partial class Form1 : Form
             mode,
             chatGptFeatureAccount?.Name,
             DateTimeOffset.UtcNow);
-        // The desktop's initial PAT is the stable transport credential for the entire
-        // request-boundary chain. Direct OAuth/API launches do not pass model requests through
-        // the local gateway, so they remain ordinary single-account launches until the user
-        // starts a PAT profile.
+        // Every eligible Official Codex launch uses one stable gateway transport, including
+        // compatible APIs. A backup API account can therefore return to the primary pool
+        // without closing Codex or guessing an unrelated OAuth/PAT bearer.
         var participatesInRotation =
             AccountRotationConfiguration.GetPool(_appSettings, account) !=
             AccountRotationPool.None;
         _patAutoRotationGatewayTransportActive = participatesInRotation &&
             (account.IsAccessToken ||
+             account.IsCompatibleApi ||
              account.IsOfficialOAuth &&
              AccountRotationConfiguration.IsEnabled(_appSettings));
         AccountRotationConfiguration.MarkUsed(_appSettings, account);
@@ -17218,9 +17705,47 @@ public partial class Form1 : Form
                 PatGatewayRotationSnapshot armed;
                 try
                 {
+                    // A manager-prepared route must identify the bearer that the live
+                    // Codex process will send.  Leaving this null creates a route that
+                    // the request-boundary selector deliberately ignores.  Resolve the
+                    // transport from the current projected profile (or the active route
+                    // when the logical account is a compatible-API target).
+                    var currentRoute = new PatGatewayRotationStore(_store.RootPath).Load();
+                    var transportAccountKey = ResolvePatGatewayTransportAccountKey(accountKey);
+                    if (currentRoute.Status == PatGatewayRotationStatus.None)
+                    {
+                        await LocalPatGateway.EnsureRunningAsync(
+                            cancellation.Token,
+                            restartOnProxyMismatch: false);
+                        var activeSource = FindSharedActiveRotationAccount();
+                        if (activeSource != null &&
+                            !QuotaAccountIdentity.CreateKey(activeSource).Equals(
+                                accountKey,
+                                StringComparison.Ordinal))
+                        {
+                            SetCurrentAccount(activeSource.Name, false, persistSettings: true);
+                            RenderCards();
+                            return;
+                        }
+                        if (_codex.TryRouteSelectedAccountThroughGateway(current))
+                        {
+                            transportAccountKey = accountKey;
+                        }
+                        else
+                        {
+                            lastCandidateFailure =
+                                "当前轮换源账号的活动凭据与共享配置不一致。";
+                            if (candidatePool == AccountRotationPool.Primary)
+                            {
+                                hadUnconfirmedPrimaryCandidate = true;
+                            }
+                            continue;
+                        }
+                    }
                     armed = await LocalPatGateway.ArmRotationAsync(
                         accountKey,
                         targetKey,
+                        transportAccountKey: transportAccountKey,
                         cancellationToken: cancellation.Token);
                 }
                 catch (Exception ex) when (
@@ -19167,6 +19692,7 @@ public partial class Form1 : Form
             return;
         }
 
+        var sharedActiveAccount = FindSharedActiveRotationAccount();
         var activity = knownActivity ?? await LocalPatGateway.ReadActivitySnapshotAsync();
         if (activity != null && await RetireUnconfirmedLegacyGatewayRouteAsync(activity))
         {
@@ -19182,12 +19708,15 @@ public partial class Form1 : Form
             }
         }
         if (activity == null &&
-            rotation is not { Status: not PatGatewayRotationStatus.None })
+            rotation is not { Status: not PatGatewayRotationStatus.None } &&
+            sharedActiveAccount == null)
         {
             return;
         }
         AccountRecord? projectedRecoveryTransport = null;
-        var rememberedRecoveryCurrent = GetCurrentAccountRecord();
+        var rememberedRecoveryCurrent = rotation?.Status == PatGatewayRotationStatus.Armed
+            ? GetCurrentAccountRecord()
+            : sharedActiveAccount ?? GetCurrentAccountRecord();
         if (rotation is { Status: PatGatewayRotationStatus.Armed } &&
             rememberedRecoveryCurrent != null &&
             PatGatewayRotationStore.TryNormalizeAccountKey(
@@ -19264,20 +19793,31 @@ public partial class Form1 : Form
         var selected = GetCurrentAccountRecord();
         var transport = rotation?.Status is PatGatewayRotationStatus.Armed or PatGatewayRotationStatus.Active
             ? FindRotationAccount(rotation.TransportAccountKey)
-            : projectedRecoveryTransport ?? observed ?? selected;
+            : projectedRecoveryTransport ?? sharedActiveAccount ?? observed ?? selected;
         var logical = rotation?.Status switch
         {
             PatGatewayRotationStatus.Armed => FindRotationAccount(rotation.SourceAccountKey),
             PatGatewayRotationStatus.Active => FindRotationAccount(rotation.TargetAccountKey),
-            _ => projectedRecoveryTransport ?? observed ?? selected
+            _ => projectedRecoveryTransport ?? sharedActiveAccount ?? observed ?? selected
         };
         if (transport == null ||
-            (!transport.IsAccessToken && !transport.IsOfficialOAuth) ||
+            (!transport.IsAccessToken && !transport.IsOfficialOAuth && !transport.IsCompatibleApi) ||
             logical == null ||
             (!logical.IsAccessToken && !logical.IsCompatibleApi && !logical.IsOfficialOAuth) ||
             AccountRotationConfiguration.GetPool(_appSettings, logical) ==
                 AccountRotationPool.None)
         {
+            return;
+        }
+
+        if (rotation?.Status is not (PatGatewayRotationStatus.Armed or
+                PatGatewayRotationStatus.Active) &&
+            !_codex.TryRouteSelectedAccountThroughGateway(transport))
+        {
+            // A new Manager version may be listening on another port while the live Codex
+            // profile still targets its predecessor. The independent marker above proves
+            // the bearer; if config-only migration cannot be verified, leave both clients
+            // running and do not manufacture a route with a guessed identity.
             return;
         }
 
@@ -19376,7 +19916,8 @@ public partial class Form1 : Form
         {
             return _codex.IsSharedProfileAlreadySelected(
                 transport,
-                routeOfficialOAuthThroughGateway: transport.IsOfficialOAuth);
+                routeOfficialOAuthThroughGateway:
+                    transport.IsOfficialOAuth || transport.IsCompatibleApi);
         }
         catch
         {

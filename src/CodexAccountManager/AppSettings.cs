@@ -159,27 +159,46 @@ public sealed class ThemeService
 
     public AppSettings LoadSettings()
     {
+        return TryLoadSettings(out var settings, out _)
+            ? settings
+            : new AppSettings();
+    }
+
+    internal bool TryLoadSettings(out AppSettings settings, out Exception? error)
+    {
+        settings = new AppSettings();
+        error = null;
         if (!File.Exists(_settingsPath))
         {
-            return new AppSettings();
+            return true;
         }
 
-        try
+        for (var attempt = 0; attempt < AtomicFilePersistence.DefaultAttempts; attempt++)
         {
-            var json = File.ReadAllText(_settingsPath);
-            return JsonSerializer.Deserialize<AppSettings>(json) ?? new AppSettings();
+            try
+            {
+                var json = AtomicFilePersistence.ReadAllTextWithRetry(_settingsPath, attempts: 1);
+                settings = JsonSerializer.Deserialize<AppSettings>(json) ?? new AppSettings();
+                return true;
+            }
+            catch (Exception ex) when (
+                ex is IOException or UnauthorizedAccessException or JsonException or
+                NotSupportedException)
+            {
+                error = ex;
+                if (attempt + 1 < AtomicFilePersistence.DefaultAttempts)
+                {
+                    Thread.Sleep(30 * (attempt + 1));
+                }
+            }
         }
-        catch
-        {
-            return new AppSettings();
-        }
+        return false;
     }
 
     public void SaveSettings(AppSettings settings)
     {
         ArgumentNullException.ThrowIfNull(settings);
         Directory.CreateDirectory(Path.GetDirectoryName(_settingsPath)!);
-        var temporaryPath = _settingsPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
         var mutexAcquired = false;
         try
         {
@@ -196,50 +215,12 @@ public sealed class ThemeService
                 throw new IOException("Account Manager 设置文件正由另一个实例更新，请稍后重试。");
             }
 
-            File.WriteAllText(
-                temporaryPath,
-                JsonSerializer.Serialize(settings, JsonOptions),
-                new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
-            Exception? lastError = null;
-            for (var attempt = 0; attempt < 5; attempt++)
-            {
-                try
-                {
-                    File.Move(temporaryPath, _settingsPath, overwrite: true);
-                    lastError = null;
-                    break;
-                }
-                catch (Exception ex) when (
-                    ex is IOException or UnauthorizedAccessException)
-                {
-                    lastError = ex;
-                    if (attempt == 4)
-                    {
-                        break;
-                    }
-                    Thread.Sleep(40 * (attempt + 1));
-                }
-            }
-            if (lastError != null)
-            {
-                throw new IOException(
-                    "Account Manager 设置文件暂时被占用，稍后会自动重试。",
-                    lastError);
-            }
+            AtomicFilePersistence.WriteAllText(
+                _settingsPath,
+                JsonSerializer.Serialize(settings, JsonOptions));
         }
         finally
         {
-            try
-            {
-                if (File.Exists(temporaryPath))
-                {
-                    File.Delete(temporaryPath);
-                }
-            }
-            catch
-            {
-                // A stale temporary settings file is ignored by readers.
-            }
             if (mutexAcquired)
             {
                 try

@@ -25,7 +25,7 @@ public partial class Form1
         var panel = new RoundedPanel
         {
             Width = width,
-            Height = 500,
+            Height = 540,
             Radius = 16,
             BorderColor = _palette.BorderColor,
             BackColor = _palette.CardColor,
@@ -81,6 +81,9 @@ public partial class Form1
         };
         ThemeStyler.ApplyLabel(source, _palette, true);
         panel.Controls.Add(source);
+        _modelCatalogSourceLabel = source;
+        _modelCatalogPanel = panel;
+        _modelCatalogEditorDirty = false;
 
         var defaultLabel = new Label
         {
@@ -119,6 +122,9 @@ public partial class Form1
         panel.Controls.Add(defaultModel);
 
         var grid = CreateModelPricingGrid(catalog, innerLeft, 174, innerWidth, 210);
+        grid.CellValueChanged += (_, _) => _modelCatalogEditorDirty = true;
+        grid.CurrentCellDirtyStateChanged += (_, _) => _modelCatalogEditorDirty = true;
+        defaultModel.SelectedIndexChanged += (_, _) => _modelCatalogEditorDirty = true;
         panel.Controls.Add(grid);
 
         var note = new Label
@@ -158,6 +164,32 @@ public partial class Form1
         official.Click += async (_, _) => await CheckOfficialModelCatalogAsync(official);
         _toolTip.SetToolTip(official, "使用上方已检测或手动填写的 HTTP 代理访问 OpenAI 官方模型页面。检查成功后覆盖手动设置。");
         panel.Controls.Add(official);
+        var automatic = new CheckBox
+        {
+            Text = "自动更新价格（启动时及每 6 小时；失败后 15 分钟重试）",
+            Left = innerLeft,
+            Top = 486,
+            Width = innerWidth,
+            Height = 28,
+            Checked = catalog.AutomaticPriceUpdatesEnabled,
+            ForeColor = _palette.TextColor,
+            BackColor = Color.Transparent,
+            Font = new Font(Font.FontFamily, 8.5F)
+        };
+        automatic.CheckedChanged += (_, _) =>
+        {
+            try
+            {
+                ModelCatalogService.SetAutomaticPriceUpdates(automatic.Checked);
+                _nextAutomaticPriceCheckUtc = DateTimeOffset.MinValue;
+                _statusBox.Text = automatic.Checked ? "已启用后台价格更新。" : "已关闭自动价格更新，仍可手动检查官网。";
+            }
+            catch (Exception error)
+            {
+                _statusBox.Text = "自动价格更新设置未保存：" + error.Message;
+            }
+        };
+        panel.Controls.Add(automatic);
 
         return panel;
     }
@@ -412,13 +444,21 @@ public partial class Form1
 
     private async Task CheckOfficialModelCatalogAsync(Button button)
     {
+        if (_modelCatalogRefreshInProgress)
+        {
+            _statusBox.Text = "正在检查官网价格，请稍候。";
+            return;
+        }
+        _modelCatalogRefreshInProgress = true;
         button.Enabled = false;
         string? proxyUri = null;
         try
         {
             proxyUri = GetModelCatalogProxyUri();
             _statusBox.Text = $"正在通过 {FormatProxyEndpoint(proxyUri)} 检查 OpenAI 官网模型与价格……";
-            var result = await ModelCatalogService.CheckAndSaveOfficialAsync(proxyUri);
+            var result = await ModelCatalogService.CheckAndSaveOfficialAsync(proxyUri, _modelCatalogRefreshCancellation.Token);
+            if (IsDisposed || Disposing) return;
+            _nextAutomaticPriceCheckUtc = DateTimeOffset.UtcNow.AddHours(6);
             ApplyModelCatalogToAccounts();
             var detail = result.Changes.Count == 0
                 ? $"官网数据校验通过，当前默认模型为 {result.Current.DefaultModel}，价格没有变化。"
@@ -431,6 +471,8 @@ public partial class Form1
         }
         catch (Exception error)
         {
+            if (IsDisposed || Disposing) return;
+            _nextAutomaticPriceCheckUtc = DateTimeOffset.UtcNow.AddMinutes(15);
             _statusBox.Text = "官网模型与价格检查失败，本地目录未修改。";
             var route = string.IsNullOrWhiteSpace(proxyUri)
                 ? "未找到可用代理"
@@ -444,6 +486,7 @@ public partial class Form1
         }
         finally
         {
+            _modelCatalogRefreshInProgress = false;
             if (!button.IsDisposed) button.Enabled = true;
         }
     }

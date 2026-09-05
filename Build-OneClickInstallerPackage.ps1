@@ -4,12 +4,30 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$defaultAppExe = Join-Path $root 'dist\CodexAccountManager\CodexAccountManager.exe'
+$currentVersion = (Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw).Trim()
+$versionedRoot = Join-Path $root 'dist'
+$discoveredAppPaths = @(
+    Get-ChildItem -LiteralPath $versionedRoot -Directory -Filter ("CodexAccountManager-" + $currentVersion + "*") -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'CodexAccountManager.exe') -PathType Leaf } |
+        Sort-Object LastWriteTime -Descending |
+        ForEach-Object { Join-Path $_.FullName 'CodexAccountManager.exe' }
+)
+$preferredAppPaths = @(
+    $discoveredAppPaths
+    (Join-Path $root 'dist\CodexAccountManager-2.3.2-hotfix\CodexAccountManager.exe')
+    (Join-Path $root 'dist\CodexAccountManager-2.3.2-fixed\CodexAccountManager.exe')
+    (Join-Path $root 'dist\CodexAccountManager\CodexAccountManager.exe')
+)
 $appExe = if ([string]::IsNullOrWhiteSpace($env:CODEX_ACCOUNT_MANAGER_APP_EXE)) {
-    $defaultAppExe
+    $preferredAppPaths |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+        Select-Object -First 1
 }
 else {
     [IO.Path]::GetFullPath($env:CODEX_ACCOUNT_MANAGER_APP_EXE)
+}
+if ([string]::IsNullOrWhiteSpace($appExe)) {
+    $appExe = $preferredAppPaths[0]
 }
 $appRuntimeRoot = Split-Path -Parent $appExe
 $dreamSkinRuntime = if ([string]::IsNullOrWhiteSpace($env:CODEX_ACCOUNT_MANAGER_DREAM_SKIN_RUNTIME)) {
@@ -29,7 +47,7 @@ else {
 }
 $stamp = Get-Date -Format 'yyyyMMdd'
 $displayVersion = if ([string]::IsNullOrWhiteSpace($env:CAM_VERSION)) {
-    Get-Date -Format 'yyyy.MM.dd'
+    (Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw).Trim()
 }
 else {
     $env:CAM_VERSION.Trim()

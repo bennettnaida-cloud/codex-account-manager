@@ -87,7 +87,8 @@ internal sealed class PatGatewaySessionAffinityLease
 /// </summary>
 internal sealed class PatGatewaySessionAffinityStore
 {
-    internal const string FileName = "pat-gateway-session-affinity-v1.json";
+    internal const string FileName =
+        "pat-gateway-session-affinity-v1-" + ReleaseConfiguration.GatewayPortText + ".json";
     internal static readonly TimeSpan BindingLifetime = TimeSpan.FromHours(1);
     internal const int DefaultMaximumEntries = 65_536;
 
@@ -724,12 +725,9 @@ internal sealed class PatGatewaySessionAffinityStore
             {
                 return;
             }
-            using var stream = new FileStream(
-                _path,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.ReadWrite | FileShare.Delete);
-            var document = JsonSerializer.Deserialize<AffinityDocument>(stream, JsonOptions);
+            var document = JsonSerializer.Deserialize<AffinityDocument>(
+                AtomicFilePersistence.ReadAllTextWithRetry(_path),
+                JsonOptions);
             if (document == null ||
                 document.SchemaVersion != SchemaVersion ||
                 !string.Equals(document.KeyId, _keyId, StringComparison.Ordinal))
@@ -831,43 +829,17 @@ internal sealed class PatGatewaySessionAffinityStore
                 };
             }
 
-            var directory = System.IO.Path.GetDirectoryName(_path)!;
-            var temporaryPath = _path + "." + Guid.NewGuid().ToString("N") + ".tmp";
             try
             {
-                Directory.CreateDirectory(directory);
-                using (var stream = new FileStream(
-                           temporaryPath,
-                           FileMode.CreateNew,
-                           FileAccess.Write,
-                           FileShare.None,
-                           bufferSize: 16 * 1024,
-                           FileOptions.WriteThrough))
-                {
-                    JsonSerializer.Serialize(stream, document, JsonOptions);
-                    stream.Flush(flushToDisk: true);
-                }
-                File.Move(temporaryPath, _path, overwrite: true);
+                AtomicFilePersistence.WriteAllText(
+                    _path,
+                    JsonSerializer.Serialize(document, JsonOptions));
                 return true;
             }
             catch (Exception ex) when (
                 ex is IOException or UnauthorizedAccessException or NotSupportedException)
             {
                 return false;
-            }
-            finally
-            {
-                try
-                {
-                    if (File.Exists(temporaryPath))
-                    {
-                        File.Delete(temporaryPath);
-                    }
-                }
-                catch
-                {
-                    // A same-directory temporary contains only digests and hashes.
-                }
             }
         }
     }

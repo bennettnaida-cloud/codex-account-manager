@@ -47,7 +47,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path '.tools/codex-cli' | Out-Null
-          npm install --prefix '.tools/codex-cli' --no-package-lock --ignore-scripts '@openai/codex@0.149.0'
+          npm install --prefix '.tools/codex-cli' --no-package-lock --ignore-scripts '@openai/codex@0.153.4'
 
       - name: Build and package Windows
         shell: pwsh
@@ -135,7 +135,11 @@ jobs:
           body: |
             自动构建版本 `${{ env.CAM_VERSION }}`。
 
-            推送到 `main` 的源码会自动构建 Windows 安装包；已安装的软件会检查此 Release 并提示更新。
+            修复 GPT-6（`gpt-6-astra`）被提示需要更新 Codex 的问题：网关保留客户端版本信息，修正旧版请求头，并随安装包提供 Codex CLI 0.153.4。
+
+            补齐 GPT-6 官方价格，支持启动后和每 6 小时自动更新价格，也可随时手动检查。修复 OAuth 账号主动测试被误判为双登录配置错误的问题。
+
+            Windows 用户可在管理器中检查更新，或下载下方 Windows 安装包。更新后重新启动管理器和 Codex，使请求经过新版网关；使用 GPT-6 仍需账号或 API 服务支持该模型。
           prerelease: true
           make_latest: false
           files: |

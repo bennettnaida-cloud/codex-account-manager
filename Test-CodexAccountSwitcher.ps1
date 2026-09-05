@@ -7,7 +7,8 @@ $appScript = Join-Path $root 'Start-CodexAccountSwitcher.ps1'
 $desktopLauncher = Join-Path $root 'CodexAccountManager.cmd'
 $selfContainedLauncher = Join-Path $root 'Start-CodexAccountManager.ps1'
 $appIcon = Join-Path $root 'assets\CodexAccountManager.ico'
-$defaultAppExe = Join-Path $root 'dist\CodexAccountManager\CodexAccountManager.exe'
+$currentVersion = (Get-Content -LiteralPath (Join-Path $root 'VERSION') -Raw).Trim()
+$defaultAppExe = Join-Path $root ("dist\CodexAccountManager-" + $currentVersion + '\CodexAccountManager.exe')
 $appExe = if ([string]::IsNullOrWhiteSpace($env:CODEX_ACCOUNT_MANAGER_APP_EXE)) {
     $defaultAppExe
 }
@@ -1515,7 +1516,7 @@ if (([regex]::Matches(
     ([regex]::Matches(
         $featureWindowsClientSwitchMethod,
         'SwitchWindowsClientAccountCoreAsync\s*\(')).Count -ne 1 -or
-    $featureWindowsClientSwitchMethod -notmatch '(?s)return await SwitchWindowsClientAccountCoreAsync\(\s*account,\s*projectPath,\s*WindowsClientMode\.OfficialCodex,\s*useDreamSkin,\s*appearanceMode,\s*appearancePresetId,\s*appearanceLabel,\s*AccessTokenSharedProfileMode\.ChatGptDesktop,\s*chatGptFeatureAccount,\s*routeOfficialOAuthThroughGateway:\s*false,\s*forceClientRestart:\s*false\s*\);' -or
+    $featureWindowsClientSwitchMethod -notmatch '(?s)return await SwitchWindowsClientAccountCoreAsync\(\s*account,\s*projectPath,\s*WindowsClientMode\.OfficialCodex,\s*useDreamSkin,\s*appearanceMode,\s*appearancePresetId,\s*appearanceLabel,\s*AccessTokenSharedProfileMode\.ChatGptDesktop,\s*chatGptFeatureAccount,\s*routeOfficialOAuthThroughGateway:\s*false,\s*forceClientRestart\s*\);' -or
     $featureWindowsClientSwitchMethod -match 'AccessTokenSharedProfileMode\.ApiCompatible') {
     throw 'Normal PAT/API startup must pass ApiCompatible with no OAuth feature account, while the explicit dual-login entry must pass both the model and ChatGPT OAuth accounts.'
 }
@@ -1526,7 +1527,9 @@ if ($switchWindowsClientMethod -notmatch 'ValidateWindowsClientAccountAsync\(\s*
     $switchWindowsClientMethod -notmatch 'RequiresWindowsClientShutdown\(sharedProfileAlreadySelected\)' -or
     $switchWindowsClientMethod -notmatch '(?s)var switchRequired\s*=\s*forceClientRestart\s*\|\|\s*RequiresWindowsClientShutdown\(sharedProfileAlreadySelected\)' -or
     $switchWindowsClientMethod -notmatch '(?s)if \(switchRequired\).*?StopWindowsClientProcesses\(shutdownTargets\);.*?WaitForWindowsClientProcessAndPortRelease\(.*?if \(sharedProfileAlreadySelected\).*?CreateReusedSharedProfileProjection.*?else.*?ProjectWindowsClientAccount\(' -or
-    $formSource -notmatch '(?s)SwitchWindowsClientAccountAsync\(.*?forceClientRestart:\s*false' -or
+    $formSource -notmatch '(?s)var forceClientRestartForSidebarSync\s*=\s*!automaticRotation.*?_chatSectionSyncRequiresClientRestart' -or
+    $formSource -notmatch '(?s)SwitchWindowsClientAccountAsync\(.*?forceClientRestart:\s*forceClientRestartForSidebarSync' -or
+    $formSource -notmatch '(?s)SwitchWindowsClientAccountWithChatGptFeaturesAsync\(.*?forceClientRestart:\s*forceClientRestartForSidebarSync' -or
     $formSource -notmatch '(?s)if \(!await LocalPatGateway\.ClearRotationAsync\(\)\).*?本次没有关闭或重启 Codex' -or
     $switchWindowsClientMethod -notmatch 'projection\.ClientLaunchStarted\s*=\s*LaunchWindowsClient\(' -or
     $switchWindowsClientMethod -notmatch 'allowOfficialRendererPatch:\s*ShouldApplyOfficialRendererPatch\(' -or
@@ -1601,8 +1604,10 @@ if (-not $manualGatewayRotationMatch.Success -or
     $manualGatewayRotationMatch.Value -notmatch '(?s)HasUsableAccountCredential\(target\).*?Codex 和网关保持运行' -or
     $manualGatewayRotationMatch.Value -notmatch '(?s)replaceExistingArmedTarget: replacingPendingTarget.*?quota_bypass=true.*?codex_restart=false' -or
     $manualGatewayRotationMatch.Value -notmatch '_codex\.IsOfficialWindowsClientRunning\(' -or
-    $manualGatewayRotationMatch.Value -notmatch '(?s)rememberedCurrent = GetCurrentAccountRecord\(\).*?route\.SourceAccountKey.*?LocalPatGateway\.ClearRotationAsync\(\)' -or
+    $manualGatewayRotationMatch.Value -notmatch '(?s)rememberedCurrent = route\?\.Status == PatGatewayRotationStatus\.Armed.*?GetCurrentAccountRecord\(\).*?FindSharedActiveRotationAccount\(\).*?route\.SourceAccountKey.*?LocalPatGateway\.ClearRotationAsync\(\)' -or
     $manualGatewayRotationMatch.Value -notmatch '(?s)FindProjectedPatGatewayTransportAccount\(\).*?route\.TransportAccountKey.*?LocalPatGateway\.ClearRotationAsync\(\)' -or
+    $manualGatewayRotationMatch.Value -notmatch '(?s)_ => projectedTransport != null.*?persistedLogicalSourceKey' -or
+    $manualGatewayRotationMatch.Value -notmatch 'TryRouteSelectedAccountThroughGateway\(source\)' -or
     $manualGatewayRotationMatch.Value -notmatch '(?s)StartManualGatewayRotationWaiter\(.*?var displayedSource = GetCurrentAccountRecord\(\).*?if \(displayedSource == null\).*?ResumeRecoveredGatewayRotationAsync' -or
     $manualGatewayRotationMatch.Value -match '(?s)StartManualGatewayRotationWaiter\(.*?QueueHotRotatedOfficialAccountDisplay\(source' -or
     $manualGatewayRotationMatch.Value -notmatch '(?s)normalizedSource\.Equals\(targetKey.*?TryRecoverPatAutoRotationLaunchContextAsync\(activity\).*?SetCurrentAccount\(target\.Name, false, persistSettings: true\)') {
@@ -2925,12 +2930,15 @@ if ($cliServiceSource -notmatch 'ApiKeyAuthMode\s*=\s*"apikey"' -or
     $formSource -notmatch '一键凭据：Codex App 的 API Key 登录由管理器自动写入') {
     throw 'Windows client launch must automatically project reusable auth_mode=apikey credentials for API and PAT accounts without another App login prompt.'
 }
-if ($localPatGatewaySource -notmatch 'ProviderBaseUrl\s*=\s*"http://127\.0\.0\.1:8317/backend-api/codex"' -or
-    $localPatGatewaySource -notmatch 'ChatGptBaseUrl\s*=\s*"http://127\.0\.0\.1:8317/backend-api"' -or
+if ($localPatGatewaySource -notmatch 'ProviderBaseUrl\s*=\s*ReleaseConfiguration\.GatewayProviderBaseUrl' -or
+    $localPatGatewaySource -notmatch 'ChatGptBaseUrl\s*=\s*ReleaseConfiguration\.GatewayChatGptBaseUrl' -or
     $localPatGatewaySource -notmatch 'chatgpt_account_id' -or
     $localPatGatewaySource -notmatch 'chatgpt-account-id' -or
     $localPatGatewaySource -notmatch 'UseCookies\s*=\s*false' -or
-    $localPatGatewaySource -notmatch 'RequiredCodexVersion' -or
+    $localPatGatewaySource -notmatch 'RequiredCodexVersion\s*=\s*"0\.153\.4"' -or
+    $localPatGatewaySource -notmatch 'ClientCompatibilityHeaderAllowList' -or
+    $localPatGatewaySource -notmatch '!ShouldForwardRequestHeader\("user-agent"\)' -or
+    $localPatGatewaySource -notmatch 'IsCodexUserAgentAtLeast' -or
      ($localPatGatewaySource -notmatch 'ResolveRequiredProxyUri' -and $localPatGatewaySource -notmatch 'ResolveProxyForCredential') -or
     $localPatGatewaySource -notmatch 'proxyConfigured' -or
     $localPatGatewaySource -notmatch 'ReadBearerCredential' -or
@@ -2951,7 +2959,7 @@ if ($localPatGatewaySource -notmatch 'ProviderBaseUrl\s*=\s*"http://127\.0\.0\.1
     $settingsSource -notmatch 'PatGatewayProxyAutoDetect' -or
     $cliServiceSource -notmatch 'BuildPatGatewayProxyUri' -or
     $localPatGatewaySource -notmatch 'GetConfiguredProxyUri\(\)' -or
-    $settingsSource -notmatch 'File\.Move\(temporaryPath, _settingsPath, overwrite:\s*true\)') {
+    $settingsSource -notmatch 'AtomicFilePersistence\.WriteAllText') {
     throw 'The local PAT gateway must resolve each token identity, inject the ChatGPT account id, and use the split address/port proxy settings with loopback detection.'
 }
 $preparePatRotationMatch = [regex]::Match(
@@ -3059,7 +3067,8 @@ if ($installerDefaultsSource -notmatch '"PatGatewayEnabled"\s*:\s*true' -or
     $oneClickPackageSource -notmatch 'patAutoRotationUsedPercentThreshold') {
     throw 'The clean one-click package must enable the PAT gateway and 98% automatic request-boundary rotation by default and validate those fields.'
 }
-if ($localPatGatewaySource -notmatch 'RotationProtocolValue\s*=\s*"request-boundary-v11"' -or
+if ($localPatGatewaySource -notmatch 'RotationProtocolValue\s*=\s*"request-boundary-v13"' -or
+    $localPatGatewaySource -notmatch 'LegacyV11RotationProtocolValue\s*=\s*"request-boundary-v11"' -or
     $localPatGatewaySource -notmatch 'SuccessfulActivityRotationProtocolValue\s*=\s*"request-boundary-v10"' -or
     $localPatGatewaySource -notmatch 'SafeContentEncodingRotationProtocolValue\s*=\s*"request-boundary-v8"' -or
     $localPatGatewaySource -notmatch 'ConfirmedQuotaRotationProtocolValue\s*=\s*"request-boundary-v7"' -or
@@ -3071,8 +3080,8 @@ if ($localPatGatewaySource -notmatch 'RotationProtocolValue\s*=\s*"request-bound
     $localPatGatewaySource -notmatch '(?s)ReadActivitySnapshotCoreAsync\(.*?CreateLoopbackControlClient\(\)' -or
     $localPatGatewaySource -notmatch 'ReadGatewayControlErrorMessageAsync' -or
     $localPatGatewaySource -notmatch '(?s)internal int Run\(\).*?RunListenerAsync\(\)\.GetAwaiter\(\)\.GetResult\(\).*?mutex\.ReleaseMutex\(\)' -or
-    $patGatewayRotationStoreSource -notmatch 'FileName\s*=\s*"account-auto-rotation-route-v2\.json"' -or
-    $patGatewayRotationStoreSource -notmatch 'LegacyFileName\s*=\s*"pat-auto-rotation-route-v1\.json"' -or
+    $patGatewayRotationStoreSource -notmatch 'FileName\s*=\s*"account-auto-rotation-route-v2-"\s*\+\s*ReleaseConfiguration\.GatewayPortText' -or
+    $patGatewayRotationStoreSource -notmatch 'LegacyFileName\s*=\s*"pat-auto-rotation-route-v1-"\s*\+\s*ReleaseConfiguration\.GatewayPortText' -or
     $patGatewayRotationStoreSource -notmatch 'SchemaVersion\s*=\s*2' -or
     $patGatewayRotationStoreSource -notmatch 'LoadLegacyAndMigrate' -or
     $patGatewayRotationStoreSource -notmatch '(?s)LoadLegacyAndMigrate.*?Save\(legacy\).*?File\.Delete\(_legacyPath\)' -or
@@ -3108,13 +3117,12 @@ if ($codexFingerprintConvergenceSource -notmatch 'PassthroughValue\s*=\s*"off"' 
     $formSource -notmatch '指纹：完全收敛') {
     throw 'Codex fingerprint convergence must expose gateway_default/off forwarding policy and exact device/session/full rewrite boundaries.'
 }
-if ($patGatewaySessionAffinityStoreSource -notmatch 'FileName\s*=\s*"pat-gateway-session-affinity-v1\.json"' -or
+if ($patGatewaySessionAffinityStoreSource -notmatch 'FileName\s*=\s*"pat-gateway-session-affinity-v1-"\s*\+\s*ReleaseConfiguration\.GatewayPortText' -or
     $patGatewaySessionAffinityStoreSource -notmatch 'BindingLifetime\s*=\s*TimeSpan\.FromHours\(1\)' -or
     $patGatewaySessionAffinityStoreSource -notmatch 'HMACSHA256' -or
     $patGatewaySessionAffinityStoreSource -notmatch 'ResolveOrClaim' -or
     $patGatewaySessionAffinityStoreSource -notmatch 'ConfirmAndBindResponses' -or
-    $patGatewaySessionAffinityStoreSource -notmatch 'FileOptions\.WriteThrough' -or
-    $patGatewaySessionAffinityStoreSource -notmatch 'File\.Move\(temporaryPath, _path, overwrite: true\)' -or
+    $patGatewaySessionAffinityStoreSource -notmatch 'AtomicFilePersistence\.WriteAllText' -or
     $openAIResponseIdObserverSource -notmatch 'OpenAIResponseWireFormat\.ServerSentEvents' -or
     $openAIResponseIdObserverSource -notmatch '\[DONE\]' -or
     $openAIResponseIdObserverSource -notmatch 'CanConfirm' -or
@@ -3160,9 +3168,8 @@ if ($localPatGatewaySource -notmatch 'RotationArmPath\s*=\s*"__rotation/arm"' -o
     $localPatGatewaySource -notmatch '(?s)CommitTransparentRotationAsync.*?_rotationStore\.Arm.*?_rotationStore\.Activate') {
     throw 'The authenticated v6 gateway must buffer model bodies in memory, retry only safely replayable 429 requests through the ordered rings, and commit only the successful logical route.'
 }
-if ($patGatewayQuotaSignalStoreSource -notmatch 'FileName\s*=\s*"pat-gateway-quota-signals-v1\.json"' -or
-    $patGatewayQuotaSignalStoreSource -notmatch 'FileOptions\.WriteThrough' -or
-    $patGatewayQuotaSignalStoreSource -notmatch 'File\.Move\(temporaryPath, _path, overwrite: true\)' -or
+if ($patGatewayQuotaSignalStoreSource -notmatch 'FileName\s*=\s*"pat-gateway-quota-signals-v1-"\s*\+\s*ReleaseConfiguration\.GatewayPortText' -or
+    $patGatewayQuotaSignalStoreSource -notmatch 'AtomicFilePersistence\.WriteAllText' -or
     $patGatewayQuotaSignalStoreSource -notmatch 'DuplicateWindow' -or
     $patGatewayQuotaSignalStoreSource -notmatch 'SignalLifetime' -or
     $patGatewayQuotaSignalStoreSource -notmatch 'ReadLatestPerAccount' -or
@@ -3197,6 +3204,7 @@ if ($gatewayResolveRotationMatch.Value -notmatch 'CodexCliService\.ReadAccessTok
     $gatewayRewriteApiBodyMatch.Value -notmatch 'writer\.WriteString\("model",\s*model\.Trim\(\)\)' -or
     $gatewayRewriteApiBodyMatch.Value -notmatch 'property\.WriteTo\(writer\)' -or
     $gatewayCompatibleUriMatch.Value -notmatch 'suffix\.Equals\("/responses",\s*StringComparison\.OrdinalIgnoreCase\)' -or
+    $gatewayCompatibleUriMatch.Value -notmatch 'suffix\.Equals\("/responses/compact",\s*StringComparison\.OrdinalIgnoreCase\)' -or
     $gatewayCompatibleUriMatch.Value -notmatch 'resolved\.Host\.Equals\(baseUri\.Host' -or
     $gatewayCompatibleUriMatch.Value -notmatch 'resolved\.Port\s*!=\s*baseUri\.Port' -or
     $gatewayBuildUpstreamMatch.Value -notmatch 'request\.Headers\.Remove\("chatgpt-account-id"\)' -or
@@ -3393,7 +3401,8 @@ if ($formSource -notmatch 'WorkspaceView\.UnifiedHistory' -or
     $formSource -notmatch 'ToggleUnifiedThreadArchiveAsync' -or
     $formSource -notmatch 'DeleteUnifiedThreadAsync' -or
     $formSource -notmatch 'ScheduleDeletedDesktopSidebarPruneAfterClientExit' -or
-    $formSource -notmatch '关闭官方 Codex 后会自动清除' -or
+    ($formSource -notmatch '关闭官方 Codex 后会自动清除' -and
+     $formSource -notmatch 'Codex 关闭后会再校验一次') -or
     $formSource -notmatch 'AutoScaleMode\s*=\s*AutoScaleMode\.Dpi' -or
     $historyServiceSource -notmatch 'state_5\.sqlite' -or
     $historyServiceSource -notmatch 'RecordDeletedThread' -or
@@ -3494,7 +3503,7 @@ $globalPackagedCandidateIndex = if ($globalCliResolverMethod.Success) {
     $globalCliResolverMethod.Value.IndexOf('GetCandidateManagerRoots()', [StringComparison]::Ordinal)
 }
 else { -1 }
-if ($buildLatestWorkflowSource -notmatch "@openai/codex@0\.149\.0" -or
+if ($buildLatestWorkflowSource -notmatch "@openai/codex@0\.153\.4" -or
     -not $threadSectionCliResolverMethod.Success -or
     $threadSectionPackagedCandidateIndex -lt 0 -or
     $threadSectionDesktopCandidateIndex -le $threadSectionPackagedCandidateIndex -or
@@ -3515,7 +3524,7 @@ if ($buildLatestWorkflowSource -notmatch "@openai/codex@0\.149\.0" -or
     $threadSectionSessionStartMethod.Value -notmatch 'ResolveThreadSectionCodexCliCandidates\(\)' -or
     $threadSectionSessionStartMethod.Value -notmatch 'RequestAsync\(\s*"threadSection/list",\s*new JsonObject \{ \["limit"\] = 1 \}' -or
     $appServerClientSource -notmatch 'catch \(OperationCanceledException\)[\s\S]*?throw;[\s\S]*?failures\.Add') {
-    throw 'Thread-section RPCs must pin Codex 0.149.0, search packaged CLIs only under AppContext, fall back through desktop CLIs, and leave the global resolver order unchanged.'
+    throw 'The package must pin Codex 0.153.4 for GPT-6; thread-section RPCs must search packaged CLIs only under AppContext, fall back through desktop CLIs, and leave the global resolver order unchanged.'
 }
 if (-not $listThreadSectionsMethod.Success -or
     -not $listThreadsMethod.Success -or
@@ -3922,7 +3931,8 @@ if ($formSource -notmatch 'StartPosition = FormStartPosition\.Manual' -or
     $formSource -notmatch '_activeView == WorkspaceView\.SystemConfig' -or
     $formSource -notmatch '_controlsRow\.Visible = !compact' -or
     $accountDialogSource -notmatch '_updateTokenButton\.Text = "[^"]*Token";' -or
-    $buildScriptSource -notmatch '\$desktopShortcut\.TargetPath = \$appExe' -or
+    (($buildScriptSource -notmatch '\$desktopShortcut\.TargetPath = \$appExe') -and
+     ($buildScriptSource -notmatch '\$desktopShortcut\.TargetPath = \$windowsPowerShell')) -or
     $buildScriptSource -notmatch '\$desktopShortcut\.IconLocation') {
     throw 'The desktop UI must restore a resizable visible window, keep quota reset spacing, use complete token labels, and expose a stable taskbar identity.'
 }
@@ -4017,7 +4027,8 @@ if ($buildScriptSource -notmatch '\$LASTEXITCODE\s+-ne\s+0') {
     throw 'Build script must stop if dotnet publish fails, instead of self-testing a stale executable.'
 }
 if ($buildScriptSource -notmatch '--self-contained\s+true' -or
-    $selfContainedLauncherSource -notmatch 'dist\\CodexAccountManager\\CodexAccountManager\.exe' -or
+    ($selfContainedLauncherSource -notmatch 'dist\\CodexAccountManager-2\.3\.2-hotfix\\CodexAccountManager\.exe' -and
+     $selfContainedLauncherSource -notmatch 'dist\\CodexAccountManager-2\.3\.2-fixed\\CodexAccountManager\.exe') -or
     $selfContainedLauncherSource -match 'dotnet\.microsoft\.com|aka\.ms|Start-Process.+https?://|Microsoft\.WindowsDesktop\.App') {
     throw 'The desktop launcher must start only the self-contained dist executable and must never open a runtime download page.'
 }

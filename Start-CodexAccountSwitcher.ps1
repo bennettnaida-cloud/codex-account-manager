@@ -87,7 +87,7 @@ service_tier = "default"
 
 [model_providers.codex_account_manager]
 name = "OpenAI Token HTTP"
-base_url = "http://127.0.0.1:8317/backend-api/codex"
+base_url = "http://127.0.0.1:8333/backend-api/codex"
 wire_api = "responses"
 requires_openai_auth = true
 supports_websockets = false
@@ -436,14 +436,34 @@ function Invoke-LocalPatConfigMigration {
 
 function Ensure-LocalPatGateway {
     # The verification suite supplies a fake/isolated Codex command and may run while the
-    # owner's real gateway is already serving 8317.  In that explicit test-only mode, do not
+    # owner's real gateway is already serving its configured port. In that explicit test-only mode, do not
     # restart or replace the live gateway just to exercise status-output formatting.
     if ($env:CODEX_SWITCHER_SKIP_GATEWAY_ENSURE -eq '1' -and
         -not [string]::IsNullOrWhiteSpace($env:CODEX_SWITCHER_CODEX_COMMAND)) {
         return
     }
 
-    $launcher = Join-Path $script:Root 'dist\CodexAccountManager\CodexAccountManager.exe'
+    $launcherCandidates = [System.Collections.Generic.List[string]]::new()
+    if (-not [string]::IsNullOrWhiteSpace($env:CODEX_ACCOUNT_MANAGER_APP_EXE)) {
+        $launcherCandidates.Add([System.IO.Path]::GetFullPath($env:CODEX_ACCOUNT_MANAGER_APP_EXE))
+    }
+    $currentVersion = (Get-Content -LiteralPath (Join-Path $script:Root 'VERSION') -Raw).Trim()
+    $versionedRoot = Join-Path $script:Root 'dist'
+    foreach ($versionedDirectory in @(
+        Get-ChildItem -LiteralPath $versionedRoot -Directory -Filter ("CodexAccountManager-" + $currentVersion + "*") -ErrorAction SilentlyContinue |
+            Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'CodexAccountManager.exe') -PathType Leaf } |
+            Sort-Object LastWriteTime -Descending)) {
+        $launcherCandidates.Add((Join-Path $versionedDirectory.FullName 'CodexAccountManager.exe'))
+    }
+    $launcherCandidates.Add((Join-Path $script:Root 'dist\CodexAccountManager-2.3.2-hotfix\CodexAccountManager.exe'))
+    $launcherCandidates.Add((Join-Path $script:Root 'dist\CodexAccountManager-2.3.2-fixed\CodexAccountManager.exe'))
+    $launcherCandidates.Add((Join-Path $script:Root 'dist\CodexAccountManager-2.2.25-fallback\CodexAccountManager.exe'))
+    $launcher = $launcherCandidates |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+        Select-Object -First 1
+    if ([string]::IsNullOrWhiteSpace($launcher)) {
+        $launcher = $launcherCandidates[0]
+    }
     $dotnet = Join-Path $script:Root '.tools\dotnet\dotnet.exe'
     $assembly = Join-Path $script:Root 'src\CodexAccountManager\bin\Release\net10.0-windows\CodexAccountManager.dll'
     $oldManagerHome = $env:CODEX_ACCOUNT_MANAGER_HOME

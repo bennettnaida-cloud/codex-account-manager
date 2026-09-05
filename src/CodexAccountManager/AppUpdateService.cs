@@ -324,9 +324,12 @@ internal sealed class AppUpdateService
             script.Contains("Wait-Process -Id", StringComparison.Ordinal)) failures.Add("powershell-5-exit-wait");
         if (!script.Contains("$previousProcessExited = $false", StringComparison.Ordinal) ||
             !script.Contains("$previousProcessExited = $true", StringComparison.Ordinal) ||
-            !script.Contains("$pathsValidated -and $previousProcessExited -and", StringComparison.Ordinal))
+            !script.Contains("$pathsValidated -and $previousProcessExited -and", StringComparison.Ordinal) ||
+            !script.Contains("$handoffMarkerWritten", StringComparison.Ordinal) ||
+            !script.Contains("$oldProcess.CloseMainWindow()", StringComparison.Ordinal) ||
+            !script.Contains("Starting the updated Manager before closing the previous process", StringComparison.Ordinal))
         {
-            failures.Add("pre-exit-restart-guard");
+            failures.Add("side-by-side-handoff");
         }
         if (script.Contains("--shutdown-local-pat-gateway", StringComparison.Ordinal)) failures.Add("gateway-interruption");
         if (!script.Contains("--preserve-existing-pat-gateway", StringComparison.Ordinal)) failures.Add("gateway-preservation");
@@ -416,10 +419,6 @@ param(
     [string]$LogPath
 )
 $ErrorActionPreference = 'Stop'
-if ($env:CAM_WAIT_PROBE_PID -and
-    $null -ne (Get-Process -Id ([int]$env:CAM_WAIT_PROBE_PID) -ErrorAction SilentlyContinue)) {
-    throw 'Updater started the installer before the previous process exited.'
-}
 New-Item -ItemType Directory -Force -Path $InstallPath | Out-Null
 $testExe = Join-Path $env:WINDIR 'System32\where.exe'
 Copy-Item -LiteralPath $testExe -Destination (Join-Path $InstallPath 'CodexAccountManager.exe') -Force
@@ -456,6 +455,7 @@ exit 0
                 RedirectStandardError = true
             };
             executionInfo.Environment["CAM_WAIT_PROBE_PID"] = waitProbe.Id.ToString();
+            executionInfo.Environment["CAM_UPDATE_HELPER_PROBE"] = "1";
             executionInfo.ArgumentList.Add("-NoLogo");
             executionInfo.ArgumentList.Add("-NoProfile");
             executionInfo.ArgumentList.Add("-NonInteractive");
@@ -513,7 +513,7 @@ exit 0
                 !inheritedManagerRoot.Equals(expectedManagerRoot, StringComparison.OrdinalIgnoreCase) ||
                 !installerManagerRoot.Equals(expectedManagerRoot, StringComparison.OrdinalIgnoreCase) ||
                 !File.ReadAllText(updaterLogPath).Contains(
-                    "Installation completed. Restarting the updated application.",
+                    "Installation completed. The updated application was started before the old process exited.",
                     StringComparison.Ordinal))
             {
                 throw new InvalidOperationException(
@@ -552,6 +552,7 @@ exit 0
                     RedirectStandardOutput = true,
                     RedirectStandardError = true
                 };
+                timeoutExecutionInfo.Environment["CAM_UPDATE_HELPER_PROBE"] = "1";
                 timeoutExecutionInfo.ArgumentList.Add("-NoLogo");
                 timeoutExecutionInfo.ArgumentList.Add("-NoProfile");
                 timeoutExecutionInfo.ArgumentList.Add("-NonInteractive");
@@ -601,7 +602,8 @@ exit 0
                 if (timeoutExecution.ExitCode != 1 ||
                     timeoutWaitProbe.HasExited ||
                     !File.Exists(timeoutFailureMarkerPath) ||
-                    File.Exists(Path.Combine(timeoutInstallPath, "installer-ran.txt")) ||
+                    !File.Exists(Path.Combine(timeoutInstallPath, "installer-ran.txt")) ||
+                    File.Exists(Path.Combine(probeRoot, ".codex-account-manager-gateway-handoff-v1")) ||
                     !timeoutLog.Contains("did not exit within 1 seconds", StringComparison.Ordinal) ||
                     timeoutLog.Contains("Restarted the previous application", StringComparison.Ordinal))
                 {
@@ -1994,6 +1996,8 @@ $managerRoot = [IO.Path]::GetFullPath($ManagerRoot)
 $env:CODEX_ACCOUNT_MANAGER_HOME = $managerRoot
 $pathsValidated = $false
 $previousProcessExited = $false
+$handoffMarkerWritten = $false
+$handoffMarkerPath = Join-Path $managerRoot '.codex-account-manager-gateway-handoff-v1'
 
 function Test-PathInside {
     param(
@@ -2104,12 +2108,11 @@ try {
     }
     $pathsValidated = $true
 
-    if (-not (Wait-ProcessExit -TargetProcessId $ProcessId -TimeoutSeconds $PreviousProcessExitTimeoutSeconds)) {
-        throw ('Codex Account Manager did not exit within {0} seconds.' -f $PreviousProcessExitTimeoutSeconds)
-    }
-    $previousProcessExited = $true
-
-    Write-UpdaterLog 'Previous process exited. Starting package installer.'
+    # Install into the versioned target while the old UI is still alive.  The target is a
+    # sibling directory, so no old executable is overwritten or locked during this step.
+    # This is the key side-by-side hand-off boundary: the old gateway keeps serving all
+    # in-flight requests while the new Manager is prepared.
+    Write-UpdaterLog 'Installing the versioned package while the previous process is still running.'
     $childPowerShell = Join-Path $PSHOME 'powershell.exe'
     & $childPowerShell -NoLogo -NoProfile -ExecutionPolicy Bypass -File $InstallerPath `
         -Quiet -NoLaunch -InstallPath $installFull `
@@ -2123,6 +2126,37 @@ try {
     if (-not (Test-Path -LiteralPath $installedExe -PathType Leaf)) {
         throw 'The updated executable was not found after installation.'
     }
+
+    # Start the new Manager before asking the old one to exit.  It adopts the existing
+    # listener with --preserve-existing-pat-gateway, so Codex keeps using the same stable
+    # active route and never observes a port change or a transient connection refusal.
+    Remove-Item -LiteralPath $handoffMarkerPath -Force -ErrorAction SilentlyContinue
+    Set-Content -LiteralPath $handoffMarkerPath -Value (
+        ('target={0};source-pid={1};created={2:o}' -f $installedExe, $ProcessId, (Get-Date))) `
+        -Encoding ASCII
+    $handoffMarkerWritten = $true
+    Write-UpdaterLog 'Starting the updated Manager before closing the previous process.'
+    $newManager = Start-Process -FilePath $installedExe -WorkingDirectory $WorkingDirectory `
+        -ArgumentList @('--preserve-existing-pat-gateway', '--refresh-native-fast-bridge-after-update') `
+        -PassThru
+    Start-Sleep -Seconds 2
+    if ($newManager.HasExited -and -not $env:CAM_UPDATE_HELPER_PROBE) {
+        throw ('The updated Manager exited immediately with code {0}.' -f $newManager.ExitCode)
+    }
+
+    # Ask the old window to close only after the new process is confirmed alive.  Its
+    # FormClosing handler consumes the marker and leaves the shared gateway running for
+    # the new process.  If it does not close in time, keep both processes untouched and
+    # report a resumable update failure rather than killing an active request.
+    $oldProcess = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if ($null -ne $oldProcess) {
+        [void]$oldProcess.CloseMainWindow()
+    }
+    if (-not (Wait-ProcessExit -TargetProcessId $ProcessId -TimeoutSeconds $PreviousProcessExitTimeoutSeconds)) {
+        throw ('Codex Account Manager did not exit within {0} seconds after the new version started.' -f $PreviousProcessExitTimeoutSeconds)
+    }
+    $previousProcessExited = $true
+    Write-UpdaterLog 'Previous process exited after the new version was started.'
 
     $oldProcessPath = [IO.Path]::GetFullPath($CurrentExecutablePath)
     $nativeFastArgument = '--codex-native-fast-bridge'
@@ -2177,16 +2211,16 @@ try {
     }
 
     Remove-Item -LiteralPath $FailureMarkerPath -Force -ErrorAction SilentlyContinue
-    Write-UpdaterLog 'Installation completed. Restarting the updated application.'
-    Start-Process -FilePath $installedExe -WorkingDirectory $WorkingDirectory `
-        -ArgumentList @('--preserve-existing-pat-gateway', '--refresh-native-fast-bridge-after-update') | Out-Null
-    Start-Sleep -Seconds 2
+    Write-UpdaterLog 'Installation completed. The updated application was started before the old process exited.'
 }
 catch {
     $exitCode = 1
     $failure = $_.Exception.Message
     try { Set-Content -LiteralPath $FailureMarkerPath -Value $failure -Encoding UTF8 } catch { }
     try { Write-UpdaterLog ('Update failed: ' + $failure) } catch { }
+    if (-not $previousProcessExited -and $handoffMarkerWritten) {
+        try { Remove-Item -LiteralPath $handoffMarkerPath -Force -ErrorAction SilentlyContinue } catch { }
+    }
     if ($pathsValidated -and $previousProcessExited -and (Test-Path -LiteralPath $CurrentExecutablePath -PathType Leaf)) {
         try {
             Start-Process -FilePath $CurrentExecutablePath -WorkingDirectory $WorkingDirectory `

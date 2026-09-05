@@ -10,10 +10,12 @@ namespace CodexAccountManager;
 
 internal static class LocalPatGateway
 {
-    internal const int Port = 8317;
-    internal const string ListenerPrefix = "http://127.0.0.1:8317/";
-    internal const string ProviderBaseUrl = "http://127.0.0.1:8317/backend-api/codex";
-    internal const string ChatGptBaseUrl = "http://127.0.0.1:8317/backend-api";
+    // Every release takes all gateway endpoints from one version-scoped source. 2.3.13
+    // can therefore run beside 2.3.12 without probing, shutting down or adopting 8332.
+    internal const int Port = ReleaseConfiguration.GatewayPort;
+    internal const string ListenerPrefix = ReleaseConfiguration.GatewayListenerPrefix;
+    internal const string ProviderBaseUrl = ReleaseConfiguration.GatewayProviderBaseUrl;
+    internal const string ChatGptBaseUrl = ReleaseConfiguration.GatewayChatGptBaseUrl;
     internal const string RequestTimeoutHeader = "X-Codex-Account-Manager-Request-Timeout-Ms";
     // Requests sent by the manager's explicit quota-test button are intentionally
     // independent of the running Codex session.  Keeping this marker on the loopback
@@ -22,6 +24,8 @@ internal static class LocalPatGateway
     internal const string RequestPurposeHeader =
         "X-Codex-Account-Manager-Request-Purpose";
     internal const string QuotaTestRequestPurpose = "quota-test";
+    internal static string QuotaTestProofPurpose(string bearer) =>
+        QuotaTestRequestPurpose + "\n" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(bearer)));
     internal const string ProcessArgument = "--local-pat-gateway";
     internal const string RootArgument = "--manager-root";
     internal const string RotationArmPath = "__rotation/arm";
@@ -62,7 +66,12 @@ internal static class LocalPatGateway
     internal const string SuccessfulActivityRotationProtocolValue = "request-boundary-v10";
     // v11 is required for backup compatible-API transports to honor a prepared primary
     // route and for a force switch to replace a pending target under the gateway lock.
-    internal const string RotationProtocolValue = "request-boundary-v11";
+    // v12 keeps those semantics and raises the upstream response-header grace period. v13
+    // also recognizes a configured compatible-API key as a gateway transport, allowing a
+    // directly projected backup API profile to return to the primary pool at a request boundary.
+    internal const string LegacyV11RotationProtocolValue = "request-boundary-v11";
+    internal const string LegacyV12RotationProtocolValue = "request-boundary-v12";
+    internal const string RotationProtocolValue = "request-boundary-v13";
     private static readonly SemaphoreSlim StartupLock = new(1, 1);
 
     internal static int RunProcess(string[] args)
@@ -242,6 +251,36 @@ internal static class LocalPatGateway
         return await ShutdownWithSecretAsync(legacySecret, cancellationToken);
     }
 
+    /// <summary>
+    /// Synchronously closes the gateway owned by this manager during the WinForms
+    /// shutdown path. The async control call runs on a worker thread so a FormClosing
+    /// handler never deadlocks waiting for an await continuation on the UI thread.
+    /// </summary>
+    internal static bool ShutdownOwnedGatewayForProcessExit(TimeSpan timeout)
+    {
+        if (timeout <= TimeSpan.Zero)
+        {
+            timeout = TimeSpan.FromSeconds(3);
+        }
+
+        try
+        {
+            using var cancellation = new CancellationTokenSource(timeout);
+            return Task.Run(() => ShutdownOwnedGatewayAsync(cancellation.Token))
+                .GetAwaiter()
+                .GetResult();
+        }
+        catch (Exception ex) when (
+            ex is HttpRequestException or TaskCanceledException or IOException or
+            UnauthorizedAccessException or InvalidOperationException)
+        {
+            ManagerLifecycleDiagnostics.WriteException(
+                "pat-gateway-shutdown-on-manager-exit-failed",
+                ex);
+            return false;
+        }
+    }
+
     internal static Task<LocalPatGatewayActivitySnapshot?> ReadActivitySnapshotAsync(
         CancellationToken cancellationToken = default) =>
         ReadActivitySnapshotCoreAsync(requireCompatibleProtocol: true, cancellationToken);
@@ -338,6 +377,7 @@ internal static class LocalPatGateway
     internal static async Task<PatGatewayRotationSnapshot> ArmRotationAsync(
         string sourceAccountKey,
         string targetAccountKey,
+        string? transportAccountKey = null,
         bool replaceExistingArmedTarget = false,
         CancellationToken cancellationToken = default)
     {
@@ -346,6 +386,12 @@ internal static class LocalPatGateway
             source.Equals(target, StringComparison.Ordinal))
         {
             throw new ArgumentException("PAT rotation requires two different account hashes.");
+        }
+        string? transport = null;
+        if (transportAccountKey != null &&
+            !PatGatewayRotationStore.TryNormalizeAccountKey(transportAccountKey, out transport))
+        {
+            throw new ArgumentException("PAT rotation transport account hash is invalid.", nameof(transportAccountKey));
         }
 
         await EnsureRunningAsync(cancellationToken, restartOnProxyMismatch: false);
@@ -359,6 +405,7 @@ internal static class LocalPatGateway
         {
             sourceAccountKey = source,
             targetAccountKey = target,
+            transportAccountKey = transport,
             replaceExistingArmedTarget
         });
         using var client = CreateLoopbackControlClient();
@@ -837,6 +884,8 @@ internal static class LocalPatGateway
 
     internal static bool IsCompatibleRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV12RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV11RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, SuccessfulActivityRotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, "request-boundary-v9", StringComparison.Ordinal) ||
         string.Equals(value, SafeContentEncodingRotationProtocolValue, StringComparison.Ordinal) ||
@@ -851,11 +900,14 @@ internal static class LocalPatGateway
     // new executable waits for a request-boundary listener hand-off.
     internal static bool IsCurrentRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV12RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, SuccessfulActivityRotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, SafeContentEncodingRotationProtocolValue, StringComparison.Ordinal);
 
     internal static bool IsTransparentRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV12RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV11RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, SuccessfulActivityRotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, "request-boundary-v9", StringComparison.Ordinal) ||
         string.Equals(value, SafeContentEncodingRotationProtocolValue, StringComparison.Ordinal) ||
@@ -865,6 +917,8 @@ internal static class LocalPatGateway
 
     internal static bool IsConfirmedQuotaRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV12RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV11RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, SuccessfulActivityRotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, "request-boundary-v9", StringComparison.Ordinal) ||
         string.Equals(value, SafeContentEncodingRotationProtocolValue, StringComparison.Ordinal) ||
@@ -898,6 +952,8 @@ internal static class LocalPatGateway
                         string.Equals(value, TransparentRotationProtocolValue, StringComparison.Ordinal) ||
                         string.Equals(value, SafeContentEncodingRotationProtocolValue, StringComparison.Ordinal) ||
                         string.Equals(value, "request-boundary-v9", StringComparison.Ordinal) ||
+                        string.Equals(value, LegacyV11RotationProtocolValue, StringComparison.Ordinal) ||
+                        string.Equals(value, LegacyV12RotationProtocolValue, StringComparison.Ordinal) ||
                         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal));
         }
         catch (Exception ex) when (
@@ -992,19 +1048,23 @@ internal sealed class LocalPatGatewayHost
     private const int SessionAffinityMetadataMaxCharacters = 64 * 1024;
     private const int SessionAffinityIdentifierMaxCharacters = 512;
     private const int SessionAffinityValuesPerKind = 3;
-    private const string MutexName = "Local\\CodexAccountManager.LocalPatGateway.8317";
+    private const string MutexName =
+        "Local\\CodexAccountManager.LocalPatGateway." +
+        ReleaseConfiguration.GatewayPortText;
     private const string UpstreamOrigin = "https://chatgpt.com";
     private const string WhoAmIUrl =
         "https://auth.openai.com/api/accounts/v1/user-auth-credential/whoami";
     private const string DefaultOriginator = "codex_cli_rs";
-    private const string RequiredCodexVersion = "0.144.1";
+    // gpt-6 class models reject the pre-0.153 client identity. Prefer the real incoming
+    // desktop version, but keep this floor for old or incomplete third-party callers.
+    private const string RequiredCodexVersion = "0.153.4";
     private const string DefaultUserAgent =
-        "codex_cli_rs/0.144.1 (Windows 10.0.0; x86_64) codex-account-manager";
+        "codex_cli_rs/0.153.4 (Windows 10.0.0; x86_64) codex-account-manager";
     private static readonly TimeSpan IdentityCacheLifetime = TimeSpan.FromMinutes(30);
     // A dead per-account node must not hold a whoami or response-header connection
     // for the default HttpClient lifetime. This is only the pre-header attempt bound;
     // once SSE headers arrive, the stream keeps using the caller's request deadline.
-    private static readonly TimeSpan UpstreamAttemptHeadersTimeout = TimeSpan.FromSeconds(6);
+    private static readonly TimeSpan UpstreamAttemptHeadersTimeout = TimeSpan.FromSeconds(60);
     private const int MaxUpstreamErrorBodyBytes = 16 * 1024;
     private const int Transient429SameAccountRetryLimit = 2;
     // A request may walk the latest configured ring after a transient 429, but a
@@ -1075,6 +1135,15 @@ internal sealed class LocalPatGatewayHost
         "traceparent",
         "tracestate"
     };
+    private static readonly HashSet<string> ClientCompatibilityHeaderAllowList = new(StringComparer.OrdinalIgnoreCase)
+    {
+        // These values carry client capability/version information, not a device or
+        // account identity. Always preserve them so a newer Codex is not downgraded by
+        // the gateway's privacy-oriented fingerprint mode.
+        "originator",
+        "user-agent",
+        "version"
+    };
     private static readonly HashSet<string> NeverForwardRequestHeaders = new(StringComparer.OrdinalIgnoreCase)
     {
         "authorization",
@@ -1116,6 +1185,7 @@ internal sealed class LocalPatGatewayHost
     private readonly PatGatewayRotationStore _rotationStore;
     private readonly PatGatewayQuotaSignalStore _quotaSignalStore;
     private readonly PatGatewaySuccessfulActivityStore _successfulActivityStore;
+    private readonly PatGatewayAccountIdentityStore _accountIdentityStore;
     private readonly PatGatewaySessionAffinityStore _sessionAffinityStore;
     private readonly AccountProxyResolver _proxyResolver;
     private readonly object _rotationGate = new();
@@ -1152,6 +1222,7 @@ internal sealed class LocalPatGatewayHost
         _quotaSignalStore = new PatGatewayQuotaSignalStore(_accountStore.RootPath);
         _successfulActivityStore = new PatGatewaySuccessfulActivityStore(
             _accountStore.RootPath);
+        _accountIdentityStore = new PatGatewayAccountIdentityStore(_accountStore.RootPath);
         var affinitySettings = _themeService.LoadSettings();
         _ = AccountRotationConfiguration.Normalize(affinitySettings, _accountStore.LoadAccounts());
         var affinityTtl = TimeSpan.FromSeconds(
@@ -1196,6 +1267,9 @@ internal sealed class LocalPatGatewayHost
             !LocalPatGateway.IsCompatibleRotationProtocolValue("request-boundary-v8") ||
             !LocalPatGateway.IsCompatibleRotationProtocolValue("request-boundary-v9") ||
             !LocalPatGateway.IsCompatibleRotationProtocolValue("request-boundary-v10") ||
+            !LocalPatGateway.IsCompatibleRotationProtocolValue("request-boundary-v11") ||
+            !LocalPatGateway.IsCompatibleRotationProtocolValue("request-boundary-v12") ||
+            !LocalPatGateway.IsCompatibleRotationProtocolValue("request-boundary-v13") ||
             !LocalPatGateway.IsManagerPreparedRotationProtocolValue("request-boundary-v3") ||
             !LocalPatGateway.IsManagerPreparedRotationProtocolValue("request-boundary-v4") ||
             LocalPatGateway.IsManagerPreparedRotationProtocolValue("request-boundary-v5") ||
@@ -1209,11 +1283,17 @@ internal sealed class LocalPatGatewayHost
             !LocalPatGateway.IsTransparentRotationProtocolValue("request-boundary-v8") ||
             !LocalPatGateway.IsTransparentRotationProtocolValue("request-boundary-v9") ||
             !LocalPatGateway.IsTransparentRotationProtocolValue("request-boundary-v10") ||
+            !LocalPatGateway.IsTransparentRotationProtocolValue("request-boundary-v11") ||
+            !LocalPatGateway.IsTransparentRotationProtocolValue("request-boundary-v12") ||
+            !LocalPatGateway.IsTransparentRotationProtocolValue("request-boundary-v13") ||
             LocalPatGateway.IsConfirmedQuotaRotationProtocolValue("request-boundary-v6") ||
             !LocalPatGateway.IsConfirmedQuotaRotationProtocolValue("request-boundary-v7") ||
             !LocalPatGateway.IsConfirmedQuotaRotationProtocolValue("request-boundary-v8") ||
             !LocalPatGateway.IsConfirmedQuotaRotationProtocolValue("request-boundary-v9") ||
             !LocalPatGateway.IsConfirmedQuotaRotationProtocolValue("request-boundary-v10") ||
+            !LocalPatGateway.IsConfirmedQuotaRotationProtocolValue("request-boundary-v11") ||
+            !LocalPatGateway.IsConfirmedQuotaRotationProtocolValue("request-boundary-v12") ||
+            !LocalPatGateway.IsConfirmedQuotaRotationProtocolValue("request-boundary-v13") ||
             LocalPatGateway.IsCurrentRotationProtocolValue("request-boundary-v7") ||
             !LocalPatGateway.IsCurrentRotationProtocolValue("request-boundary-v8") ||
             LocalPatGateway.IsCurrentRotationProtocolValue("request-boundary-v9") ||
@@ -1223,8 +1303,8 @@ internal sealed class LocalPatGatewayHost
             LocalPatGateway.IsCompatibleRotationProtocolValue(null))
         {
             throw new InvalidOperationException(
-                "Gateway routing compatibility must accept only request-boundary v3-v10, " +
-                "with v7-v10 confirmed quota signals and v8/v10 success-only activity markers.");
+                "Gateway routing compatibility must accept only request-boundary v3-v13, " +
+                "with v7-v13 confirmed quota signals and v8/v10/v12-v13 success-only activity markers.");
         }
 
         var pat = ParseBearerCredential("Bearer at-test-only-not-a-real-token");
@@ -1256,6 +1336,9 @@ internal sealed class LocalPatGatewayHost
                         "backend-api/%25252e%25252e%25252f/v1/models"),
                 out _) ||
             !ShouldForwardRequestHeader("content-encoding") ||
+            !ShouldForwardRequestHeader("originator") ||
+            !ShouldForwardRequestHeader("user-agent") ||
+            !ShouldForwardRequestHeader("version") ||
             ShouldForwardRequestHeader("x-codex-installation-id") ||
             !ShouldForwardRequestHeader("x-codex-installation-id", true) ||
             ShouldForwardRequestHeader("authorization", true) ||
@@ -1263,11 +1346,26 @@ internal sealed class LocalPatGatewayHost
             ShouldForwardRequestHeader("chatgpt-account-id", true) ||
             ShouldForwardRequestHeader("x-openai-workspace-id", true) ||
             ShouldForwardRequestHeader("x-openai-future-client-metadata", true) ||
-            ShouldForwardRequestHeader(LocalPatGatewayControl.ChallengeHeader, true))
+            ShouldForwardRequestHeader(LocalPatGatewayControl.ChallengeHeader, true) ||
+            !IsVersionAtLeast("0.153.4", RequiredCodexVersion) ||
+            IsVersionAtLeast("0.153.3", RequiredCodexVersion) ||
+            !IsCodexUserAgentAtLeast(
+                "codex_cli_rs/0.153.4 (Windows 10.0.0; x86_64)",
+                RequiredCodexVersion) ||
+            IsCodexUserAgentAtLeast(
+                "codex_cli_rs/0.144.4 (Windows 10.0.0; x86_64)",
+                RequiredCodexVersion))
         {
             throw new InvalidOperationException(
                 "Gateway routing must stay open within fixed ChatGPT prefixes and reject escapes.");
         }
+
+        if (!ShouldRejectSharedOAuthModelRequest(true, false, true, false) ||
+            ShouldRejectSharedOAuthModelRequest(true, false, true, true) ||
+            ShouldRejectSharedOAuthModelRequest(true, true, true, false) ||
+            ShouldRejectSharedOAuthModelRequest(false, false, true, false) ||
+            ShouldRejectSharedOAuthModelRequest(true, false, false, false))
+            throw new InvalidOperationException("Explicit authenticated OAuth tests must not be rejected as dual-login traffic.");
 
         var transportKey = new string('A', 64);
         var sourceKey = new string('B', 64);
@@ -1331,6 +1429,18 @@ internal sealed class LocalPatGatewayHost
             new Uri("https://api.example.invalid/v1"),
             new Uri(LocalPatGateway.ListenerPrefix + "backend-api/codex/responses?stream=true"),
             out var compatibleUri);
+        var compatibleCompactUriOk = TryBuildCompatibleApiUpstreamUri(
+            new Uri("https://api.example.invalid/v1"),
+            new Uri(LocalPatGateway.ListenerPrefix + "backend-api/codex/responses/compact?stream=false"),
+            out var compatibleCompactUri);
+        var compatibleExtraPathRejected = !TryBuildCompatibleApiUpstreamUri(
+            new Uri("https://api.example.invalid/v1"),
+            new Uri(LocalPatGateway.ListenerPrefix + "backend-api/codex/responses/compact/extra"),
+            out _);
+        var compatibleTraversalRejected = !TryBuildCompatibleApiUpstreamUri(
+            new Uri("https://api.example.invalid/v1"),
+            new Uri(LocalPatGateway.ListenerPrefix + "backend-api/codex/responses/%252e%252e/secret"),
+            out _);
         if (!activated ||
             !ShouldApplyRotationAtRequestBoundary(
                 isModelRequest: true,
@@ -1347,6 +1457,10 @@ internal sealed class LocalPatGatewayHost
             SelectChatGptAccountId(oauthSelected, null, "account-old") != "account-target" ||
             !compatibleUriOk ||
             compatibleUri.AbsoluteUri != "https://api.example.invalid/v1/responses?stream=true" ||
+            !compatibleCompactUriOk ||
+            compatibleCompactUri.AbsoluteUri != "https://api.example.invalid/v1/responses/compact?stream=false" ||
+            !compatibleExtraPathRejected ||
+            !compatibleTraversalRejected ||
             rewrittenDocument.RootElement.GetProperty("model").GetString() != "gpt-api-test" ||
             rewrittenDocument.RootElement.GetProperty("input")[0].GetProperty("content").GetString() != "keep" ||
             Encoding.UTF8.GetString(rewritten).Contains("sk-api-test-only", StringComparison.Ordinal))
@@ -2075,13 +2189,30 @@ internal sealed class LocalPatGatewayHost
                 await WriteErrorAsync(
                     response,
                     HttpStatusCode.Unauthorized,
-                    "请求没有携带可用的 Codex PAT 或 ChatGPT OAuth Bearer。");
+                    "请求没有携带可用的 Codex PAT、ChatGPT OAuth 或已配置兼容 API Bearer。");
                 return;
             }
             credential = BindConfiguredAccountKey(credential);
 
             var isModelRequest = IsModelRequest(context.Request, upstreamUri);
             var isIndependentAccountProbe = IsIndependentAccountProbe(context.Request);
+            var authenticatedAccountProbe = isIndependentAccountProbe &&
+                !string.IsNullOrWhiteSpace(credential.AccountKey) &&
+                LocalPatGatewayControl.ValidateRequest(
+                    context.Request, _controlSecret, LocalPatGateway.QuotaTestProofPurpose(credential.Token));
+            if (ShouldRejectSharedOAuthModelRequest(
+                    isModelRequest,
+                    credential.IsPersonalAccessToken || credential.IsCompatibleApi,
+                    CodexCliService.IsSharedDualLoginModeConfigured(),
+                    authenticatedAccountProbe))
+            {
+                await WriteErrorAsync(
+                    response,
+                    HttpStatusCode.Conflict,
+                    "本地双登录配置错误：模型请求携带的是 ChatGPT OAuth，而不是所选 PAT/API Bearer。" +
+                    "Account Manager 已阻止本次请求，以免错误消耗 OAuth 模型额度；请重新投放该账号后再试。");
+                return;
+            }
             var rotationBoundaryApplied = false;
             if (ShouldApplyRotationAtRequestBoundary(
                     isModelRequest,
@@ -2740,6 +2871,13 @@ internal sealed class LocalPatGatewayHost
                 }
                 catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
                 {
+                    var requestWasCanceled = requestCancellationToken.IsCancellationRequested;
+                    ManagerLifecycleDiagnostics.WriteException(
+                        "pat-gateway-upstream-send-failed",
+                        ex,
+                        $"account={NormalizeOptionalAccountKey(credential.AccountKey) ?? "unbound"}; " +
+                        $"request_canceled={requestWasCanceled}; " +
+                        $"header_timeout_ms={(int)UpstreamAttemptHeadersTimeout.TotalMilliseconds}");
                     if (!requestCancellationToken.IsCancellationRequested &&
                         TryActivateRuntimeGlobalProxyFallback(
                             credential,
@@ -2768,9 +2906,46 @@ internal sealed class LocalPatGatewayHost
                     await WriteErrorAsync(
                         response,
                         HttpStatusCode.BadGateway,
-                        "通过本地代理请求 ChatGPT Codex 上游失败：" +
-                        SanitizeNetworkError(ex.Message));
+                        requestWasCanceled
+                            ? "通过本地代理请求 ChatGPT Codex 上游失败：" +
+                              SanitizeNetworkError(ex.Message)
+                            : "通过本地代理请求 ChatGPT Codex 上游失败：上游在 " +
+                              $"{UpstreamAttemptHeadersTimeout.TotalSeconds:0} 秒内未返回响应头，" +
+                              "可能是代理节点响应过慢；请稍后重试或更换代理节点。" +
+                              "（" + SanitizeNetworkError(ex.Message) + "）");
                     return;
+                }
+
+                if (credential.IsCompatibleApi &&
+                    IsCompatibleCompactRequest(context.Request.Url) &&
+                    !attemptResponse.IsSuccessStatusCode)
+                {
+                    var compactErrorBody = await BufferUpstreamErrorResponseAsync(
+                        attemptResponse,
+                        requestCancellationToken);
+                    if (IsCompatibleCompactUnsupportedResponse(
+                            attemptResponse,
+                            compactErrorBody))
+                    {
+                        attemptResponse.Dispose();
+                        await WriteErrorAsync(
+                            response,
+                            HttpStatusCode.BadGateway,
+                            "兼容上游不支持 /responses/compact。该请求没有回退到 ChatGPT OAuth，也没有记为账号额度耗尽；" +
+                            "请改用原生支持 Responses Compact 的兼容上游。");
+                        return;
+                    }
+                    if ((int)attemptResponse.StatusCode >= 500)
+                    {
+                        var upstreamStatus = (int)attemptResponse.StatusCode;
+                        attemptResponse.Dispose();
+                        await WriteErrorAsync(
+                            response,
+                            HttpStatusCode.BadGateway,
+                            $"兼容上游已接收 /responses/compact，但返回 HTTP {upstreamStatus}，" +
+                            "当前上游的 compact 能力不可用。这不是账号额度耗尽，且请求没有回退到 ChatGPT OAuth。");
+                        return;
+                    }
                 }
 
                 if (modelRequestActivity != null &&
@@ -3500,6 +3675,16 @@ internal sealed class LocalPatGatewayHost
             return;
         }
 
+        string? transport = null;
+        if (command.TransportAccountKey != null &&
+            !PatGatewayRotationStore.TryNormalizeAccountKey(
+                command.TransportAccountKey,
+                out transport))
+        {
+            await WriteErrorAsync(response, HttpStatusCode.BadRequest, "PAT 轮换传输账号哈希无效。");
+            return;
+        }
+
         PatGatewayRotationSnapshot rotation;
         try
         {
@@ -3509,11 +3694,16 @@ internal sealed class LocalPatGatewayHost
                 // route. Neither credential crosses the HTTP control plane.
                 _ = ResolveRotationCredential(source);
                 _ = ResolveRotationCredential(target);
+                if (transport != null)
+                {
+                    _ = ResolveRotationCredential(transport);
+                }
                 rotation = _rotationStore.Arm(
                     source,
                     target,
                     DateTimeOffset.UtcNow,
-                    command.ReplaceExistingArmedTarget);
+                    command.ReplaceExistingArmedTarget,
+                    transport);
             }
         }
         catch (Exception ex) when (
@@ -3750,11 +3940,41 @@ internal sealed class LocalPatGatewayHost
             return route;
         }
 
-        var invalidReason = "configuration_reload_failed";
+        List<AccountRecord> accounts;
         try
         {
-            var accounts = _accountStore.LoadAccounts();
-            var settings = _themeService.LoadSettings();
+            accounts = _accountStore.LoadAccounts();
+        }
+        catch (Exception ex) when (
+            ex is IOException or UnauthorizedAccessException or JsonException or
+            InvalidDataException or InvalidOperationException or NotSupportedException or
+            ArgumentException)
+        {
+            ManagerLifecycleDiagnostics.WriteException(
+                "pat-gateway-route-revalidation-deferred",
+                ex,
+                $"read=accounts; attempts={AtomicFilePersistence.DefaultAttempts}; " +
+                $"status={route.Status}; transport={route.TransportAccountKey}; " +
+                $"source={route.SourceAccountKey}; target={route.TargetAccountKey}; " +
+                "route_preserved=true; downstream_bytes=0");
+            return route;
+        }
+
+        if (!_themeService.TryLoadSettings(out var settings, out var settingsError))
+        {
+            ManagerLifecycleDiagnostics.WriteException(
+                "pat-gateway-route-revalidation-deferred",
+                settingsError ?? new IOException("Settings read failed after bounded retries."),
+                $"read=settings; attempts={AtomicFilePersistence.DefaultAttempts}; " +
+                $"status={route.Status}; transport={route.TransportAccountKey}; " +
+                $"source={route.SourceAccountKey}; target={route.TargetAccountKey}; " +
+                "route_preserved=true; downstream_bytes=0");
+            return route;
+        }
+
+        string invalidReason;
+        try
+        {
             _ = AccountRotationConfiguration.Normalize(settings, accounts);
             invalidReason = GetRotationRouteIneligibilityReason(
                                 route,
@@ -3772,8 +3992,13 @@ internal sealed class LocalPatGatewayHost
             InvalidDataException or InvalidOperationException or NotSupportedException or
             ArgumentException)
         {
-            // A route whose configured target cannot be positively revalidated is less
-            // trustworthy than the credential carried by the live Codex request.
+            ManagerLifecycleDiagnostics.WriteException(
+                "pat-gateway-route-revalidation-deferred",
+                ex,
+                $"read=normalized-configuration; attempts=1; status={route.Status}; " +
+                $"transport={route.TransportAccountKey}; source={route.SourceAccountKey}; " +
+                $"target={route.TargetAccountKey}; route_preserved=true; downstream_bytes=0");
+            return route;
         }
 
         _rotationStore.Clear();
@@ -3858,7 +4083,7 @@ internal sealed class LocalPatGatewayHost
 
         // A manager-prepared route belongs to the quota window that armed it.  If that
         // window already reset while Codex was idle, activating the route hours later is
-        // precisely the stale lkcau -> xikeucas/KK failure this guard prevents.  A manual
+        // precisely the stale source-to-target route failure this guard prevents. A manual
         // route armed after that reset belongs to the new window and must remain eligible;
         // otherwise an old persisted reset marker clears every force-switch at its first
         // live request boundary.
@@ -3907,6 +4132,10 @@ internal sealed class LocalPatGatewayHost
         bool isModelRequest,
         bool isIndependentAccountProbe) =>
         isModelRequest && !isIndependentAccountProbe;
+
+    private static bool ShouldRejectSharedOAuthModelRequest(
+        bool isModelRequest, bool isPatOrApi, bool sharedDualLogin, bool authenticatedAccountProbe) =>
+        isModelRequest && !isPatOrApi && sharedDualLogin && !authenticatedAccountProbe;
 
     private bool TrySelectNextTransparentRotationCredential(
         GatewayCredential current,
@@ -4602,8 +4831,34 @@ internal sealed class LocalPatGatewayHost
             return false;
         }
 
-        var path = upstreamUri.AbsolutePath.TrimEnd('/');
-        return path.EndsWith("/responses", StringComparison.OrdinalIgnoreCase);
+        var path = upstreamUri.AbsolutePath;
+        return path.EndsWith("/responses", StringComparison.OrdinalIgnoreCase) ||
+               path.EndsWith("/responses/compact", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsCompatibleCompactRequest(Uri? incoming) =>
+        incoming?.AbsolutePath.Equals(
+            "/backend-api/codex/responses/compact",
+            StringComparison.OrdinalIgnoreCase) == true;
+
+    private static bool IsCompatibleCompactUnsupportedResponse(
+        HttpResponseMessage response,
+        ReadOnlySpan<byte> body)
+    {
+        if (response.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.MethodNotAllowed or
+            HttpStatusCode.NotImplemented)
+        {
+            return true;
+        }
+
+        if (body.IsEmpty)
+        {
+            return false;
+        }
+        var text = Encoding.UTF8.GetString(body);
+        return text.Contains("not_supported", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("unsupported", StringComparison.OrdinalIgnoreCase) &&
+               text.Contains("compact", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool IsIndependentAccountProbe(HttpListenerRequest request)
@@ -5173,7 +5428,53 @@ internal sealed class LocalPatGatewayHost
         _identityCache[key] = new IdentityCacheEntry(
             identity,
             DateTimeOffset.UtcNow + IdentityCacheLifetime);
+        var accountKey = ResolveAccountKeyForPatToken(token);
+        if (accountKey != null)
+        {
+            _ = _accountIdentityStore.Record(accountKey, accountId);
+        }
         return identity;
+    }
+
+    private string? ResolveAccountKeyForPatToken(string token)
+    {
+        try
+        {
+            var matches = _accountStore.LoadAccounts()
+                .Where(account => account.IsAccessToken && !account.IsCompatibleApi)
+                .Where(account =>
+                {
+                    try
+                    {
+                        var configured = CodexCliService.ReadAccessTokenCredential(
+                            Path.Combine(account.CodexHome, "auth.json"));
+                        return TokenHashesEqual(token, configured);
+                    }
+                    catch (Exception ex) when (
+                        ex is IOException or UnauthorizedAccessException or JsonException or
+                        InvalidDataException or FormatException or ArgumentException or
+                        NotSupportedException)
+                    {
+                        return false;
+                    }
+                })
+                .Take(2)
+                .ToList();
+            return matches.Count == 1
+                ? QuotaAccountIdentity.CreateKey(matches[0])
+                : null;
+        }
+        catch (Exception ex) when (
+            ex is IOException or UnauthorizedAccessException or JsonException or
+            InvalidDataException or InvalidOperationException or NotSupportedException or
+            ArgumentException)
+        {
+            ManagerLifecycleDiagnostics.WriteException(
+                "pat-gateway-account-identity-binding-deferred",
+                ex,
+                "credentials_persisted=false");
+            return null;
+        }
     }
 
     private bool IsSessionAffinityAccountEligible(
@@ -6080,8 +6381,7 @@ internal sealed class LocalPatGatewayHost
         var userAgent = request.Headers.TryGetValues("User-Agent", out var userAgentValues)
             ? userAgentValues.FirstOrDefault()
             : null;
-        if (string.IsNullOrWhiteSpace(userAgent) ||
-            !userAgent.StartsWith("codex", StringComparison.OrdinalIgnoreCase))
+        if (!IsCodexUserAgentAtLeast(userAgent, RequiredCodexVersion))
         {
             request.Headers.Remove("User-Agent");
             request.Headers.TryAddWithoutValidation("User-Agent", DefaultUserAgent);
@@ -6126,8 +6426,31 @@ internal sealed class LocalPatGatewayHost
             return false;
         }
 
-        return ProtocolRequestHeaderAllowList.Contains(headerName) ||
+        return ClientCompatibilityHeaderAllowList.Contains(headerName) ||
+               ProtocolRequestHeaderAllowList.Contains(headerName) ||
                forwardClientMetadata && ClientMetadataHeaderAllowList.Contains(headerName);
+    }
+
+    private static bool IsCodexUserAgentAtLeast(string? value, string minimum)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        const string marker = "codex_cli_rs/";
+        var markerIndex = value.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+        if (markerIndex < 0)
+        {
+            return false;
+        }
+
+        var versionStart = markerIndex + marker.Length;
+        var versionEnd = value.IndexOfAny([' ', '\t', '(', ';'], versionStart);
+        var version = versionEnd < 0
+            ? value[versionStart..]
+            : value[versionStart..versionEnd];
+        return IsVersionAtLeast(version, minimum);
     }
 
     private static bool IsVersionAtLeast(string? value, string minimum)
@@ -6311,21 +6634,24 @@ internal sealed class LocalPatGatewayHost
         return true;
     }
 
-    private static GatewayCredential? ReadBearerCredential(HttpListenerRequest request)
+    private GatewayCredential? ReadBearerCredential(HttpListenerRequest request)
     {
-        return ParseBearerCredential(request.Headers["Authorization"]);
+        var authorization = request.Headers["Authorization"];
+        if (!TryReadRawBearerToken(authorization, out var token))
+        {
+            return null;
+        }
+
+        // A compatible endpoint may issue keys whose spelling resembles a PAT or JWT.
+        // Prefer an exact, locally configured API-key owner before generic syntax
+        // classification so transparent rotation and prepared routes retain its account key.
+        return ResolveConfiguredCompatibleApiBearer(token) ??
+               ParseBearerCredential(authorization);
     }
 
     private static GatewayCredential? ParseBearerCredential(string? authorization)
     {
-        authorization = authorization?.Trim();
-        if (string.IsNullOrWhiteSpace(authorization) ||
-            !authorization.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
-        {
-            return null;
-        }
-        var token = authorization["Bearer ".Length..].Trim();
-        if (token.Any(char.IsWhiteSpace))
+        if (!TryReadRawBearerToken(authorization, out var token))
         {
             return null;
         }
@@ -6344,6 +6670,89 @@ internal sealed class LocalPatGatewayHost
                jwtSegments.All(segment => segment.Length > 0)
             ? new GatewayCredential(token, IsPersonalAccessToken: false)
             : null;
+    }
+
+    private static bool TryReadRawBearerToken(
+        string? authorization,
+        out string token)
+    {
+        authorization = authorization?.Trim();
+        token = string.Empty;
+        if (string.IsNullOrWhiteSpace(authorization) ||
+            !authorization.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        token = authorization["Bearer ".Length..].Trim();
+        return token.Length is >= 8 and <= 8192 &&
+               !token.Any(character => char.IsWhiteSpace(character) || char.IsControl(character));
+    }
+
+    private GatewayCredential? ResolveConfiguredCompatibleApiBearer(string token)
+    {
+        try
+        {
+            var matches = new List<(AccountRecord Account, string AccountKey)>();
+            foreach (var account in _accountStore.LoadAccounts().Where(account => account.IsCompatibleApi))
+            {
+                try
+                {
+                    var configuredToken = CodexCliService.ReadAccessTokenCredential(
+                        Path.Combine(account.CodexHome, "auth.json"));
+                    if (TokenHashesEqual(token, configuredToken))
+                    {
+                        matches.Add((account, QuotaAccountIdentity.CreateKey(account)));
+                    }
+                }
+                catch (Exception ex) when (
+                    ex is IOException or UnauthorizedAccessException or JsonException or
+                    InvalidDataException or FormatException or ArgumentException or
+                    NotSupportedException)
+                {
+                    // A broken unrelated API record cannot hide the exact active key.
+                }
+            }
+            if (matches.Count == 0)
+            {
+                return null;
+            }
+
+            var route = _rotationStore.Load();
+            var selected = matches.FirstOrDefault(candidate =>
+                PatGatewayRotationStore.TryNormalizeAccountKey(
+                    route.TransportAccountKey,
+                    out var routeTransport) &&
+                candidate.AccountKey.Equals(routeTransport, StringComparison.Ordinal));
+            if (selected.Account == null)
+            {
+                var currentName = _themeService.LoadSettings().CurrentAccountName?.Trim();
+                var currentMatches = matches
+                    .Where(candidate => candidate.Account.Name.Equals(
+                        currentName,
+                        StringComparison.OrdinalIgnoreCase))
+                    .Take(2)
+                    .ToList();
+                selected = currentMatches.Count == 1
+                    ? currentMatches[0]
+                    : matches.Count == 1
+                        ? matches[0]
+                        : default;
+            }
+
+            return selected.Account == null
+                ? null
+                : ResolveRotationCredential(selected.AccountKey);
+        }
+        catch (Exception ex) when (
+            ex is IOException or UnauthorizedAccessException or JsonException or
+            InvalidDataException or FormatException or ArgumentException or
+            NotSupportedException or InvalidOperationException)
+        {
+            // Unknown or ambiguous API keys are rejected by the caller. They are never
+            // forwarded to chatgpt.com as if they were an OAuth token.
+            return null;
+        }
     }
 
     private static string? ReadSafeIncomingAccountId(HttpListenerRequest request)
@@ -6461,6 +6870,11 @@ internal sealed class LocalPatGatewayHost
             !string.IsNullOrEmpty(baseUri.Query) ||
             !string.IsNullOrEmpty(baseUri.Fragment) ||
             incoming == null ||
+            !incoming.Scheme.Equals("http", StringComparison.OrdinalIgnoreCase) ||
+            !LocalProxyDetector.IsLoopbackHost(incoming.Host) ||
+            incoming.Port != LocalPatGateway.Port ||
+            !string.IsNullOrEmpty(incoming.UserInfo) ||
+            !string.IsNullOrEmpty(incoming.Fragment) ||
             ContainsDotSegments(incoming.OriginalString.Split('?', 2)[0]))
         {
             return false;
@@ -6472,11 +6886,8 @@ internal sealed class LocalPatGatewayHost
             return false;
         }
         var suffix = incoming.AbsolutePath[modelGatewayPrefix.Length..];
-        if (suffix.Length == 0)
-        {
-            suffix = "/responses";
-        }
-        if (!suffix.Equals("/responses", StringComparison.OrdinalIgnoreCase))
+        if (!suffix.Equals("/responses", StringComparison.OrdinalIgnoreCase) &&
+            !suffix.Equals("/responses/compact", StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
@@ -6719,6 +7130,8 @@ internal sealed class LocalPatGatewayHost
         string? SourceAccountKey,
         [property: System.Text.Json.Serialization.JsonPropertyName("targetAccountKey")]
         string? TargetAccountKey,
+        [property: System.Text.Json.Serialization.JsonPropertyName("transportAccountKey")]
+        string? TransportAccountKey,
         [property: System.Text.Json.Serialization.JsonPropertyName("replaceExistingArmedTarget")]
         bool ReplaceExistingArmedTarget = false);
     private sealed record SessionAffinityInvalidateRequest(

@@ -936,6 +936,17 @@ public partial class Form1
             }
         }
         RerenderAccountRotationWorkspacePreservingScroll();
+
+        // Moving an account into the primary/“使用” pool is an explicit signal that a
+        // backup session may return now.  The 250 ms quota timer is intentionally
+        // lightweight and can be throttled while the rotation page is being rebuilt, so
+        // perform one immediate local-evidence check as well.  This never probes the
+        // provider by itself; PreparePrimaryPoolReturnAsync still requires the same
+        // persisted quota evidence and request-boundary gateway route as the timer path.
+        if (target == AccountRotationPool.Primary)
+        {
+            RefreshAccountRotationPrimaryReturnIfNeeded();
+        }
     }
 
     private void MoveAccountRotationAccount(AccountRecord account, int offset)

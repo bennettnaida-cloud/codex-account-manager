@@ -42,14 +42,34 @@ public sealed class AccountStore
             return [];
         }
 
-        var json = File.ReadAllText(AccountsPath);
-        var accounts = JsonSerializer.Deserialize<List<AccountRecord>>(json) ?? [];
-        foreach (var account in accounts)
+        Exception? lastError = null;
+        for (var attempt = 0; attempt < AtomicFilePersistence.DefaultAttempts; attempt++)
         {
-            NormalizeAccount(account);
+            try
+            {
+                var json = AtomicFilePersistence.ReadAllTextWithRetry(AccountsPath, attempts: 1);
+                var accounts = JsonSerializer.Deserialize<List<AccountRecord>>(json) ?? [];
+                foreach (var account in accounts)
+                {
+                    NormalizeAccount(account);
+                }
+                return accounts;
+            }
+            catch (Exception ex) when (
+                ex is IOException or UnauthorizedAccessException or JsonException or
+                NotSupportedException)
+            {
+                lastError = ex;
+                if (attempt + 1 < AtomicFilePersistence.DefaultAttempts)
+                {
+                    Thread.Sleep(30 * (attempt + 1));
+                }
+            }
         }
 
-        return accounts;
+        throw new IOException(
+            "账号配置文件在有限重试后仍无法读取；已保留磁盘原文件和当前路由。",
+            lastError);
     }
 
     public void SaveAccounts(IEnumerable<AccountRecord> accounts)
@@ -59,7 +79,9 @@ public sealed class AccountStore
             .Where(a => !string.IsNullOrWhiteSpace(a.Name))
             .OrderBy(a => a.Name, StringComparer.OrdinalIgnoreCase)
             .ToList();
-        File.WriteAllText(AccountsPath, JsonSerializer.Serialize(ordered, _jsonOptions));
+        AtomicFilePersistence.WriteAllText(
+            AccountsPath,
+            JsonSerializer.Serialize(ordered, _jsonOptions));
     }
 
     public Dictionary<string, TokenMetadata> LoadTokenMetadata()
@@ -71,7 +93,7 @@ public sealed class AccountStore
 
         try
         {
-            var json = File.ReadAllText(TokenMetadataPath);
+            var json = AtomicFilePersistence.ReadAllTextWithRetry(TokenMetadataPath);
             return JsonSerializer.Deserialize<Dictionary<string, TokenMetadata>>(json) ??
                    new Dictionary<string, TokenMetadata>(StringComparer.OrdinalIgnoreCase);
         }
@@ -83,7 +105,9 @@ public sealed class AccountStore
 
     public void SaveTokenMetadata(Dictionary<string, TokenMetadata> metadata)
     {
-        File.WriteAllText(TokenMetadataPath, JsonSerializer.Serialize(metadata, _jsonOptions));
+        AtomicFilePersistence.WriteAllText(
+            TokenMetadataPath,
+            JsonSerializer.Serialize(metadata, _jsonOptions));
     }
 
     public void SaveAccount(string name, string codexHome, string? originalName)
