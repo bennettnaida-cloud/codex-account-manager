@@ -155,6 +155,17 @@ internal static class PatAutoRotationPolicy
         return null;
     }
 
+    internal static bool CanRetryCompatiblePrimary(
+        DateTimeOffset resetAtUtc, PatGatewayQuotaSignal? exhaustion, DateTimeOffset now)
+    {
+        if (resetAtUtc != default && resetAtUtc + AccountRotationConfiguration.PrimaryResetGracePeriod > now)
+            return false;
+        if (exhaustion == null) return true;
+        return exhaustion.ResetAtUtc is { } reset
+            ? reset + AccountRotationConfiguration.PrimaryResetGracePeriod <= now
+            : exhaustion.ObservedAtUtc + QuotaLimitedSignalLifetime <= now;
+    }
+
     internal static bool HasLocallyAvailableFiveHourQuota(
         PersistedQuotaSnapshot snapshot,
         PatGatewayQuotaSignal? latestConfirmedExhaustion,
@@ -429,6 +440,13 @@ internal static class PatAutoRotationPolicy
             lastQuotaLimitedAtUtc: null,
             now);
         var localSnapshotKey = new string('D', 64);
+        var apiExhaustion = new PatGatewayQuotaSignal(1, localSnapshotKey, now);
+        if (!CanRetryCompatiblePrimary(default, null, now) ||
+            CanRetryCompatiblePrimary(default, apiExhaustion, now) ||
+            !CanRetryCompatiblePrimary(default, apiExhaustion, now.AddMinutes(16)) ||
+            CanRetryCompatiblePrimary(now.AddHours(1), null, now) ||
+            CanRetryCompatiblePrimary(default, apiExhaustion with { ResetAtUtc = now.AddHours(2) }, now.AddMinutes(16)))
+            throw new InvalidOperationException("API primary return must allow unknown quota but respect exhaustion cooldown/reset.");
         var localAvailableSnapshot = new PersistedQuotaSnapshot(
             localSnapshotKey,
             now,

@@ -10,7 +10,7 @@ using System.Text.Json.Serialization;
 
 namespace CodexAccountManager;
 
-public enum ProxyNodeProtocol { Http, Https, Socks5, Vless, Vmess, Trojan, Shadowsocks }
+public enum ProxyNodeProtocol { Http, Https, Socks5, Vless, Vmess, Trojan, Shadowsocks, Hysteria2 }
 public enum ProxyBindingMode { InheritGlobal, FixedNode, Disabled }
 public enum ProxyFallbackPolicy { FailClosed, InheritGlobal }
 
@@ -19,6 +19,10 @@ public sealed class ProxyNodeRecord
     [JsonPropertyName("nodeId")] public string NodeId { get; set; } = Guid.NewGuid().ToString("N");
     [JsonPropertyName("name")] public string Name { get; set; } = "未命名节点";
     [JsonPropertyName("scheme")] public string Scheme { get; set; } = "http";
+    // Preserve legacy loopback adapter addresses for a still-running older gateway
+    // while new resolvers can start the attached native node themselves.
+    [JsonPropertyName("nativeScheme")] public string? NativeScheme { get; set; }
+    [JsonIgnore] public string EffectiveScheme => string.IsNullOrWhiteSpace(NativeScheme) ? Scheme : NativeScheme;
     [JsonPropertyName("address")] public string Address { get; set; } = "";
     [JsonPropertyName("port")] public int Port { get; set; }
     [JsonPropertyName("username")] public string? Username { get; set; }
@@ -26,6 +30,7 @@ public sealed class ProxyNodeRecord
     // Native subscription protocols are kept encrypted until ProxyCoreService builds
     // an ephemeral Xray config.  The raw URI is never rendered or written to logs.
     [JsonPropertyName("encryptedNativeUri")] public string? EncryptedNativeUri { get; set; }
+    [JsonPropertyName("encryptedNativeOutbound")] public string? EncryptedNativeOutbound { get; set; }
     [JsonPropertyName("enabled")] public bool Enabled { get; set; } = true;
     [JsonPropertyName("lastHealthTestAtUtc")] public DateTimeOffset? LastHealthTestAtUtc { get; set; }
     [JsonPropertyName("lastTcpMilliseconds")] public double? LastTcpMilliseconds { get; set; }
@@ -46,11 +51,8 @@ public sealed class ProxyNodeRecord
         Uri.CheckHostName(Address) == UriHostNameType.IPv6 ? $"[{Address}]:{Port}" : $"{Address}:{Port}";
     [JsonIgnore] public bool HasPassword => !string.IsNullOrWhiteSpace(EncryptedPassword);
     [JsonIgnore] public string? Password { get; set; }
-    [JsonIgnore] public bool IsNativeProtocol => Scheme.Equals("vless", StringComparison.OrdinalIgnoreCase) ||
-        Scheme.Equals("vmess", StringComparison.OrdinalIgnoreCase) ||
-        Scheme.Equals("trojan", StringComparison.OrdinalIgnoreCase) ||
-        Scheme.Equals("ss", StringComparison.OrdinalIgnoreCase) ||
-        Scheme.Equals("shadowsocks", StringComparison.OrdinalIgnoreCase);
+    [JsonIgnore] public bool IsNativeProtocol => EffectiveScheme.ToLowerInvariant() is
+        "vless" or "vmess" or "trojan" or "ss" or "shadowsocks" or "hysteria2" or "hy2";
 
     public void SetPassword(string? password)
     {
@@ -66,17 +68,17 @@ public sealed class ProxyNodeRecord
     public bool TryGetNativeUri(out string uri) => ProxyNodeStore.TryUnprotect(EncryptedNativeUri, out uri);
 
     public bool TryGetProtocol(out ProxyNodeProtocol protocol) =>
-        Enum.TryParse(Scheme.Equals("shadowsocks", StringComparison.OrdinalIgnoreCase) ? "ss" : Scheme, true, out protocol) &&
+        Enum.TryParse(EffectiveScheme.ToLowerInvariant() switch { "ss" or "shadowsocks" => "Shadowsocks", "hy2" => "Hysteria2", _ => EffectiveScheme }, true, out protocol) &&
         protocol is ProxyNodeProtocol.Http or ProxyNodeProtocol.Https or ProxyNodeProtocol.Socks5 or
-            ProxyNodeProtocol.Vless or ProxyNodeProtocol.Vmess or ProxyNodeProtocol.Trojan or ProxyNodeProtocol.Shadowsocks;
+            ProxyNodeProtocol.Vless or ProxyNodeProtocol.Vmess or ProxyNodeProtocol.Trojan or ProxyNodeProtocol.Shadowsocks or ProxyNodeProtocol.Hysteria2;
 
     public bool TryValidate(out string error)
     {
         error = "";
-        if (!TryGetProtocol(out _)) { error = "协议必须是 HTTP、HTTPS、SOCKS5、VLESS、VMess、Trojan 或 SS。"; return false; }
+        if (!TryGetProtocol(out _)) { error = "协议必须是 HTTP、HTTPS、SOCKS5、VLESS、VMess、Trojan、SS 或 Hysteria2。"; return false; }
         if (string.IsNullOrWhiteSpace(Address) || Address.Any(char.IsControl) || Address.Contains('/')) { error = "节点地址无效。"; return false; }
         if (Port is < 1 or > 65535) { error = "端口必须在 1-65535。"; return false; }
-        if (IsNativeProtocol && string.IsNullOrWhiteSpace(EncryptedNativeUri)) { error = "原生协议缺少受保护的订阅配置。"; return false; }
+        if (IsNativeProtocol && string.IsNullOrWhiteSpace(EncryptedNativeUri) && string.IsNullOrWhiteSpace(EncryptedNativeOutbound)) { error = "原生协议缺少受保护的订阅配置。"; return false; }
         return true;
     }
 
@@ -233,7 +235,7 @@ public sealed class ProxyNodeStore
         var schemeMarker = value.IndexOf("://", StringComparison.Ordinal);
         if (schemeMarker <= 0) { error = "无法解析代理 URL。"; return false; }
         var scheme = value[..schemeMarker].ToLowerInvariant();
-        if (scheme is ("vless" or "vmess" or "trojan" or "ss" or "shadowsocks"))
+        if (scheme is ("vless" or "vmess" or "trojan" or "ss" or "shadowsocks" or "hysteria2" or "hy2"))
         {
             if (!ProxyNativeUriParser.TryGetMetadata(value, out var nativeAddress, out var nativePort, out var nativeName, out error)) return false;
             node.Name = nativeName;
@@ -272,7 +274,9 @@ public sealed class ProxyNodeStore
                 scheme.Equals("vless", StringComparison.OrdinalIgnoreCase) ||
                 scheme.Equals("trojan", StringComparison.OrdinalIgnoreCase) ||
                 scheme.Equals("ss", StringComparison.OrdinalIgnoreCase) ||
-                scheme.Equals("shadowsocks", StringComparison.OrdinalIgnoreCase))
+                scheme.Equals("shadowsocks", StringComparison.OrdinalIgnoreCase) ||
+                scheme.Equals("hysteria2", StringComparison.OrdinalIgnoreCase) ||
+                scheme.Equals("hy2", StringComparison.OrdinalIgnoreCase))
                 return scheme + "://***";
         }
         if (Uri.TryCreate(value, UriKind.Absolute, out var uri) && !string.IsNullOrEmpty(uri.UserInfo))
@@ -448,7 +452,9 @@ public static class ProxyHttpClientFactory
         if (!resolution.Success || resolution.ProxyUri == null) throw new InvalidOperationException(resolution.Error);
         if (resolution.ProxyUri.Scheme.Equals("socks5", StringComparison.OrdinalIgnoreCase))
         {
-            var handler = new SocketsHttpHandler { UseProxy = false, ConnectCallback = (context, cancellation) => Socks5ConnectAsync(context.DnsEndPoint, node, cancellation) };
+            var handler = new SocketsHttpHandler { UseProxy = false, UseCookies = false, AllowAutoRedirect = false,
+                AutomaticDecompression = DecompressionMethods.All,
+                ConnectCallback = (context, cancellation) => Socks5ConnectAsync(context.DnsEndPoint, node, cancellation) };
             return new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
         }
         var web = new WebProxy(resolution.ProxyUri);
@@ -462,9 +468,12 @@ public static class ProxyHttpClientFactory
     private static async ValueTask<Stream> Socks5ConnectAsync(DnsEndPoint endpoint, ProxyNodeRecord? node, CancellationToken cancellation)
     {
         if (node == null) throw new InvalidOperationException("SOCKS5 节点配置缺失。");
-        using var socket = new Socket(SocketType.Stream, ProtocolType.Tcp);
+        var socket = new Socket(SocketType.Stream, ProtocolType.Tcp);
+        NetworkStream? stream = null;
+        try
+        {
         await socket.ConnectAsync(node.Address, node.Port, cancellation);
-        var stream = new NetworkStream(socket, ownsSocket: true);
+        stream = new NetworkStream(socket, ownsSocket: true);
         var wantsAuth = !string.IsNullOrWhiteSpace(node.Username);
         await stream.WriteAsync(wantsAuth ? new byte[] { 5, 2, 0, 2 } : new byte[] { 5, 1, 0 }, cancellation);
         var hello = new byte[2]; await ReadExact(stream, hello, cancellation);
@@ -480,8 +489,41 @@ public static class ProxyHttpClientFactory
         var host = Encoding.UTF8.GetBytes(endpoint.Host); var port = BitConverter.GetBytes(IPAddress.HostToNetworkOrder((short)endpoint.Port));
         var request = new byte[7 + host.Length]; request[0] = 5; request[1] = 1; request[2] = 0; request[3] = 3; request[4] = (byte)host.Length; Buffer.BlockCopy(host, 0, request, 5, host.Length); Buffer.BlockCopy(port, 0, request, 5 + host.Length, 2);
         await stream.WriteAsync(request, cancellation); var head = new byte[4]; await ReadExact(stream, head, cancellation); if (head[1] != 0) throw new IOException("SOCKS5 连接被拒绝。");
-        var length = head[3] switch { 1 => 4, 3 => (await ReadOne(stream, cancellation)), 4 => 16, _ => 0 }; var tail = new byte[length + 2]; await ReadExact(stream, tail, cancellation); return stream;
+        var length = head[3] switch { 1 => 4, 3 => (await ReadOne(stream, cancellation)), 4 => 16, _ => throw new IOException("SOCKS5 地址类型无效。") }; var tail = new byte[length + 2]; await ReadExact(stream, tail, cancellation); return stream;
+        }
+        catch
+        {
+            stream?.Dispose();
+            socket.Dispose();
+            throw;
+        }
     }
     private static async Task ReadExact(Stream stream, byte[] buffer, CancellationToken token) { var offset = 0; while (offset < buffer.Length) { var n = await stream.ReadAsync(buffer.AsMemory(offset), token); if (n == 0) throw new EndOfStreamException(); offset += n; } }
     private static async Task<int> ReadOne(Stream stream, CancellationToken token) { var b = new byte[1]; await ReadExact(stream, b, token); return b[0]; }
+
+    internal static void ValidateSocksStreamLifetime()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        var server = Task.Run(async () =>
+        {
+            using var peer = await listener.AcceptTcpClientAsync(timeout.Token);
+            using var stream = peer.GetStream();
+            var hello = new byte[3]; await stream.ReadExactlyAsync(hello, timeout.Token);
+            await stream.WriteAsync(new byte[] { 5, 0 }, timeout.Token);
+            var header = new byte[5]; await stream.ReadExactlyAsync(header, timeout.Token);
+            var address = new byte[header[4] + 2]; await stream.ReadExactlyAsync(address, timeout.Token);
+            await stream.WriteAsync(new byte[] { 5, 0, 0, 1, 127, 0, 0, 1, 0, 80 }, timeout.Token);
+            using var reader = new StreamReader(stream, leaveOpen: true);
+            while (!string.IsNullOrEmpty(await reader.ReadLineAsync(timeout.Token))) { }
+            await stream.WriteAsync(Encoding.ASCII.GetBytes("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"), timeout.Token);
+        });
+        var node = new ProxyNodeRecord { Scheme = "socks5", Address = "127.0.0.1", Port = port };
+        using var client = Create(new ProxyResolution(true, node.BuildUri(), node.NodeId, "test", ""), node);
+        if (client.GetStringAsync("http://example.invalid/", timeout.Token).GetAwaiter().GetResult() != "ok")
+            throw new InvalidOperationException("SOCKS stream closed before the HTTP request finished.");
+        server.GetAwaiter().GetResult();
+    }
 }

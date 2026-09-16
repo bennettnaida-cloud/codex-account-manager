@@ -547,6 +547,10 @@ public sealed class AccountStore
         // authKind was absent in early manifests. Normalize all known spellings while
         // retaining the historical Access Token fallback for a missing value.
         account.AuthKind = AccountAuthKind.Normalize(account.AuthKind);
+        if (!account.IsCompatibleApi)
+        {
+            account.UseBundledCompatibleApiModelCatalog = false;
+        }
         if (string.IsNullOrWhiteSpace(account.ApiProviderName))
         {
             account.ApiProviderName = "OpenAI";
@@ -651,7 +655,6 @@ chatgpt_base_url = {TomlString(LocalPatGateway.ChatGptBaseUrl)}
 disable_response_storage = true
 model_provider = {TomlString(AccessTokenProviderId)}
 service_tier = {TomlString(normalizedServiceTier)}
-model_auto_compact_token_limit = 1000000000
 windows_wsl_setup_acknowledged = true
 
 approval_policy = "never"
@@ -659,7 +662,7 @@ sandbox_mode = "danger-full-access"
 
 [features]
 js_repl = false
-remote_compaction_v2 = false
+remote_compaction_v2 = true
 remote_plugin = false
 plugins = false
 
@@ -723,11 +726,10 @@ model_reasoning_effort = "xhigh"
 disable_response_storage = true
 network_access = "enabled"
 service_tier = {TomlString(normalizedServiceTier)}
-model_auto_compact_token_limit = 1000000000
 windows_wsl_setup_acknowledged = true
 
 [features]
-remote_compaction_v2 = false
+remote_compaction_v2 = true
 remote_plugin = false
 
 [model_providers.{CompatibleApiProviderId}]

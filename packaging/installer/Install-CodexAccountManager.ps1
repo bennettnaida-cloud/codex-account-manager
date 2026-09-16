@@ -286,7 +286,7 @@ function New-ManagerShortcut {
     $shortcut = $shell.CreateShortcut($ShortcutPath)
     $shortcut.TargetPath = $ExecutablePath
     $shortcut.WorkingDirectory = $WorkingDirectory
-    $shortcut.Arguments = ''
+    $shortcut.Arguments = '--manager-root "' + $WorkingDirectory + '"'
     $shortcut.IconLocation = $ExecutablePath + ',0'
     $shortcut.Description = '管理和切换 Codex 账号'
     $shortcut.Save()
@@ -406,9 +406,12 @@ try {
     $startMenuFolder = Join-Path ([Environment]::GetFolderPath('Programs')) 'Codex Account Manager'
     $startMenuShortcut = Join-Path $startMenuFolder 'Codex Account Manager.lnk'
     if (-not $NoShortcuts) {
-        Write-InstallerProgress -Status '正在创建桌面和开始菜单快捷方式。' -Percent 80
+        Write-InstallerProgress -Status '正在更新桌面、开始菜单和已有任务栏快捷方式。' -Percent 80
         New-ManagerShortcut -ShortcutPath $desktopShortcut -ExecutablePath $installedExe -WorkingDirectory $managerRoot
         New-ManagerShortcut -ShortcutPath $startMenuShortcut -ExecutablePath $installedExe -WorkingDirectory $managerRoot
+        . (Join-Path $PSScriptRoot 'Sync-ManagerShortcuts.ps1')
+        Sync-ManagerShortcuts -ExecutablePath $installedExe -ManagerRoot $managerRoot |
+            ForEach-Object { Write-Output "Updated shortcut: $_" }
         Copy-Item -LiteralPath (Join-Path $installRoot '卸载 Codex Account Manager.cmd') -Destination $startMenuFolder -Force
     }
 

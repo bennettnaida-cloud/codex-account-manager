@@ -13,11 +13,12 @@ Codex Account Manager 是一个在本机运行的 Codex 多账号管理器。它
 | 平台 | 安装包 | 校验文件 | 要求 |
 | --- | --- | --- | --- |
 | Windows | [下载最新一键安装包](https://github.com/bennettnaida-cloud/codex-account-manager/releases/download/latest/CodexAccountManager-Windows-latest.zip) | [SHA-256](https://github.com/bennettnaida-cloud/codex-account-manager/releases/download/latest/CodexAccountManager-Windows-latest.zip.sha256) | Windows 10/11 x64 |
-| macOS | [下载 Apple Silicon 安装包](https://github.com/bennettnaida-cloud/codex-account-manager/releases/download/latest/CodexAccountManager-macOS-latest.zip) | [SHA-256](https://github.com/bennettnaida-cloud/codex-account-manager/releases/download/latest/CodexAccountManager-macOS-latest.zip.sha256) | Apple Silicon，macOS 12+ |
 
 也可以打开 [Latest Release](https://github.com/bennettnaida-cloud/codex-account-manager/releases/tag/latest) 查看版本、发布时间和全部文件。
 
-安装包内置运行所需的 Codex CLI。Windows 不要求另装 .NET，macOS 不要求另装 Node.js。
+当前发布为 Windows 2.3.22，内置 Codex CLI 0.154.0，无需另装 .NET。旧 macOS 下载包已停止提供；仓库中的 macOS 源码保留，但不代表已同步验证本次 Windows 修复。
+
+本次修复包含旧会话续聊用量统计、轮换、逐账号代理与模型目录，以及升级时同步任务栏快捷方式。桌面兼容验证基线为 Windows OpenAI.Codex 26.908.9136.0（ChatGPT.exe）；未来版本及第三方上游仍需按实际协议验证。
 
 ## 这个项目解决什么问题
 

@@ -10,5 +10,19 @@ public sealed partial class CodexCliService
     private const string CompatibleApiDefaultModel = "gpt-5.5";
     private const string CompatibleApiReasoningEffort = "xhigh";
     private const string DesktopServiceTier = "default";
-    private const int DesktopAutoCompactTokenLimit = 1_000_000_000;
+    private const int LegacyDisabledAutoCompactTokenLimit = 1_000_000_000;
+
+    private static string GetAccessTokenModel(AccountRecord? account)
+    {
+        if (account != null && !string.IsNullOrWhiteSpace(account.AccessTokenModel))
+        {
+            var configured = account.AccessTokenModel.Trim();
+            if (GetCompatibleApiModelIdValidationError(configured) == null)
+            {
+                return configured;
+            }
+        }
+
+        return AccessTokenModel;
+    }
 }

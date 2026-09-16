@@ -259,7 +259,7 @@ public partial class Form1 : Form
     private static readonly TimeSpan QuotaRollingWindowRefreshInterval = TimeSpan.FromSeconds(10);
     // Only the account launched during this manager session is eligible for an automatic
     // official read. Opening the quota workspace and loading an account never opt it in.
-    private static readonly TimeSpan OfficialQuotaActiveRefreshInterval = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan OfficialQuotaActiveRefreshInterval = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan UnknownQuotaResetRetryDelay = TimeSpan.FromMinutes(2);
     private static readonly TimeSpan ResetCreditUnavailableRetryDelay = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan MinimalQuotaPostRefreshTimeout = TimeSpan.FromSeconds(30);
@@ -2129,7 +2129,9 @@ public partial class Form1 : Form
 
                 _patAutoRotationState = PatAutoRotationState.WaitingForRequestBoundary;
                 _statusBox.Text =
-                    $"使用轮换池账号 {candidate.Name} 的本地额度信息已确认可用；" +
+                    (candidate.IsCompatibleApi
+                        ? $"使用轮换池账号 {candidate.Name} 没有仍有效的额度耗尽标记，已安排重试；"
+                        : $"使用轮换池账号 {candidate.Name} 的本地额度信息已确认可用；") +
                     "当前响应继续，下一次模型请求自动返回使用轮换池。";
                 UpdatePatAutoRotationControls();
                 var activatedAtUtc = await WaitForPatGatewayRotationActivationAsync(
@@ -6684,7 +6686,7 @@ public partial class Form1 : Form
                 var desktopSidebarPruned = await Task.Run(() =>
                     _codex.TryPruneDeletedDesktopSidebarState(
                         allowWhileOfficialClientRunning: desktopSidebarRefreshPending));
-                if (desktopSidebarRefreshPending)
+                if (desktopSidebarRefreshPending || cleanupPending)
                 {
                     ScheduleDeletedDesktopSidebarPruneAfterClientExit();
                 }
@@ -6882,6 +6884,7 @@ public partial class Form1 : Form
                 {
                     if (!_codex.IsOfficialWindowsClientRunning())
                     {
+                        RetryDeletedThreadArtifactsAcrossHomes();
                         CodexRolloutHistoryRepairService.TryRepairLaggingPaginatedRollouts(
                             CodexCliService.GetDefaultCodexHome(),
                             allowOrdinalRewrite: true);
@@ -6897,6 +6900,51 @@ public partial class Form1 : Form
                 Interlocked.Exchange(ref _deletedDesktopSidebarPruneScheduled, 0);
             }
         });
+    }
+
+    private void RetryDeletedThreadArtifactsAcrossHomes()
+    {
+        try
+        {
+            var sharedHome = CodexCliService.GetDefaultCodexHome();
+            var deletedIds = SharedHistoryService.LoadDeletedThreadIds(sharedHome);
+            if (deletedIds.Count == 0)
+            {
+                return;
+            }
+
+            // Reload from disk because accounts can be added while this background waiter is
+            // armed.  A stale UI snapshot must not leave a newly added account able to merge a
+            // deleted task back into the shared history.
+            var homes = _store.LoadAccounts()
+                .Select(account => account.CodexHome)
+                .Append(sharedHome)
+                .Where(home => !string.IsNullOrWhiteSpace(home))
+                .Select(Path.GetFullPath)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            var failures = 0;
+            foreach (var threadId in deletedIds)
+            {
+                foreach (var home in homes)
+                {
+                    if (!_sharedHistory.TryDeleteThreadArtifacts(home, threadId))
+                    {
+                        failures++;
+                    }
+                }
+            }
+
+            ManagerLifecycleDiagnostics.Write(
+                "deleted-thread-artifacts-retried-after-client-exit",
+                $"deleted_ids={deletedIds.Count}; homes={homes.Count}; failures={failures}");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            ManagerLifecycleDiagnostics.WriteException(
+                "deleted-thread-artifacts-retry-failed",
+                ex);
+        }
     }
 
     private async Task NormalizeUnifiedHistorySectionOrderAsync()
@@ -11583,7 +11631,7 @@ public partial class Form1 : Form
             subtitle,
             account.IsCompatibleApi
                 ? "本地 Token 用量按 API 单价估算。"
-                : "打开额度页只读本地日志；当前已启动账号每 10 秒自动刷新一次官方百分比，也可以手动查询。"
+                : "打开额度页只读本地日志；当前已启动账号每 5 秒自动刷新一次官方百分比，也可以手动查询。"
         );
         card.Controls.Add(subtitle);
 
@@ -14343,7 +14391,7 @@ public partial class Form1 : Form
         ValidateQuotaResetLayoutAtScale(1.5F);
         ValidateQuotaResetLayoutAtScale(2F);
         ModelUsageDistributionControl.ValidateResponsiveLayout();
-        if (OfficialQuotaActiveRefreshInterval != TimeSpan.FromSeconds(10) ||
+        if (OfficialQuotaActiveRefreshInterval != TimeSpan.FromSeconds(5) ||
             shortUsage.ModelUsage.Count != 3 ||
             longUsage.ModelUsage.Count != 3 ||
             shortUsage.CacheWriteTokens != 240_000L ||
@@ -16645,19 +16693,20 @@ public partial class Form1 : Form
         var clientName = chatGptFeatureAccount == null
             ? GetWindowsClientDisplayName(mode)
             : "官方 Codex（PAT/API + ChatGPT 双登录）";
-        var routeOfficialOAuthThroughGateway =
+        var routeOfficialOAuthThroughGateway = CodexCliService.RequiresDesktopGateway(account,
             mode == WindowsClientMode.OfficialCodex &&
             (account.IsOfficialOAuth || account.IsCompatibleApi) &&
             AccountRotationConfiguration.IsEnabled(_appSettings) &&
             AccountRotationConfiguration.GetPool(_appSettings, account) !=
-                AccountRotationPool.None;
+                AccountRotationPool.None);
         var profileAlreadySelected = chatGptFeatureAccount == null
             ? _codex.IsSharedProfileAlreadySelected(
                 account,
                 routeOfficialOAuthThroughGateway)
             : _codex.IsSharedChatGptFeatureProfileAlreadySelected(
                 account,
-                chatGptFeatureAccount);
+                chatGptFeatureAccount,
+                routeOfficialOAuthThroughGateway);
         _statusBox.Text = profileAlreadySelected
             ? mode == WindowsClientMode.OfficialCodex && !automaticRotation &&
               chatGptFeatureAccount == null
@@ -16718,7 +16767,8 @@ public partial class Form1 : Form
                     GetCodexAppearanceRuntimeMode(startupAppearance),
                     GetCodexAppearanceRuntimePresetId(startupAppearance),
                     GetCodexAppearanceLabelById(_appSettings.CodexAppearancePresetId),
-                    forceClientRestart: forceClientRestartForSidebarSync);
+                    forceClientRestart: forceClientRestartForSidebarSync,
+                    routeThroughGateway: routeOfficialOAuthThroughGateway);
             _statusCache[account.Name] = projection.Status;
             if (!projection.FailedLaunchProfileRestored)
             {
@@ -16960,10 +17010,17 @@ public partial class Form1 : Form
                     _statusBox.Text = "待切换路线缺少有效源账号，未改变 Codex 或网关。";
                     return false;
                 }
+                var transport = FindRotationAccount(route.TransportAccountKey);
+                if (transport == null || !_codex.TryRouteSelectedAccountThroughGateway(transport))
+                {
+                    _statusBox.Text = "待切换路线的传输账号与当前凭据不一致，未改写凭据；请从管理器重新启动所选账号。";
+                    return false;
+                }
                 StartManualGatewayRotationWaiter(
                     existingSource,
                     target,
                     targetKey);
+                _statusBox.Text = $"已登记切换到 {target.Name}，正在等待模型请求经过网关；尚未完成切换。";
                 return true;
             }
 
@@ -17544,6 +17601,15 @@ public partial class Form1 : Form
                 .Where(account =>
                 {
                     var key = QuotaAccountIdentity.CreateKey(account);
+                    if (account.IsCompatibleApi)
+                    {
+                        // Compatible APIs do not expose an official five-hour quota
+                        // snapshot. Unknown quota is not zero: retry at the next model
+                        // request once the gateway's exhaustion cooldown has expired.
+                        return PatAutoRotationPolicy.CanRetryCompatiblePrimary(
+                            latestSettings.AccountRotationResetAtUtc.GetValueOrDefault(key),
+                            confirmedExhaustions.GetValueOrDefault(key), nowUtc);
+                    }
                     if (latestSettings.AccountRotationResetAtUtc.TryGetValue(
                             key,
                             out var resetAtUtc) &&
@@ -17897,6 +17963,7 @@ public partial class Form1 : Form
         CancellationToken cancellationToken)
     {
         var inconsistentSnapshots = 0;
+        var waitingSince = DateTimeOffset.UtcNow;
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -17925,6 +17992,12 @@ public partial class Form1 : Form
                                       rotation.TargetAccountKey,
                                       targetAccountKey,
                                       StringComparison.Ordinal);
+            if (routeStillArmed && DateTimeOffset.UtcNow - waitingSince > TimeSpan.FromSeconds(15) &&
+                (activity?.LastModelRequestStartedAtUtc == null ||
+                 activity.LastModelRequestStartedAtUtc < waitingSince))
+            {
+                _statusBox.Text = "切换已登记，但网关尚未收到新的模型请求。若你已发送消息，请保存任务后重新从管理器启动 Codex，让新的路由配置生效；当前未关闭任何程序。";
+            }
             inconsistentSnapshots = activity == null || routeStillArmed
                 ? 0
                 : inconsistentSnapshots + 1;
@@ -19282,7 +19355,13 @@ public partial class Form1 : Form
             ApiProviderName = dialog.ApiProviderNameValue,
             ApiBaseUrl = dialog.ApiBaseUrlValue,
             ApiModel = dialog.ApiModelValue,
+            AccessTokenModel = existingAccount?.AccessTokenModel ?? "",
             ApiWireApi = dialog.ApiWireApiValue,
+            UseBundledCompatibleApiModelCatalog =
+                dialog.AuthKindValue.Equals(
+                    AccountAuthKind.CompatibleApi,
+                    StringComparison.OrdinalIgnoreCase) &&
+                (existingAccount?.UseBundledCompatibleApiModelCatalog ?? false),
             QuotaLimitType = existingAccount?.QuotaLimitType ?? AccountQuotaLimitType.Unknown,
             QuotaPrimaryWindowMinutes = existingAccount?.QuotaPrimaryWindowMinutes,
             QuotaSecondaryWindowMinutes = existingAccount?.QuotaSecondaryWindowMinutes,

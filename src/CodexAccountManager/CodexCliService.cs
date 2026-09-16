@@ -107,6 +107,10 @@ public sealed partial class CodexCliService
     private static readonly TimeSpan AccessTokenModelCacheLifetime = TimeSpan.FromHours(6);
     private static readonly TimeSpan AccessTokenSwitchValidationCacheLifetime = TimeSpan.FromMinutes(2);
     private static readonly TimeSpan CompatibleApiPreflightCacheLifetime = TimeSpan.FromMinutes(30);
+    // A one-off successful probe may temporarily cover a provider whose /models catalog
+    // lags deployment, but it must not mask later group/entitlement changes indefinitely.
+    private static readonly TimeSpan CompatibleApiVerifiedModelLifetime = TimeSpan.FromMinutes(30);
+    private static readonly TimeSpan CompatibleApiVerifiedModelFutureClockSkew = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan CompatibleApiLaunchPreflightTimeout = TimeSpan.FromSeconds(6);
     private static readonly TimeSpan CompatibleApiProxyConnectTimeout = TimeSpan.FromMilliseconds(1200);
     private static readonly TimeSpan MinimalQuotaTestTimeout = TimeSpan.FromSeconds(25);
@@ -394,7 +398,8 @@ public sealed partial class CodexCliService
 
     public bool IsSharedChatGptFeatureProfileAlreadySelected(
         AccountRecord account,
-        AccountRecord chatGptFeatureAccount)
+        AccountRecord chatGptFeatureAccount,
+        bool routeThroughGateway = false)
     {
         ArgumentNullException.ThrowIfNull(account);
         ArgumentNullException.ThrowIfNull(chatGptFeatureAccount);
@@ -402,7 +407,8 @@ public sealed partial class CodexCliService
         return CanReuseChatGptFeatureProfileForLaunchWithoutNetwork(
             account,
             Path.Combine(account.CodexHome, ConfigFileName),
-            chatGptFeatureAccount);
+            chatGptFeatureAccount,
+            routeThroughGateway);
     }
 
     public bool IsOfficialWindowsClientRunning()
@@ -983,7 +989,7 @@ public sealed partial class CodexCliService
             throw new InvalidOperationException($"Codex 登录失败：{failure}");
         }
 
-        ProjectAccessTokenSourceConfig(Path.Combine(account.CodexHome, ConfigFileName));
+        ProjectAccessTokenSourceConfig(Path.Combine(account.CodexHome, ConfigFileName), account);
         var status = await GetLoginStatusAsync(account);
         if (status.ExitCode == 0)
         {
@@ -2222,7 +2228,7 @@ public sealed partial class CodexCliService
             return;
         }
 
-        ProjectAccessTokenSourceConfig(Path.Combine(account.CodexHome, ConfigFileName));
+        ProjectAccessTokenSourceConfig(Path.Combine(account.CodexHome, ConfigFileName), account);
     }
 
     internal void EnsureOfficialOAuthAccountConfig(AccountRecord account)
@@ -2448,7 +2454,8 @@ public sealed partial class CodexCliService
         ThemeMode appearanceMode,
         string appearancePresetId = "manager",
         string? appearanceLabel = null,
-        bool forceClientRestart = false)
+        bool forceClientRestart = false,
+        bool routeThroughGateway = false)
     {
         ArgumentNullException.ThrowIfNull(account);
         ArgumentNullException.ThrowIfNull(chatGptFeatureAccount);
@@ -2468,7 +2475,7 @@ public sealed partial class CodexCliService
             appearanceLabel,
             AccessTokenSharedProfileMode.ChatGptDesktop,
             chatGptFeatureAccount,
-            routeOfficialOAuthThroughGateway: false,
+            routeOfficialOAuthThroughGateway: routeThroughGateway,
             forceClientRestart);
     }
 
@@ -2492,6 +2499,15 @@ public sealed partial class CodexCliService
         if (!Enum.IsDefined(mode))
         {
             throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unsupported Windows client mode.");
+        }
+
+        routeOfficialOAuthThroughGateway = RequiresDesktopGateway(account, routeOfficialOAuthThroughGateway);
+        if (routeOfficialOAuthThroughGateway)
+        {
+            // Resolve and verify the gateway before shutting down any existing client.
+            await LocalPatGateway.EnsureRunningAsync(restartOnProxyMismatch: false);
+            if (await LocalPatGateway.RequiresRotationProtocolUpgradeAsync())
+                throw new InvalidOperationException("账号代理网关尚未就绪；没有关闭当前 Codex，请稍后重试。");
         }
 
         // Capture the native picker value before the validation/reuse decision.  The shared
@@ -2559,7 +2575,8 @@ public sealed partial class CodexCliService
                     chatGptFeatureAccount != null &&
                     CanIdentifySharedChatGptFeatureProfileWithoutNetwork(
                         account,
-                        chatGptFeatureAccount);
+                        chatGptFeatureAccount,
+                        routeOfficialOAuthThroughGateway);
                 if (sharedProfileAlreadySelected && !exactSharedProfileAlreadySelected)
                 {
                     // Codex can persist harmless runtime preferences while it is open. The
@@ -2716,7 +2733,8 @@ public sealed partial class CodexCliService
                 chatGptFeatureAccount != null &&
                 !CanIdentifySharedChatGptFeatureProfileWithoutNetwork(
                     account,
-                    chatGptFeatureAccount))
+                    chatGptFeatureAccount,
+                    routeOfficialOAuthThroughGateway))
             {
                 projection.ClientLaunchStarted = false;
                 projection.CodexPlusPlusLaunchStarted = false;
@@ -3304,6 +3322,7 @@ public sealed partial class CodexCliService
             ApiProviderName = account.ApiProviderName,
             ApiBaseUrl = account.ApiBaseUrl,
             ApiModel = account.ApiModel,
+            AccessTokenModel = account.AccessTokenModel,
             ApiWireApi = account.ApiWireApi,
             QuotaLimitType = account.QuotaLimitType,
             QuotaPrimaryWindowMinutes = account.QuotaPrimaryWindowMinutes,
@@ -3382,7 +3401,7 @@ public sealed partial class CodexCliService
         }
         else
         {
-            ProjectAccessTokenSourceConfig(sourceConfigPath);
+            ProjectAccessTokenSourceConfig(sourceConfigPath, account);
         }
 
         var sharedProfileCanBeReused =
@@ -3444,6 +3463,7 @@ public sealed partial class CodexCliService
         AccountRecord? chatGptFeatureAccount = null,
         bool routeOfficialOAuthThroughGateway = false)
     {
+        routeOfficialOAuthThroughGateway = RequiresDesktopGateway(account, routeOfficialOAuthThroughGateway);
         if (account.IsOfficialOAuth)
         {
             return CanReuseOfficialOAuthSharedProfile(
@@ -3530,7 +3550,8 @@ public sealed partial class CodexCliService
                         providerBearerToken: ReadAccessTokenCredential(
                             Path.Combine(account.CodexHome, AuthFileName)),
                         forceFileAuthStore: true,
-                        serviceTier: targetServiceTier)
+                        serviceTier: targetServiceTier,
+                        modelOverride: GetAccessTokenModel(account))
                 : account.IsCompatibleApi
                     ? ProjectCompatibleApiConfigText(
                         sharedConfig,
@@ -3544,7 +3565,8 @@ public sealed partial class CodexCliService
                         requiresOpenAiAuth: true,
                         desktopProviderName: account.Name,
                         forceFileAuthStore: true,
-                        serviceTier: targetServiceTier);
+                        serviceTier: targetServiceTier,
+                        modelOverride: GetAccessTokenModel(account));
             projectedSharedConfig = PreserveSharedMcpServerSections(
                 sharedConfig,
                 projectedSharedConfig);
@@ -3564,7 +3586,8 @@ public sealed partial class CodexCliService
 
     private static bool CanIdentifySharedChatGptFeatureProfileWithoutNetwork(
         AccountRecord modelAccount,
-        AccountRecord chatGptFeatureAccount)
+        AccountRecord chatGptFeatureAccount,
+        bool routeThroughGateway = false)
     {
         ArgumentNullException.ThrowIfNull(modelAccount);
         ArgumentNullException.ThrowIfNull(chatGptFeatureAccount);
@@ -3619,13 +3642,15 @@ public sealed partial class CodexCliService
 
         return IsManagedDesktopModelCredentialBoundToAccount(
             modelAccount,
-            Path.Combine(sharedHome, ConfigFileName));
+            Path.Combine(sharedHome, ConfigFileName),
+            RequiresDesktopGateway(modelAccount, routeThroughGateway));
     }
 
     private static bool CanReuseChatGptFeatureProfileForLaunchWithoutNetwork(
         AccountRecord modelAccount,
         string sourceConfigPath,
-        AccountRecord chatGptFeatureAccount)
+        AccountRecord chatGptFeatureAccount,
+        bool routeThroughGateway = false)
     {
         ArgumentNullException.ThrowIfNull(modelAccount);
         ArgumentNullException.ThrowIfNull(chatGptFeatureAccount);
@@ -3633,10 +3658,12 @@ public sealed partial class CodexCliService
                    modelAccount,
                    sourceConfigPath,
                    AccessTokenSharedProfileMode.ChatGptDesktop,
-                   chatGptFeatureAccount) ||
+                   chatGptFeatureAccount,
+                   routeThroughGateway) ||
                CanIdentifySharedChatGptFeatureProfileWithoutNetwork(
                    modelAccount,
-                   chatGptFeatureAccount);
+                   chatGptFeatureAccount,
+                   routeThroughGateway);
     }
 
     private static bool IsManagedDesktopModelCredentialBoundToAccount(
@@ -3660,7 +3687,7 @@ public sealed partial class CodexCliService
                 : AccountStore.AccessTokenProviderId;
             var expectedModel = account.IsCompatibleApi
                 ? account.ApiModel.Trim()
-                : AccessTokenModel;
+                : GetAccessTokenModel(account);
             if (!TomlTopLevelRawValueMatches(
                     configLines,
                     "model_provider",
@@ -3960,6 +3987,7 @@ public sealed partial class CodexCliService
         AccountRecord? chatGptFeatureAccount = null,
         bool routeOfficialOAuthThroughGateway = false)
     {
+        routeOfficialOAuthThroughGateway = RequiresDesktopGateway(account, routeOfficialOAuthThroughGateway);
         return account.IsOfficialOAuth
             ? ProjectOfficialOAuthAccount(account, status, routeOfficialOAuthThroughGateway)
             : account.IsCompatibleApi
@@ -4310,7 +4338,7 @@ public sealed partial class CodexCliService
             }
             else
             {
-                ProjectAccessTokenSourceConfig(sourceConfigPath);
+                ProjectAccessTokenSourceConfig(sourceConfigPath, account);
                 sourceConfig = File.ReadAllText(sourceConfigPath);
                 var projectedConfig = useChatGptDesktopAuth
                     ? ProjectWindowsClientConfigText(
@@ -4319,13 +4347,15 @@ public sealed partial class CodexCliService
                         desktopProviderName: account.Name,
                         providerBearerToken: ReadAccessTokenCredential(sourceAuthPath),
                         forceFileAuthStore: true,
-                        serviceTier: ReadDesktopServiceTier(sourceConfig))
+                        serviceTier: ReadDesktopServiceTier(sourceConfig),
+                        modelOverride: GetAccessTokenModel(account))
                     : ProjectWindowsClientConfigText(
                         sourceConfig,
                         requiresOpenAiAuth: true,
                         desktopProviderName: account.Name,
                         forceFileAuthStore: true,
-                        serviceTier: ReadDesktopServiceTier(sourceConfig));
+                        serviceTier: ReadDesktopServiceTier(sourceConfig),
+                        modelOverride: GetAccessTokenModel(account));
                 var currentConfig = File.Exists(configPath) ? File.ReadAllText(configPath) : "";
                 projectedConfig = PreserveSharedMcpServerSections(currentConfig, projectedConfig);
                 if (!string.Equals(currentConfig, projectedConfig, StringComparison.Ordinal))
@@ -4797,8 +4827,12 @@ public sealed partial class CodexCliService
         {
             try
             {
-                nativeFastPort = SelectOfficialNativeFastCdpPort();
-                activationIdentity = ActivateOfficialCodexPackage(nativeFastPort.Value);
+                // Ordinary launches do not install the Fast renderer patch. Do not start
+                // Chromium debugging (or its fallback activation) for those launches.
+                nativeFastPort = SelectOfficialStartupDebugPort(
+                    allowRendererPatch, SelectOfficialNativeFastCdpPort);
+                activationIdentity = ActivateOfficialCodexPackage(
+                    nativeFastPort, cleanupUnverifiableIdentity: allowRendererPatch);
             }
             catch (OfficialCodexActivationIdentityException)
             {
@@ -4808,7 +4842,7 @@ public sealed partial class CodexCliService
                 // a second package activation would risk attaching to an orphaned shell.
                 throw;
             }
-            catch (Exception nativeFastError)
+            catch (Exception nativeFastError) when (allowRendererPatch)
             {
                 // Native Fast is additive.  If CDP activation itself is unavailable, open the
                 // signed client without debugging and still require its primary ready handshake.
@@ -4838,11 +4872,8 @@ public sealed partial class CodexCliService
             // or busy IPC queue as a crash and destructively recycle the process. The existing
             // background observer will deliver the optional project deep link only after the
             // runtime becomes healthy, and will merely log a timeout without stopping Codex.
-            if (!IsWindowsClientActivationIdentityAlive(activationIdentity))
-            {
-                throw new InvalidOperationException(
-                    "Official Codex exited immediately after package activation.");
-            }
+            activationIdentity = WaitForOfficialCodexActivationStartup(
+                activationIdentity, launchGeneration);
 
             OpenNewTaskAfterOfficialCodexLaunchInBackground(
                 projectPath,
@@ -5800,7 +5831,7 @@ public sealed partial class CodexCliService
     }
 
     private static WindowsClientActivationIdentity ActivateOfficialCodexPackage(
-        int? nativeFastCdpPort = null)
+        int? nativeFastCdpPort = null, bool cleanupUnverifiableIdentity = true)
     {
         var appUserModelId = ResolveCodexWindowsClientAppUserModelId();
         if (string.IsNullOrWhiteSpace(appUserModelId))
@@ -5827,7 +5858,9 @@ public sealed partial class CodexCliService
                     "Windows did not return a process ID after official Codex activation.");
             }
 
-            return CaptureWindowsClientActivationIdentity(processId);
+            WriteCodexPlusPlusLaunchDiagnostic("official-package-activation-accepted",
+                $"pid={processId}; debugging={nativeFastCdpPort.HasValue}");
+            return CaptureWindowsClientActivationIdentity(processId, cleanupUnverifiableIdentity);
         }
         finally
         {
@@ -5838,7 +5871,8 @@ public sealed partial class CodexCliService
         }
     }
 
-    private static WindowsClientActivationIdentity CaptureWindowsClientActivationIdentity(uint processId)
+    private static WindowsClientActivationIdentity CaptureWindowsClientActivationIdentity(
+        uint processId, bool cleanupUnverifiableIdentity = true)
     {
         if (processId > int.MaxValue)
         {
@@ -5913,8 +5947,8 @@ public sealed partial class CodexCliService
                 Thread.Sleep(50);
             } while (DateTime.UtcNow < identityDeadline);
 
-            var cleanupSucceeded = TryStopOfficialCodexActivationWithoutStartTime(
-                activationProcess);
+            var cleanupSucceeded = cleanupUnverifiableIdentity &&
+                TryStopOfficialCodexActivationWithoutStartTime(activationProcess);
             throw new OfficialCodexActivationIdentityException(
                 managedProcessId,
                 cleanupSucceeded);
@@ -6753,6 +6787,7 @@ public sealed partial class CodexCliService
 
     internal static void ValidateOfficialCodexActivation()
     {
+        ValidateOfficialCodexStartupObservation();
         var projectPath = Path.Combine("C:\\", "Users", "Example User", "Demo");
         var startInfo = BuildOfficialCodexActivationStartInfo(projectPath);
         if (!startInfo.UseShellExecute ||
@@ -9868,7 +9903,7 @@ catch {
     {
         if (!account.IsCompatibleApi)
         {
-            return (AccessTokenModel, AccessTokenReasoningEffort);
+            return (GetAccessTokenModel(account), AccessTokenReasoningEffort);
         }
 
         var model = string.IsNullOrWhiteSpace(account.ApiModel)
@@ -10171,7 +10206,10 @@ catch {
         try
         {
             using var document = JsonDocument.Parse(result.StdOut);
-            if (CatalogSupportsAccessTokenDefaults(document.RootElement))
+            if (CatalogSupportsAccessTokenDefaults(
+                    document.RootElement,
+                    GetAccessTokenModel(account),
+                    AccessTokenReasoningEffort))
             {
                 return;
             }
@@ -10184,7 +10222,7 @@ catch {
         }
 
         throw new InvalidOperationException(
-            $"Account {account.Name} does not currently offer {AccessTokenModel} / {AccessTokenReasoningEffort}. " +
+            $"Account {account.Name} does not currently offer {GetAccessTokenModel(account)} / {AccessTokenReasoningEffort}. " +
             "The shared Codex profile was not changed.");
     }
 
@@ -10220,7 +10258,10 @@ catch {
                 return false;
             }
 
-            return CatalogSupportsAccessTokenDefaults(root);
+            return CatalogSupportsAccessTokenDefaults(
+                root,
+                GetAccessTokenModel(account),
+                AccessTokenReasoningEffort);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException)
         {
@@ -10228,7 +10269,10 @@ catch {
         }
     }
 
-    private static bool CatalogSupportsAccessTokenDefaults(JsonElement root)
+    private static bool CatalogSupportsAccessTokenDefaults(
+        JsonElement root,
+        string? model = null,
+        string? reasoningEffort = null)
     {
         JsonElement models;
         if (root.ValueKind == JsonValueKind.Array)
@@ -10240,18 +10284,22 @@ catch {
             return false;
         }
 
-        foreach (var model in models.EnumerateArray())
+        var expectedModel = string.IsNullOrWhiteSpace(model) ? AccessTokenModel : model.Trim();
+        var expectedEffort = string.IsNullOrWhiteSpace(reasoningEffort)
+            ? AccessTokenReasoningEffort
+            : reasoningEffort.Trim();
+        foreach (var modelEntry in models.EnumerateArray())
         {
-            if (!model.TryGetProperty("slug", out var slug) ||
-                !string.Equals(slug.GetString(), AccessTokenModel, StringComparison.Ordinal))
+            if (!modelEntry.TryGetProperty("slug", out var slug) ||
+                !string.Equals(slug.GetString(), expectedModel, StringComparison.Ordinal))
             {
                 continue;
             }
 
-            return !model.TryGetProperty("supported_reasoning_levels", out var levels) ||
+            return !modelEntry.TryGetProperty("supported_reasoning_levels", out var levels) ||
                    levels.EnumerateArray().Any(level =>
                        level.TryGetProperty("effort", out var effort) &&
-                       string.Equals(effort.GetString(), AccessTokenReasoningEffort, StringComparison.Ordinal));
+                       string.Equals(effort.GetString(), expectedEffort, StringComparison.Ordinal));
         }
 
         return false;
@@ -10342,25 +10390,13 @@ catch {
         var apiEndpointIsLoopback = LocalProxyDetector.IsLoopbackHost(baseUri.Host);
         // A loopback API endpoint is reached directly by the child Codex process. An unrelated
         // stopped or malformed system proxy must not block that local-only account.
-        var configuredProxyText = apiEndpointIsLoopback ? null : GetConfiguredProxyUri();
-        Uri? configuredProxy = null;
-        if (!string.IsNullOrWhiteSpace(configuredProxyText))
-        {
-            if (!Uri.TryCreate(configuredProxyText, UriKind.Absolute, out var parsedProxy))
-            {
-                throw BuildCompatibleApiLaunchPreflightError(
-                    account,
-                    "当前代理配置无效：无法解析代理地址。请在设置中修正代理地址和端口后重试。");
-            }
-            if (GetCompatibleApiProxyValidationError(parsedProxy) is { } proxyError)
-            {
-                throw BuildCompatibleApiLaunchPreflightError(
-                    account,
-                    $"当前代理配置无效：{proxyError}。请在设置中修正代理地址和端口后重试。");
-            }
-
-            configuredProxy = parsedProxy;
-        }
+        using var proxyResolver = new AccountProxyResolver(new AccountStore().RootPath);
+        var proxyResolution = apiEndpointIsLoopback
+            ? new ProxyResolution(true, null, null, "direct", "")
+            : proxyResolver.Resolve(AccountProxyResolver.AccountKeyFor(account));
+        if (!proxyResolution.Success)
+            throw BuildCompatibleApiLaunchPreflightError(account, proxyResolution.Error);
+        var configuredProxy = proxyResolution.ProxyUri;
 
         if (configuredProxy != null && LocalProxyDetector.IsLoopbackHost(configuredProxy.Host))
         {
@@ -10389,21 +10425,9 @@ catch {
         }
 
         var modelsUri = BuildCompatibleApiModelsUri(baseUri);
-        using var handler = new HttpClientHandler();
-        if (configuredProxy != null)
-        {
-            handler.Proxy = new WebProxy(configuredProxy);
-            handler.UseProxy = true;
-        }
-        else if (apiEndpointIsLoopback)
-        {
-            handler.UseProxy = false;
-        }
-
-        using var client = new HttpClient(handler)
-        {
-            Timeout = Timeout.InfiniteTimeSpan
-        };
+        using var client = configuredProxy != null
+            ? ProxyHttpClientFactory.Create(proxyResolution, proxyResolver.GetNode(proxyResolution.NodeId))
+            : new HttpClient(new HttpClientHandler { UseProxy = false }) { Timeout = Timeout.InfiniteTimeSpan };
         using var request = new HttpRequestMessage(HttpMethod.Get, modelsUri);
         request.Headers.TryAddWithoutValidation(
             "Authorization",
@@ -10494,7 +10518,18 @@ catch {
                 return;
             }
 
-            if (modelIds.Contains(configuredModel, StringComparer.Ordinal))
+            RefreshManagedCompatibleModelCatalog(account, modelIds);
+
+            if (modelIds.Contains(configuredModel, StringComparer.Ordinal) ||
+                GetCompatibleApiAllowedModels(account).Contains(configuredModel))
+            {
+                return;
+            }
+
+            // Some providers serve new models before updating /models. Honor only a
+            // locally recorded successful probe for this exact endpoint, key and model.
+            // Network and authentication failures above must never be bypassed.
+            if (HasLocallyVerifiedCompatibleApiModel(account))
             {
                 return;
             }
@@ -10516,6 +10551,44 @@ catch {
                 $"模型 ID“{configuredModel}”不在接口 /models 返回的列表中。请在“编辑 API”里改成准确的模型 ID。{suggestionText}");
         }
     }
+
+    private static string BuildVerifiedCompatibleApiModelFingerprint(
+        string baseUrl, string wireApi, string model, string credential) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
+            JsonSerializer.Serialize(new[]
+            {
+                baseUrl.Trim().TrimEnd('/'), wireApi.Trim(), model.Trim(), credential
+            }))));
+
+    private static bool HasLocallyVerifiedCompatibleApiModel(AccountRecord account)
+    {
+        try
+        {
+            var path = Path.Combine(account.CodexHome, ".codex-account-manager-verified-model.sha256");
+            var marker = new FileInfo(path);
+            if (!marker.Exists || marker.Length > 128 ||
+                !IsVerifiedCompatibleApiModelMarkerFresh(marker.LastWriteTimeUtc, DateTime.UtcNow))
+            {
+                return false;
+            }
+            var credential = ReadAccessTokenCredential(Path.Combine(account.CodexHome, AuthFileName));
+            if (string.IsNullOrWhiteSpace(credential)) return false;
+            return File.ReadAllText(path).Trim().Equals(
+                BuildVerifiedCompatibleApiModelFingerprint(
+                    account.ApiBaseUrl, account.ApiWireApi, account.ApiModel, credential),
+                StringComparison.Ordinal);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsVerifiedCompatibleApiModelMarkerFresh(
+        DateTime lastWriteTimeUtc,
+        DateTime nowUtc) =>
+        lastWriteTimeUtc <= nowUtc + CompatibleApiVerifiedModelFutureClockSkew &&
+        lastWriteTimeUtc >= nowUtc - CompatibleApiVerifiedModelLifetime;
 
     internal static string? GetCompatibleApiModelIdValidationError(string? model)
     {
@@ -10675,6 +10748,38 @@ catch {
 
     internal static void ValidateCompatibleApiLaunchPreflight()
     {
+        var verified = BuildVerifiedCompatibleApiModelFingerprint(
+            "https://example.invalid/v1", "responses", "gpt-6-astra", "test-key");
+        if (verified != BuildVerifiedCompatibleApiModelFingerprint(
+                "https://example.invalid/v1/", "responses", "gpt-6-astra", "test-key") ||
+            verified == BuildVerifiedCompatibleApiModelFingerprint(
+                "https://other.invalid/v1", "responses", "gpt-6-astra", "test-key") ||
+            verified == BuildVerifiedCompatibleApiModelFingerprint(
+                "https://example.invalid/v1", "chat", "gpt-6-astra", "test-key") ||
+            verified == BuildVerifiedCompatibleApiModelFingerprint(
+                "https://example.invalid/v1", "responses", "gpt-5.6-luna", "test-key") ||
+            verified == BuildVerifiedCompatibleApiModelFingerprint(
+                "https://example.invalid/v1", "responses", "gpt-6-astra", "other-key"))
+        {
+            throw new InvalidOperationException("Verified compatible API model isolation self-test failed.");
+        }
+
+        var markerNow = DateTime.UtcNow;
+        if (!IsVerifiedCompatibleApiModelMarkerFresh(markerNow, markerNow) ||
+            !IsVerifiedCompatibleApiModelMarkerFresh(
+                markerNow - CompatibleApiVerifiedModelLifetime + TimeSpan.FromSeconds(1),
+                markerNow) ||
+            IsVerifiedCompatibleApiModelMarkerFresh(
+                markerNow - CompatibleApiVerifiedModelLifetime - TimeSpan.FromSeconds(1),
+                markerNow) ||
+            IsVerifiedCompatibleApiModelMarkerFresh(
+                markerNow + CompatibleApiVerifiedModelFutureClockSkew + TimeSpan.FromSeconds(1),
+                markerNow))
+        {
+            throw new InvalidOperationException(
+                "Verified compatible API model freshness self-test failed.");
+        }
+
         if (GetCompatibleApiModelIdValidationError("gpt-5.6-sol") != null ||
             GetCompatibleApiModelIdValidationError("gpt-5.6 sol") is not { } whitespaceError ||
             !whitespaceError.Contains("空格", StringComparison.Ordinal))
@@ -11239,12 +11344,15 @@ catch {
         return string.Join(Environment.NewLine, output).TrimEnd() + Environment.NewLine;
     }
 
-    private static void ProjectAccessTokenSourceConfig(string targetConfigPath)
+    private static void ProjectAccessTokenSourceConfig(string targetConfigPath, AccountRecord? account = null)
     {
         var currentConfig = File.Exists(targetConfigPath)
             ? File.ReadAllText(targetConfigPath)
             : "";
-        var projected = ProjectWindowsClientConfigText(currentConfig, requiresOpenAiAuth: true);
+        var projected = ProjectWindowsClientConfigText(
+            currentConfig,
+            requiresOpenAiAuth: true,
+            modelOverride: account?.IsAccessToken == true ? GetAccessTokenModel(account) : null);
         if (!string.Equals(currentConfig, projected, StringComparison.Ordinal))
         {
             WriteTextAtomically(targetConfigPath, projected);
@@ -11265,6 +11373,7 @@ catch {
 
     internal static void ValidateConfigProjectionDefaults()
     {
+        ValidateCompatibleModelCatalogProjection();
         var migratedFastAlias = UpsertDesktopServiceTier(
             "model = \"test\"\n\n[features]\njs_repl = false\n",
             "fast");
@@ -11307,7 +11416,7 @@ catch {
             AccountStore.AccessTokenProviderId,
             AccessTokenModel,
             AccessTokenReasoningEffort,
-            false,
+            true,
             pluginsEnabled: false,
             expectedServiceTier: "priority");
         AssertManagedProviderSection(tokenConfig, requiresOpenAiAuth: false);
@@ -11334,7 +11443,7 @@ catch {
             AccountStore.AccessTokenProviderId,
             AccessTokenModel,
             AccessTokenReasoningEffort,
-            false,
+            true,
             pluginsEnabled: false,
             expectedServiceTier: "priority");
         AssertManagedProviderSection(dualLoginDesktopConfig, requiresOpenAiAuth: true);
@@ -11385,7 +11494,7 @@ catch {
             AccountStore.AccessTokenProviderId,
             AccessTokenModel,
             AccessTokenReasoningEffort,
-            false,
+            true,
             pluginsEnabled: false);
         AssertAccessTokenHttpProvider(standaloneTokenConfig, requiresOpenAiAuth: true);
         if (!standaloneTokenConfig.Contains(
@@ -11409,7 +11518,7 @@ catch {
             AccountStore.CompatibleApiProviderId,
             CompatibleApiDefaultModel,
             CompatibleApiReasoningEffort,
-            false,
+            true,
             expectedServiceTier: "priority");
         if (!apiConfig.Contains("base_url = \"https://example.invalid\"", StringComparison.Ordinal))
         {
@@ -11967,7 +12076,7 @@ catch {
                 AccountStore.CompatibleApiProviderId,
                 CompatibleApiDefaultModel,
                 CompatibleApiReasoningEffort,
-                false,
+                true,
                 expectedServiceTier: "default");
             if (!IsChatGptDesktopAuthJson(sharedAuthPath) ||
                 File.ReadAllText(sharedAuthPath) != desktopOAuth)
@@ -12635,6 +12744,8 @@ catch {
                     "Explicit compatible API + ChatGPT feature projection lost either credential owner.");
             }
 
+            ValidateBoundDesktopProxyProjection(apiAccount, oauthA);
+
             // Deleting a selected model account must scrub its bearer from both the live
             // config and manager-created backups without deleting the OAuth owner's auth.
             var apiBackupDirectory = Path.Combine(
@@ -13217,6 +13328,12 @@ catch {
                 );
             }
             if (!routedProjectedConfig.Contains(
+                    "openai_base_url = " + TomlString(LocalPatGateway.ProviderBaseUrl),
+                    StringComparison.Ordinal) ||
+                !routedProjectedConfig.Contains(
+                    "chatgpt_base_url = " + TomlString(LocalPatGateway.ChatGptBaseUrl),
+                    StringComparison.Ordinal) ||
+                !routedProjectedConfig.Contains(
                     "base_url = " + TomlString(LocalPatGateway.ProviderBaseUrl),
                     StringComparison.Ordinal) ||
                 routedProjectedConfig.Contains(
@@ -13299,12 +13416,10 @@ catch {
             }
         }
 
-        var expectedAutoCompactLine =
-            "model_auto_compact_token_limit = " + DesktopAutoCompactTokenLimit;
-        if (topLevelLines.Count(line => TomlKeyEquals(line, "model_auto_compact_token_limit")) != 1 ||
-            !topLevelLines.Contains(expectedAutoCompactLine, StringComparer.Ordinal))
+        if (topLevelLines.Count(line => TomlKeyEquals(line, "model_auto_compact_token_limit")) > 1 ||
+            topLevelLines.Any(IsLegacyDisabledCompactionLimit))
         {
-            throw new InvalidOperationException("Config projection did not disable automatic compaction.");
+            throw new InvalidOperationException("Config projection retained the obsolete compaction-disable override.");
         }
 
         if (normalized.Split(SitesPluginHeader, StringSplitOptions.None).Length != 2 ||
@@ -13352,6 +13467,7 @@ catch {
         string? serviceTier = null,
         bool routeThroughGateway = false)
     {
+        currentConfig = RemoveManagedModelCatalog(currentConfig);
         var desktopServiceTier = serviceTier == null
             ? ReadDesktopServiceTier(currentConfig)
             : NormalizeDesktopServiceTier(serviceTier);
@@ -13364,6 +13480,13 @@ catch {
             "forced_login_method = \"chatgpt\"",
             "service_tier = " + TomlString(desktopServiceTier)
         };
+        // Existing desktop tasks can retain the built-in OpenAI provider. Both
+        // OAuth entry points must reach the gateway when rotation is enabled.
+        if (routeThroughGateway)
+        {
+            output.Insert(1, "chatgpt_base_url = " + TomlString(LocalPatGateway.ChatGptBaseUrl));
+            output.Insert(1, "openai_base_url = " + TomlString(LocalPatGateway.ProviderBaseUrl));
+        }
         string? currentSection = null;
         var skipSection = false;
         for (var index = 0; index < lines.Count; index++)
@@ -13540,8 +13663,10 @@ catch {
         string? desktopProviderName = null,
         string? providerBearerToken = null,
         bool forceFileAuthStore = false,
-        string? serviceTier = null)
+        string? serviceTier = null,
+        string? modelOverride = null)
     {
+        currentConfig = RemoveManagedModelCatalog(currentConfig);
         var desktopServiceTier = serviceTier == null
             ? ReadDesktopServiceTier(currentConfig)
             : NormalizeDesktopServiceTier(serviceTier);
@@ -13555,11 +13680,10 @@ catch {
         var output = new List<string>
         {
             "model_provider = " + TomlString(AccountStore.AccessTokenProviderId),
-            "model = " + TomlString(AccessTokenModel),
-            "review_model = " + TomlString(AccessTokenModel),
+            "model = " + TomlString(string.IsNullOrWhiteSpace(modelOverride) ? AccessTokenModel : modelOverride.Trim()),
+            "review_model = " + TomlString(string.IsNullOrWhiteSpace(modelOverride) ? AccessTokenModel : modelOverride.Trim()),
             "model_reasoning_effort = " + TomlString(AccessTokenReasoningEffort),
-            "chatgpt_base_url = " + TomlString(LocalPatGateway.ChatGptBaseUrl),
-            "model_auto_compact_token_limit = " + DesktopAutoCompactTokenLimit
+            "chatgpt_base_url = " + TomlString(LocalPatGateway.ChatGptBaseUrl)
         };
         if (forceFileAuthStore)
         {
@@ -13615,8 +13739,6 @@ catch {
                  IsTopLevelModelReasoningEffortLine(trimmed) ||
                  IsTopLevelChatGptBaseUrlLine(trimmed) ||
                  IsTopLevelServiceTierLine(trimmed) ||
-                 IsTopLevelModelAutoCompactTokenLimitLine(trimmed) ||
-                 IsTopLevelModelAutoCompactTokenLimitScopeLine(trimmed) ||
                  (forceFileAuthStore && IsCliAuthCredentialsStoreLine(trimmed)) ||
                  IsExperimentalBearerTokenLine(trimmed)))
             {
@@ -13677,6 +13799,7 @@ catch {
         string? serviceTier = null,
         bool routeThroughGateway = false)
     {
+        currentConfig = RemoveManagedModelCatalog(currentConfig);
         var desktopServiceTier = serviceTier == null
             ? ReadDesktopServiceTier(currentConfig)
             : NormalizeDesktopServiceTier(serviceTier);
@@ -13693,9 +13816,11 @@ catch {
             "model_provider = " + TomlString(AccountStore.CompatibleApiProviderId),
             "model = " + TomlString(model),
             "review_model = " + TomlString(model),
-            "model_reasoning_effort = " + TomlString(CompatibleApiReasoningEffort),
-            "model_auto_compact_token_limit = " + DesktopAutoCompactTokenLimit
+            "model_reasoning_effort = " + TomlString(CompatibleApiReasoningEffort)
         };
+        var catalogPath = ManagedCompatibleModelCatalogPath(account);
+        if (catalogPath != null && !Regex.IsMatch(currentConfig, @"(?m)^\s*model_catalog_json\s*="))
+            output.Insert(3, "model_catalog_json = " + TomlString(catalogPath) + ManagedModelCatalogMarker);
         if (forceFileAuthStore)
         {
             output.Add("cli_auth_credentials_store = \"file\"");
@@ -13745,8 +13870,6 @@ catch {
                  IsTopLevelModelReasoningEffortLine(trimmed) ||
                  IsTopLevelChatGptBaseUrlLine(trimmed) ||
                  IsTopLevelServiceTierLine(trimmed) ||
-                 IsTopLevelModelAutoCompactTokenLimitLine(trimmed) ||
-                 IsTopLevelModelAutoCompactTokenLimitScopeLine(trimmed) ||
                  (forceFileAuthStore && IsCliAuthCredentialsStoreLine(trimmed)) ||
                  IsExperimentalBearerTokenLine(trimmed)))
             {
@@ -13849,7 +13972,10 @@ catch {
 
     private static bool IsTopLevelChatGptBaseUrlLine(string trimmedLine)
     {
-        return TomlKeyEquals(trimmedLine, "chatgpt_base_url");
+        // Both built-in entry points must be removed when replacing a managed
+        // profile, otherwise an old gateway can survive an account/port change.
+        return TomlKeyEquals(trimmedLine, "chatgpt_base_url") ||
+               TomlKeyEquals(trimmedLine, "openai_base_url");
     }
 
     private static bool IsTopLevelServiceTierLine(string trimmedLine)
@@ -14023,7 +14149,7 @@ catch {
 
     private static string ApplyDesktopFeatureDefaults(string config, bool disablePlugins = false)
     {
-        var projected = UpsertFeatureFlag(config, "remote_compaction_v2", false);
+        var projected = RepairManagedCompactionSettings(config);
         projected = UpsertFeatureFlag(projected, "remote_plugin", false);
         return disablePlugins
             ? UpsertFeatureFlag(projected, "plugins", false)

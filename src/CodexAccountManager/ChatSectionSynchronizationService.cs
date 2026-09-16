@@ -131,6 +131,14 @@ internal static class ChatSectionSynchronizationService
                        ?? throw new InvalidOperationException("Codex 全局状态 JSON 格式无效。");
             var persisted = GetOrCreateObject(root, PersistedStateName);
             var profiles = GetOrCreateObject(persisted, ProfilesStateName);
+            // Normalize before choosing the template: duplicated memberships otherwise
+            // inflate its score and change the chosen template again on the next pass.
+            var normalizedProfiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var target in profileAccounts)
+            {
+                if (profiles[target.AccountId] is JsonObject existing && MergeDuplicateLocalSections(existing))
+                    normalizedProfiles.Add(target.AccountId);
+            }
             var profileByAccountId = ReadProfiles(profiles);
             var deletedThreadIds = SharedHistoryService.LoadDeletedThreadIds(codexHome);
             var officialSnapshot = LoadOfficialSectionSnapshot(codexHome);
@@ -150,7 +158,7 @@ internal static class ChatSectionSynchronizationService
             foreach (var target in profileAccounts)
             {
                 var targetProfile = GetOrCreateProfile(profiles, target.AccountId);
-                var changed = false;
+                var changed = normalizedProfiles.Contains(target.AccountId);
                 if (template != null && template.Sections.Count > 0)
                 {
                     changed |= MergeProfile(
@@ -520,9 +528,68 @@ internal static class ChatSectionSynchronizationService
                 ref addedItems);
         }
 
+        changed |= MergeDuplicateLocalSections(targetProfile);
         changed |= RemoveMissingSectionReferences(targetProfile, targetSections);
         changed |= EnsureEverySectionIsOrdered(targetProfile, targetSections);
         return changed;
+    }
+
+    // The renderer assigns a local task to just one section. Two presentation IDs
+    // mapped to the same official section therefore render as one full and one empty
+    // folder. Merge by the authoritative host/section ID, never by display name alone.
+    private static bool MergeDuplicateLocalSections(JsonObject profile)
+    {
+        var sections = GetOrCreateArray(profile, SectionsStateName);
+        var canonical = new Dictionary<string, JsonObject>(StringComparer.OrdinalIgnoreCase);
+        var aliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var section in sections.OfType<JsonObject>().ToArray())
+        {
+            var officialId = ReadHostSectionId(section);
+            if (string.IsNullOrWhiteSpace(officialId)) continue;
+            if (!canonical.TryGetValue(officialId, out var kept))
+            {
+                canonical[officialId] = section;
+                continue;
+            }
+            var hosts = GetOrCreateObject(section, HostSectionIdsStateName);
+            var keptHosts = GetOrCreateObject(kept, HostSectionIdsStateName);
+            // Distinct remote section mappings can carry different user intent.
+            if (hosts.Any(pair => keptHosts.TryGetPropertyValue(pair.Key, out var existing) &&
+                                  !JsonNode.DeepEquals(existing, pair.Value))) continue;
+            foreach (var pair in hosts)
+            {
+                if (!keptHosts.ContainsKey(pair.Key)) keptHosts[pair.Key] = pair.Value?.DeepClone();
+            }
+            var keptItems = GetOrCreateArray(kept, ItemKeysStateName);
+            foreach (var item in GetOrCreateArray(section, ItemKeysStateName))
+            {
+                if (!keptItems.Any(existing => JsonNode.DeepEquals(existing, item)))
+                    keptItems.Add(item?.DeepClone());
+            }
+            aliases[ReadString(section, "id")] = ReadString(kept, "id");
+            sections.Remove(section);
+        }
+        if (aliases.Count == 0) return false;
+        foreach (var (key, prefix) in new[]
+                 { (SectionOrderStateName, "custom:"), (CollapsedSectionIdsStateName, "") })
+        {
+            var values = GetOrCreateArray(profile, key);
+            var replacement = new JsonArray();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var node in values)
+            {
+                if (node is not JsonValue value || !value.TryGetValue<string>(out var text))
+                {
+                    replacement.Add(node?.DeepClone());
+                    continue;
+                }
+                if (text.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) &&
+                    aliases.TryGetValue(text[prefix.Length..], out var id)) text = prefix + id;
+                if (seen.Add(text)) replacement.Add(text);
+            }
+            profile[key] = replacement;
+        }
+        return true;
     }
 
     private static bool ReconcileOfficialItemKeys(
@@ -1134,6 +1201,7 @@ internal static class ChatSectionSynchronizationService
             }
 
             ValidateOfficialMembershipProjection();
+            ValidateDuplicateLocalSections();
         }
         finally
         {
@@ -1146,6 +1214,26 @@ internal static class ChatSectionSynchronizationService
                 // Best-effort cleanup for the temporary self-test directory.
             }
         }
+    }
+
+    private static void ValidateDuplicateLocalSections()
+    {
+        var profile = JsonNode.Parse("""
+            {"sections":[
+              {"id":"original","name":"学习","hostSectionIds":{"local":"official"},"itemKeys":["local-a"]},
+              {"id":"duplicate","name":"学习","hostSectionIds":{"local":"official","remote":"remote-section"},"itemKeys":["local-a","remote-b"]},
+              {"id":"different","name":"学习","hostSectionIds":{"local":"other"},"itemKeys":["local-c"]}],
+             "sectionOrder":["chats","custom:duplicate","custom:original","custom:different"],
+             "collapsedSectionIds":["duplicate","original"]}
+            """)!.AsObject();
+        if (!MergeDuplicateLocalSections(profile) ||
+            profile[SectionsStateName]!.AsArray().Count != 2 ||
+            profile[SectionsStateName]![0]![ItemKeysStateName]!.AsArray().Count != 2 ||
+            profile[SectionsStateName]![0]![HostSectionIdsStateName]!["remote"]!.GetValue<string>() != "remote-section" ||
+            profile[SectionOrderStateName]!.ToJsonString() != "[\"chats\",\"custom:original\",\"custom:different\"]" ||
+            profile[CollapsedSectionIdsStateName]!.ToJsonString() != "[\"original\"]" ||
+            MergeDuplicateLocalSections(profile))
+            throw new InvalidOperationException("Duplicate local sections lost membership/order or were not idempotent.");
     }
 
     private static void WriteOAuthAuth(string home, Guid accountId)

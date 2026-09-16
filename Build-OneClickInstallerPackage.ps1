@@ -383,6 +383,7 @@ foreach ($required in @(
     (Join-Path $defaultsRoot 'token-metadata.json'),
     (Join-Path $defaultsRoot 'usage-account-switches.json'),
     (Join-Path $installerRoot 'Install-CodexAccountManager.ps1'),
+    (Join-Path $installerRoot 'Sync-ManagerShortcuts.ps1'),
     (Join-Path $installerRoot 'Uninstall-CodexAccountManager.ps1'),
     (Join-Path $installerRoot '一键安装 Codex Account Manager.cmd'),
     (Join-Path $installerRoot '卸载 Codex Account Manager.cmd'),
@@ -428,6 +429,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $assetsRoot 'CodexAccountManager.ico') -Destination $packageAssets -Force
     Copy-Item -LiteralPath (Join-Path $assetsRoot 'CodexAccountManager.png') -Destination $packageAssets -Force
     Copy-Item -LiteralPath (Join-Path $assetsRoot 'model-catalog.json') -Destination $packageAssets -Force
+    Copy-Item -LiteralPath (Join-Path $assetsRoot 'codex-models') -Destination $packageAssets -Recurse -Force
     Copy-Item -LiteralPath $codexRuntime -Destination $portableCliRoot -Recurse -Force
 
     foreach ($defaultName in @(
@@ -440,6 +442,7 @@ try {
     }
     foreach ($installerName in @(
         'Install-CodexAccountManager.ps1',
+        'Sync-ManagerShortcuts.ps1',
         'Uninstall-CodexAccountManager.ps1',
         '一键安装 Codex Account Manager.cmd',
         '卸载 Codex Account Manager.cmd',
@@ -577,7 +580,17 @@ try {
             }
         }
 
-        foreach ($pathMatch in $absoluteDrivePathPattern.Matches($content)) {
+        $pathScanContent = $content
+        if ($file.Extension -eq '.json') {
+            # JSON escaped newlines after prose such as "REQUIRED:" are not D:\ paths.
+            $pathScanContent = $pathScanContent.Replace('\n', [string][char]10).Replace('\r', [string][char]13)
+        }
+        if ($file.DirectoryName -eq (Join-Path $packageAssets 'codex-models')) {
+            # Exact public upstream documentation example, not a local user path.
+            # Credential and personal-identifier scans still inspect the unmodified text.
+            $pathScanContent = $pathScanContent.Replace('C:\\repo\\project\\main.rs:12:5', 'example/main.rs:12:5')
+        }
+        foreach ($pathMatch in $absoluteDrivePathPattern.Matches($pathScanContent)) {
             $absolutePath = $pathMatch.Groups['path'].Value
             if (-not (Test-IsAllowedInstallerAbsolutePath -Value $absolutePath)) {
                 throw "Installer contains a non-system absolute local path: $($file.FullName)"
@@ -632,6 +645,7 @@ try {
         (Join-Path $testInstallRoot 'CodexAccountManager.exe'),
         (Join-Path $testInstallRoot 'assets\CodexAccountManager.ico'),
         (Join-Path $testInstallRoot 'assets\model-catalog.json'),
+        (Join-Path $testInstallRoot 'assets\codex-models\gpt-6-astra.json'),
         (Join-Path $testInstallRoot '.tools\codex-cli\node_modules'),
         (Join-Path $testInstallRoot '.tools\codex-cli\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\codex-resources\codex-command-runner.exe'),
         (Join-Path $testInstallRoot 'CodexDreamSkin\bundle-version.txt'),
@@ -735,6 +749,7 @@ try {
         "$archivePrefix/payload/CodexAccountManager.exe",
         "$archivePrefix/payload/assets/CodexAccountManager.ico",
         "$archivePrefix/payload/assets/model-catalog.json",
+        "$archivePrefix/payload/assets/codex-models/gpt-6-astra.json",
         "$archivePrefix/payload/.tools/codex-cli/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe",
         "$archivePrefix/payload/CodexDreamSkin/bundle-version.txt",
         "$archivePrefix/payload/CodexDreamSkin/assets/account-manager-nebula.jpg",
@@ -772,6 +787,7 @@ try {
         "$archivePrefix/defaults/token-metadata.json",
         "$archivePrefix/defaults/usage-account-switches.json",
         "$archivePrefix/Install-CodexAccountManager.ps1",
+        "$archivePrefix/Sync-ManagerShortcuts.ps1",
         "$archivePrefix/README.md"
     )
     $zip = $null

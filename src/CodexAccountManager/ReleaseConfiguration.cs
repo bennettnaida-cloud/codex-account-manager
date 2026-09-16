@@ -7,12 +7,12 @@ namespace CodexAccountManager;
 /// </summary>
 internal static class ReleaseConfiguration
 {
-    internal const string Version = "2.3.13";
-    internal const int GatewayPort = 8333;
-    internal const string GatewayPortText = "8333";
-    internal const string GatewayListenerPrefix = "http://127.0.0.1:8333/";
+    internal const string Version = "2.3.22";
+    internal const int GatewayPort = 8339;
+    internal const string GatewayPortText = "8339";
+    internal const string GatewayListenerPrefix = "http://127.0.0.1:8339/";
     internal const string GatewayProviderBaseUrl =
-        "http://127.0.0.1:8333/backend-api/codex";
+        "http://127.0.0.1:8339/backend-api/codex";
     internal const string GatewayChatGptBaseUrl =
-        "http://127.0.0.1:8333/backend-api";
+        "http://127.0.0.1:8339/backend-api";
 }

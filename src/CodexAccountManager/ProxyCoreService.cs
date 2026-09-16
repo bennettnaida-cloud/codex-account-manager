@@ -65,14 +65,14 @@ internal static class ProxyNativeUriParser
         }
 
         if (!Uri.TryCreate(candidate, UriKind.Absolute, out var uri) ||
-            uri.Host.Length == 0 || uri.Port is < 1 or > 65535)
+            uri.Host.Length == 0 || (uri.Port is < 1 or > 65535 && scheme is not ("hysteria2" or "hy2")))
         {
             error = "节点必须包含有效主机和端口。";
             return false;
         }
 
         address = uri.Host;
-        port = uri.Port;
+        port = uri.Port < 0 && scheme is ("hysteria2" or "hy2") ? 443 : uri.Port;
         var fragment = Uri.UnescapeDataString(uri.Fragment.TrimStart('#'));
         name = string.IsNullOrWhiteSpace(fragment) ? address : fragment;
         return ValidateEndpoint(address, port, out error);
@@ -175,7 +175,11 @@ internal sealed class ProxyCoreService : IDisposable
             error = "该节点不需要原生协议核心。";
             return false;
         }
-        if (!node.TryGetNativeUri(out var nativeUri))
+        var hasNativeOutbound = !string.IsNullOrWhiteSpace(node.EncryptedNativeOutbound);
+        var readable = hasNativeOutbound
+            ? ProxyNodeStore.TryUnprotect(node.EncryptedNativeOutbound, out var nativeUri)
+            : node.TryGetNativeUri(out nativeUri);
+        if (!readable)
         {
             error = "原生节点凭据无法解密，已安全拒绝请求。";
             return false;
@@ -184,10 +188,11 @@ internal sealed class ProxyCoreService : IDisposable
         var fingerprint = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(nativeUri)))[..24];
         lock (_gate)
         {
-            var preferSingBox = RequiresInsecureTls(nativeUri);
+            var requiresSingBox = hasNativeOutbound || node.EffectiveScheme.ToLowerInvariant() is "hysteria2" or "hy2";
+            var preferSingBox = requiresSingBox || RequiresInsecureTls(nativeUri);
             if (_running.TryGetValue(node.NodeId, out var existing) &&
                 existing.Fingerprint.Equals(fingerprint, StringComparison.Ordinal) &&
-                existing.UsesSingBox == preferSingBox &&
+                (!preferSingBox || existing.UsesSingBox) &&
                 !existing.Process.HasExited)
             {
                 localProxy = new Uri($"http://127.0.0.1:{existing.Port}");
@@ -201,17 +206,42 @@ internal sealed class ProxyCoreService : IDisposable
                 error = "未找到 Xray/sing-box 核心。请在设置中指定 ProxyCorePath，或将 xray 放入 PATH。";
                 return false;
             }
+            if (requiresSingBox && !usesSingBox)
+            {
+                error = "Hysteria2 需要 sing-box 核心，请设置 ProxyCorePath 为 sing-box.exe。";
+                return false;
+            }
             JsonObject? outbound = null;
             JsonObject? singBoxConfig = null;
             if (usesSingBox)
             {
-                if (!TryBuildSingBoxConfig(node.Scheme, nativeUri, out singBoxConfig, out error)) return false;
+                if (hasNativeOutbound)
+                {
+                    try
+                    {
+                        var native = JsonNode.Parse(nativeUri)?.AsObject();
+                        if (native == null || native["type"]?.ToString() != node.EffectiveScheme ||
+                            string.IsNullOrWhiteSpace(native["server"]?.ToString()) ||
+                            Int(native, "server_port") is < 1 or > 65535 || native["detour"] != null)
+                        { error = "独立节点的原生配置无效。"; return false; }
+                        native["tag"] = "proxy";
+                        singBoxConfig = new JsonObject
+                        {
+                            ["log"] = new JsonObject { ["level"] = "error" },
+                            ["outbounds"] = new JsonArray { native },
+                            ["route"] = new JsonObject { ["final"] = "proxy" }
+                        };
+                    }
+                    catch (Exception ex) when (ex is JsonException or InvalidOperationException)
+                    { error = "独立节点的原生配置无法读取。"; return false; }
+                }
+                else if (!TryBuildSingBoxConfig(node.EffectiveScheme, nativeUri, out singBoxConfig, out error)) return false;
             }
-            else if (!TryBuildOutbound(node.Scheme, nativeUri, out outbound, out error)) return false;
+            else if (!TryBuildOutbound(node.EffectiveScheme, nativeUri, out outbound, out error)) return false;
             var port = GetFreePort();
             var runtimeDir = Path.Combine(_rootPath, ".proxy-runtime");
             Directory.CreateDirectory(runtimeDir);
-            var configPath = Path.Combine(runtimeDir, node.NodeId + ".json");
+            var configPath = Path.Combine(runtimeDir, Guid.NewGuid().ToString("N") + ".json");
             try
             {
                 var config = usesSingBox
@@ -231,18 +261,20 @@ internal sealed class ProxyCoreService : IDisposable
                         },
                         ["outbounds"] = new JsonArray { outbound }
                     };
-                File.WriteAllText(configPath, config.ToJsonString(new JsonSerializerOptions { WriteIndented = false }), new UTF8Encoding(false));
+                var configJson = config.ToJsonString(new JsonSerializerOptions { WriteIndented = false });
+                if (!usesSingBox) File.WriteAllText(configPath, configJson, new UTF8Encoding(false));
                 var psi = new ProcessStartInfo(corePath)
                 {
                     UseShellExecute = false,
                     CreateNoWindow = true,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
+                    RedirectStandardInput = usesSingBox,
                     WorkingDirectory = Path.GetDirectoryName(corePath) ?? AppContext.BaseDirectory
                 };
                 psi.ArgumentList.Add("run");
                 psi.ArgumentList.Add("-c");
-                psi.ArgumentList.Add(configPath);
+                psi.ArgumentList.Add(usesSingBox ? "stdin" : configPath);
                 var process = Process.Start(psi);
                 if (process is null)
                 {
@@ -251,6 +283,11 @@ internal sealed class ProxyCoreService : IDisposable
                 }
                 _ = process.StandardOutput.ReadToEndAsync();
                 _ = process.StandardError.ReadToEndAsync();
+                if (usesSingBox)
+                {
+                    process.StandardInput.Write(configJson);
+                    process.StandardInput.Close();
+                }
                 // A dead subscription should fail quickly in the UI. The gateway
                 // has its own resolver/core instance, so this only shortens an
                 // interactive node probe and never changes the rotation path.
@@ -270,6 +307,10 @@ internal sealed class ProxyCoreService : IDisposable
                 error = "原生代理核心启动失败。";
                 try { File.Delete(configPath); } catch { }
                 return false;
+            }
+            finally
+            {
+                try { File.Delete(configPath); } catch { }
             }
         }
     }
@@ -493,7 +534,41 @@ internal sealed class ProxyCoreService : IDisposable
         config = new JsonObject();
         error = string.Empty;
         JsonObject outbound;
-        if (scheme.Equals("ss", StringComparison.OrdinalIgnoreCase) || scheme.Equals("shadowsocks", StringComparison.OrdinalIgnoreCase))
+        if (scheme.ToLowerInvariant() is "hysteria2" or "hy2")
+        {
+            if (!Uri.TryCreate(raw, UriKind.Absolute, out var hy) ||
+                string.IsNullOrWhiteSpace(hy.Host) || string.IsNullOrWhiteSpace(hy.UserInfo))
+            {
+                error = "Hysteria2 节点缺少地址或密码。";
+                return false;
+            }
+            var query = ParseQuery(hy.Query);
+            if (query.Keys.Any(key => key is "pinSHA256" or "mport"))
+            {
+                error = "当前不支持 Hysteria2 证书指纹或端口跳跃参数；未忽略配置。";
+                return false;
+            }
+            outbound = new JsonObject
+            {
+                ["type"] = "hysteria2", ["tag"] = "proxy", ["server"] = hy.Host,
+                ["server_port"] = hy.Port < 0 ? 443 : hy.Port,
+                ["password"] = Uri.UnescapeDataString(hy.UserInfo)
+            };
+            var obfs = query.GetValueOrDefault("obfs", "");
+            if (obfs.Length > 0)
+            {
+                if (obfs != "salamander" || string.IsNullOrEmpty(query.GetValueOrDefault("obfs-password")))
+                {
+                    error = "Hysteria2 混淆配置无效。";
+                    return false;
+                }
+                outbound["obfs"] = new JsonObject { ["type"] = obfs, ["password"] = query["obfs-password"] };
+            }
+            AddSingBoxTls(outbound, "tls", query.GetValueOrDefault("sni", hy.Host), "", "", "",
+                query.GetValueOrDefault("alpn", ""),
+                IsTruthy(query.GetValueOrDefault("insecure", query.GetValueOrDefault("allowInsecure", ""))));
+        }
+        else if (scheme.Equals("ss", StringComparison.OrdinalIgnoreCase) || scheme.Equals("shadowsocks", StringComparison.OrdinalIgnoreCase))
         {
             if (!TryParseShadowsocks(raw, out var ssAddress, out var ssPort, out var ssMethod, out var ssPassword, out error)) return false;
             outbound = new JsonObject
@@ -710,4 +785,16 @@ internal sealed class ProxyCoreService : IDisposable
     }
 
     private sealed record RunningCore(Process Process, int Port, string Fingerprint, bool UsesSingBox);
+
+    internal static void ValidateNativeNodeConfig()
+    {
+        const string uri = "hy2://example%3Apassword@192.0.2.10?sni=example.test&obfs=salamander&obfs-password=test";
+        if (!ProxyNativeUriParser.TryGetMetadata(uri, out _, out var port, out _, out _) || port != 443 ||
+            !TryBuildSingBoxConfig("hy2", uri, out var config, out _) ||
+            config["outbounds"]?[0]?["password"]?.ToString() != "example:password" ||
+            config["outbounds"]?[0]?["tls"]?["insecure"] != null ||
+            config["outbounds"]?[0]?["obfs"]?["type"]?.ToString() != "salamander" ||
+            TryBuildSingBoxConfig("hy2", uri + "&pinSHA256=unsupported", out _, out _))
+            throw new InvalidOperationException("Hysteria2 configuration projection regression.");
+    }
 }

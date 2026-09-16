@@ -139,7 +139,7 @@ internal sealed class ProxySidebarPanel : Panel
 
         _nodesTitle = MakeLabel("代理节点库", 14F, strong: true);
         _nodesSubtitle = MakeLabel(
-            "HTTP / HTTPS / SOCKS5 / VLESS / VMess / Trojan / SS · 凭据使用当前 Windows 用户的 DPAPI 加密保存",
+            "HTTP / SOCKS5 / VLESS / VMess / Trojan / SS / Hysteria2 · 凭据加密保存",
             10F,
             muted: true);
         _nodesCard.Controls.AddRange([_nodesTitle, _nodesSubtitle]);
@@ -413,7 +413,7 @@ internal sealed class ProxySidebarPanel : Panel
                 : "-1";
             var exitIp = FormatExitIpForList(node);
             var item = new ListViewItem(node.Name) { Tag = node };
-            item.SubItems.Add(CompactProtocol(node.Scheme));
+            item.SubItems.Add(CompactProtocol(node.EffectiveScheme));
             item.SubItems.Add(node.DisplayAddress);
             item.SubItems.Add(latency);
             item.SubItems.Add(exitIp);
@@ -431,6 +431,7 @@ internal sealed class ProxySidebarPanel : Panel
     }
     private static string CompactProtocol(string scheme) => scheme.ToLowerInvariant() switch
     {
+        "hysteria2" or "hy2" => "HY2",
         "https" => "TLS",
         "socks5" => "S5",
         "vless" => "VL",
@@ -535,7 +536,7 @@ internal sealed class ProxySidebarPanel : Panel
         var account = SelectedAccount(); if (account == null) return; var key = AccountProxyResolver.AccountKeyFor(account);
         var node = _node.SelectedItem as NodeItem;
         _store.SetBinding(new AccountProxyBinding { AccountKey = key, Mode = _mode.SelectedIndex switch { 1 => ProxyBindingMode.FixedNode, 2 => ProxyBindingMode.Disabled, _ => ProxyBindingMode.InheritGlobal }, NodeId = node?.Node.NodeId, FallbackPolicy = _fallback.SelectedIndex == 1 ? ProxyFallbackPolicy.InheritGlobal : ProxyFallbackPolicy.FailClosed });
-        ReportStatus($"已保存账号“{account.Name}”的代理绑定（凭据不会显示）。");
+        ReportStatus($"已保存账号“{account.Name}”的代理绑定。已走本版本网关的会话从下一次请求生效；旧直连会话请从账号卡片重新启动 Codex（三种启动方式均支持），无需切换系统代理。");
     }
     private void EditNode(ProxyNodeRecord? existing)
     {

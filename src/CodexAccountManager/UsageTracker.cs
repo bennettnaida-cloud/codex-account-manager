@@ -1755,6 +1755,68 @@ public sealed class UsageTracker
         }
     }
 
+    internal static void ValidateResumedOldSessionUsage()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "codex-resumed-usage-" + Guid.NewGuid().ToString("N"));
+        var sessions = Path.Combine(root, "sessions");
+        var now = DateTimeOffset.Now;
+        var oldDate = now.AddDays(-90);
+        var oldDirectory = Path.Combine(sessions, oldDate.ToString("yyyy"), oldDate.ToString("MM"), oldDate.ToString("dd"));
+        var newDirectory = Path.Combine(sessions, now.ToString("yyyy"), now.ToString("MM"), now.ToString("dd"));
+        Directory.CreateDirectory(oldDirectory);
+        Directory.CreateDirectory(newDirectory);
+        var oldPath = Path.Combine(oldDirectory, "resumed.jsonl");
+        var account = new AccountRecord { Name = "new-account", CodexHome = Path.Combine(root, "account") };
+        try
+        {
+            File.WriteAllText(Path.Combine(root, "usage-account-switches.json"),
+                JsonSerializer.Serialize(new[] { new UsageSwitchEvent {
+                    AccountName = account.Name,
+                    AccountKey = QuotaAccountIdentity.CreateKey(account),
+                    SwitchedAtUtc = now.AddMinutes(-10).ToString("O")
+                }}));
+            File.WriteAllLines(oldPath, [
+                MakeTurnContextFixture(oldDate, "gpt-6-astra"),
+                MakeTokenCountFixture(oldDate, 900, 1),
+                MakeTurnContextFixture(now.AddMinutes(-5), "gpt-5.6-sol"),
+                MakeTokenCountFixture(now.AddMinutes(-5), 100, 2, 1000)
+            ]);
+            File.WriteAllLines(Path.Combine(newDirectory, "today.jsonl"), [
+                MakeTurnContextFixture(now.AddMinutes(-4), "gpt-6-astra"),
+                MakeTokenCountFixture(now.AddMinutes(-4), 200, 3)
+            ]);
+            var stalePath = Path.Combine(oldDirectory, "inactive.jsonl");
+            File.WriteAllText(stalePath, MakeTokenCountFixture(oldDate, 800, 1));
+            File.SetLastWriteTime(stalePath, oldDate.LocalDateTime);
+            var tracker = new UsageTracker(root);
+            AssertReport(tracker, 100);
+            AssertReport(tracker, 100); // Warm cache must not duplicate the recovered event.
+            tracker = new UsageTracker(root);
+            AssertReport(tracker, 100); // A restart must preserve discovery and attribution.
+            File.AppendAllLines(oldPath, [MakeTokenCountFixture(now.AddMinutes(-1), 50, 4, 1050)]);
+            AssertReport(tracker, 150); // New writes in the old directory remain incremental.
+
+            void AssertReport(UsageTracker current, long expectedSol)
+            {
+                var report = current.BuildReport([account], sessions, now);
+                var usage = report.Accounts.Single();
+                if (usage.Month.TotalTokens != expectedSol + 200 ||
+                    usage.Timeline.Where(e => e.Model == "gpt-5.6-sol").Sum(e => e.TotalTokens) != expectedSol ||
+                    usage.Timeline.Any(e => e.AccountName != account.Name) ||
+                    report.UnassignedMonth.TotalTokens != 0 ||
+                    current._usageFileCache.ContainsKey(stalePath))
+                {
+                    throw new InvalidOperationException(
+                        "Resumed old sessions must count recent Sol usage under the new account alongside current directories, without replay or stale usage.");
+                }
+            }
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
     private static void ValidateCachedSessionSwitchAttribution(
         string root,
         AccountRecord firstAccount,
@@ -3032,7 +3094,7 @@ public sealed class UsageTracker
         List<string> files;
         try
         {
-            files = EnumerateRecentUsageLogFiles(normalizedRoot, minWriteTime)
+            files = EnumerateUsageLogFiles(normalizedRoot)
                 .Where(path => File.GetLastWriteTime(path) >= minWriteTime)
                 .Select(Path.GetFullPath)
                 .ToList();
@@ -3116,48 +3178,13 @@ public sealed class UsageTracker
         return snapshot;
     }
 
-    private static IEnumerable<string> EnumerateRecentUsageLogFiles(
-        string sessionsRoot,
-        DateTime minWriteTime)
+    private static IEnumerable<string> EnumerateUsageLogFiles(string sessionsRoot)
     {
-        // Codex stores sessions in sessions\\yyyy\\MM\\dd. Walking only the days that can
-        // contribute to this dashboard avoids repeatedly traversing years of immutable history.
-        // Keep top-level files for fixtures and older flat layouts, and fall back to the legacy
-        // recursive scan when the dated layout is not present at all.
-        var hasDatedDirectory = false;
-        var today = DateTime.Today;
-        for (var date = minWriteTime.Date; date <= today; date = date.AddDays(1))
-        {
-            var dateDirectory = Path.Combine(
-                sessionsRoot,
-                date.Year.ToString("D4", CultureInfo.InvariantCulture),
-                date.Month.ToString("D2", CultureInfo.InvariantCulture),
-                date.Day.ToString("D2", CultureInfo.InvariantCulture));
-            if (!Directory.Exists(dateDirectory))
-            {
-                continue;
-            }
-
-            hasDatedDirectory = true;
-            foreach (var file in Directory.EnumerateFiles(dateDirectory, "*.jsonl", SearchOption.TopDirectoryOnly))
-            {
-                yield return file;
-            }
-        }
-
-        if (!hasDatedDirectory)
-        {
-            foreach (var file in Directory.EnumerateFiles(sessionsRoot, "*.jsonl", SearchOption.AllDirectories))
-            {
-                yield return file;
-            }
-            yield break;
-        }
-
-        foreach (var file in Directory.EnumerateFiles(sessionsRoot, "*.jsonl", SearchOption.TopDirectoryOnly))
-        {
-            yield return file;
-        }
+        // Directory dates identify creation, not last activity: an old conversation
+        // continues appending today's usage in its original directory. Discover every
+        // path, then filter modification times before reading content. The incremental
+        // cache still avoids reparsing unchanged files.
+        return Directory.EnumerateFiles(sessionsRoot, "*.jsonl", SearchOption.AllDirectories);
     }
 
     private void RemoveCachedFilesForRoot(string normalizedRoot, HashSet<string>? activePaths)

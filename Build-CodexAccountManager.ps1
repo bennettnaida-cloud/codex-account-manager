@@ -123,38 +123,13 @@ finally {
     Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-# Keep a source-tree development shortcut current without replacing a shortcut
-# owned by an installed copy of the application.
-$desktopPath = [Environment]::GetFolderPath('Desktop')
-$desktopShortcutPath = Join-Path $desktopPath 'Codex Account Manager.lnk'
-if (Test-Path -LiteralPath $desktopShortcutPath -PathType Leaf) {
-    $shortcutShell = New-Object -ComObject WScript.Shell
-    $desktopShortcut = $shortcutShell.CreateShortcut($desktopShortcutPath)
-    $sourceRootPrefix = [IO.Path]::GetFullPath($root).TrimEnd('\') + '\'
-    $shortcutTarget = if ([string]::IsNullOrWhiteSpace($desktopShortcut.TargetPath)) {
-        ''
-    }
-    else {
-        [IO.Path]::GetFullPath($desktopShortcut.TargetPath)
-    }
-    $launcherScript = Join-Path $root 'Start-CodexAccountManager.ps1'
-    $sourceOwnedShortcut =
-        $shortcutTarget.StartsWith($sourceRootPrefix, [StringComparison]::OrdinalIgnoreCase) -or
-        $desktopShortcut.Arguments.IndexOf($launcherScript, [StringComparison]::OrdinalIgnoreCase) -ge 0
-    if ($sourceOwnedShortcut) {
-        # Launch the published WinForms executable directly.  The previous
-        # shortcut target was powershell.exe, which opened a visible Windows
-        # Terminal tab on every click and added an unnecessary script startup
-        # hop.  Pass the shared manager root explicitly so the shortcut keeps
-        # using the same account data as the launcher script.
-        $dataRoot = Join-Path (Split-Path -Parent $root) 'codex-account-manager'
-        if (-not (Test-Path -LiteralPath (Join-Path $dataRoot 'accounts.json') -PathType Leaf)) {
-            $dataRoot = $root
-        }
-        $desktopShortcut.TargetPath = $appExe
-        $desktopShortcut.WorkingDirectory = $out
-        $desktopShortcut.Arguments = '--manager-root "' + $dataRoot + '"'
-        $desktopShortcut.IconLocation = $appExe + ',0'
-        $desktopShortcut.Save()
-    }
+# Synchronize all existing launch entries after publish AND self-test succeed.
+# Taskbar pins are separate .lnk files; updating only Desktop leaves old versions pinned.
+$dataRoot = Join-Path (Split-Path -Parent $root) 'codex-account-manager'
+if (-not (Test-Path -LiteralPath (Join-Path $dataRoot 'accounts.json') -PathType Leaf)) {
+    $dataRoot = $root
 }
+. (Join-Path $root 'packaging\installer\Sync-ManagerShortcuts.ps1')
+& (Join-Path $root 'tools\Test-ManagerShortcuts.ps1')
+Sync-ManagerShortcuts -ExecutablePath $appExe -ManagerRoot $dataRoot -SourceRoot $root |
+    ForEach-Object { Write-Output "Updated shortcut: $_" }

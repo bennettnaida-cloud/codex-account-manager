@@ -31,6 +31,47 @@ static class Program
             }
         }
 
+        if (args.Contains("--sync-compatible-model-catalogs", StringComparer.OrdinalIgnoreCase))
+        {
+            try { Console.WriteLine("Model catalogs updated: " + new CodexCliService().SyncCompatibleModelCatalogs()); return 0; }
+            catch { Console.Error.WriteLine("Model catalog synchronization failed; credentials were not changed."); return 1; }
+        }
+        var refreshCompatibleCatalogIndex = Array.FindIndex(
+            args,
+            argument => argument.Equals(
+                "--refresh-compatible-model-catalog",
+                StringComparison.OrdinalIgnoreCase));
+        if (refreshCompatibleCatalogIndex >= 0)
+        {
+            if (refreshCompatibleCatalogIndex + 1 >= args.Length ||
+                string.IsNullOrWhiteSpace(args[refreshCompatibleCatalogIndex + 1]))
+            {
+                Console.Error.WriteLine("--refresh-compatible-model-catalog requires an account name.");
+                return 2;
+            }
+            try
+            {
+                var count = new CodexCliService()
+                    .RefreshCompatibleModelCatalogAsync(args[refreshCompatibleCatalogIndex + 1])
+                    .GetAwaiter()
+                    .GetResult();
+                Console.WriteLine("Compatible model catalog refreshed: " + count);
+                return 0;
+            }
+            catch
+            {
+                Console.Error.WriteLine(
+                    "Compatible model catalog refresh failed; credentials were not changed.");
+                return 1;
+            }
+        }
+        if (args.Contains("--sync-native-compaction", StringComparer.OrdinalIgnoreCase))
+        {
+            try { Console.WriteLine("Native compaction configs updated: " + new CodexCliService().SyncManagedCompactionSettings()); return 0; }
+            catch { Console.Error.WriteLine("Compaction configuration migration failed; credentials were not changed."); return 1; }
+        }
+        if (args.Contains("--proxy-stdio", StringComparer.OrdinalIgnoreCase)) return ProxyStdioHost.Run(import: false);
+        if (args.Contains("--proxy-import-stdio", StringComparer.OrdinalIgnoreCase)) return ProxyStdioHost.Run(import: true);
         if (args.Contains(LocalPatGateway.ProcessArgument, StringComparer.OrdinalIgnoreCase))
         {
             return LocalPatGateway.RunProcess(args);
@@ -92,6 +133,17 @@ static class Program
         if (args.Contains("--gateway-quota-signal-self-test", StringComparer.OrdinalIgnoreCase))
         {
             return RunGatewayQuotaSignalSelfTest();
+        }
+        if (args.Contains("--gateway-rotation-self-test", StringComparer.OrdinalIgnoreCase))
+        {
+            CodexCliService.ValidateOfficialOAuthProfileProjection();
+            PatAutoRotationPolicy.Validate();
+            LocalPatGatewayHost.ValidateRoutingAndCredentialClassification();
+            LocalPatGatewayHost.ValidateCompatibleQuotaErrors();
+            AccountRotationConfiguration.Validate();
+            LocalPatGatewayHost.ValidateCompatibleQuotaFailoverAsync().GetAwaiter().GetResult();
+            Console.WriteLine("Gateway rotation and compatible quota classification self-test passed.");
+            return 0;
         }
         if (args.Contains("--oauth-link-probe", StringComparer.OrdinalIgnoreCase))
         {
@@ -216,6 +268,15 @@ static class Program
         ManagerLifecycleDiagnostics.Write(
             "manager-message-loop-started",
             $"preserve_gateway={preserveExistingPatGateway}; refresh_bridge={refreshNativeFastBridge}");
+        try
+        {
+            var updated = new CodexCliService().SyncManagedCompactionSettings();
+            ManagerLifecycleDiagnostics.Write("native-compaction-configs-migrated", $"updated={updated}");
+        }
+        catch (Exception ex)
+        {
+            ManagerLifecycleDiagnostics.WriteException("native-compaction-config-migration-failed", ex);
+        }
         try
         {
             Application.Run(new Form1(preserveExistingPatGateway, refreshNativeFastBridge));
@@ -494,6 +555,8 @@ static class Program
         {
             var store = new AccountStore();
             ProxyNodeStore.Validate();
+            ProxyCoreService.ValidateNativeNodeConfig();
+            ProxyHttpClientFactory.ValidateSocksStreamLifetime();
             var accounts = store.LoadAccounts();
             foreach (var account in accounts)
             {
@@ -505,9 +568,11 @@ static class Program
             }
 
             CodexCliService.ValidateConfigProjectionDefaults();
+            CodexCliService.ValidateNativeCompactionSettings();
             CodexCliService.ValidateLocalPatConfigMigration();
             LocalPatGatewayHost.ValidateRoutingAndCredentialClassification();
             LocalPatGatewayHost.ValidateSessionAffinityRouting();
+            LocalPatGatewayHost.ValidateCompatibleQuotaErrors();
             LocalPatGatewayHost.ValidatePatRejectionMessaging();
             Form1.ValidateGatewaySuccessfulActivityIsolation();
             PatAutoRotationPolicy.Validate();
@@ -543,6 +608,7 @@ static class Program
             UsageTracker.ValidateProbeUsageMerge();
             UsageTracker.ValidateSwitchEventNormalization();
             UsageTracker.ValidateSessionAccountAttribution();
+            UsageTracker.ValidateResumedOldSessionUsage();
             UsageTracker.ValidateSubagentReplayFiltering();
             UsageTracker.ValidatePersistentIncrementalCache();
             UsageTracker.ValidatePersistentCacheWriteIndex();

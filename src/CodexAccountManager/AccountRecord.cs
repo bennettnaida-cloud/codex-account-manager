@@ -22,8 +22,16 @@ public sealed class AccountRecord
     [JsonPropertyName("apiModel")]
     public string ApiModel { get; set; } = "gpt-5.5";
 
+    // PAT accounts keep an account-specific model instead of inheriting the
+    // global catalog default.
+    [JsonPropertyName("accessTokenModel")]
+    public string AccessTokenModel { get; set; } = "";
+
     [JsonPropertyName("apiWireApi")]
     public string ApiWireApi { get; set; } = "responses";
+
+    [JsonPropertyName("useBundledCompatibleApiModelCatalog")]
+    public bool UseBundledCompatibleApiModelCatalog { get; set; }
 
     [JsonPropertyName("quotaLimitType")]
     public string QuotaLimitType { get; set; } = AccountQuotaLimitType.Unknown;

@@ -111,7 +111,7 @@ internal static class LocalPatGateway
         if (!IsEnabledBySettings())
         {
             throw new InvalidOperationException(
-                "本地 PAT 网关已在系统配置中关闭，请先打开网关再启动 Access Token 账号。");
+                "本地网关已在系统配置中关闭；Access Token、独立代理或轮换需要网关，请先在系统配置中开启网关。");
         }
 
         await StartupLock.WaitAsync(cancellationToken);
@@ -1040,7 +1040,7 @@ internal sealed record LocalPatGatewayActivitySnapshot(
     string? LastSuccessfulModelRequestProxyNodeId = null,
     bool? LastSuccessfulModelRequestUsedGlobalProxy = null);
 
-internal sealed class LocalPatGatewayHost
+internal sealed partial class LocalPatGatewayHost
 {
     private const int CompatibleApiRequestBodyMaxBytes = 128 * 1024 * 1024;
     private const int ReplayableModelRequestBodyMaxBytes = CompatibleApiRequestBodyMaxBytes;
@@ -1211,8 +1211,11 @@ internal sealed class LocalPatGatewayHost
     private DateTimeOffset? _lastQuotaLimitedAtUtc;
     private long? _lastQuotaLimitedSequence;
 
-    internal LocalPatGatewayHost(string markerHeader, string markerValue)
+    private readonly int _listenerPort;
+
+    internal LocalPatGatewayHost(string markerHeader, string markerValue, int listenerPort = LocalPatGateway.Port)
     {
+        _listenerPort = listenerPort;
         _markerHeader = markerHeader;
         _markerValue = markerValue;
         _controlSecret = LocalPatGatewayControl.LoadOrCreateSecret();
@@ -1422,9 +1425,34 @@ internal sealed class LocalPatGatewayHost
             ResolveFixture,
             () => { });
         var rewritten = RewriteCompatibleApiRequestBody(
-            Encoding.UTF8.GetBytes("{\"model\":\"old\",\"input\":[{\"role\":\"user\",\"content\":\"keep\"}]}"),
+            Encoding.UTF8.GetBytes("{\"model\":\"old\",\"stream\":true,\"input\":[{\"role\":\"user\",\"content\":\"keep\"},{\"type\":\"compaction_trigger\"}]}"),
             "gpt-api-test");
         using var rewrittenDocument = JsonDocument.Parse(rewritten);
+        var allowedCompatibleModels = new HashSet<string>(
+            new[] { "gpt-api-test", "gpt-api-secondary" },
+            StringComparer.Ordinal);
+        var selectedModelBody = RewriteCompatibleApiRequestBody(
+            Encoding.UTF8.GetBytes("{\"model\":\"gpt-api-secondary\",\"input\":\"keep\"}"),
+            "gpt-api-test",
+            allowedCompatibleModels);
+        using var selectedModelDocument = JsonDocument.Parse(selectedModelBody);
+        var defaultModelBody = RewriteCompatibleApiRequestBody(
+            Encoding.UTF8.GetBytes("{\"input\":\"keep\"}"),
+            "gpt-api-test",
+            allowedCompatibleModels);
+        using var defaultModelDocument = JsonDocument.Parse(defaultModelBody);
+        var unavailableModelRejected = false;
+        try
+        {
+            _ = RewriteCompatibleApiRequestBody(
+                Encoding.UTF8.GetBytes("{\"model\":\"gpt-api-unavailable\",\"input\":\"keep\"}"),
+                "gpt-api-test",
+                allowedCompatibleModels);
+        }
+        catch (InvalidDataException)
+        {
+            unavailableModelRejected = true;
+        }
         var compatibleUriOk = TryBuildCompatibleApiUpstreamUri(
             new Uri("https://api.example.invalid/v1"),
             new Uri(LocalPatGateway.ListenerPrefix + "backend-api/codex/responses?stream=true"),
@@ -1462,7 +1490,13 @@ internal sealed class LocalPatGatewayHost
             !compatibleExtraPathRejected ||
             !compatibleTraversalRejected ||
             rewrittenDocument.RootElement.GetProperty("model").GetString() != "gpt-api-test" ||
+            selectedModelDocument.RootElement.GetProperty("model").GetString() != "gpt-api-secondary" ||
+            defaultModelDocument.RootElement.GetProperty("model").GetString() != "gpt-api-test" ||
+            !unavailableModelRejected ||
             rewrittenDocument.RootElement.GetProperty("input")[0].GetProperty("content").GetString() != "keep" ||
+            rewrittenDocument.RootElement.GetProperty("input")[1].GetProperty("type").GetString() != "compaction_trigger" ||
+            !rewrittenDocument.RootElement.GetProperty("stream").GetBoolean() ||
+            !ShouldForwardRequestHeader("x-codex-beta-features") ||
             Encoding.UTF8.GetString(rewritten).Contains("sk-api-test-only", StringComparison.Ordinal))
         {
             throw new InvalidOperationException(
@@ -2434,7 +2468,8 @@ internal sealed class LocalPatGatewayHost
                     !TryBuildCompatibleApiUpstreamUri(
                         credential.CompatibleApiBaseUri!,
                         context.Request.Url,
-                        out upstreamUri))
+                        out upstreamUri,
+                        _listenerPort))
                 {
                     if (lastQuotaResponse != null &&
                         TrySelectNextTransparentRotationCredential(
@@ -2682,7 +2717,8 @@ internal sealed class LocalPatGatewayHost
                         }
                         requestBody = RewriteCompatibleApiRequestBody(
                             replayableBody.Bytes,
-                            credential.CompatibleApiModel!);
+                            credential.CompatibleApiModel!,
+                            credential.CompatibleApiModels);
                         requestBodyWasRewritten = true;
                     }
                     catch (InvalidDataException ex)
@@ -2916,7 +2952,19 @@ internal sealed class LocalPatGatewayHost
                     return;
                 }
 
-                if (credential.IsCompatibleApi &&
+                byte[]? quotaErrorBody = null;
+                Upstream429Classification? quotaClassification = null;
+                if (modelRequestActivity != null &&
+                    (attemptResponse.StatusCode == HttpStatusCode.TooManyRequests ||
+                     (credential.IsCompatibleApi && IsCompatibleQuotaStatus(attemptResponse.StatusCode))))
+                {
+                    quotaErrorBody = await BufferUpstreamErrorResponseAsync(
+                        attemptResponse, requestCancellationToken);
+                    quotaClassification = ClassifyQuotaFailure(
+                        credential.IsCompatibleApi, attemptResponse, quotaErrorBody, DateTimeOffset.UtcNow);
+                }
+
+                if (quotaClassification?.IsQuotaExhausted != true && credential.IsCompatibleApi &&
                     IsCompatibleCompactRequest(context.Request.Url) &&
                     !attemptResponse.IsSuccessStatusCode)
                 {
@@ -2948,16 +2996,10 @@ internal sealed class LocalPatGatewayHost
                     }
                 }
 
-                if (modelRequestActivity != null &&
-                    attemptResponse.StatusCode == HttpStatusCode.TooManyRequests)
+                if (quotaClassification != null)
                 {
-                    var buffered429Body = await BufferUpstreamErrorResponseAsync(
-                        attemptResponse,
-                        requestCancellationToken);
-                    var classification = ClassifyUpstream429(
-                        attemptResponse,
-                        buffered429Body,
-                        DateTimeOffset.UtcNow);
+                    var buffered429Body = quotaErrorBody!;
+                    var classification = quotaClassification;
                     var transientKey = NormalizeOptionalAccountKey(credential.AccountKey) ??
                                        "unbound";
                     if (!classification.IsQuotaExhausted &&
@@ -4446,7 +4488,8 @@ internal sealed class LocalPatGatewayHost
                 CompatibleApiBaseUri: baseUri,
                 CompatibleApiModel: account.ApiModel.Trim(),
                 AccountKey: accountKey,
-                AllowIncomingChatGptIdentity: false);
+                AllowIncomingChatGptIdentity: false,
+                CompatibleApiModels: CodexCliService.GetCompatibleApiAllowedModels(account));
         }
 
         var credential = ParseBearerCredential("Bearer " + token);
@@ -6228,7 +6271,8 @@ internal sealed class LocalPatGatewayHost
 
     private static byte[] RewriteCompatibleApiRequestBody(
         ReadOnlySpan<byte> body,
-        string model)
+        string model,
+        IReadOnlySet<string>? allowedModels = null)
     {
         if (string.IsNullOrWhiteSpace(model) ||
             CodexCliService.GetCompatibleApiModelIdValidationError(model) != null)
@@ -6254,6 +6298,7 @@ internal sealed class LocalPatGatewayHost
             {
                 writer.WriteStartObject();
                 var modelCount = 0;
+                string? selectedModel = null;
                 foreach (var property in document.RootElement.EnumerateObject())
                 {
                     if (property.NameEquals("model"))
@@ -6263,14 +6308,46 @@ internal sealed class LocalPatGatewayHost
                         {
                             throw new InvalidDataException("请求体包含重复的 model 字段。");
                         }
-                        writer.WriteString("model", model.Trim());
+                        if (allowedModels == null)
+                        {
+                            selectedModel = model.Trim();
+                        }
+                        else if (property.Value.ValueKind != JsonValueKind.String ||
+                                 string.IsNullOrWhiteSpace(property.Value.GetString()))
+                        {
+                            throw new InvalidDataException("请求体中的 model 必须是非空字符串。");
+                        }
+                        else
+                        {
+                            selectedModel = property.Value.GetString()!.Trim();
+                            if (CodexCliService.GetCompatibleApiModelIdValidationError(selectedModel) != null ||
+                                !allowedModels.Contains(selectedModel))
+                            {
+                                var available = allowedModels
+                                    .OrderBy(value => value, StringComparer.OrdinalIgnoreCase)
+                                    .Take(8)
+                                    .ToArray();
+                                throw new InvalidDataException(
+                                    $"模型“{selectedModel}”不在当前兼容 API 账号的已同步目录中。" +
+                                    (available.Length == 0
+                                        ? string.Empty
+                                        : $"可选模型：{string.Join("、", available)}。"));
+                            }
+                        }
+                        writer.WriteString("model", selectedModel);
                         continue;
                     }
                     property.WriteTo(writer);
                 }
                 if (modelCount == 0)
                 {
-                    writer.WriteString("model", model.Trim());
+                    selectedModel = model.Trim();
+                    if (allowedModels != null && !allowedModels.Contains(selectedModel))
+                    {
+                        throw new InvalidDataException(
+                            $"默认模型“{selectedModel}”不在当前兼容 API 账号的已同步目录中。");
+                    }
+                    writer.WriteString("model", selectedModel);
                 }
                 writer.WriteEndObject();
             }
@@ -6858,7 +6935,8 @@ internal sealed class LocalPatGatewayHost
     private static bool TryBuildCompatibleApiUpstreamUri(
         Uri baseUri,
         Uri? incoming,
-        out Uri upstream)
+        out Uri upstream,
+        int listenerPort = LocalPatGateway.Port)
     {
         upstream = null!;
         if (!baseUri.IsAbsoluteUri ||
@@ -6872,7 +6950,7 @@ internal sealed class LocalPatGatewayHost
             incoming == null ||
             !incoming.Scheme.Equals("http", StringComparison.OrdinalIgnoreCase) ||
             !LocalProxyDetector.IsLoopbackHost(incoming.Host) ||
-            incoming.Port != LocalPatGateway.Port ||
+            incoming.Port != listenerPort ||
             !string.IsNullOrEmpty(incoming.UserInfo) ||
             !string.IsNullOrEmpty(incoming.Fragment) ||
             ContainsDotSegments(incoming.OriginalString.Split('?', 2)[0]))
@@ -7120,7 +7198,8 @@ internal sealed class LocalPatGatewayHost
         string? CompatibleApiModel = null,
         string? AccountKey = null,
         string? ChatGptAccountId = null,
-        bool AllowIncomingChatGptIdentity = true)
+        bool AllowIncomingChatGptIdentity = true,
+        IReadOnlySet<string>? CompatibleApiModels = null)
     {
         internal bool IsCompatibleApi =>
             CompatibleApiBaseUri != null && !string.IsNullOrWhiteSpace(CompatibleApiModel);
