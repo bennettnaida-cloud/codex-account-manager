@@ -58,7 +58,8 @@ jobs:
           & .\Build-CodexAccountManager.ps1
           if ($LASTEXITCODE -ne 0) { throw 'Windows application build failed.' }
           $startupExe = Join-Path $PWD ('dist/CodexAccountManager-{0}/CodexAccountManager.exe' -f $env:CAM_VERSION)
-          $startupTest = Start-Process -FilePath $startupExe -ArgumentList '--startup-self-test' -WindowStyle Hidden -Wait -PassThru
+          $startupTest = Start-Process -FilePath $startupExe -ArgumentList '--startup-self-test' -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput 'startup-self-test.out' -RedirectStandardError 'startup-self-test.err'
+          Get-Content 'startup-self-test.out','startup-self-test.err'
           if ($startupTest.ExitCode -ne 0) { throw 'Windows startup regression test failed.' }
           & .\Build-OneClickInstallerPackage.ps1 -OutputPath (Join-Path $PWD 'CodexAccountManager-Windows-latest.zip')
           if ($LASTEXITCODE -ne 0) { throw 'Windows installer package build failed.' }
