@@ -57,6 +57,9 @@ jobs:
           $env:CODEX_ACCOUNT_MANAGER_SKIP_WINDOWS_CLIENT_SELF_TEST = '1'
           & .\Build-CodexAccountManager.ps1
           if ($LASTEXITCODE -ne 0) { throw 'Windows application build failed.' }
+          $startupExe = Join-Path $PWD ('dist/CodexAccountManager-{0}/CodexAccountManager.exe' -f $env:CAM_VERSION)
+          $startupTest = Start-Process -FilePath $startupExe -ArgumentList '--startup-self-test' -WindowStyle Hidden -Wait -PassThru
+          if ($startupTest.ExitCode -ne 0) { throw 'Windows startup regression test failed.' }
           & .\Build-OneClickInstallerPackage.ps1 -OutputPath (Join-Path $PWD 'CodexAccountManager-Windows-latest.zip')
           if ($LASTEXITCODE -ne 0) { throw 'Windows installer package build failed.' }
           $versionedPackage = 'CodexAccountManager-Windows-{0}.zip' -f $env:CAM_VERSION
@@ -135,9 +138,9 @@ jobs:
           body: |
             自动构建版本 `${{ env.CAM_VERSION }}`。
 
-            修复普通 Codex 与语音/手机启动的非必要重启、延迟新聊天跳转和就绪误判；适配新版外置 app-server，并保护未知官方目录结构。
+            修复语音/手机启动长时间停在标志页：普通 Codex 和语音/手机入口都会将所选账号节点传给桌面登录与功能页面；保留官方插件安装状态，持续显示初始化进度，窗口出现不再等同于启动完成。
 
-            安装包内置 Codex CLI 0.154.0 和模型目录。本机已针对 Windows 桌面包 26.924.2738.0 核验进程与官方就绪日志，并运行启动安全回归测试。当前资源拆分不满足旧 Fast 补丁契约时，跳过可选增强，不强制刷新页面。其他电脑完整 UI 冷启动及实际跨账号切换未实测；模型权限仍取决于账号及上游。
+            安装包内置 Codex CLI 0.154.0 和模型目录。已通过完整自检和启动专项回归；在 26.924.2738.0 隔离配置中验证日本节点下冷启动约 19.5 秒、保留插件状态后重复启动约 7.5–8.5 秒。测试不构成所有网络环境的时延保证；其他电脑以及用户正在运行的账号切换未进行破坏性实测。模型权限仍取决于账号及上游。Dream Skin 自定义启动不在本次网络修复的实测范围内。
 
             Windows 用户可在管理器中检查更新，或下载下方 Windows 安装包。更新后重新启动管理器和 Codex，使请求经过新版网关；使用 GPT-6 仍需账号或 API 服务支持该模型。
           prerelease: true

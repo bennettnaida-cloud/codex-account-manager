@@ -2541,6 +2541,14 @@ public sealed partial class CodexCliService
             // looking at a blank Codex window after the old profile has already been replaced.
             await EnsureCompatibleApiLaunchPreflightAsync(account);
         }
+        // Resolve/start the selected node BEFORE closing the old client. A functioning
+        // model gateway alone does not configure Chromium's OAuth/feature bootstrap.
+        var desktopProxy = mode == WindowsClientMode.OfficialCodex
+            ? await Task.Run(() => ResolveOfficialDesktopProxy(account)) : null;
+        if (mode == WindowsClientMode.OfficialCodex)
+            LaunchPhase("official-desktop-network-prepared", "账号节点已准备，正在检查桌面启动配置…",
+                desktopProxy == null ? "desktop_proxy=system-default" :
+                "desktop_proxy=" + desktopProxy.GetLeftPart(UriPartial.Authority) + "; model_route=gateway-policy");
         long successfulLaunchGeneration = 0;
         var projectionResult = await Task.Run(() =>
         {
@@ -2772,7 +2780,8 @@ public sealed partial class CodexCliService
                         account,
                         accessTokenMode,
                         chatGptFeatureAccount),
-                    expectedLaunchGeneration: launchGeneration);
+                    expectedLaunchGeneration: launchGeneration,
+                    desktopProxy: desktopProxy);
                 if (projection.ClientLaunchStarted)
                 {
                     successfulLaunchGeneration = launchGeneration;
@@ -4343,6 +4352,7 @@ public sealed partial class CodexCliService
                     routeThroughGateway: routeThroughGateway);
                 var currentConfig = File.Exists(configPath) ? File.ReadAllText(configPath) : "";
                 projectedConfig = PreserveSharedMcpServerSections(currentConfig, projectedConfig);
+                projectedConfig = PreserveSharedDesktopRuntimeSections(currentConfig, projectedConfig);
                 if (!string.Equals(currentConfig, projectedConfig, StringComparison.Ordinal))
                 {
                     WriteTextAtomically(configPath, projectedConfig);
@@ -4370,6 +4380,7 @@ public sealed partial class CodexCliService
                         modelOverride: GetAccessTokenModel(account));
                 var currentConfig = File.Exists(configPath) ? File.ReadAllText(configPath) : "";
                 projectedConfig = PreserveSharedMcpServerSections(currentConfig, projectedConfig);
+                projectedConfig = PreserveSharedDesktopRuntimeSections(currentConfig, projectedConfig);
                 if (!string.Equals(currentConfig, projectedConfig, StringComparison.Ordinal))
                 {
                     WriteTextAtomically(configPath, projectedConfig);
@@ -4576,7 +4587,8 @@ public sealed partial class CodexCliService
         string appearancePresetId,
         string? appearanceLabel,
         bool allowOfficialRendererPatch,
-        long? expectedLaunchGeneration = null)
+        long? expectedLaunchGeneration = null,
+        Uri? desktopProxy = null)
     {
         ArgumentNullException.ThrowIfNull(account);
         if (!Directory.Exists(projectPath))
@@ -4641,7 +4653,8 @@ public sealed partial class CodexCliService
                 appearancePresetId,
                 appearanceLabel,
                 allowOfficialRendererPatch,
-                launchGeneration),
+                launchGeneration,
+                desktopProxy),
             _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unsupported Windows client mode.")
         };
     }
@@ -5837,7 +5850,8 @@ public sealed partial class CodexCliService
     }
 
     private static WindowsClientActivationIdentity ActivateOfficialCodexPackage(
-        int? nativeFastCdpPort = null, bool cleanupUnverifiableIdentity = true, string? projectPath = null)
+        int? nativeFastCdpPort = null, bool cleanupUnverifiableIdentity = true, string? projectPath = null,
+        Uri? desktopProxy = null)
     {
         var appUserModelId = ResolveCodexWindowsClientAppUserModelId();
         if (string.IsNullOrWhiteSpace(appUserModelId))
@@ -5852,7 +5866,7 @@ public sealed partial class CodexCliService
         {
             var result = activationManager.ActivateApplication(
                 appUserModelId,
-                BuildOfficialStartupArguments(nativeFastCdpPort, projectPath),
+                BuildOfficialStartupArguments(nativeFastCdpPort, projectPath, desktopProxy),
                 ApplicationActivationOptions.None,
                 out var processId);
             Marshal.ThrowExceptionForHR(result);
@@ -11416,7 +11430,7 @@ catch {
             AccessTokenModel,
             AccessTokenReasoningEffort,
             true,
-            pluginsEnabled: false,
+            pluginsEnabled: true,
             expectedServiceTier: "priority");
         AssertManagedProviderSection(dualLoginDesktopConfig, requiresOpenAiAuth: true);
         AssertAccessTokenHttpProvider(dualLoginDesktopConfig, requiresOpenAiAuth: true);
@@ -11658,7 +11672,6 @@ catch {
             !config.Contains(
                 "requires_openai_auth = " + requiresOpenAiAuth.ToString().ToLowerInvariant(),
                 StringComparison.Ordinal) ||
-            !config.Contains("plugins = false", StringComparison.Ordinal) ||
             !config.Contains("supports_websockets = false", StringComparison.Ordinal) ||
             !config.Contains("stream_max_retries = 0", StringComparison.Ordinal) ||
             !config.Contains("request_max_retries = 1", StringComparison.Ordinal))
@@ -13556,6 +13569,25 @@ catch {
     private static string PreserveSharedMcpServerSections(
         string currentSharedConfig,
         string projectedConfig)
+        => PreserveSharedConfigSections(currentSharedConfig, projectedConfig, IsMcpServerSection);
+
+    private static string PreserveSharedDesktopRuntimeSections(string currentSharedConfig, string projectedConfig)
+    {
+        // These are installed desktop capabilities, not account credentials. New Codex
+        // versions persist their native plugin inventory/marketplace locations here.
+        // Replacing them from an old account template triggers reinstall on every launch.
+        return PreserveSharedConfigSections(currentSharedConfig, projectedConfig, header =>
+        {
+            if (IsSitesPluginSection(header)) return false; // Keep the targeted safety exclusion.
+            var table = header.TrimStart('[').TrimEnd(']').Trim();
+            return table is "plugins" or "marketplaces" ||
+                table.StartsWith("plugins.", StringComparison.Ordinal) ||
+                table.StartsWith("marketplaces.", StringComparison.Ordinal);
+        });
+    }
+
+    private static string PreserveSharedConfigSections(
+        string currentSharedConfig, string projectedConfig, Func<string, bool> preserve)
     {
         var sharedLines = currentSharedConfig
             .Replace("\r\n", "\n", StringComparison.Ordinal)
@@ -13568,7 +13600,7 @@ catch {
             var trimmed = line.Trim();
             if (IsTomlTableHeader(trimmed))
             {
-                inMcpServerSection = IsMcpServerSection(trimmed);
+                inMcpServerSection = preserve(trimmed);
             }
 
             if (inMcpServerSection)
@@ -13597,7 +13629,7 @@ catch {
             var trimmed = line.Trim();
             if (IsTomlTableHeader(trimmed))
             {
-                inMcpServerSection = IsMcpServerSection(trimmed);
+                inMcpServerSection = preserve(trimmed);
             }
 
             if (!inMcpServerSection)
@@ -13744,7 +13776,8 @@ catch {
         AppendDisabledSitesPlugin(output);
         return ApplyDesktopFeatureDefaults(
             string.Join(Environment.NewLine, output) + Environment.NewLine,
-            disablePlugins: true);
+            disablePlugins: true,
+            enableNativePlugins: forceFileAuthStore && !string.IsNullOrWhiteSpace(providerBearerToken));
     }
 
     private static bool IsTopLevelModelProviderLine(string trimmedLine)
@@ -13874,7 +13907,8 @@ catch {
         AppendDisabledSitesPlugin(output);
         return ApplyDesktopFeatureDefaults(
             string.Join(Environment.NewLine, output) + Environment.NewLine,
-            disablePlugins: forceFileAuthStore);
+            disablePlugins: forceFileAuthStore,
+            enableNativePlugins: forceFileAuthStore && !string.IsNullOrWhiteSpace(providerBearerToken));
     }
 
     private static bool IsManagedLegacyCompatibleApiProviderSection(
@@ -14119,10 +14153,13 @@ catch {
         return matches == 1;
     }
 
-    private static string ApplyDesktopFeatureDefaults(string config, bool disablePlugins = false)
+    private static string ApplyDesktopFeatureDefaults(string config, bool disablePlugins = false,
+        bool enableNativePlugins = false)
     {
         var projected = RepairManagedCompactionSettings(config);
         projected = UpsertFeatureFlag(projected, "remote_plugin", false);
+        if (enableNativePlugins)
+            return UpsertFeatureFlag(projected, "plugins", true);
         return disablePlugins
             ? UpsertFeatureFlag(projected, "plugins", false)
             : projected;

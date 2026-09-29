@@ -26,6 +26,10 @@ public sealed partial class CodexCliService
         internal string ProgressText = "正在检查配置与网关…";
         internal long ElapsedSeconds => _clock.ElapsedMilliseconds / 1000;
         internal long ElapsedMilliseconds => _clock.ElapsedMilliseconds;
+        internal TaskCompletionSource<string>? PageObservation { get; private set; }
+        internal void StartPageObservation() => PageObservation ??=
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal void FinishPageObservation(string message) => PageObservation?.TrySetResult(message);
         internal LaunchDiagnostics(LaunchDiagnostics? previous) => _previous = previous;
         public void Dispose() => CurrentLaunch.Value = _previous;
     }
@@ -154,18 +158,24 @@ public sealed partial class CodexCliService
     [DllImport("user32.dll")] private static extern bool ShowWindowAsync(IntPtr hWnd, int command);
     [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr hWnd);
 
-    private static string BuildOfficialStartupArguments(int? debugPort, string? projectPath)
+    private static string BuildOfficialStartupArguments(int? debugPort, string? projectPath, Uri? desktopProxy = null)
     {
         var arguments = debugPort.HasValue ? BuildOfficialNativeFastActivationArguments(debugPort.Value) : "";
+        if (desktopProxy != null)
+        {
+            var proxy = ValidateDesktopProxyUri(desktopProxy);
+            arguments += " --proxy-server=" + proxy.GetLeftPart(UriPartial.Authority) +
+                " --proxy-bypass-list=localhost;127.0.0.1;[::1]";
+        }
         // Codex queues initialArgv deep links itself until its primary route is ready.
         // Submit once with activation, never as a second shell activation after page-ready.
-        return string.IsNullOrWhiteSpace(projectPath) ? arguments :
+        return string.IsNullOrWhiteSpace(projectPath) ? arguments.Trim() :
             (arguments + " " + BuildNewThreadDeepLink(projectPath)).Trim();
     }
 
     private static bool LaunchOfficialCodex(string projectPath, bool useDreamSkin,
         ThemeMode appearanceMode, string appearancePresetId, string? appearanceLabel,
-        bool allowRendererPatch, long launchGeneration)
+        bool allowRendererPatch, long launchGeneration, Uri? desktopProxy = null)
     {
         if (useDreamSkin)
             return LaunchOfficialCodexWithLegacyRendererReload(projectPath, true,
@@ -190,12 +200,13 @@ public sealed partial class CodexCliService
         LaunchPhase("official-system-activation-start", "正在请求 Windows 打开 Codex…",
             "navigation=initial-argv; reload_permitted=false; retry=false");
         // One COM activation. A timeout/metadata error is not permission to activate again.
-        var identity = ActivateOfficialCodexPackage(port, cleanupUnverifiableIdentity: false, projectPath);
+        var identity = ActivateOfficialCodexPackage(port, cleanupUnverifiableIdentity: false, projectPath, desktopProxy);
         Interlocked.Exchange(ref _navigationIssuedGeneration, launchGeneration);
         Volatile.Write(ref _pendingOfficialStartup, identity);
         LaunchPhase("official-system-activation-accepted", "Windows 已接受启动，Codex 正在初始化…",
             $"pid={identity.ProcessId}; start_ticks={identity.StartTimeUtcTicks}; " +
             "project_navigation=queued-once-with-activation; reload=false");
+        CurrentLaunch.Value?.StartPageObservation();
         ObserveOfficialStartupInBackground(baseline, identity, launchStartedUtc,
             launchGeneration, port, allowRendererPatch);
         return true;
@@ -205,6 +216,7 @@ public sealed partial class CodexCliService
         OfficialCodexLogBaseline baseline, WindowsClientActivationIdentity identity,
         DateTime originalLaunchStartedUtc, long generation, int? nativeFastPort, bool optionalFast)
     {
+        var trace = CurrentLaunch.Value;
         _ = Task.Run(() =>
         {
             try
@@ -233,6 +245,7 @@ public sealed partial class CodexCliService
                         }
                         LaunchPhase("official-process-exited", "Codex 进程已退出，请查看启动诊断",
                             $"pid={identity.ProcessId}; retry=false");
+                        trace?.FinishPageObservation("Codex 启动进程已退出，请查看启动诊断。");
                         return;
                     }
                     if (state == StartupProcessState.Alive)
@@ -256,12 +269,14 @@ public sealed partial class CodexCliService
                             $"app_server_utc={probe.AppServerConnectedAtUtc:O}; routes_utc={probe.RoutesMountedAtUtc:O}; ready_utc={probe.ReadyAtUtc:O}");
                         if (optionalFast && nativeFastPort.HasValue)
                             StartOptionalFastWithoutReload(nativeFastPort.Value, identity, generation);
+                        trace?.FinishPageObservation("Codex 主页面已就绪。");
                         return;
                     }
                     if (observation == StartupObservation.InitializationError)
                     {
                         LaunchPhase("official-initialization-error-preserved", "Codex 报告初始化错误，未自动重启",
                             $"pid={identity.ProcessId}; reason=persisted-atom-sync; retry=false");
+                        trace?.FinishPageObservation("Codex 报告初始化错误；已保留窗口和账号，请查看启动诊断。");
                         return;
                     }
                     if (!runtimeRecorded && IsWindowsClientRuntimeHealthySince(
@@ -283,6 +298,12 @@ public sealed partial class CodexCliService
             {
                 WriteCodexPlusPlusLaunchDiagnostic("official-observation-unavailable",
                     $"pid={identity.ProcessId}; error_type={ex.GetType().Name}; restart=false; navigation=false");
+            }
+            finally
+            {
+                trace?.FinishPageObservation(IsCurrentWindowsClientLaunchGeneration(generation)
+                    ? "Codex 窗口已启动，但尚未确认主页面就绪。若仍停在标志页，请检查所选账号节点对官方登录和功能服务的连接。"
+                    : "本次启动观察已被新的启动取代。");
             }
         });
     }
@@ -452,7 +473,11 @@ public sealed partial class CodexCliService
         var project = @"C:\Projects\project with spaces\学习";
         foreach (var dual in new[] { false, true })
         {
-            var arguments = BuildOfficialStartupArguments(dual ? 19335 : null, project);
+            var arguments = BuildOfficialStartupArguments(dual ? 19335 : null, project,
+                new Uri("http://127.0.0.1:12805"));
+            Require(arguments.Contains("--proxy-server=http://127.0.0.1:12805", StringComparison.Ordinal) &&
+                arguments.Contains("--proxy-bypass-list=localhost;127.0.0.1;[::1]", StringComparison.Ordinal),
+                "both desktop entries use the selected proxy and preserve local gateway access");
             Require(arguments.Split("codex://", StringSplitOptions.None).Length == 2,
                 "each cold launch must queue exactly one project link in initial argv");
             Require(arguments.Contains(BuildNewThreadDeepLink(project), StringComparison.Ordinal), "project encoding");
@@ -462,6 +487,23 @@ public sealed partial class CodexCliService
             Require(!ShouldPreserveExistingOfficialWindow(true, WindowsClientMode.OfficialCodex, false, true, dual),
                 "actual account switch still requires profile replacement");
         }
+        foreach (var unsafeProxy in new[] { "http://user:password@127.0.0.1:8080", "file:///test", "http://example.test/path?secret=1" })
+        {
+            var rejected = false;
+            try { _ = BuildOfficialStartupArguments(null, project, new Uri(unsafeProxy)); }
+            catch (InvalidOperationException) { rejected = true; }
+            Require(rejected, "proxy credentials/invalid values cannot leak into process arguments");
+        }
+        using (var trace = new LaunchDiagnostics(null))
+        {
+            Require(trace.PageObservation == null, "window reuse does not introduce a wait");
+            trace.StartPageObservation();
+            Require(!trace.PageObservation!.Task.IsCompleted, "activation is not page-ready");
+            trace.FinishPageObservation("ready");
+            trace.FinishPageObservation("timeout");
+            Require(trace.PageObservation.Task.Result == "ready", "late observer cleanup cannot overwrite readiness");
+        }
+        ValidateDesktopNativePluginPreservation();
         using (var first = new DesktopLaunchLease())
         {
             var rejected = false;
@@ -496,6 +538,38 @@ public sealed partial class CodexCliService
             "import './app-shared-abcdef123.js';serviceTierForRequest:x"), "split bundles rejected as an incomplete contract");
         Require(!CodexNativeFastBridge.HasSplitServiceTierContract(
             "serviceTierForRequest:x;p=`priority`,f=`fast`,"), "old complete resource is not confused with split layout");
+    }
+
+    private static void ValidateDesktopNativePluginPreservation()
+    {
+        var current = "[plugins.\"documents@openai-primary-runtime\"]\nenabled = true\n" +
+            "[plugins.\"browser@openai-bundled\"]\nenabled = false\n" +
+            "[marketplaces.openai-bundled]\nsource = 'C:/runtime/plugins'\n" +
+            "[model_providers.old]\nexperimental_bearer_token = 'must-not-copy'\n";
+        var projected = "model = 'test-model'\n[plugins.\"documents@openai-primary-runtime\"]\nenabled = false\n" +
+            "[model_providers.new]\nexperimental_bearer_token = 'selected-model-key'\n";
+        var preserved = PreserveSharedDesktopRuntimeSections(current, projected);
+        if (!preserved.Contains("source = 'C:/runtime/plugins'", StringComparison.Ordinal) ||
+            !preserved.Contains("selected-model-key", StringComparison.Ordinal) ||
+            preserved.Contains("must-not-copy", StringComparison.Ordinal) ||
+            !preserved.Contains("browser@openai-bundled\"]\r\nenabled = false", StringComparison.Ordinal) ||
+            preserved.Split("documents@openai-primary-runtime").Length != 2 ||
+            PreserveSharedDesktopRuntimeSections(preserved, preserved) != preserved)
+            throw new InvalidOperationException("Desktop native plugin preservation/credential isolation regression.");
+        var api = new AccountRecord { Name = "fixture-api", AuthKind = "compatible_api",
+            ApiBaseUrl = "https://example.invalid", ApiModel = "fixture-model" };
+        foreach (var ordinary in new[] { false, true })
+        {
+            var apiConfig = ProjectCompatibleApiConfigText("[features]\nplugins = false\n", api,
+                requiresOpenAiAuth: true, forceFileAuthStore: true,
+                providerBearerToken: ordinary ? null : "fixture-key");
+            var patConfig = ProjectWindowsClientConfigText("[features]\nplugins = false\n",
+                requiresOpenAiAuth: true, forceFileAuthStore: true,
+                providerBearerToken: ordinary ? null : "fixture-key");
+            var expected = "plugins = " + (ordinary ? "false" : "true");
+            if (!apiConfig.Contains(expected, StringComparison.Ordinal) || !patConfig.Contains(expected, StringComparison.Ordinal))
+                throw new InvalidOperationException("Native plugins must be available for both PAT/API OAuth feature launches.");
+        }
     }
 
     internal static object AuditWindowsStartupRuntime(int processId)

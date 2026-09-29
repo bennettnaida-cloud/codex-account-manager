@@ -16627,11 +16627,20 @@ public partial class Form1 : Form
         launchProgress.Start();
         try
         {
-            return await LaunchAccountCoreAsync(
+            var launched = await LaunchAccountCoreAsync(
                 account,
                 mode,
                 chatGptFeatureAccount,
                 automaticRotation);
+            if (launched && launchTrace.PageObservation is { } observation)
+            {
+                // Activation/window creation does not mean the login/main page is ready.
+                // Keep the click guard and progress alive through the actual observation.
+                var result = await observation.Task;
+                launchProgress.Stop();
+                if (!IsDisposed && !Disposing) _statusBox.Text = result;
+            }
+            return launched;
         }
         catch (Exception ex)
         {

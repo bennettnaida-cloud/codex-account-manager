@@ -2,8 +2,47 @@ namespace CodexAccountManager;
 
 public sealed partial class CodexCliService
 {
-    // A desktop process inherits one global proxy. Per-account egress is enforced
-    // by the gateway, independently of rotation and of the desktop login button.
+    private AccountProxyResolver? _officialDesktopProxyResolver;
+
+    private Uri? ResolveOfficialDesktopProxy(AccountRecord account)
+    {
+        var store = new ProxyNodeStore();
+        var binding = store.GetBinding(AccountProxyResolver.AccountKeyFor(account));
+        if (store.BindingsLoadFailed)
+            throw new InvalidDataException("账号代理绑定无法读取；没有关闭当前 Codex。");
+        // Unbound installations may intentionally use the OS proxy or a direct connection.
+        if (binding?.Mode is null or ProxyBindingMode.InheritGlobal)
+        {
+            var global = GetConfiguredProxyUri();
+            return string.IsNullOrWhiteSpace(global) ? null : ValidateDesktopProxyUri(new Uri(global));
+        }
+        if (_officialDesktopProxyResolver == null)
+        {
+            var resolver = new AccountProxyResolver(new AccountStore().RootPath);
+            _officialDesktopProxyResolver = resolver;
+            // Keep managed native cores alive for the desktop's lifetime, not just preflight.
+            AppDomain.CurrentDomain.ProcessExit += (_, _) => resolver.Dispose();
+        }
+        var resolution = _officialDesktopProxyResolver.Resolve(AccountProxyResolver.AccountKeyFor(account));
+        if (!resolution.Success || resolution.ProxyUri == null)
+            throw new InvalidOperationException(resolution.Error);
+        var node = _officialDesktopProxyResolver.GetNode(resolution.NodeId);
+        if (!string.IsNullOrWhiteSpace(node?.Username))
+            throw new InvalidOperationException("官方桌面端不能通过启动参数安全传递代理密码，请为此账号绑定本地代理入口或原生节点。当前 Codex 未关闭。");
+        return ValidateDesktopProxyUri(resolution.ProxyUri);
+    }
+
+    private static Uri ValidateDesktopProxyUri(Uri uri)
+    {
+        if (!uri.IsAbsoluteUri || uri.Scheme is not ("http" or "https" or "socks5") ||
+            !string.IsNullOrEmpty(uri.UserInfo) || string.IsNullOrEmpty(uri.Host) ||
+            uri.AbsolutePath != "/" || !string.IsNullOrEmpty(uri.Query) || !string.IsNullOrEmpty(uri.Fragment))
+            throw new InvalidOperationException("桌面代理必须为不含凭据的 HTTP/HTTPS/SOCKS5 地址。");
+        return uri;
+    }
+
+    // Model traffic remains request-boundary routed by the gateway. The desktop's
+    // Chromium login/feature requests also need an explicit proxy on cold activation.
     internal static bool RequiresDesktopGateway(AccountRecord account, bool requested = false)
     {
         if (requested || account.IsAccessToken) return true;
