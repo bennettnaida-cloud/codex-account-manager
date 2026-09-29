@@ -69,6 +69,7 @@ internal sealed class OfficialCodexLogBaseline
 
     internal string Root { get; }
     internal DateTimeOffset CapturedAtUtc { get; }
+    internal long CapturedAtUtcTicks => CapturedAtUtc.UtcDateTime.Ticks;
 
     /// <summary>
     /// True only when the AUMID-derived root was resolved and every t0 file present at capture
@@ -300,9 +301,13 @@ internal sealed class OfficialCodexLogProbe
     }
 
     internal bool IsAvailable => _baselineCaptureComplete && !string.IsNullOrEmpty(_root);
+    internal DateTimeOffset? ReadyAtUtc { get; private set; }
+    internal DateTimeOffset? RoutesMountedAtUtc { get; private set; }
+    internal DateTimeOffset? AppServerConnectedAtUtc { get; private set; }
 
     internal OfficialCodexLogReadinessState Poll()
     {
+        ReadyAtUtc = RoutesMountedAtUtc = AppServerConnectedAtUtc = null;
         if (!IsAvailable ||
             !TryEnumerateCurrentIncrementFiles(out var candidates))
         {
@@ -332,6 +337,9 @@ internal sealed class OfficialCodexLogProbe
             if (readiness.ObservedReady)
             {
                 aggregate = OfficialCodexLogReadinessState.Ready;
+                ReadyAtUtc = readiness.ReadyAtUtc;
+                RoutesMountedAtUtc = readiness.ReadyRoutesAtUtc;
+                AppServerConnectedAtUtc = readiness.AppServerConnectedAt;
             }
         }
 
@@ -583,6 +591,8 @@ internal sealed class OfficialCodexLogProbe
                                         MaximumRoutesToReadyInterval))
                                 {
                                     readiness.ObservedReady = true;
+                                    readiness.ReadyAtUtc = readyAt;
+                                    readiness.ReadyRoutesAtUtc = readiness.PrimaryRoutesMountedAt;
                                 }
 
                                 readiness.PrimaryRoutesMountedAt = null;
@@ -733,6 +743,8 @@ internal sealed class OfficialCodexLogProbe
         internal int? AppServerConnectionId { get; set; }
         internal DateTimeOffset? PrimaryRoutesMountedAt { get; set; }
         internal bool ObservedReady { get; set; }
+        internal DateTimeOffset? ReadyAtUtc { get; set; }
+        internal DateTimeOffset? ReadyRoutesAtUtc { get; set; }
 
         internal void Invalidate()
         {
@@ -740,6 +752,7 @@ internal sealed class OfficialCodexLogProbe
             AppServerConnectionId = null;
             PrimaryRoutesMountedAt = null;
             ObservedReady = false;
+            ReadyAtUtc = ReadyRoutesAtUtc = null;
         }
     }
 

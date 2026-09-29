@@ -409,6 +409,7 @@ public partial class Form1 : Form
     private int _rolloutHistoryRepairMonitorScheduled;
     private int _chatSectionSyncScheduled;
     private int _chatSectionSyncRequiresClientRestart;
+    private int _accountLaunchInProgress;
     private bool _threadSectionOrderNormalizationStarted;
     private bool _patGatewayRuntimeRunning;
     private bool _patGatewayActionRunning;
@@ -4158,18 +4159,13 @@ public partial class Form1 : Form
                 CodexCliService.GetDefaultCodexHome(),
                 _currentAccountName,
                 _store.RootPath);
-            // A Manager opened on top of an already-running Codex cannot know which
-            // revision of the main-process sidebar cache that client loaded. Arm one
-            // explicit-launch reload; a fresh Manager-first launch does not take this path.
-            if (_chatSectionStateWatcher == null && _codex.IsOfficialWindowsClientRunning())
-            {
-                Interlocked.Exchange(ref _chatSectionSyncRequiresClientRestart, 1);
-            }
+            // Only a real disk change needs a one-time reload. Merely opening the
+            // Manager after Codex must not invalidate an already-running client.
             if (sectionSync.Changed)
             {
-                if (_codex.IsOfficialWindowsClientRunning())
+                if (sectionSync.ActiveProfileChanged && _codex.IsOfficialWindowsClientRunning())
                 {
-                    Interlocked.Exchange(ref _chatSectionSyncRequiresClientRestart, 1);
+                    Interlocked.Increment(ref _chatSectionSyncRequiresClientRestart);
                 }
                 ManagerLifecycleDiagnostics.Write(
                     "chat-sections-synchronized",
@@ -4319,9 +4315,9 @@ public partial class Form1 : Form
                     _store.RootPath);
                 if (result.Changed)
                 {
-                    if (_codex.IsOfficialWindowsClientRunning())
+                    if (result.ActiveProfileChanged && _codex.IsOfficialWindowsClientRunning())
                     {
-                        Interlocked.Exchange(ref _chatSectionSyncRequiresClientRestart, 1);
+                        Interlocked.Increment(ref _chatSectionSyncRequiresClientRestart);
                     }
                     ManagerLifecycleDiagnostics.Write(
                         "chat-sections-synchronized-after-account-switch",
@@ -4356,9 +4352,9 @@ public partial class Form1 : Form
             $"operation={operation}; changed={result.Changed}; " +
             $"profiles={result.UpdatedProfiles}; sections={result.AddedSections}; " +
             $"items={result.AddedItems}");
-        if (result.Changed && _codex.IsOfficialWindowsClientRunning())
+        if (result.ActiveProfileChanged && _codex.IsOfficialWindowsClientRunning())
         {
-            Interlocked.Exchange(ref _chatSectionSyncRequiresClientRestart, 1);
+            Interlocked.Increment(ref _chatSectionSyncRequiresClientRestart);
         }
     }
 
@@ -16613,6 +16609,22 @@ public partial class Form1 : Form
         AccountRecord? chatGptFeatureAccount = null,
         bool automaticRotation = false)
     {
+        if (Interlocked.CompareExchange(ref _accountLaunchInProgress, 1, 0) != 0)
+        {
+            return false; // Do not queue a second switch behind the first click.
+        }
+        using var launchTrace = CodexCliService.BeginLaunchDiagnostics(
+            chatGptFeatureAccount == null ? "ordinary" : "voice-mobile");
+        using var launchProgress = new System.Windows.Forms.Timer { Interval = 500 };
+        launchProgress.Tick += (_, _) =>
+        {
+            _statusBox.Text = $"{launchTrace.ProgressText}（{launchTrace.ElapsedSeconds}s）";
+        };
+        Cursor = Cursors.WaitCursor;
+        SetButtonsEnabled(false);
+        _statusBox.Text = "正在准备启动，检查配置与网关；请勿重复点击…";
+        _statusBox.Refresh();
+        launchProgress.Start();
         try
         {
             return await LaunchAccountCoreAsync(
@@ -16643,6 +16655,13 @@ public partial class Form1 : Form
                 ShowError(message);
             }
             return false;
+        }
+        finally
+        {
+            launchProgress.Stop();
+            Interlocked.Exchange(ref _accountLaunchInProgress, 0);
+            SetButtonsEnabled(true);
+            Cursor = Cursors.Default;
         }
     }
 
@@ -16708,10 +16727,9 @@ public partial class Form1 : Form
                 chatGptFeatureAccount,
                 routeOfficialOAuthThroughGateway);
         _statusBox.Text = profileAlreadySelected
-            ? mode == WindowsClientMode.OfficialCodex && !automaticRotation &&
-              chatGptFeatureAccount == null
-                ? $"正在强制关闭 Codex，并用 {account.Name} 的凭据重新打开…"
-                : $"正在使用现有凭据启动 {clientName}…"
+            ? Volatile.Read(ref _chatSectionSyncRequiresClientRestart) != 0 && !automaticRotation
+                ? $"目录同步有实际变更，正在准备重新加载 {clientName}…"
+                : $"正在使用现有凭据打开 {clientName}，优先复用已有窗口…"
             : chatGptFeatureAccount == null
                 ? $"正在切换到 {account.Name} 并启动 {clientName}…"
                 : $"正在用 {account.Name} 的模型凭据和 {chatGptFeatureAccount.Name} 的 ChatGPT 功能身份启动…";
@@ -16742,9 +16760,10 @@ public partial class Form1 : Form
             var startupAppearance = GetCodexAppearanceOptionById(_appSettings.CodexAppearancePresetId);
             var useDreamSkinAtStartup = _appSettings.UseCodexDreamSkin &&
                                         !IsOfficialCodexAppearance(startupAppearance);
+            var sidebarSyncRevision = Volatile.Read(ref _chatSectionSyncRequiresClientRestart);
             var forceClientRestartForSidebarSync =
                 !automaticRotation &&
-                Volatile.Read(ref _chatSectionSyncRequiresClientRestart) != 0;
+                sidebarSyncRevision != 0;
             projection = chatGptFeatureAccount == null
                 ? await _codex.SwitchWindowsClientAccountAsync(
                     account,
@@ -16831,7 +16850,7 @@ public partial class Form1 : Form
             {
                 if (forceClientRestartForSidebarSync)
                 {
-                    Interlocked.Exchange(ref _chatSectionSyncRequiresClientRestart, 0);
+                    Interlocked.CompareExchange(ref _chatSectionSyncRequiresClientRestart, 0, sidebarSyncRevision);
                 }
                 ConfigurePatAutoRotationLaunchContext(
                     account,

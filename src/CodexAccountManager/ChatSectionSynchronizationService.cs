@@ -13,6 +13,8 @@ internal readonly record struct ChatSectionSyncResult(
     string? TemplateAccountId,
     string? BackupPath)
 {
+    // Other identity buckets can be synchronized without invalidating the visible client.
+    public bool ActiveProfileChanged { get; init; }
     public static ChatSectionSyncResult Empty(int accountCount = 0) =>
         new(accountCount, 0, 0, 0, false, null, null);
 }
@@ -129,8 +131,16 @@ internal static class ChatSectionSynchronizationService
             var root = JsonNode.Parse(string.IsNullOrWhiteSpace(originalText) ? "{}" : originalText)
                        as JsonObject
                        ?? throw new InvalidOperationException("Codex 全局状态 JSON 格式无效。");
-            var persisted = GetOrCreateObject(root, PersistedStateName);
-            var profiles = GetOrCreateObject(persisted, ProfilesStateName);
+            if (!TryGetCompatibleProfiles(root, out var profiles))
+            {
+                ManagerLifecycleDiagnostics.Write("chat-section-sync-unsupported-schema",
+                    "Official sidebar schema is absent or changed; no state was overwritten.");
+                return ChatSectionSyncResult.Empty(profileAccounts.Count);
+            }
+            var originalRoot = root.DeepClone();
+            var activeId = TryReadIdentity(new AccountRecord { CodexHome = codexHome }, out var activeIdentity)
+                ? activeIdentity.AccountId : LocalProfileAccountId;
+            var originalActiveProfile = profiles[activeId]?.DeepClone();
             // Normalize before choosing the template: duplicated memberships otherwise
             // inflate its score and change the chosen template again on the next pass.
             var normalizedProfiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -185,7 +195,7 @@ internal static class ChatSectionSynchronizationService
             }
 
             var projected = root.ToJsonString(CompactJson);
-            if (string.Equals(originalText, projected, StringComparison.Ordinal))
+            if (JsonNode.DeepEquals(originalRoot, root))
             {
                 return new ChatSectionSyncResult(
                     profileAccounts.Count,
@@ -197,6 +207,10 @@ internal static class ChatSectionSynchronizationService
                     null);
             }
 
+            // Codex does not take our mutex. Avoid replacing a newer official write observed
+            // while the projection was being computed. A later watcher pass can rebase it.
+            if (!string.Equals(File.ReadAllText(globalStatePath, Encoding.UTF8), originalText, StringComparison.Ordinal))
+                return ChatSectionSyncResult.Empty(profileAccounts.Count);
             var backupPath = CreateBackup(globalStatePath);
             WriteTextAtomically(globalStatePath, projected);
             return new ChatSectionSyncResult(
@@ -206,7 +220,10 @@ internal static class ChatSectionSynchronizationService
                 addedItems,
                 true,
                 template?.AccountId,
-                backupPath);
+                backupPath)
+            {
+                ActiveProfileChanged = !JsonNode.DeepEquals(originalActiveProfile, profiles[activeId])
+            };
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException)
         {
@@ -232,6 +249,28 @@ internal static class ChatSectionSynchronizationService
                 }
             }
         }
+    }
+
+    private static bool TryGetCompatibleProfiles(JsonObject root, out JsonObject profiles)
+    {
+        profiles = null!;
+        if (root[PersistedStateName] is not JsonObject persisted ||
+            persisted.Any(pair => pair.Key.StartsWith("sidebar-custom-sections-v", StringComparison.Ordinal) &&
+                                  pair.Key != ProfilesStateName) ||
+            persisted[ProfilesStateName] is not JsonObject candidates) return false;
+        foreach (var pair in candidates)
+        {
+            if (pair.Value is not JsonObject profile) return false;
+            foreach (var name in new[] { SectionsStateName, SectionOrderStateName, CollapsedSectionIdsStateName })
+                if (profile[name] != null && profile[name] is not JsonArray) return false;
+            if (profile[SectionsStateName] is JsonArray sections && sections.Any(section =>
+                    section is not JsonObject obj ||
+                    obj[ItemKeysStateName] != null && obj[ItemKeysStateName] is not JsonArray ||
+                    obj[HostSectionIdsStateName] != null && obj[HostSectionIdsStateName] is not JsonObject))
+                return false;
+        }
+        profiles = candidates;
+        return true;
     }
 
     private static bool MergeProfile(
@@ -1199,6 +1238,27 @@ internal static class ChatSectionSynchronizationService
             {
                 throw new InvalidOperationException("聊天目录同步自测不是幂等的。");
             }
+
+            // Pretty printing and unknown official fields must not create a restart loop.
+            var pretty = JsonNode.Parse(File.ReadAllText(globalPath))!.AsObject();
+            pretty["future-official-field"] = new JsonObject { ["preserved"] = true };
+            var prettyText = pretty.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(globalPath, prettyText);
+            if (Synchronize(accounts, root, "template", root).Changed || File.ReadAllText(globalPath) != prettyText)
+                throw new InvalidOperationException("Sidebar formatting/unknown fields triggered a rewrite.");
+
+            var future = (JsonObject)pretty.DeepClone();
+            future[PersistedStateName]!["sidebar-custom-sections-v4"] = new JsonObject();
+            var futureText = future.ToJsonString();
+            File.WriteAllText(globalPath, futureText);
+            if (Synchronize(accounts, root, "template", root).Changed || File.ReadAllText(globalPath) != futureText)
+                throw new InvalidOperationException("Unknown sidebar schema was overwritten.");
+            var invalid = (JsonObject)pretty.DeepClone();
+            invalid[PersistedStateName]![ProfilesStateName]![templateId.ToString("D")]![SectionsStateName] = new JsonObject();
+            var invalidText = invalid.ToJsonString();
+            File.WriteAllText(globalPath, invalidText);
+            if (Synchronize(accounts, root, "template", root).Changed || File.ReadAllText(globalPath) != invalidText)
+                throw new InvalidOperationException("Changed official section shape was overwritten.");
 
             ValidateOfficialMembershipProjection();
             ValidateDuplicateLocalSections();

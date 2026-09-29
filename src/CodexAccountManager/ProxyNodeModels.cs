@@ -370,10 +370,11 @@ public sealed record ProxyResolution(bool Success, Uri? ProxyUri, string? NodeId
 
 public sealed class AccountProxyResolver : IDisposable
 {
+    private readonly string _rootPath;
     private readonly ProxyNodeStore _store;
     private readonly ThemeService _theme;
     private readonly ProxyCoreService _core;
-    public AccountProxyResolver(string rootPath) { _store = new(rootPath); _theme = new(rootPath); _core = new(rootPath); }
+    public AccountProxyResolver(string rootPath) { _rootPath = rootPath; _store = new(rootPath); _theme = new(rootPath); _core = new(rootPath); }
     public ProxyResolution Resolve(string? accountKey)
     {
         var binding = string.IsNullOrWhiteSpace(accountKey) ? null : _store.GetBinding(accountKey);
@@ -436,6 +437,7 @@ public sealed class AccountProxyResolver : IDisposable
         }
         else
         {
+            if (!LocalProxyBridgeService.EnsureReady(_rootPath, node, out var bridgeError)) return ProxyResolution.Fail(bridgeError);
             uri = node.BuildUri();
         }
         var fingerprint = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(uri.AbsoluteUri + "|" + node.Username + "|" + node.EncryptedPassword)))[..16];

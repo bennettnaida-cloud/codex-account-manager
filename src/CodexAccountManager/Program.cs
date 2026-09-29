@@ -31,6 +31,27 @@ static class Program
             }
         }
 
+        if (args.Contains("--startup-self-test", StringComparer.OrdinalIgnoreCase))
+        {
+            try
+            {
+                CodexCliService.ValidateWindowsStartupSafety();
+                Console.WriteLine("Windows startup self test passed: both entries, navigation, identity, concurrency, log readiness, optional patch and sidebar compatibility.");
+                return 0;
+            }
+            catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }
+        }
+        var startupAuditIndex = Array.IndexOf(args, "--audit-windows-startup");
+        if (startupAuditIndex >= 0)
+        {
+            if (startupAuditIndex + 1 >= args.Length || !int.TryParse(args[startupAuditIndex + 1], out var processId)) return 2;
+            try
+            {
+                Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(CodexCliService.AuditWindowsStartupRuntime(processId)));
+                return 0;
+            }
+            catch (Exception ex) { Console.Error.WriteLine(ex.GetType().Name); return 1; }
+        }
         if (args.Contains("--sync-compatible-model-catalogs", StringComparer.OrdinalIgnoreCase))
         {
             try { Console.WriteLine("Model catalogs updated: " + new CodexCliService().SyncCompatibleModelCatalogs()); return 0; }
@@ -555,6 +576,7 @@ static class Program
         {
             var store = new AccountStore();
             ProxyNodeStore.Validate();
+            LocalProxyBridgeService.Validate();
             ProxyCoreService.ValidateNativeNodeConfig();
             ProxyHttpClientFactory.ValidateSocksStreamLifetime();
             var accounts = store.LoadAccounts();

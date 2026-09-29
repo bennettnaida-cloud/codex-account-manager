@@ -31,6 +31,11 @@ internal enum NativeFastPatchWaitOutcome
 /// </summary>
 internal static class CodexNativeFastBridge
 {
+    internal static bool HasSplitServiceTierContract(string source) =>
+        Regex.IsMatch(source, @"\./app-shared-[A-Za-z0-9_-]{6,80}\.js", RegexOptions.CultureInvariant) &&
+        source.Contains("serviceTierForRequest:", StringComparison.Ordinal) &&
+        !Regex.IsMatch(source, "[A-Za-z_$][A-Za-z0-9_$]*=`priority`,[A-Za-z_$][A-Za-z0-9_$]*=`fast`,", RegexOptions.CultureInvariant);
+
     internal const string ProcessArgument = "--codex-native-fast-bridge";
     internal const string PortArgument = "--cdp-port";
     internal const string BrowserIdArgument = "--cdp-browser-id";
@@ -1045,8 +1050,7 @@ internal static class CodexNativeFastBridge
                             cancellationToken);
                     }
                 }
-                else if (allowRendererReload &&
-                         targets.Count != 0 &&
+                else if (targets.Count != 0 &&
                          targets.All(target => workers.TryGetValue(target.Id, out var worker) &&
                                                !worker.IsClosed))
                 {
@@ -4591,6 +4595,15 @@ internal static class CodexNativeFastBridge
                 return;
             }
 
+            if (HasSplitServiceTierContract(source))
+            {
+                // 26.924 splits priority/default and writeServiceTier into app-shared,
+                // leaving visibility and serviceTierForRequest in app-initial. All five
+                // edits and four anchors must be reviewed together, never patched partially.
+                RejectPreflight("split service-tier dependency contract is not reviewed; " +
+                    "app-initial + app-shared require joint validation; optional patch skipped without reload");
+                return;
+            }
             var fingerprint = SourceFingerprint(source);
             RendererPatchProfile? profile = null;
             RendererPatchResult? patch = null;

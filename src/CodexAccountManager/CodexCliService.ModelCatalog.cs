@@ -331,7 +331,7 @@ public sealed partial class CodexCliService
             var expectedModels = new[]
             {
                 "gpt-5.6-sol", "gpt-5.2", "gpt-5.4", "gpt-5.4-mini",
-                "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-6-astra"
+                "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-sol"
             };
             var firstWrite = RefreshManagedCompatibleModelCatalog(account, sixModels);
             var repeatedWrite = RefreshManagedCompatibleModelCatalog(account, sixModels);
@@ -358,7 +358,7 @@ public sealed partial class CodexCliService
             };
             var providerWrite = RefreshManagedCompatibleModelCatalog(
                 providerAccount,
-                new[] { "gpt-5.6-sol", "gpt-5.6-terra", "unknown-upstream-model" });
+                new[] { "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-sol", "unknown-upstream-model" });
             var providerRead = TryReadManagedCompatibleModelIds(
                 ManagedCompatibleModelCatalogPath(providerAccount.CodexHome),
                 out var providerModels);
@@ -384,7 +384,7 @@ public sealed partial class CodexCliService
                 !reducedModels.SequenceEqual(expectedModels, StringComparer.Ordinal) ||
                 !providerWrite || !providerRead ||
                 !providerModels.SequenceEqual(
-                    new[] { "gpt-5.6-sol", "gpt-5.6-terra" },
+                    new[] { "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-sol" },
                     StringComparer.Ordinal) ||
                 !upgradedProviderRead ||
                 !upgradedProviderModels.SequenceEqual(expectedModels, StringComparer.Ordinal) ||

@@ -2492,6 +2492,10 @@ public sealed partial class CodexCliService
         bool routeOfficialOAuthThroughGateway,
         bool forceClientRestart)
     {
+        using var launchLease = new DesktopLaunchLease();
+        using var diagnosticScope = CurrentLaunch.Value == null
+            ? BeginLaunchDiagnostics(chatGptFeatureAccount == null ? "ordinary" : "voice-mobile") : null;
+        LaunchPhase("launch-configuration-start", "正在检查配置、账号与网络…");
         if (!Directory.Exists(projectPath))
         {
             throw new DirectoryNotFoundException($"Project path does not exist: {projectPath}");
@@ -2546,7 +2550,7 @@ public sealed partial class CodexCliService
             {
                 try
                 {
-                    mutexAcquired = switchMutex.WaitOne(TimeSpan.FromSeconds(15));
+                    mutexAcquired = switchMutex.WaitOne(TimeSpan.Zero);
                 }
                 catch (AbandonedMutexException)
                 {
@@ -2560,8 +2564,6 @@ public sealed partial class CodexCliService
                 // Invalidate every delayed deep-link task from the previous launch before
                 // stopping or rewriting the shared profile. Otherwise an older task can wake
                 // during this switch and reactivate the package against half-written state.
-                var launchGeneration = BeginWindowsClientLaunchGeneration();
-
                 // Re-check after taking the cross-process switch lock. Another installed/copy of
                 // Account Manager may have changed the shared profile while this click was waiting.
                 var exactSharedProfileAlreadySelected = CanReuseSharedProfileWithoutNetwork(
@@ -2593,6 +2595,12 @@ public sealed partial class CodexCliService
                 // keep the healthy process alive when the shared profile can be reused.
                 var switchRequired = forceClientRestart ||
                                      RequiresWindowsClientShutdown(sharedProfileAlreadySelected);
+                var launchGeneration = !switchRequired && HasPendingOfficialStartup()
+                    ? Volatile.Read(ref _windowsClientLaunchGeneration)
+                    : BeginWindowsClientLaunchGeneration();
+                LaunchPhase("launch-restart-decision", switchRequired
+                    ? "配置检查完成，正在关闭旧 Codex…" : "配置检查完成，正在打开或复用 Codex…",
+                    $"restart={switchRequired}; profile_match={sharedProfileAlreadySelected}; sidebar_changed={forceClientRestart}");
                 var shutdownTargets = switchRequired
                     ? CaptureWindowsClientProcessSnapshots()
                     : Array.Empty<WindowsClientProcessSnapshot>();
@@ -2628,6 +2636,8 @@ public sealed partial class CodexCliService
                     GetDefaultCodexHome(),
                     allowOrdinalRewrite: true);
                 TryPruneDeletedDesktopSidebarState();
+                LaunchPhase("launch-old-processes-exited", "旧 Codex 已退出，正在准备新配置…",
+                    $"count={shutdownTargets.Count}");
             }
             if (sharedProfileAlreadySelected)
             {
@@ -2745,6 +2755,8 @@ public sealed partial class CodexCliService
             else
             try
             {
+                LaunchPhase("launch-configuration-ready", "配置已准备，正在打开 Codex…",
+                    $"profile_changed={projection.ProfileChanged}");
                 projection.ClientLaunchStarted = LaunchWindowsClient(
                     account,
                     projectPath,
@@ -4580,6 +4592,14 @@ public sealed partial class CodexCliService
 
         SanitizeCuratedPluginManifests(codexHome);
         var launchGeneration = expectedLaunchGeneration ?? BeginWindowsClientLaunchGeneration();
+        if (!switchRequired && mode == WindowsClientMode.OfficialCodex &&
+            (HasPendingOfficialStartup() || FindExistingOfficialStartup() != null) &&
+            FindExistingOfficialWindow() == null)
+        {
+            LaunchPhase("official-pending-startup-preserved", "Codex 已在初始化，未重复启动…",
+                "reactivated=false; navigation=false; retry=false");
+            return true;
+        }
         var hasExistingOfficialWindow =
             mode == WindowsClientMode.OfficialCodex &&
             HasWindowsClientMainWindowSince(DateTime.MinValue);
@@ -4598,19 +4618,8 @@ public sealed partial class CodexCliService
             // but its failure must not mutate the existing process tree. A direct Codex launch
             // never applies the Fast renderer patch; an already-open dual-login window is also
             // preserved instead of being reloaded merely to add that optional control.
-            try
-            {
-                Process.Start(new ProcessStartInfo(BuildNewThreadDeepLink(projectPath))
-                {
-                    UseShellExecute = true
-                });
-            }
-            catch (Exception ex)
-            {
-                WriteCodexPlusPlusLaunchDiagnostic(
-                    "official-project-deep-link-unavailable",
-                    MaskSensitive(ex.Message));
-            }
+            if (FindExistingOfficialWindow() is { } existingIdentity)
+                _ = FocusExistingOfficialWindow(existingIdentity);
             WriteCodexPlusPlusLaunchDiagnostic(
                 "official-same-profile-window-preserved",
                 "renderer patch and runtime-health shutdown were disabled for the existing same-profile window");
@@ -4653,13 +4662,8 @@ public sealed partial class CodexCliService
     private static OfficialCodexStartupReadinessPolicy SelectOfficialCodexStartupReadinessPolicy(
         bool allowRendererPatch)
     {
-        // A controlled renderer reload needs a synchronous routes + IPC contract because the
-        // manager itself caused that reload. Ordinary Codex launches do not patch/reload the
-        // renderer; a delayed log line there must never become permission to kill a visible
-        // client and restart it. Their readiness is observed in the background.
-        return allowRendererPatch
-            ? OfficialCodexStartupReadinessPolicy.VerifySynchronouslyForRendererPatch
-            : OfficialCodexStartupReadinessPolicy.PreserveActivationAndObserveInBackground;
+        // Fast is optional for BOTH entry points; startup never requires a renderer reload.
+        return OfficialCodexStartupReadinessPolicy.PreserveActivationAndObserveInBackground;
     }
 
     private bool LaunchCodexPlusPlus(
@@ -4775,7 +4779,7 @@ public sealed partial class CodexCliService
             "找不到已安装的 Codex++。为确保聊天记录管理增强功能可用，本次没有绕过 Codex++ 直接启动 Codex。");
     }
 
-    private static bool LaunchOfficialCodex(
+    private static bool LaunchOfficialCodexWithLegacyRendererReload(
         string projectPath,
         bool useDreamSkin,
         ThemeMode appearanceMode,
@@ -4953,11 +4957,11 @@ public sealed partial class CodexCliService
                 $"stage=before-patch; outcome={initialReadiness}; pid={activationIdentity.ProcessId}");
             if (ShouldDeferOfficialCodexReadinessFailure(
                     initialReadiness,
-                    IsWindowsClientActivationIdentityAlive(activationIdentity)))
+                    ObserveStartupIdentity(activationIdentity) != StartupProcessState.Exited))
             {
                 OpenNewTaskAfterOfficialCodexLaunchInBackground(
                     projectPath,
-                    DateTime.UtcNow,
+                    new DateTime(activationIdentity.StartTimeUtcTicks ?? launchLogBaseline.CapturedAtUtcTicks, DateTimeKind.Utc),
                     activationIdentity,
                     launchGeneration);
                 WriteCodexPlusPlusLaunchDiagnostic(
@@ -5062,11 +5066,11 @@ public sealed partial class CodexCliService
                 $"pid={activationIdentity.ProcessId}; port={nativeFastPort.Value}");
             if (ShouldDeferOfficialCodexReadinessFailure(
                     postPatchReadiness,
-                    IsWindowsClientActivationIdentityAlive(activationIdentity)))
+                    ObserveStartupIdentity(activationIdentity) != StartupProcessState.Exited))
             {
                 OpenNewTaskAfterOfficialCodexLaunchInBackground(
                     projectPath,
-                    DateTime.UtcNow,
+                    new DateTime(activationIdentity.StartTimeUtcTicks ?? launchLogBaseline.CapturedAtUtcTicks, DateTimeKind.Utc),
                     activationIdentity,
                     launchGeneration);
                 WriteCodexPlusPlusLaunchDiagnostic(
@@ -5123,10 +5127,8 @@ public sealed partial class CodexCliService
             {
                 return OfficialCodexMainPageWaitOutcome.PersistedAtomSyncFailed;
             }
-            if (!IsWindowsClientActivationIdentityAlive(activationIdentity))
-            {
+            if (ObserveStartupIdentity(activationIdentity) == StartupProcessState.Exited)
                 return OfficialCodexMainPageWaitOutcome.ProcessExited;
-            }
             if (logState == OfficialCodexLogReadinessState.Ready)
             {
                 readySinceUtc ??= DateTime.UtcNow;
@@ -5519,6 +5521,15 @@ public sealed partial class CodexCliService
             return;
         }
 
+        using var process = Process.GetProcessById(activationIdentity.ProcessId);
+        if (!CanSubmitStartupNavigation(launchGeneration, identityAlive: true,
+                windowVisible: process.MainWindowHandle != IntPtr.Zero))
+        {
+            WriteCodexPlusPlusLaunchDiagnostic("official-late-navigation-suppressed",
+                $"pid={activationIdentity.ProcessId}; reason=visible-or-already-delivered-or-superseded");
+            return;
+        }
+
         try
         {
             Process.Start(new ProcessStartInfo(BuildNewThreadDeepLink(projectPath))
@@ -5806,9 +5817,7 @@ public sealed partial class CodexCliService
                     }
                 }
 
-                // Runtime health has already remained stable for several seconds. Give the
-                // first renderer frame one final short turn before delivering the deep link.
-                Thread.Sleep(TimeSpan.FromSeconds(1));
+                // This compatibility observer must not open a new chat after a visible page.
                 if (!IsCurrentWindowsClientLaunchGeneration(launchGeneration) ||
                     !IsWindowsClientRuntimeHealthySince(
                         launchStartedUtc.AddSeconds(-2),
@@ -5817,10 +5826,7 @@ public sealed partial class CodexCliService
                     return;
                 }
 
-                Process.Start(new ProcessStartInfo(BuildNewThreadDeepLink(projectPath))
-                {
-                    UseShellExecute = true
-                });
+                TryOpenOfficialCodexProject(projectPath, activationIdentity, launchGeneration);
             }
             catch
             {
@@ -5831,7 +5837,7 @@ public sealed partial class CodexCliService
     }
 
     private static WindowsClientActivationIdentity ActivateOfficialCodexPackage(
-        int? nativeFastCdpPort = null, bool cleanupUnverifiableIdentity = true)
+        int? nativeFastCdpPort = null, bool cleanupUnverifiableIdentity = true, string? projectPath = null)
     {
         var appUserModelId = ResolveCodexWindowsClientAppUserModelId();
         if (string.IsNullOrWhiteSpace(appUserModelId))
@@ -5846,9 +5852,7 @@ public sealed partial class CodexCliService
         {
             var result = activationManager.ActivateApplication(
                 appUserModelId,
-                nativeFastCdpPort.HasValue
-                    ? BuildOfficialNativeFastActivationArguments(nativeFastCdpPort.Value)
-                    : string.Empty,
+                BuildOfficialStartupArguments(nativeFastCdpPort, projectPath),
                 ApplicationActivationOptions.None,
                 out var processId);
             Marshal.ThrowExceptionForHR(result);
@@ -6907,7 +6911,7 @@ public sealed partial class CodexCliService
             OfficialCodexPostPatchPageReadyTimeout < TimeSpan.FromSeconds(30) ||
             OfficialCodexReadyStableDuration < TimeSpan.FromMilliseconds(400) ||
             SelectOfficialCodexStartupReadinessPolicy(allowRendererPatch: true) !=
-                OfficialCodexStartupReadinessPolicy.VerifySynchronouslyForRendererPatch ||
+                OfficialCodexStartupReadinessPolicy.PreserveActivationAndObserveInBackground ||
             SelectOfficialCodexStartupReadinessPolicy(allowRendererPatch: false) !=
                 OfficialCodexStartupReadinessPolicy.PreserveActivationAndObserveInBackground ||
             DecideOfficialCodexRecovery(
@@ -7472,6 +7476,7 @@ public sealed partial class CodexCliService
 
     private static bool HasWindowsClientMainWindowSince(DateTime earliestStartUtc)
     {
+        var packageRoot = Path.GetDirectoryName(ResolveCodexWindowsClientPath());
         foreach (var process in Process.GetProcessesByName("ChatGPT"))
         {
             using (process)
@@ -7479,6 +7484,7 @@ public sealed partial class CodexCliService
                 try
                 {
                     if (!process.HasExited &&
+                        IsCodexWindowsClientProcess(process, packageRoot) &&
                         process.MainWindowHandle != IntPtr.Zero &&
                         process.StartTime.ToUniversalTime() >= earliestStartUtc)
                     {
@@ -7504,18 +7510,18 @@ public sealed partial class CodexCliService
         DateTime earliestStartUtc,
         WindowsClientActivationIdentity? activationIdentity)
     {
-        var clientPath = ResolveCodexWindowsClientPath();
-        var packageRoot = string.IsNullOrWhiteSpace(clientPath)
-            ? null
-            : Path.GetDirectoryName(clientPath);
-        if (string.IsNullOrWhiteSpace(packageRoot))
-        {
+        var identity = activationIdentity ?? FindExistingOfficialWindow();
+        if (identity == null || !identity.StartTimeUtcTicks.HasValue ||
+            new DateTime(identity.StartTimeUtcTicks.Value, DateTimeKind.Utc) < earliestStartUtc ||
+            ObserveStartupIdentity(identity) != StartupProcessState.Alive)
             return false;
-        }
-
-        var mainWindowReady = false;
-        var packagedAppServerReady = false;
-        var helperProcessCount = 0;
+        var packageRoot = Path.GetDirectoryName(ResolveCodexWindowsClientPath());
+        var parents = CaptureProcessParentIds();
+        using var main = Process.GetProcessById(identity.ProcessId);
+        if (main.MainWindowHandle == IntPtr.Zero || !IsWindowVisible(main.MainWindowHandle))
+            return false;
+        var appServer = false;
+        var helpers = 0;
         foreach (var process in Process.GetProcesses())
         {
             using (process)
@@ -7523,46 +7529,24 @@ public sealed partial class CodexCliService
                 try
                 {
                     if (process.HasExited ||
-                        !IsCodexWindowsClientProcess(process, packageRoot) ||
-                        process.StartTime.ToUniversalTime() < earliestStartUtc)
-                    {
+                        parents.GetValueOrDefault(process.Id) != identity.ProcessId ||
+                        process.StartTime.ToUniversalTime().Ticks < identity.StartTimeUtcTicks.Value)
                         continue;
-                    }
-
-                    if (process.ProcessName.Equals("ChatGPT", StringComparison.OrdinalIgnoreCase))
-                    {
-                        if (process.MainWindowHandle != IntPtr.Zero)
-                        {
-                            if (MatchesWindowsClientActivationIdentity(process, activationIdentity) &&
-                                process.Responding &&
-                                GetWindowsClientSurfaceState(process.MainWindowHandle) !=
-                                    WindowsClientSurfaceState.Blank)
-                            {
-                                mainWindowReady = true;
-                            }
-                        }
-                        else
-                        {
-                            // Electron does not expose renderer command lines through Process.
-                            // Requiring multiple packaged helpers avoids treating a lone crashpad
-                            // process as a usable renderer runtime.
-                            helperProcessCount++;
-                        }
-                    }
-                    else if (process.ProcessName.Equals("Codex", StringComparison.OrdinalIgnoreCase))
-                    {
-                        packagedAppServerReady = true;
-                    }
+                    if (process.ProcessName.Equals("ChatGPT", StringComparison.OrdinalIgnoreCase) &&
+                        IsCodexWindowsClientProcess(process, packageRoot))
+                        helpers++;
+                    else if (process.ProcessName.Equals("codex", StringComparison.OrdinalIgnoreCase) &&
+                             (IsCodexWindowsClientProcess(process, packageRoot) ||
+                              IsTrustedExternalAppServer(process, identity, parents)))
+                        appServer = true;
                 }
-                catch (Exception ex) when (
-                    ex is InvalidOperationException or Win32Exception or NotSupportedException)
-                {
-                    // A process may exit or become inaccessible while the runtime is sampled.
-                }
+                catch (Exception ex) when (ex is InvalidOperationException or Win32Exception or NotSupportedException)
+                { /* Metadata races are unknown, not proof that the client crashed. */ }
             }
         }
-
-        return mainWindowReady && packagedAppServerReady && helperProcessCount >= 2;
+        // Runtime evidence only. Interactivity is established by the scoped routes + ready log.
+        // Never synchronously send PrintWindow/WM_PRINT to another process here.
+        return appServer && helpers >= 2;
     }
 
     private static bool MatchesWindowsClientActivationIdentity(
@@ -7622,22 +7606,8 @@ public sealed partial class CodexCliService
                 return WindowsClientSurfaceState.Unknown;
             }
 
-            var printCaptured = PrintWindow(
-                windowHandle,
-                memoryDc,
-                PrintWindowClientOnly | PrintWindowRenderFullContent);
-            var printState = printCaptured
-                ? AnalyzeCapturedClientSurface(memoryDc, width, height)
-                : WindowsClientSurfaceState.Unknown;
-            if (printState != WindowsClientSurfaceState.Unknown)
-            {
-                return printState;
-            }
-
-            // Hardware-accelerated Electron windows can return a uniformly black bitmap from
-            // PrintWindow even while they are healthy. A client-DC copy is a safe fallback;
-            // if both methods are unavailable the visual result remains Unknown and the
-            // process/app-server checks decide health instead of forcing a restart loop.
+            // Never send synchronous WM_PRINT into an initializing/hung renderer.
+            // A DC copy is only advisory; obscured/accelerated surfaces may be Unknown.
             if (!BitBlt(
                     memoryDc,
                     0,
@@ -8808,6 +8778,8 @@ catch {
             var safeDetail = MaskSensitive(detail ?? "")
                 .Replace("\r", " ", StringComparison.Ordinal)
                 .Replace("\n", " ", StringComparison.Ordinal);
+            if (CurrentLaunch.Value is { } trace)
+                safeDetail = $"launch_id={trace.Id}; elapsed_ms={trace.ElapsedMilliseconds}; " + safeDetail;
             if (safeDetail.Length > 4000)
             {
                 safeDetail = safeDetail[..4000] + "…";
