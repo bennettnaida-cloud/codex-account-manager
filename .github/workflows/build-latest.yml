@@ -30,6 +30,11 @@ jobs:
           if ($version -notmatch '^\d+\.\d+\.\d+(?:\.\d+)?$') {
             throw "VERSION is invalid: $version"
           }
+          $runtimeSource = Get-Content -LiteralPath 'src/CodexAccountManager/ReleaseConfiguration.cs' -Raw
+          $runtimeVersions = [regex]::Matches($runtimeSource, 'internal\s+const\s+string\s+Version\s*=\s*"([^"]+)"')
+          if ($runtimeVersions.Count -ne 1 -or $runtimeVersions[0].Groups[1].Value -ne $version) {
+            throw 'VERSION and ReleaseConfiguration.Version must match before publishing.'
+          }
           "CAM_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
@@ -58,9 +63,20 @@ jobs:
           & .\Build-CodexAccountManager.ps1
           if ($LASTEXITCODE -ne 0) { throw 'Windows application build failed.' }
           $startupExe = Join-Path $PWD ('dist/CodexAccountManager-{0}/CodexAccountManager.exe' -f $env:CAM_VERSION)
+          $builtVersion = ([System.Diagnostics.FileVersionInfo]::GetVersionInfo($startupExe).ProductVersion -split '\+')[0]
+          $packageVersion = (Get-Content -LiteralPath (Join-Path (Split-Path $startupExe) 'package-version.txt') -Raw).Trim()
+          if ($builtVersion -ne $env:CAM_VERSION -or $packageVersion -ne $env:CAM_VERSION) {
+            throw 'Built executable, package marker and release version do not match.'
+          }
           $startupTest = Start-Process -FilePath $startupExe -ArgumentList '--startup-self-test' -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput 'startup-self-test.out' -RedirectStandardError 'startup-self-test.err'
           Get-Content 'startup-self-test.out','startup-self-test.err'
           if ($startupTest.ExitCode -ne 0) { throw 'Windows startup regression test failed.' }
+          $catalogCli = Join-Path $env:CODEX_ACCOUNT_MANAGER_CODEX_RUNTIME '@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe'
+          if (-not (Test-Path -LiteralPath $catalogCli -PathType Leaf)) {
+            throw 'Bundled Codex CLI is missing; model catalog verification cannot run.'
+          }
+          & node .\tools\Test-AutomaticModelCatalog.cjs $startupExe $catalogCli
+          if ($LASTEXITCODE -ne 0) { throw 'Automatic model catalog regression test failed.' }
           & .\Build-OneClickInstallerPackage.ps1 -OutputPath (Join-Path $PWD 'CodexAccountManager-Windows-latest.zip')
           if ($LASTEXITCODE -ne 0) { throw 'Windows installer package build failed.' }
           $versionedPackage = 'CodexAccountManager-Windows-{0}.zip' -f $env:CAM_VERSION
@@ -139,11 +155,11 @@ jobs:
           body: |
             自动构建版本 `${{ env.CAM_VERSION }}`。
 
-            修复语音/手机启动长时间停在标志页：普通 Codex 和语音/手机入口都会将所选账号节点传给桌面登录与功能页面；保留官方插件安装状态，持续显示初始化进度，窗口出现不再等同于启动完成。
+            兼容 API 模型目录现在独立于价格检查自动同步：管理器启动时检查一次，此后每 15 分钟检查上游模型列表。新增模型不再因缺少随软件打包的模板而被遗漏；同步不会主动切换所选模型或重启 Codex。
 
-            安装包内置 Codex CLI 0.154.0 和模型目录。已通过完整自检和启动专项回归；在 26.924.2738.0 隔离配置中验证日本节点下冷启动约 19.5 秒、保留插件状态后重复启动约 7.5–8.5 秒。测试不构成所有网络环境的时延保证；其他电脑以及用户正在运行的账号切换未进行破坏性实测。模型权限仍取决于账号及上游。Dream Skin 自定义启动不在本次网络修复的实测范围内。
+            更新 GPT-6.1 Sol 等模型的本地描述，并保留网络失败时已有的可用目录。模型是否可调用仍取决于对应账号和上游授权，模型列表显示不代表授予额外权限。
 
-            Windows 用户可在管理器中检查更新，或下载下方 Windows 安装包。更新后重新启动管理器和 Codex，使请求经过新版网关；使用 GPT-6 仍需账号或 API 服务支持该模型。
+            发布流程执行完整自检、启动和模型同步专项回归及安装包检查，并核对源码、可执行文件及更新清单的版本。Windows 用户可在管理器中检查更新，或下载下方安装包。已打开的 Codex 需要重启一次才能读取新增模型；管理器不会强制重启当前会话。其他电脑的实际网络与桌面环境未逐一实测。
           prerelease: true
           make_latest: false
           files: |

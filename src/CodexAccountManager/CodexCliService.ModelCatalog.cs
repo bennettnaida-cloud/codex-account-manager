@@ -29,9 +29,36 @@ public sealed partial class CodexCliService
         }
 
         var account = matches[0];
-        await EnsureCompatibleApiLaunchPreflightAsync(account, cancellationToken);
+        await RefreshOfficialCompatibleModelTemplatesAsync(cancellationToken);
+        await EnsureCompatibleApiLaunchPreflightAsync(account, cancellationToken, validateConfiguredModel: false);
         SyncCompatibleModelCatalogs();
         return GetCompatibleApiAllowedModels(account).Count;
+    }
+
+    internal async Task RefreshAllCompatibleModelCatalogsAsync(CancellationToken cancellationToken)
+    {
+        var accounts = new AccountStore().LoadAccounts().Where(a => a.IsCompatibleApi).ToArray();
+        if (accounts.Length > 0) await RefreshOfficialCompatibleModelTemplatesAsync(cancellationToken);
+        foreach (var account in accounts)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                await EnsureCompatibleApiLaunchPreflightAsync(
+                    account, cancellationToken, validateConfiguredModel: false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                // One offline account cannot prevent other providers from receiving new models.
+                // Never log credentials, provider response bodies or account names.
+                ManagerLifecycleDiagnostics.WriteException("compatible-model-auto-refresh-failed", ex);
+            }
+        }
+        cancellationToken.ThrowIfCancellationRequested();
+        var updated = SyncCompatibleModelCatalogs();
+        ManagerLifecycleDiagnostics.Write("compatible-model-auto-refresh-completed",
+            $"accounts={accounts.Length}; configs_updated={updated}");
     }
 
     internal int SyncCompatibleModelCatalogs()
@@ -82,7 +109,7 @@ public sealed partial class CodexCliService
         {
             try
             {
-                RefreshManagedCompatibleModelCatalog(account, Array.Empty<string>());
+                RefreshManagedCompatibleModelCatalog(account, cachedModels);
                 if (TryReadManagedCompatibleModelIds(cachedPath, out cachedModels) &&
                     cachedModels.Count > 0 &&
                     IsCompleteBundledCompatibleModelCatalog(cachedModels))
@@ -148,62 +175,57 @@ public sealed partial class CodexCliService
 
     private static bool RefreshManagedCompatibleModelCatalog(
         AccountRecord account,
-        IEnumerable<string> upstreamModelIds)
+        IEnumerable<string> upstreamModelIds,
+        Func<bool>? isCurrent = null)
     {
         ArgumentNullException.ThrowIfNull(account);
         ArgumentNullException.ThrowIfNull(upstreamModelIds);
 
         var defaultModel = account.ApiModel?.Trim() ?? string.Empty;
         var packagedModels = GetBundledCompatibleModelIds();
+        var upstreamModels = upstreamModelIds.Where(IsSafeCompatibleApiModelId)
+            .Where(IsUserSelectableCompatibleApiModelId).ToArray();
+        if (upstreamModels.Length == 0 && TryReadManagedCompatibleModelIds(
+                ManagedCompatibleModelCatalogPath(account.CodexHome), out var existingModels) &&
+            existingModels.Count > 0 && (!account.UseBundledCompatibleApiModelCatalog ||
+                                       IsCompleteBundledCompatibleModelCatalog(existingModels)))
+            return false;
         var requestedModels = (account.UseBundledCompatibleApiModelCatalog
-                ? upstreamModelIds.Concat(packagedModels)
-                : upstreamModelIds)
+                ? upstreamModels.Concat(packagedModels)
+                : upstreamModels)
             .Where(IsSafeCompatibleApiModelId)
             .Where(IsUserSelectableCompatibleApiModelId)
             .Distinct(StringComparer.Ordinal)
             .OrderBy(model => model.Equals(defaultModel, StringComparison.Ordinal) ? 0 : 1)
             .ThenBy(model => model, StringComparer.OrdinalIgnoreCase)
             .ToArray();
+        var officialTemplates = ReadOfficialCompatibleModelTemplates();
         var models = new JsonArray();
         foreach (var model in requestedModels)
         {
-            var templatePath = Path.Combine(
-                AppContext.BaseDirectory,
-                "assets",
-                "codex-models",
-                model + ".json");
-            if (!File.Exists(templatePath)) continue;
-
-            try
-            {
-                var template = JsonNode.Parse(
-                    AtomicFilePersistence.ReadAllTextWithRetry(templatePath)) as JsonObject;
-                var source = template?["models"] is JsonArray templateModels
-                    ? templateModels
-                        .OfType<JsonObject>()
-                        .FirstOrDefault(candidate =>
-                            candidate["slug"]?.GetValue<string>()
-                                .Equals(model, StringComparison.Ordinal) == true)
-                    : null;
-                if (source == null) continue;
-
-                var selectable = source.DeepClone().AsObject();
-                selectable["visibility"] = "list";
-                models.Add(selectable);
-            }
-            catch (Exception ex) when (
-                ex is IOException or UnauthorizedAccessException or JsonException or
-                InvalidOperationException or FormatException)
-            {
-                // A broken local template cannot make the whole upstream catalog unusable.
-            }
+            var source = officialTemplates.GetValueOrDefault(model) ??
+                         ReadPackagedCompatibleModelTemplate(model) ??
+                         ReadPackagedCompatibleModelTemplate("fallback");
+            if (source == null) continue;
+            var selectable = source.DeepClone().AsObject();
+            var isFallback = selectable["slug"]?.GetValue<string>() == "fallback";
+            selectable["slug"] = model;
+            if (isFallback) selectable["display_name"] = model;
+            selectable["visibility"] = "list";
+            models.Add(selectable);
         }
+
+        // Empty/unsupported provider responses must not erase the last usable catalog.
+        if (models.Count == 0) return false;
 
         var output = new JsonObject { ["models"] = models }
             .ToJsonString(new JsonSerializerOptions { WriteIndented = true }) + Environment.NewLine;
         var path = ManagedCompatibleModelCatalogPath(account.CodexHome);
         lock (CompatibleModelCatalogLock)
         {
+            // The account/key may have changed while /models or official metadata was
+            // in flight. Never publish that old response into the new account settings.
+            if (isCurrent != null && !isCurrent()) return false;
             try
             {
                 if (File.Exists(path) &&
@@ -220,14 +242,28 @@ public sealed partial class CodexCliService
             }
 
             AtomicFilePersistence.WriteAllText(path, output);
+            ManagerLifecycleDiagnostics.Write("compatible-model-catalog-updated", $"models={models.Count}");
             return true;
         }
     }
 
+    private static string CompatibleModelCatalogIdentity(AccountRecord account, string credential) =>
+        BuildVerifiedCompatibleApiModelFingerprint(account.ApiBaseUrl, account.ApiWireApi,
+            account.ApiModel + ":" + account.UseBundledCompatibleApiModelCatalog, credential);
+
+    private static bool IsCompatibleModelCatalogIdentityCurrent(AccountRecord account, string identity)
+    {
+        var current = new AccountStore().LoadAccounts().FirstOrDefault(candidate =>
+            candidate.IsCompatibleApi && candidate.CodexHome.Equals(account.CodexHome, StringComparison.OrdinalIgnoreCase));
+        return current != null && CompatibleModelCatalogIdentity(current,
+            ReadAccessTokenCredential(Path.Combine(current.CodexHome, AuthFileName))) == identity;
+    }
+
     private static bool IsUserSelectableCompatibleApiModelId(string model) =>
-        model.StartsWith("gpt-", StringComparison.Ordinal) &&
-        !model.StartsWith("gpt-daybreak-", StringComparison.Ordinal) &&
-        !model.Equals("codex-auto-review", StringComparison.Ordinal);
+        // Require a filename-safe coding/reasoning family. /models can also advertise
+        // image, speech, realtime and internal models that cannot run a Codex session.
+        Regex.IsMatch(model, @"^gpt-(?:[5-9]|[1-9][0-9]+)(?:\.[0-9]+)*(?:-[a-z0-9]+)*$") &&
+        !Regex.IsMatch(model, @"-(?:image|audio|realtime|transcribe|tts|embedding|search|chat|moderation)(?:-|$)");
 
     private static IReadOnlyList<string> GetBundledCompatibleModelIds()
     {
@@ -248,7 +284,7 @@ public sealed partial class CodexCliService
         var bundledModels = GetBundledCompatibleModelIds();
         return bundledModels.Count > 0 &&
                new HashSet<string>(cachedModels, StringComparer.Ordinal)
-                   .SetEquals(bundledModels);
+                   .IsSupersetOf(bundledModels);
     }
 
     private static bool TryReadManagedCompatibleModelIds(
@@ -331,7 +367,7 @@ public sealed partial class CodexCliService
             var expectedModels = new[]
             {
                 "gpt-5.6-sol", "gpt-5.2", "gpt-5.4", "gpt-5.4-mini",
-                "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-sol"
+                "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"
             };
             var firstWrite = RefreshManagedCompatibleModelCatalog(account, sixModels);
             var repeatedWrite = RefreshManagedCompatibleModelCatalog(account, sixModels);
@@ -400,6 +436,35 @@ public sealed partial class CodexCliService
                 throw new InvalidOperationException(
                     "Account-scoped model catalog projection regression.");
             }
+
+            // A future upstream model must be usable without rebuilding this application.
+            var future = "gpt-99.123-sol";
+            RefreshManagedCompatibleModelCatalog(providerAccount, new[]
+            {
+                "gpt-5.6-sol", future, future, "gpt-99-audio", "gpt-image-1", "gpt-99/../../secret"
+            });
+            var futurePath = ManagedCompatibleModelCatalogPath(providerAccount.CodexHome);
+            var lastGood = File.ReadAllText(futurePath);
+            var futureNode = JsonNode.Parse(lastGood)?["models"]?.AsArray()
+                .OfType<JsonObject>().Single(m => m["slug"]?.GetValue<string>() == future);
+            if (!GetCompatibleApiAllowedModels(providerAccount).SetEquals(new[] { "gpt-5.6-sol", future }) ||
+                futureNode?["context_window"]?.GetValue<int>() != 32768 ||
+                futureNode["supported_reasoning_levels"]?.AsArray().Count != 0 ||
+                futureNode["service_tiers"]?.AsArray().Count != 0 ||
+                futureNode["input_modalities"]?.ToJsonString() != "[\"text\"]" ||
+                RefreshManagedCompatibleModelCatalog(providerAccount, Array.Empty<string>()) ||
+                RefreshManagedCompatibleModelCatalog(providerAccount, new[] { "gpt-image-1" }) ||
+                RefreshManagedCompatibleModelCatalog(providerAccount, new[] { "gpt-6-sol" }, () => false) ||
+                File.ReadAllText(futurePath) != lastGood)
+                throw new InvalidOperationException("Future model fallback/last-good/stale refresh regression.");
+
+            providerAccount.UseBundledCompatibleApiModelCatalog = true;
+            _ = ManagedCompatibleModelCatalogPath(providerAccount);
+            if (!GetCompatibleApiAllowedModels(providerAccount).Contains(future))
+                throw new InvalidOperationException("Bundled catalog repair discarded a newly discovered model.");
+            _ = ManagedCompatibleModelCatalogPath(providerAccount);
+            if (!GetCompatibleApiAllowedModels(providerAccount).Contains(future))
+                throw new InvalidOperationException("Bundled catalog completeness discarded an upstream model.");
         }
         finally
         {

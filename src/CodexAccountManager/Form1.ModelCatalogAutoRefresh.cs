@@ -5,8 +5,10 @@ public partial class Form1
     private readonly System.Windows.Forms.Timer _modelCatalogRefreshTimer = new() { Interval = 60_000 };
     private readonly CancellationTokenSource _modelCatalogRefreshCancellation = new();
     private bool _modelCatalogRefreshInProgress;
+    private bool _compatibleModelRefreshInProgress;
     private bool _modelCatalogEditorDirty;
     private DateTimeOffset _nextAutomaticPriceCheckUtc;
+    private DateTimeOffset _nextAutomaticCompatibleModelCheckUtc;
     private Control? _modelCatalogPanel;
     private Label? _modelCatalogSourceLabel;
 
@@ -15,9 +17,9 @@ public partial class Form1
         Shown += async (_, _) =>
         {
             _modelCatalogRefreshTimer.Start();
-            await RefreshModelCatalogAutomaticallyAsync();
+            await RefreshAutomaticCatalogsAsync();
         };
-        _modelCatalogRefreshTimer.Tick += async (_, _) => await RefreshModelCatalogAutomaticallyAsync();
+        _modelCatalogRefreshTimer.Tick += async (_, _) => await RefreshAutomaticCatalogsAsync();
         FormClosed += (_, _) =>
         {
             _modelCatalogRefreshTimer.Stop();
@@ -25,6 +27,33 @@ public partial class Form1
             _modelCatalogRefreshCancellation.Cancel();
             _modelCatalogRefreshCancellation.Dispose();
         };
+    }
+
+    private Task RefreshAutomaticCatalogsAsync() => Task.WhenAll(
+        RefreshCompatibleModelsAutomaticallyAsync(), RefreshModelCatalogAutomaticallyAsync());
+
+    private async Task RefreshCompatibleModelsAutomaticallyAsync()
+    {
+        if (IsDisposed || Disposing || _compatibleModelRefreshInProgress ||
+            DateTimeOffset.UtcNow < _nextAutomaticCompatibleModelCheckUtc) return;
+        _compatibleModelRefreshInProgress = true;
+        _nextAutomaticCompatibleModelCheckUtc = DateTimeOffset.UtcNow.AddMinutes(15);
+        var cancellationToken = _modelCatalogRefreshCancellation.Token;
+        try
+        {
+            // Discovery runs independently of the price update preference and off the UI
+            // thread. Updating files never changes the selected model or restarts Codex.
+            await Task.Run(() => _codex.RefreshAllCompatibleModelCatalogsAsync(cancellationToken), cancellationToken);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            ManagerLifecycleDiagnostics.WriteException("compatible-model-auto-refresh-failed", ex);
+        }
+        finally
+        {
+            _compatibleModelRefreshInProgress = false;
+        }
     }
 
     private async Task RefreshModelCatalogAutomaticallyAsync()

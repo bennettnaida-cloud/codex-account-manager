@@ -10355,7 +10355,8 @@ catch {
 
     private static async Task EnsureCompatibleApiLaunchPreflightAsync(
         AccountRecord account,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool validateConfiguredModel = true)
     {
         var modelError = GetCompatibleApiModelIdValidationError(account.ApiModel);
         if (modelError != null)
@@ -10415,9 +10416,11 @@ catch {
             ? ProxyHttpClientFactory.Create(proxyResolution, proxyResolver.GetNode(proxyResolution.NodeId))
             : new HttpClient(new HttpClientHandler { UseProxy = false }) { Timeout = Timeout.InfiniteTimeSpan };
         using var request = new HttpRequestMessage(HttpMethod.Get, modelsUri);
+        var credential = ReadAccessTokenCredential(Path.Combine(account.CodexHome, AuthFileName));
+        var catalogIdentity = CompatibleModelCatalogIdentity(account, credential);
         request.Headers.TryAddWithoutValidation(
             "Authorization",
-            "Bearer " + ReadAccessTokenCredential(Path.Combine(account.CodexHome, AuthFileName)));
+            "Bearer " + credential);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(CompatibleApiLaunchPreflightTimeout);
 
@@ -10504,7 +10507,10 @@ catch {
                 return;
             }
 
-            RefreshManagedCompatibleModelCatalog(account, modelIds);
+            RefreshManagedCompatibleModelCatalog(account, modelIds,
+                () => IsCompatibleModelCatalogIdentityCurrent(account, catalogIdentity));
+
+            if (!validateConfiguredModel) return;
 
             if (modelIds.Contains(configuredModel, StringComparer.Ordinal) ||
                 GetCompatibleApiAllowedModels(account).Contains(configuredModel))

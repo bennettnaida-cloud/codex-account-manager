@@ -25,7 +25,7 @@ public partial class Form1
         var panel = new RoundedPanel
         {
             Width = width,
-            Height = 540,
+            Height = 578,
             Radius = 16,
             BorderColor = _palette.BorderColor,
             BackColor = _palette.CardColor,
@@ -190,6 +190,18 @@ public partial class Form1
             }
         };
         panel.Controls.Add(automatic);
+
+        var discovery = new Label
+        {
+            Text = "可选模型在启动时及每 15 分钟自动同步；已打开的 Codex 重启后显示新增模型。",
+            Left = innerLeft,
+            Top = 520,
+            Width = innerWidth,
+            Height = 38,
+            Font = new Font(Font.FontFamily, 8.3F)
+        };
+        ThemeStyler.ApplyLabel(discovery, _palette, true);
+        panel.Controls.Add(discovery);
 
         return panel;
     }
