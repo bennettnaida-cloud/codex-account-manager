@@ -87,6 +87,17 @@ internal sealed class OfficialCodexLogBaseline
             static () => DateTimeOffset.UtcNow);
     }
 
+    internal static OfficialCodexLogBaseline CaptureForValidation(
+        string root,
+        DateTimeOffset capturedAtUtc)
+    {
+        return CaptureCore(
+            ResolveRoot(root),
+            OfficialCodexLogProbe.EnumerateT0LogFiles,
+            OfficialCodexLogFileSnapshot.Capture,
+            () => capturedAtUtc);
+    }
+
     internal OfficialCodexLogProbe CreateProbe(
         int pid,
         long? activationStartTimeUtcTicks,
@@ -799,6 +810,8 @@ internal static class OfficialCodexLogReadiness
                 CreateTestDirectory(root, "temporal"));
             ValidateStaleNewAndReplacementFiles(
                 CreateTestDirectory(root, "file-identity"));
+            ValidateFileCreationBoundary(
+                CreateTestDirectory(root, "file-creation-boundary"));
             ValidatePersistedAtomFailure(
                 CreateTestDirectory(root, "persisted-atom"));
             ValidateBaselineBoundary(
@@ -826,7 +839,7 @@ internal static class OfficialCodexLogReadiness
     private static void ValidateInitiallyMissingLogDirectory(string directory)
     {
         Expect(!Directory.Exists(directory), "the missing-log-directory fixture already existed");
-        var baseline = OfficialCodexLogBaseline.Capture(directory);
+        var baseline = CaptureUsable(directory);
         Expect(
             baseline.IsUsable,
             "a resolved but not-yet-created Logs directory was not a complete empty baseline");
@@ -1327,6 +1340,29 @@ internal static class OfficialCodexLogReadiness
             "a stale file absent from the baseline path set was accepted as new");
     }
 
+    private static void ValidateFileCreationBoundary(string directory)
+    {
+        var baseline = CaptureUsable(directory);
+        var clock = EvidenceClock.After(baseline);
+        const int freshPid = 45101;
+        var freshPath = NewT0Path(directory, freshPid);
+        File.WriteAllText(freshPath, ValidInitialSequence(clock), Utf8WithoutBom);
+        File.SetCreationTimeUtc(freshPath, baseline.CapturedAtUtc.AddMilliseconds(-1).UtcDateTime);
+        ExpectState(
+            CreateProbe(baseline, freshPid, clock.Activation, OfficialCodexLogReadinessStage.InitialLaunch),
+            OfficialCodexLogReadinessState.Ready,
+            "fresh evidence within the one-millisecond file-clock tolerance was rejected");
+
+        const int stalePid = 45102;
+        var stalePath = NewT0Path(directory, stalePid);
+        File.WriteAllText(stalePath, ValidInitialSequence(clock), Utf8WithoutBom);
+        File.SetCreationTimeUtc(stalePath, baseline.CapturedAtUtc.AddMilliseconds(-2).UtcDateTime);
+        ExpectState(
+            CreateProbe(baseline, stalePid, clock.Activation, OfficialCodexLogReadinessStage.InitialLaunch),
+            OfficialCodexLogReadinessState.Pending,
+            "file-clock tolerance admitted a stale file outside its boundary");
+    }
+
     private static void ValidatePersistedAtomFailure(string directory)
     {
         var baseline = CaptureUsable(directory);
@@ -1507,7 +1543,13 @@ internal static class OfficialCodexLogReadiness
 
     private static OfficialCodexLogBaseline CaptureUsable(string directory)
     {
-        var baseline = OfficialCodexLogBaseline.Capture(directory);
+        // Log evidence already uses a synthetic clock. Use the same deterministic
+        // baseline instead of racing DateTime.UtcNow against NTFS's creation clock
+        // on virtualized CI runners. File age/replacement boundaries are exercised
+        // separately with explicit SetCreationTimeUtc calls; production capture
+        // continues to use the real clock and the unchanged fail-closed rules.
+        var baseline = OfficialCodexLogBaseline.CaptureForValidation(
+            directory, new DateTimeOffset(2025, 1, 1, 0, 0, 0, TimeSpan.Zero));
         Expect(baseline.IsUsable, "a complete baseline was not usable");
         return baseline;
     }
