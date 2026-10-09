@@ -619,7 +619,7 @@ public sealed class AccountStore
     internal static string BuildOfficialOAuthConfig(string? serviceTier = null)
     {
         var normalizedServiceTier = CodexCliService.NormalizeDesktopServiceTier(serviceTier);
-        return $"""
+        return CodexCliService.ApplyDesktopReasoningDefaults($"""
 model_provider = {TomlString(OfficialOAuthProviderId)}
 cli_auth_credentials_store = "file"
 forced_login_method = "chatgpt"
@@ -641,13 +641,13 @@ localeOverride = {TomlString(OfficialOAuthDesktopLocale)}
 
 [windows]
 sandbox = "unelevated"
-""";
+""");
     }
 
     internal static string BuildAccessTokenConfig(string? serviceTier = null)
     {
         var normalizedServiceTier = CodexCliService.NormalizeDesktopServiceTier(serviceTier);
-        return $"""
+        return CodexCliService.ApplyDesktopReasoningDefaults($"""
 model = {TomlString(ModelCatalogService.CanonicalDefaultModel)}
 review_model = {TomlString(ModelCatalogService.CanonicalDefaultModel)}
 model_reasoning_effort = {TomlString(ModelCatalogService.DefaultReasoningEffort)}
@@ -680,7 +680,7 @@ enabled = false
 
 [windows]
 sandbox = "unelevated"
-""";
+""");
     }
 
     private static void EnsureCompatibleApiHome(AccountRecord account, string? apiKey)
@@ -718,7 +718,7 @@ sandbox = "unelevated"
         var wireApi = TomlString(account.ApiWireApi.Trim());
         var normalizedServiceTier = CodexCliService.NormalizeDesktopServiceTier(serviceTier);
 
-        return $"""
+        return CodexCliService.ApplyDesktopReasoningDefaults($"""
 model_provider = {providerId}
 model = {model}
 review_model = {model}
@@ -743,7 +743,7 @@ request_max_retries = 1
 
 [windows]
 sandbox = "unelevated"
-""";
+""");
     }
 
     internal static void ValidateOfficialOAuthAccountStorage()

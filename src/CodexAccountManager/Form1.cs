@@ -16687,6 +16687,7 @@ public partial class Form1 : Form
 
         if (!automaticRotation)
         {
+            CodexCliService.ReportLaunchProgress("launch-rotation-cleanup-start", "正在清除上次的轮换路线…");
             CancelPendingPatAutoRotation(resetState: true);
             _patAutoRotationLaunchContext = null;
             _patAutoRotationGatewayTransportActive = false;
@@ -16699,6 +16700,7 @@ public partial class Form1 : Form
                 throw new InvalidOperationException(
                     "未能清除旧的账号轮换路线；为避免界面账号与实际请求账号不一致，本次没有关闭或重启 Codex。");
             }
+            CodexCliService.ReportLaunchProgress("launch-rotation-cleanup-complete", "轮换路线已清除，正在核对配置…");
             UpdatePatAutoRotationControls();
         }
 
@@ -16727,14 +16729,14 @@ public partial class Form1 : Form
             AccountRotationConfiguration.IsEnabled(_appSettings) &&
             AccountRotationConfiguration.GetPool(_appSettings, account) !=
                 AccountRotationPool.None);
-        var profileAlreadySelected = chatGptFeatureAccount == null
+        var profileAlreadySelected = await Task.Run(() => chatGptFeatureAccount == null
             ? _codex.IsSharedProfileAlreadySelected(
                 account,
                 routeOfficialOAuthThroughGateway)
             : _codex.IsSharedChatGptFeatureProfileAlreadySelected(
                 account,
                 chatGptFeatureAccount,
-                routeOfficialOAuthThroughGateway);
+                routeOfficialOAuthThroughGateway));
         _statusBox.Text = profileAlreadySelected
             ? Volatile.Read(ref _chatSectionSyncRequiresClientRestart) != 0 && !automaticRotation
                 ? $"目录同步有实际变更，正在准备重新加载 {clientName}…"
@@ -16751,21 +16753,8 @@ public partial class Form1 : Form
         WindowsClientAccountProjection? projection = null;
         await RunBusyAsync(async () =>
         {
-            if (routeOfficialOAuthThroughGateway)
-            {
-                await LocalPatGateway.EnsureRunningAsync(
-                    restartOnProxyMismatch: false);
-                if (await LocalPatGateway.RequiresRotationProtocolUpgradeAsync())
-                {
-                    throw new InvalidOperationException(
-                        "账号轮换网关正在等待当前任务的安全边界完成升级；" +
-                        "为避免中断任务，本次没有切换账号，请稍后再试。");
-                }
-                _patGatewayRuntimeRunning = true;
-                _patGatewayRuntimeStatus =
-                    $"已开启 · 127.0.0.1:{LocalPatGateway.Port}";
-                UpdatePatGatewayControls();
-            }
+            // The service performs the single authenticated gateway preparation for both
+            // entry points, before shutdown/projection. Do not repeat it in the UI.
             var startupAppearance = GetCodexAppearanceOptionById(_appSettings.CodexAppearancePresetId);
             var useDreamSkinAtStartup = _appSettings.UseCodexDreamSkin &&
                                         !IsOfficialCodexAppearance(startupAppearance);
@@ -16797,6 +16786,12 @@ public partial class Form1 : Form
                     GetCodexAppearanceLabelById(_appSettings.CodexAppearancePresetId),
                     forceClientRestart: forceClientRestartForSidebarSync,
                     routeThroughGateway: routeOfficialOAuthThroughGateway);
+            if (routeOfficialOAuthThroughGateway)
+            {
+                _patGatewayRuntimeRunning = true;
+                _patGatewayRuntimeStatus = $"已开启 · 127.0.0.1:{LocalPatGateway.Port}";
+                UpdatePatGatewayControls();
+            }
             _statusCache[account.Name] = projection.Status;
             if (!projection.FailedLaunchProfileRestored)
             {

@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Diagnostics;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -52,6 +53,8 @@ internal readonly record struct OfficialCodexLogFileSnapshot(
 /// </summary>
 internal sealed class OfficialCodexLogBaseline
 {
+    private static readonly TimeSpan CaptureBudget = TimeSpan.FromSeconds(1);
+    private const int MaximumBaselineFiles = 4096;
     private readonly IReadOnlyDictionary<string, OfficialCodexLogFileSnapshot> _files;
     private readonly bool _captureComplete;
 
@@ -167,6 +170,14 @@ internal sealed class OfficialCodexLogBaseline
             throw new InvalidOperationException(
                 "Official Codex log baseline accepted a partial file-metadata snapshot.");
         }
+        var inspected = 0;
+        var overBudget = CaptureCore(existingRoot,
+            _ => Enumerable.Repeat(syntheticPath, MaximumBaselineFiles + 1).ToArray(),
+            _ => { inspected++; return new OfficialCodexLogFileSnapshot(1, 1); },
+            static () => DateTimeOffset.UtcNow);
+        if (overBudget.IsUsable || overBudget.TryGetRecordedLength(syntheticPath, out _) ||
+            inspected > MaximumBaselineFiles)
+            throw new InvalidOperationException("Optional log capture must discard an over-budget partial baseline.");
     }
 
     private static OfficialCodexLogBaseline CaptureCore(
@@ -177,6 +188,7 @@ internal sealed class OfficialCodexLogBaseline
     {
         var files = new Dictionary<string, OfficialCodexLogFileSnapshot>(
             StringComparer.OrdinalIgnoreCase);
+        var clock = Stopwatch.StartNew();
         // A fresh Codex installation creates Logs only after package activation. A trusted,
         // AUMID-derived path that does not exist yet is therefore a complete empty baseline,
         // not a probe failure. An unresolved path remains explicitly unusable.
@@ -185,11 +197,16 @@ internal sealed class OfficialCodexLogBaseline
         {
             try
             {
+                var inspected = 0;
                 foreach (var path in enumerate(resolvedRoot))
                 {
+                    if (clock.Elapsed >= CaptureBudget || inspected++ >= MaximumBaselineFiles)
+                        throw new IOException("Optional Codex log baseline exceeded its startup work budget.");
                     var fullPath = Path.GetFullPath(path);
                     files[fullPath] = inspect(fullPath);
                 }
+                if (clock.Elapsed >= CaptureBudget)
+                    throw new IOException("Optional Codex log baseline exceeded its startup work budget.");
             }
             catch (Exception ex) when (IsRecoverableCaptureException(ex))
             {
@@ -360,6 +377,8 @@ internal sealed class OfficialCodexLogProbe
     internal static IReadOnlyList<string> EnumerateT0LogFiles(string root)
     {
         var matches = new List<string>();
+        var clock = Stopwatch.StartNew();
+        var inspected = 0;
         if (!Directory.Exists(root))
         {
             return matches;
@@ -370,6 +389,8 @@ internal sealed class OfficialCodexLogProbe
                      "codex-desktop-*.log",
                      SearchOption.AllDirectories))
         {
+            if (clock.Elapsed >= TimeSpan.FromSeconds(1) || inspected++ >= 4096)
+                throw new IOException("Optional Codex log enumeration exceeded its work budget.");
             if (T0LogFileNamePattern.IsMatch(Path.GetFileName(path)))
             {
                 matches.Add(Path.GetFullPath(path));

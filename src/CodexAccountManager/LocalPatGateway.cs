@@ -73,6 +73,8 @@ internal static class LocalPatGateway
     internal const string LegacyV12RotationProtocolValue = "request-boundary-v12";
     internal const string RotationProtocolValue = "request-boundary-v13";
     private static readonly SemaphoreSlim StartupLock = new(1, 1);
+    private static readonly TimeSpan StartupLockTimeout = TimeSpan.FromSeconds(8);
+    private static readonly TimeSpan DesktopStartupTimeout = TimeSpan.FromSeconds(12);
 
     internal static int RunProcess(string[] args)
     {
@@ -108,16 +110,127 @@ internal static class LocalPatGateway
         CancellationToken cancellationToken = default,
         bool restartOnProxyMismatch = true)
     {
+        _ = await EnsureRunningCoreAsync(cancellationToken, restartOnProxyMismatch).ConfigureAwait(false);
+    }
+
+    // One authenticated probe/start for the whole desktop launch. Repeated callers used
+    // to queue on the startup gate and the local PAT validator could then restart a
+    // gateway which the outer launch deliberately preserved. No network login/model
+    // request or gateway replacement is part of this preparation.
+    internal static Task EnsureReadyForDesktopLaunchAsync(CancellationToken cancellationToken = default) =>
+        PrepareDesktopGatewayAsync(
+            token => EnsureRunningCoreAsync(token, restartOnProxyMismatch: false),
+            DesktopStartupTimeout, cancellationToken);
+
+    private static async Task PrepareDesktopGatewayAsync(
+        Func<CancellationToken, Task<GatewayHealth>> prepare,
+        TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadline.CancelAfter(timeout);
+        try
+        {
+            var health = await prepare(deadline.Token).ConfigureAwait(false);
+            deadline.Token.ThrowIfCancellationRequested();
+            if (health is not (GatewayHealth.Ready or GatewayHealth.ProxyMismatch))
+                throw new InvalidOperationException(
+                    "账号代理网关尚未就绪或正在等待安全升级；没有关闭当前 Codex，请稍后重试。");
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && deadline.IsCancellationRequested)
+        {
+            throw new TimeoutException(
+                "本地账号网关准备超时；没有关闭当前 Codex或切换凭据。请检查网关状态后重试。");
+        }
+    }
+
+    private static async Task AcquireStartupLockAsync(
+        SemaphoreSlim gate, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        if (!await gate.WaitAsync(timeout, cancellationToken).ConfigureAwait(false))
+            throw new TimeoutException(
+                "本地网关正在处理另一次启动；本次等待已结束，没有关闭 Codex或切换凭据，请稍后重试。");
+    }
+
+    internal static void ValidateDesktopStartupPreparation()
+    {
+        static void Require(bool condition, string message)
+        {
+            if (!condition) throw new InvalidOperationException("Gateway startup regression: " + message);
+        }
+        // Only injected gates/preparation callbacks are used: no real listener, account,
+        // proxy or credential is read/changed by these tests.
+        foreach (var health in new[] { GatewayHealth.Ready, GatewayHealth.ProxyMismatch })
+        {
+            var calls = 0;
+            PrepareDesktopGatewayAsync(_ =>
+            {
+                calls++;
+                return Task.FromResult(health);
+            }, TimeSpan.FromSeconds(2), CancellationToken.None).GetAwaiter().GetResult();
+            Require(calls == 1, "one preparation must supply health and protocol for a desktop launch");
+        }
+        foreach (var health in new[] { GatewayHealth.UpgradeRequired, GatewayHealth.ForeignListener,
+                     GatewayHealth.Unavailable, GatewayHealth.LegacyRootMismatch, GatewayHealth.ProxyMissing })
+        {
+            try
+            {
+                PrepareDesktopGatewayAsync(_ => Task.FromResult(health), TimeSpan.FromSeconds(2),
+                    CancellationToken.None).GetAwaiter().GetResult();
+                throw new Exception("Unready/foreign gateway was accepted.");
+            }
+            catch (InvalidOperationException) { }
+        }
+        using var gate = new SemaphoreSlim(0, 1);
+        var clock = Stopwatch.StartNew();
+        try
+        {
+            AcquireStartupLockAsync(gate, TimeSpan.FromMilliseconds(25), CancellationToken.None)
+                .GetAwaiter().GetResult();
+            throw new Exception("An occupied startup gate did not time out.");
+        }
+        catch (TimeoutException) { }
+        Require(clock.Elapsed < TimeSpan.FromSeconds(3) && gate.CurrentCount == 0,
+            "a contended gate must terminate its wait without releasing another owner's lease");
+        gate.Release();
+        AcquireStartupLockAsync(gate, TimeSpan.FromSeconds(2), CancellationToken.None).GetAwaiter().GetResult();
+        Require(gate.CurrentCount == 0, "a later startup must still acquire the gate exactly once");
+        gate.Release();
+        try
+        {
+            PrepareDesktopGatewayAsync(async token =>
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, token).ConfigureAwait(false);
+                throw new Exception("Timed-out preparation continued to activation.");
+            }, TimeSpan.FromMilliseconds(25), CancellationToken.None).GetAwaiter().GetResult();
+            throw new Exception("Slow preparation did not time out.");
+        }
+        catch (TimeoutException) { }
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+        try
+        {
+            PrepareDesktopGatewayAsync(token => Task.FromCanceled<GatewayHealth>(token),
+                TimeSpan.FromSeconds(2), cancelled.Token).GetAwaiter().GetResult();
+            throw new Exception("Caller cancellation was swallowed.");
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    private static async Task<GatewayHealth> EnsureRunningCoreAsync(
+        CancellationToken cancellationToken,
+        bool restartOnProxyMismatch)
+    {
         if (!IsEnabledBySettings())
         {
             throw new InvalidOperationException(
                 "本地网关已在系统配置中关闭；Access Token、独立代理或轮换需要网关，请先在系统配置中开启网关。");
         }
 
-        await StartupLock.WaitAsync(cancellationToken);
+        await AcquireStartupLockAsync(StartupLock, StartupLockTimeout, cancellationToken).ConfigureAwait(false);
         try
         {
-            var health = await ProbeAsync(cancellationToken);
+            var health = await ProbeAsync(cancellationToken).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
             if (health == GatewayHealth.LegacyRootMismatch)
             {
                 if (!restartOnProxyMismatch)
@@ -143,7 +256,7 @@ internal static class LocalPatGateway
                     // A quota test must never interrupt an already-running account. The
                     // existing gateway can safely finish the request through its inherited
                     // proxy; the next explicit gateway start may apply the new proxy choice.
-                    return;
+                    return health;
                 }
                 // A gateway is a long-lived child process, so it may have inherited an
                 // older proxy choice. Restart it before any PAT-bearing request is sent.
@@ -162,7 +275,7 @@ internal static class LocalPatGateway
                 {
                     // Read-only quota probes may share an older gateway while a task is
                     // active. The next explicit PAT launch upgrades it at a safe boundary.
-                    return;
+                    return health;
                 }
                 if (!await ShutdownIfRunningAsync(cancellationToken))
                 {
@@ -175,7 +288,7 @@ internal static class LocalPatGateway
             }
             if (health == GatewayHealth.Ready)
             {
-                return;
+                return health;
             }
             if (health == GatewayHealth.ProxyMissing)
             {
@@ -187,16 +300,19 @@ internal static class LocalPatGateway
                     $"本地端口 {Port} 已被其它程序占用。为避免把 PAT 发送给未知进程，本地 PAT 网关未启动。");
             }
 
-            using var process = Process.Start(BuildGatewayStartInfo());
+            var startInfo = BuildGatewayStartInfo();
+            cancellationToken.ThrowIfCancellationRequested();
+            using var process = Process.Start(startInfo);
             var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(8);
             while (DateTime.UtcNow < deadline)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                await Task.Delay(120, cancellationToken);
-                health = await ProbeAsync(cancellationToken);
+                await Task.Delay(120, cancellationToken).ConfigureAwait(false);
+                health = await ProbeAsync(cancellationToken).ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
                 if (health == GatewayHealth.Ready)
                 {
-                    return;
+                    return health;
                 }
                 if (health == GatewayHealth.ProxyMissing)
                 {

@@ -361,6 +361,7 @@ public sealed partial class CodexCliService
                         forceFileAuthStore: true,
                         serviceTier: ReadDesktopServiceTier(current));
             projected = PreserveSharedMcpServerSections(current, projected);
+            projected = PreserveSharedDesktopRuntimeSections(current, projected);
             if (!string.Equals(current, projected, StringComparison.Ordinal))
             {
                 WriteTextAtomically(sharedConfigPath, projected);
@@ -2509,37 +2510,41 @@ public sealed partial class CodexCliService
         if (routeOfficialOAuthThroughGateway)
         {
             // Resolve and verify the gateway before shutting down any existing client.
-            await LocalPatGateway.EnsureRunningAsync(restartOnProxyMismatch: false);
-            if (await LocalPatGateway.RequiresRotationProtocolUpgradeAsync())
-                throw new InvalidOperationException("账号代理网关尚未就绪；没有关闭当前 Codex，请稍后重试。");
+            LaunchPhase("launch-gateway-prepare-start", "正在准备本地账号网关…");
+            await Task.Run(() => LocalPatGateway.EnsureReadyForDesktopLaunchAsync());
+            LaunchPhase("launch-gateway-prepare-complete", "网关已就绪，正在核对本地凭据…");
         }
 
         // Capture the native picker value before the validation/reuse decision.  The shared
         // config belongs to the account that is currently running, not necessarily the account
         // represented by this click.
-        PersistSharedServiceTierToSelectedAccount();
-
-        if (accessTokenMode == AccessTokenSharedProfileMode.ChatGptDesktop)
-        {
-            PrepareChatGptFeatureAccount(account, chatGptFeatureAccount);
-        }
-
         // A normal desktop switch only validates local files. Running login status, debug
         // models, or a minimal model request here could consume quota and block this click for
         // one or more 120-second CLI timeouts. Codex++ performs the online validation when the
         // user opens it; explicit status/login actions remain available separately.
-        var status = await ValidateWindowsClientAccountAsync(
-            account,
-            localOnly: true,
-            accessTokenMode: accessTokenMode,
-            chatGptFeatureAccount: chatGptFeatureAccount);
+        LaunchPhase("launch-local-validation-start", "正在读取和校验本地账号配置…");
+        var status = await Task.Run(async () =>
+        {
+            PersistSharedServiceTierToSelectedAccount();
+            if (accessTokenMode == AccessTokenSharedProfileMode.ChatGptDesktop)
+                PrepareChatGptFeatureAccount(account, chatGptFeatureAccount);
+            return await ValidateWindowsClientAccountAsync(
+                account,
+                localOnly: true,
+                accessTokenMode: accessTokenMode,
+                chatGptFeatureAccount: chatGptFeatureAccount);
+        });
+        LaunchPhase("launch-local-validation-complete", "本地凭据已核对，正在准备所选节点…",
+            "online_login_probe=false; online_pat_model_probe=false");
         if (account.IsCompatibleApi)
         {
             // A compatible-API switch is destructive to the currently open client once the
             // switch lock is taken.  Verify the configured proxy, endpoint and model catalog
             // first so a stopped v2rayN/Clash process or a mistyped model cannot leave the user
             // looking at a blank Codex window after the old profile has already been replaced.
+            LaunchPhase("launch-compatible-preflight-start", "正在核对兼容 API 的网络与模型目录…");
             await EnsureCompatibleApiLaunchPreflightAsync(account);
+            LaunchPhase("launch-compatible-preflight-complete", "兼容 API 检查完成…");
         }
         // Resolve/start the selected node BEFORE closing the old client. A functioning
         // model gateway alone does not configure Chromium's OAuth/feature bootstrap.
@@ -2640,12 +2645,17 @@ public sealed partial class CodexCliService
                 // deletion tombstones before projecting/launching the next account so deleted
                 // tasks cannot remain in "最近" merely because the manager recorded the deletion
                 // while Codex was still open.
-                CodexRolloutHistoryRepairService.TryRepairLaggingPaginatedRollouts(
-                    GetDefaultCodexHome(),
-                    allowOrdinalRewrite: true);
-                TryPruneDeletedDesktopSidebarState();
-                LaunchPhase("launch-old-processes-exited", "旧 Codex 已退出，正在准备新配置…",
+                LaunchPhase("launch-old-processes-exited", "旧 Codex 已退出，正在检查本地历史索引…",
                     $"count={shutdownTargets.Count}");
+                LaunchPhase("launch-history-maintenance-start", "正在检查本地历史索引…");
+                var historyRepair = CodexRolloutHistoryRepairService.TryRepairLaggingPaginatedRollouts(
+                    GetDefaultCodexHome(),
+                    allowOrdinalRewrite: true,
+                    forDesktopLaunch: true);
+                TryPruneDeletedDesktopSidebarState();
+                LaunchPhase("launch-history-maintenance-complete", "历史检查完成，正在准备新配置…",
+                    $"scanned_files={historyRepair.ScannedFiles}; scanned_bytes={historyRepair.ScannedBytes}; " +
+                    $"repaired_records={historyRepair.RepairedRecords}; deferred={historyRepair.WorkDeferred}");
             }
             if (sharedProfileAlreadySelected)
             {
@@ -3368,8 +3378,10 @@ public sealed partial class CodexCliService
         AccessTokenSharedProfileMode accessTokenMode = AccessTokenSharedProfileMode.ChatGptDesktop,
         AccountRecord? chatGptFeatureAccount = null)
     {
-        if (account.IsAccessToken)
+        if (account.IsAccessToken && !localOnly)
         {
+            // Desktop startup already prepared the gateway once, non-destructively.
+            // An independent explicit status/login validation retains its own check.
             await LocalPatGateway.EnsureRunningAsync();
         }
         else if (account.IsOfficialOAuth)
@@ -3589,6 +3601,9 @@ public sealed partial class CodexCliService
                         serviceTier: targetServiceTier,
                         modelOverride: GetAccessTokenModel(account));
             projectedSharedConfig = PreserveSharedMcpServerSections(
+                sharedConfig,
+                projectedSharedConfig);
+            projectedSharedConfig = PreserveSharedDesktopRuntimeSections(
                 sharedConfig,
                 projectedSharedConfig);
             var currentFingerprint = SHA256.HashData(Encoding.UTF8.GetBytes(
@@ -4602,41 +4617,23 @@ public sealed partial class CodexCliService
             throw new DirectoryNotFoundException($"Shared CODEX_HOME does not exist: {codexHome}");
         }
 
-        SanitizeCuratedPluginManifests(codexHome);
         var launchGeneration = expectedLaunchGeneration ?? BeginWindowsClientLaunchGeneration();
-        if (!switchRequired && mode == WindowsClientMode.OfficialCodex &&
-            (HasPendingOfficialStartup() || FindExistingOfficialStartup() != null) &&
-            FindExistingOfficialWindow() == null)
-        {
-            LaunchPhase("official-pending-startup-preserved", "Codex 已在初始化，未重复启动…",
-                "reactivated=false; navigation=false; retry=false");
-            return true;
-        }
-        var hasExistingOfficialWindow =
-            mode == WindowsClientMode.OfficialCodex &&
-            HasWindowsClientMainWindowSince(DateTime.MinValue);
         if (ShouldPreserveExistingOfficialWindow(
                 switchRequired,
                 mode,
                 useDreamSkin,
-                hasExistingOfficialWindow,
-                allowOfficialRendererPatch))
+                hasExistingOfficialWindow: true,
+                allowOfficialRendererPatch) && TryReuseExistingOfficialClient())
         {
-            // A same-profile click is an activation request, never a recovery transaction.
-            // Runtime health can be transiently false while a turn is busy, IPC is
-            // back-pressured, or the app-server is rotating state. Closing that visible
-            // verified Codex window would kill the in-flight task. Preserve it
-            // unconditionally; a best-effort deep link may focus/open the requested project
-            // but its failure must not mutate the existing process tree. A direct Codex launch
-            // never applies the Fast renderer patch; an already-open dual-login window is also
-            // preserved instead of being reloaded merely to add that optional control.
-            if (FindExistingOfficialWindow() is { } existingIdentity)
-                _ = FocusExistingOfficialWindow(existingIdentity);
             WriteCodexPlusPlusLaunchDiagnostic(
                 "official-same-profile-window-preserved",
-                "renderer patch and runtime-health shutdown were disabled for the existing same-profile window");
+                "existing instance preserved; renderer reload, project navigation and shutdown disabled");
             return true;
         }
+
+        LaunchPhase("launch-plugin-check-start", "正在核对本地插件配置…");
+        SanitizeCuratedPluginManifests(codexHome);
+        LaunchPhase("launch-plugin-check-complete", "插件检查完成，正在打开 Codex…");
 
         return mode switch
         {
@@ -11365,6 +11362,7 @@ catch {
 
     internal static void ValidateConfigProjectionDefaults()
     {
+        ValidateDesktopReasoningPreferences();
         ValidateCompatibleModelCatalogProjection();
         var migratedFastAlias = UpsertDesktopServiceTier(
             "model = \"test\"\n\n[features]\njs_repl = false\n",
@@ -12108,6 +12106,8 @@ catch {
                     requiresOpenAiAuth: true,
                     providerBearerToken: "virtual-api",
                     forceFileAuthStore: true));
+            reprojectedSharedApiConfig = PreserveSharedDesktopRuntimeSections(
+                sharedApiConfig, reprojectedSharedApiConfig);
             if (!string.Equals(
                     NormalizeTextForFingerprint(sharedApiConfig),
                     NormalizeTextForFingerprint(reprojectedSharedApiConfig),
@@ -13545,7 +13545,7 @@ catch {
         }
 
         var baseProjection = UpsertTomlSectionStringValue(
-            string.Join(Environment.NewLine, output) + Environment.NewLine,
+            ApplyDesktopReasoningDefaults(string.Join(Environment.NewLine, output) + Environment.NewLine),
             "desktop",
             "localeOverride",
             AccountStore.OfficialOAuthDesktopLocale);
@@ -13569,7 +13569,7 @@ catch {
         output.Add("wire_api = \"responses\"");
         output.Add("requires_openai_auth = true");
         output.Add("supports_websockets = false");
-        return string.Join(Environment.NewLine, output) + Environment.NewLine;
+        return ApplyDesktopReasoningDefaults(string.Join(Environment.NewLine, output) + Environment.NewLine);
     }
 
     private static string PreserveSharedMcpServerSections(
@@ -13579,10 +13579,10 @@ catch {
 
     private static string PreserveSharedDesktopRuntimeSections(string currentSharedConfig, string projectedConfig)
     {
-        // These are installed desktop capabilities, not account credentials. New Codex
+        // These are desktop preferences/capabilities, not account credentials. New Codex
         // versions persist their native plugin inventory/marketplace locations here.
         // Replacing them from an old account template triggers reinstall on every launch.
-        return PreserveSharedConfigSections(currentSharedConfig, projectedConfig, header =>
+        projectedConfig = PreserveSharedConfigSections(currentSharedConfig, projectedConfig, header =>
         {
             if (IsSitesPluginSection(header)) return false; // Keep the targeted safety exclusion.
             var table = header.TrimStart('[').TrimEnd(']').Trim();
@@ -13590,6 +13590,14 @@ catch {
                 table.StartsWith("plugins.", StringComparison.Ordinal) ||
                 table.StartsWith("marketplaces.", StringComparison.Ordinal);
         });
+        // Canonicalize the desktop table even on first use. Otherwise the initial
+        // projection and the reuse check put it on different sides of the MCP tables.
+        var hasSharedDesktop = currentSharedConfig.Split('\n').Any(line =>
+            line.Trim().Equals("[desktop]", StringComparison.OrdinalIgnoreCase));
+        var desktopSource = hasSharedDesktop ? currentSharedConfig : projectedConfig;
+        return ApplyDesktopReasoningDefaults(PreserveSharedConfigSections(
+            desktopSource, projectedConfig,
+            header => header.Equals("[desktop]", StringComparison.OrdinalIgnoreCase)));
     }
 
     private static string PreserveSharedConfigSections(
@@ -13810,7 +13818,7 @@ catch {
         string? serviceTier = null,
         bool routeThroughGateway = false)
     {
-        currentConfig = RemoveManagedModelCatalog(currentConfig);
+        currentConfig = ApplyDesktopReasoningDefaults(RemoveManagedModelCatalog(currentConfig));
         var desktopServiceTier = serviceTier == null
             ? ReadDesktopServiceTier(currentConfig)
             : NormalizeDesktopServiceTier(serviceTier);
@@ -14070,6 +14078,13 @@ catch {
         string section,
         string key,
         string value)
+        => UpsertTomlSectionRawValue(config, section, key, TomlString(value));
+
+    private static string UpsertTomlSectionRawValue(
+        string config,
+        string section,
+        string key,
+        string rawValue)
     {
         var normalized = config.Replace("\r\n", "\n").Replace('\r', '\n');
         var lines = normalized.Split('\n').ToList();
@@ -14081,7 +14096,7 @@ catch {
         var sectionHeader = "[" + section + "]";
         var sectionHeaderIndex = lines.FindIndex(line =>
             line.Trim().Equals(sectionHeader, StringComparison.OrdinalIgnoreCase));
-        var valueLine = key + " = " + TomlString(value);
+        var valueLine = key + " = " + rawValue;
 
         if (sectionHeaderIndex < 0)
         {
@@ -14162,7 +14177,7 @@ catch {
     private static string ApplyDesktopFeatureDefaults(string config, bool disablePlugins = false,
         bool enableNativePlugins = false)
     {
-        var projected = RepairManagedCompactionSettings(config);
+        var projected = RepairManagedCompactionSettings(ApplyDesktopReasoningDefaults(config));
         projected = UpsertFeatureFlag(projected, "remote_plugin", false);
         if (enableNativePlugins)
             return UpsertFeatureFlag(projected, "plugins", true);

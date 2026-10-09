@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace CodexAccountManager;
 
@@ -47,6 +48,8 @@ public sealed partial class CodexCliService
         if (CurrentLaunch.Value is { } trace) trace.ProgressText = progress;
         WriteCodexPlusPlusLaunchDiagnostic(phase, detail);
     }
+
+    internal static void ReportLaunchProgress(string phase, string progress) => LaunchPhase(phase, progress);
 
     private sealed class DesktopLaunchLease : IDisposable
     {
@@ -122,41 +125,142 @@ public sealed partial class CodexCliService
             {
                 try
                 {
-                    if (!process.HasExited && process.MainWindowHandle != IntPtr.Zero &&
-                        IsCodexWindowsClientProcess(process, packageRoot))
-                        return new(process.Id, process.StartTime.ToUniversalTime().Ticks);
+                    if (process.HasExited || !IsCodexWindowsClientProcess(process, packageRoot)) continue;
+                    var identity = new WindowsClientActivationIdentity(
+                        process.Id, process.StartTime.ToUniversalTime().Ticks);
+                    if (FindOfficialMainWindow(identity) != null) return identity;
                 }
-                catch (Exception ex) when (ex is InvalidOperationException or
+                catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or
                                            System.ComponentModel.Win32Exception or NotSupportedException) { }
             }
         }
         return null;
     }
 
-    private static WindowsClientActivationIdentity? FindExistingOfficialStartup()
+    private static WindowsClientActivationIdentity? FindExistingOfficialProcess()
     {
-        var samples = CaptureOfficialStartupSamples();
+        return SelectExistingOfficialProcess(CaptureOfficialStartupSamples());
+    }
+
+    private static WindowsClientActivationIdentity? SelectExistingOfficialProcess(
+        IReadOnlyList<OfficialStartupSample> samples)
+    {
         var roots = samples.Where(sample => sample.VerifiedPackage && sample.StartTicks > 0 &&
             !samples.Any(parent => parent.ProcessId == sample.ParentProcessId)).ToArray();
         return roots.Length == 1 ? new(roots[0].ProcessId, roots[0].StartTicks) : null;
     }
 
+    private sealed record OfficialDesktopWindow(
+        IntPtr Handle, int ProcessId, string ClassName, bool Owned, bool ToolWindow,
+        bool Visible, bool Minimized);
+
+    private static OfficialDesktopWindow? SelectOfficialMainWindow(
+        int processId, IntPtr preferredHandle, IReadOnlyList<OfficialDesktopWindow> windows)
+    {
+        var candidates = windows.Where(window => window.Handle != IntPtr.Zero &&
+            window.ProcessId == processId && !window.Owned && !window.ToolWindow &&
+            window.ClassName.Equals("Chrome_WidgetWin_1", StringComparison.Ordinal)).ToArray();
+        var preferred = candidates.FirstOrDefault(window => window.Handle == preferredHandle);
+        if (preferred != null) return preferred;
+        var visible = candidates.Where(window => window.Visible).ToArray();
+        // Multiple hidden Electron windows are ambiguous; let official activation choose.
+        return visible.Length == 1 ? visible[0] : candidates.Length == 1 ? candidates[0] : null;
+    }
+
+    private static OfficialDesktopWindow? FindOfficialMainWindow(WindowsClientActivationIdentity identity)
+    {
+        if (ObserveStartupIdentity(identity) != StartupProcessState.Alive) return null;
+        try
+        {
+            using var process = Process.GetProcessById(identity.ProcessId);
+            var selected = SelectOfficialMainWindow(identity.ProcessId, process.MainWindowHandle,
+                EnumerateOfficialDesktopWindows(identity.ProcessId));
+            return ObserveStartupIdentity(identity) == StartupProcessState.Alive ? selected : null;
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or
+            System.ComponentModel.Win32Exception or NotSupportedException) { return null; }
+    }
+
+    private static IReadOnlyList<OfficialDesktopWindow> EnumerateOfficialDesktopWindows(int processId)
+    {
+        var windows = new List<OfficialDesktopWindow>();
+        EnumDesktopWindowCallback callback = (window, state) =>
+        {
+            _ = GetWindowThreadProcessId(window, out var ownerProcessId);
+            if (ownerProcessId != processId) return true;
+            var className = new StringBuilder(256);
+            if (GetClassName(window, className, className.Capacity) == 0) return true;
+            windows.Add(new OfficialDesktopWindow(window, processId, className.ToString(),
+                GetWindow(window, 4) != IntPtr.Zero, (GetWindowLong(window, -20) & 0x80) != 0,
+                IsWindowVisible(window), IsIconic(window)));
+            return true;
+        };
+        _ = EnumWindows(callback, IntPtr.Zero);
+        return windows;
+    }
+
+    private static int? GetOfficialWindowRestoreCommand(bool visible, bool minimized) =>
+        minimized ? 9 : !visible ? 5 : null;
+
+    private static bool ShouldPreservePendingOfficialStartup(bool managedPending, bool hasMainWindow) =>
+        managedPending && !hasMainWindow;
+
     private static bool FocusExistingOfficialWindow(WindowsClientActivationIdentity identity)
     {
-        if (ObserveStartupIdentity(identity) != StartupProcessState.Alive) return false;
-        using var process = Process.GetProcessById(identity.ProcessId);
-        var window = process.MainWindowHandle;
-        if (window == IntPtr.Zero) return false;
-        if (IsIconic(window)) _ = ShowWindowAsync(window, 9);
-        _ = SetForegroundWindow(window); // Explicit user click only; never called by an observer.
-        LaunchPhase("official-window-reused", "已复用现有 Codex 窗口",
-            $"pid={identity.ProcessId}; start_ticks={identity.StartTimeUtcTicks}; navigation=false; restart=false");
+        var window = FindOfficialMainWindow(identity);
+        if (window == null) return false;
+        _ = GetWindowThreadProcessId(window.Handle, out var ownerProcessId);
+        if (ownerProcessId != identity.ProcessId ||
+            ObserveStartupIdentity(identity) != StartupProcessState.Alive) return false;
+        var command = GetOfficialWindowRestoreCommand(window.Visible, window.Minimized);
+        if (command.HasValue && !ShowWindowAsync(window.Handle, command.Value)) return false;
+        var focused = SetForegroundWindow(window.Handle); // Explicit click, never an observer.
+        LaunchPhase("official-window-reused", "已唤回现有 Codex 窗口",
+            $"pid={identity.ProcessId}; start_ticks={identity.StartTimeUtcTicks}; " +
+            $"was_visible={window.Visible}; was_minimized={window.Minimized}; " +
+            $"restore_command={command}; foreground_accepted={focused}; navigation=false; restart=false");
+        CurrentLaunch.Value?.StartPageObservation();
+        CurrentLaunch.Value?.FinishPageObservation("已唤回现有 Codex 窗口；未重启或切换聊天。");
+        return true;
+    }
+
+    private static bool TryReuseExistingOfficialClient()
+    {
+        var existingWindow = FindExistingOfficialWindow();
+        if (existingWindow != null && FocusExistingOfficialWindow(existingWindow)) return true;
+        if (ShouldPreservePendingOfficialStartup(HasPendingOfficialStartup(), existingWindow != null))
+        {
+            LaunchPhase("official-pending-startup-preserved", "Codex 本次启动仍在初始化，未重复启动…",
+                "managed_observer=true; reactivated=false; navigation=false; retry=false");
+            CurrentLaunch.Value?.StartPageObservation();
+            CurrentLaunch.Value?.FinishPageObservation("Codex 本次启动仍在初始化；未重复启动或切换聊天。");
+            return true;
+        }
+        var existingProcess = existingWindow ?? FindExistingOfficialProcess();
+        if (existingProcess == null || ObserveStartupIdentity(existingProcess) != StartupProcessState.Alive)
+            return false;
+        LaunchPhase("official-existing-instance-activation-start", "正在请求 Windows 唤回现有 Codex…",
+            $"pid={existingProcess.ProcessId}; start_ticks={existingProcess.StartTimeUtcTicks}; " +
+            "arguments=empty; navigation=false; restart=false");
+        // No deep link or renderer flags: this explicit click only restores the official instance.
+        var activated = ActivateOfficialCodexPackage(cleanupUnverifiableIdentity: false);
+        LaunchPhase("official-existing-instance-activation-accepted", "已请求 Windows 唤回现有 Codex",
+            $"existing_pid={existingProcess.ProcessId}; activation_pid={activated.ProcessId}; " +
+            "arguments=empty; navigation=false; restart=false");
+        CurrentLaunch.Value?.StartPageObservation();
+        CurrentLaunch.Value?.FinishPageObservation("已请求 Windows 唤回现有 Codex；未重启或切换聊天。");
         return true;
     }
 
     [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] private static extern bool ShowWindowAsync(IntPtr hWnd, int command);
     [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr hWnd);
+    private delegate bool EnumDesktopWindowCallback(IntPtr window, IntPtr state);
+    [DllImport("user32.dll")] private static extern bool EnumWindows(EnumDesktopWindowCallback callback, IntPtr state);
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr window, StringBuilder className, int capacity);
+    [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr window, uint command);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] private static extern int GetWindowLong(IntPtr window, int index);
 
     private static string BuildOfficialStartupArguments(int? debugPort, string? projectPath, Uri? desktopProxy = null)
     {
@@ -184,7 +288,10 @@ public sealed partial class CodexCliService
         var clientPath = ResolveCodexWindowsClientPath();
         if (string.IsNullOrWhiteSpace(clientPath) || !File.Exists(clientPath))
             throw new FileNotFoundException("找不到已安装的官方 Codex Windows 客户端。", clientPath);
+        LaunchPhase("official-log-baseline-start", "正在准备启动诊断，随后打开 Codex…");
         var baseline = CaptureOfficialCodexLaunchLogBaseline();
+        LaunchPhase("official-log-baseline-complete", "启动诊断已准备，正在请求 Windows 打开 Codex…",
+            $"log_probe_available={baseline.IsUsable}; log_failure_does_not_block_activation=true");
         var launchStartedUtc = DateTime.UtcNow;
         int? port = null;
         if (allowRendererPatch)
@@ -301,6 +408,7 @@ public sealed partial class CodexCliService
             }
             finally
             {
+                Interlocked.CompareExchange(ref _pendingOfficialStartup, null, identity);
                 trace?.FinishPageObservation(IsCurrentWindowsClientLaunchGeneration(generation)
                     ? "Codex 窗口已启动，但尚未确认主页面就绪。若仍停在标志页，请检查所选账号节点对官方登录和功能服务的连接。"
                     : "本次启动观察已被新的启动取代。");
@@ -437,6 +545,7 @@ public sealed partial class CodexCliService
 
     private static void ValidateOfficialCodexStartupObservation()
     {
+        LocalPatGateway.ValidateDesktopStartupPreparation();
         ValidateNonDestructiveStartupPolicy();
         var selectedPorts = 0;
         int SelectPort() { selectedPorts++; return 19335; }
@@ -473,6 +582,32 @@ public sealed partial class CodexCliService
         var project = @"C:\Projects\project with spaces\学习";
         foreach (var dual in new[] { false, true })
         {
+            var hidden = new OfficialDesktopWindow((IntPtr)11, 100, "Chrome_WidgetWin_1",
+                false, false, false, false);
+            Require(SelectOfficialMainWindow(100, IntPtr.Zero, [hidden]) == hidden,
+                "both entries must find a hidden main window even when MainWindowHandle is zero");
+            Require(GetOfficialWindowRestoreCommand(false, false) == 5 &&
+                GetOfficialWindowRestoreCommand(true, true) == 9 &&
+                GetOfficialWindowRestoreCommand(false, true) == 9 &&
+                GetOfficialWindowRestoreCommand(true, false) == null,
+                "hidden windows are shown, minimized windows restored, visible windows not shown again");
+            foreach (var rejected in new[]
+                { hidden with { ProcessId = 9 }, hidden with { Owned = true },
+                  hidden with { ToolWindow = true }, hidden with { ClassName = "Chrome_MessageWindow" },
+                  hidden with { Handle = IntPtr.Zero } })
+                Require(SelectOfficialMainWindow(100, IntPtr.Zero, [rejected]) == null,
+                    "foreign, message, owned and utility windows cannot be restored as the primary window");
+            var second = hidden with { Handle = (IntPtr)12 };
+            Require(SelectOfficialMainWindow(100, IntPtr.Zero, [hidden, second]) == null &&
+                SelectOfficialMainWindow(100, second.Handle, [hidden, second]) == second &&
+                SelectOfficialMainWindow(100, IntPtr.Zero, [hidden, second with { Visible = true }])?.Handle == second.Handle,
+                "ambiguous hidden windows use official activation rather than selecting an arbitrary window");
+            Require(ShouldPreservePendingOfficialStartup(true, false) &&
+                !ShouldPreservePendingOfficialStartup(false, false) &&
+                !ShouldPreservePendingOfficialStartup(true, true),
+                "only a managed active observer can classify a no-window process as initializing");
+            Require(BuildOfficialStartupArguments(null, null) == "",
+                "existing-instance activation has no renderer flags, project navigation or proxy override");
             var arguments = BuildOfficialStartupArguments(dual ? 19335 : null, project,
                 new Uri("http://127.0.0.1:12805"));
             Require(arguments.Contains("--proxy-server=http://127.0.0.1:12805", StringComparison.Ordinal) &&
@@ -493,6 +628,16 @@ public sealed partial class CodexCliService
             try { _ = BuildOfficialStartupArguments(null, project, new Uri(unsafeProxy)); }
             catch (InvalidOperationException) { rejected = true; }
             Require(rejected, "proxy credentials/invalid values cannot leak into process arguments");
+        }
+        using (var fixture = new Form { Text = "CAM hidden-window fixture", ShowInTaskbar = false })
+        {
+            var handle = fixture.Handle;
+            var hidden = EnumerateOfficialDesktopWindows(Environment.ProcessId)
+                .SingleOrDefault(window => window.Handle == handle);
+            Require(hidden != null && !hidden.Visible,
+                "native enumeration must include a real hidden top-level HWND, not only Process.MainWindowHandle");
+            Require(EnumerateOfficialDesktopWindows(-1).Count == 0,
+                "native enumeration must not borrow another process's windows");
         }
         using (var trace = new LaunchDiagnostics(null))
         {
@@ -519,6 +664,23 @@ public sealed partial class CodexCliService
         Require(!CanSubmitStartupNavigation(generation, true, false), "navigation is at most once");
         _ = BeginWindowsClientLaunchGeneration();
         Require(!CanSubmitStartupNavigation(generation, true, false), "superseded navigation is cancelled");
+        var completedStartup = new WindowsClientActivationIdentity(100, 1000);
+        Volatile.Write(ref _pendingOfficialStartup, completedStartup);
+        Interlocked.CompareExchange(ref _pendingOfficialStartup, null, completedStartup);
+        Require(Volatile.Read(ref _pendingOfficialStartup) == null,
+            "a completed or timed-out observer cannot keep a process pending forever");
+        var nextStartup = new WindowsClientActivationIdentity(101, 2000);
+        Volatile.Write(ref _pendingOfficialStartup, nextStartup);
+        Interlocked.CompareExchange(ref _pendingOfficialStartup, null, completedStartup);
+        Require(ReferenceEquals(Volatile.Read(ref _pendingOfficialStartup), nextStartup),
+            "an old observer cannot clear a newer startup identity");
+        Interlocked.CompareExchange(ref _pendingOfficialStartup, null, nextStartup);
+        var existingRoot = new OfficialStartupSample(100, 1000, 1, true, false);
+        Require(SelectExistingOfficialProcess([existingRoot]) == completedStartup &&
+            SelectExistingOfficialProcess([existingRoot, existingRoot with { ProcessId = 101, ParentProcessId = 100 }]) == completedStartup &&
+            SelectExistingOfficialProcess([existingRoot with { VerifiedPackage = false }]) == null &&
+            SelectExistingOfficialProcess([existingRoot, existingRoot with { ProcessId = 102 }]) == null,
+            "existing-instance activation is restricted to one verified package root, not helpers or ambiguous instances");
         Require(EvaluateStartupObservation(StartupProcessState.Alive, OfficialCodexLogReadinessState.Pending, true)
                 == StartupObservation.Initializing, "slow initialization is not a crash");
         Require(EvaluateStartupObservation(StartupProcessState.Alive, OfficialCodexLogReadinessState.Ready, true)
@@ -595,10 +757,14 @@ public sealed partial class CodexCliService
             new Dictionary<string, OfficialCodexLogFileSnapshot>(), true,
             processId, identity.StartTimeUtcTicks, OfficialCodexLogReadinessStage.InitialLaunch);
         var replayedReadiness = replay.Poll();
+        var window = FindOfficialMainWindow(identity);
         return new { pid = processId, startTimeUtc = main.StartTime.ToUniversalTime(),
             processState = ObserveStartupIdentity(identity).ToString(),
             runtimeHealthy = IsWindowsClientRuntimeHealthySince(main.StartTime.ToUniversalTime().AddSeconds(-2), identity),
             observationOnly = true, children, replayedOfficialLogReadiness = replayedReadiness.ToString(),
+            standardMainWindowFound = main.MainWindowHandle != IntPtr.Zero,
+            windowFound = window != null, windowVisible = window?.Visible,
+            windowMinimized = window?.Minimized, windowClassName = window?.ClassName,
             replay.AppServerConnectedAtUtc, replay.RoutesMountedAtUtc, replay.ReadyAtUtc };
     }
 

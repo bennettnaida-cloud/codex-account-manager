@@ -10,7 +10,8 @@ internal readonly record struct CodexRolloutHistoryRepairResult(
     int ScannedFiles,
     int RepairedFiles,
     int RepairedRecords,
-    long ScannedBytes);
+    long ScannedBytes,
+    bool WorkDeferred = false);
 
 /// <summary>
 /// Repairs a narrowly identified Codex desktop rollout serialization defect that leaves
@@ -23,6 +24,9 @@ internal static class CodexRolloutHistoryRepairService
     private const int CandidateLimit = 128;
     private const int BufferSize = 1024 * 1024;
     private const long MaximumBytesPerPass = 512L * 1024L * 1024L;
+    private const long MaximumDesktopStartupBytes = 8L * 1024L * 1024L;
+    // Scan + backup read/write + staging read/write, with headroom for growing ordinals.
+    private const int OrdinalRewriteIoMultiplier = 8;
     private static readonly byte[] InvalidPermissionProfile =
         Encoding.UTF8.GetBytes("\"id\":\":danger-full-access\"");
     private static readonly byte[] ValidPermissionProfile =
@@ -32,7 +36,8 @@ internal static class CodexRolloutHistoryRepairService
 
     internal static CodexRolloutHistoryRepairResult TryRepairLaggingPaginatedRollouts(
         string codexHome,
-        bool allowOrdinalRewrite = false)
+        bool allowOrdinalRewrite = false,
+        bool forDesktopLaunch = false)
     {
         if (InvalidPermissionProfile.Length != ValidPermissionProfile.Length)
         {
@@ -58,15 +63,19 @@ internal static class CodexRolloutHistoryRepairService
             }
 
             var candidates = LoadRecentPaginatedRollouts(root, statePath, projectionCursors);
+            var maximumBytes = forDesktopLaunch ? MaximumDesktopStartupBytes : MaximumBytesPerPass;
             var scannedFiles = 0;
             var repairedFiles = 0;
             var repairedRecords = 0;
             long scannedBytes = 0;
+            long maintenanceBytes = 0;
+            var deferred = false;
 
             foreach (var candidate in candidates)
             {
-                if (scannedBytes >= MaximumBytesPerPass)
+                if (maintenanceBytes >= maximumBytes)
                 {
+                    deferred = true;
                     break;
                 }
 
@@ -90,7 +99,7 @@ internal static class CodexRolloutHistoryRepairService
 
                     var allowedEnd = Math.Min(
                         info.Length,
-                        scanStart + Math.Max(0, MaximumBytesPerPass - scannedBytes));
+                        scanStart + Math.Max(0, maximumBytes - maintenanceBytes));
                     if (allowedEnd <= scanStart)
                     {
                         continue;
@@ -103,14 +112,23 @@ internal static class CodexRolloutHistoryRepairService
                         out var bytesRead);
                     scannedFiles++;
                     scannedBytes += bytesRead;
+                    maintenanceBytes += bytesRead;
                     LastScannedLengths[candidate.Path] = allowedEnd;
+                    deferred |= allowedEnd < info.Length;
                     if (allowOrdinalRewrite)
                     {
-                        repaired += RepairNonIncreasingOrdinalTail(
-                            root,
-                            candidate.Path,
-                            candidate.ProjectionOffset,
-                            candidate.NextOrdinal);
+                        // Ordinal repair scans the tail, backs up the original, and stages
+                        // a full rewrite before atomic replacement. Do not spend hundreds of
+                        // MB of disk I/O before displaying a desktop window. Large originals
+                        // are left intact for the existing offline maintenance path.
+                        if (!forDesktopLaunch || CanStageOrdinalRepairWithinStartupBudget(
+                                info.Length, maximumBytes - maintenanceBytes))
+                        {
+                            repaired += RepairNonIncreasingOrdinalTail(
+                                root, candidate.Path, candidate.ProjectionOffset, candidate.NextOrdinal);
+                            if (forDesktopLaunch) maintenanceBytes += info.Length * OrdinalRewriteIoMultiplier;
+                        }
+                        else deferred = true;
                     }
                     if (repaired > 0)
                     {
@@ -130,7 +148,8 @@ internal static class CodexRolloutHistoryRepairService
                 scannedFiles,
                 repairedFiles,
                 repairedRecords,
-                scannedBytes);
+                scannedBytes,
+                deferred);
         }
         catch (Exception ex) when (ex is IOException or SqliteException or UnauthorizedAccessException)
         {
@@ -138,6 +157,9 @@ internal static class CodexRolloutHistoryRepairService
             return default;
         }
     }
+
+    private static bool CanStageOrdinalRepairWithinStartupBudget(long fileLength, long remainingBytes) =>
+        fileLength >= 0 && remainingBytes >= 0 && fileLength <= remainingBytes / OrdinalRewriteIoMultiplier;
 
     private static string? FindLatestHistoryDatabase(string root)
     {
@@ -615,7 +637,11 @@ internal static class CodexRolloutHistoryRepairService
                 command.ExecuteNonQuery();
             }
 
-            var result = TryRepairLaggingPaginatedRollouts(root, allowOrdinalRewrite: true);
+            if (CanStageOrdinalRepairWithinStartupBudget(long.MaxValue, MaximumDesktopStartupBytes) ||
+                CanStageOrdinalRepairWithinStartupBudget(3, 23) ||
+                !CanStageOrdinalRepairWithinStartupBudget(3, 24))
+                throw new InvalidOperationException("Startup ordinal-repair I/O budget overflow/regression.");
+            var result = TryRepairLaggingPaginatedRollouts(root, allowOrdinalRewrite: true, forDesktopLaunch: true);
             var repairedText = File.ReadAllText(rolloutPath);
             if (result.RepairedRecords != 3 ||
                 new FileInfo(rolloutPath).Length != originalLength ||
@@ -631,6 +657,23 @@ internal static class CodexRolloutHistoryRepairService
             {
                 using var document = JsonDocument.Parse(line);
             }
+
+            // A large original must not be copied/replaced on the interactive path. The
+            // normal offline pass still repairs it, proving that deferral is not deletion
+            // or permanent loss of the earlier history fix.
+            File.AppendAllText(rolloutPath,
+                "{\"ordinal\":3,\"type\":\"event_msg\"}\n{\"padding\":\"" +
+                new string('x', 3 * 1024 * 1024) + "\"}\n");
+            var largeOriginal = File.ReadAllBytes(rolloutPath);
+            var deferredResult = TryRepairLaggingPaginatedRollouts(root,
+                allowOrdinalRewrite: true, forDesktopLaunch: true);
+            if (!deferredResult.WorkDeferred || deferredResult.ScannedBytes > MaximumDesktopStartupBytes ||
+                !File.ReadAllBytes(rolloutPath).AsSpan().SequenceEqual(largeOriginal))
+                throw new InvalidOperationException("Large startup history repair must defer and preserve the original.");
+            var offlineResult = TryRepairLaggingPaginatedRollouts(root, allowOrdinalRewrite: true);
+            if (offlineResult.RepairedRecords != 1 ||
+                !File.ReadAllText(rolloutPath).Contains("{\"ordinal\":4,\"type\":\"event_msg\"}", StringComparison.Ordinal))
+                throw new InvalidOperationException("Deferred ordinal repair must remain available offline.");
         }
         finally
         {
