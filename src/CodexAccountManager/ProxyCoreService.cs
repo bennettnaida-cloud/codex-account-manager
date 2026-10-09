@@ -421,18 +421,30 @@ internal sealed class ProxyCoreService : IDisposable
         return port;
     }
 
-    private static bool WaitForPort(int port, TimeSpan timeout)
+    private static bool WaitForPort(int port, TimeSpan timeout,
+        Func<TcpClient, int, CancellationToken, ValueTask>? connect = null)
     {
-        var deadline = DateTime.UtcNow + timeout;
-        while (DateTime.UtcNow < deadline)
+        if (timeout <= TimeSpan.Zero) return false;
+        using var deadline = new CancellationTokenSource(timeout);
+        while (!deadline.IsCancellationRequested)
         {
             try
             {
                 using var client = new TcpClient();
-                client.Connect("127.0.0.1", port);
+                // The old synchronous Connect could outlive the outer four-second
+                // loop under firewall/TCP retransmission pressure. Bound the actual
+                // operation, not only the condition checked between attempts.
+                var attempt = connect == null
+                    ? client.ConnectAsync(IPAddress.Loopback, port, deadline.Token)
+                    : connect(client, port, deadline.Token);
+                attempt.AsTask().GetAwaiter().GetResult();
                 return true;
             }
-            catch (SocketException) { Thread.Sleep(80); }
+            catch (OperationCanceledException) when (deadline.IsCancellationRequested) { return false; }
+            catch (SocketException)
+            {
+                if (deadline.Token.WaitHandle.WaitOne(80)) return false;
+            }
         }
         return false;
     }
@@ -788,6 +800,19 @@ internal sealed class ProxyCoreService : IDisposable
 
     internal static void ValidateNativeNodeConfig()
     {
+        var clock = Stopwatch.StartNew();
+        if (WaitForPort(1, TimeSpan.FromMilliseconds(25),
+                (_, _, token) => new ValueTask(Task.Delay(Timeout.InfiniteTimeSpan, token))) ||
+            clock.Elapsed > TimeSpan.FromSeconds(3))
+            throw new InvalidOperationException("Native proxy port connect must honor the deadline inside an attempt.");
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        try
+        {
+            if (!WaitForPort(((IPEndPoint)listener.LocalEndpoint).Port, TimeSpan.FromSeconds(2)))
+                throw new InvalidOperationException("A ready native proxy port must not wait for the timeout.");
+        }
+        finally { listener.Stop(); }
         const string uri = "hy2://example%3Apassword@192.0.2.10?sni=example.test&obfs=salamander&obfs-password=test";
         if (!ProxyNativeUriParser.TryGetMetadata(uri, out _, out var port, out _, out _) || port != 443 ||
             !TryBuildSingBoxConfig("hy2", uri, out var config, out _) ||
