@@ -6,9 +6,11 @@ public partial class Form1
     private readonly CancellationTokenSource _modelCatalogRefreshCancellation = new();
     private bool _modelCatalogRefreshInProgress;
     private bool _compatibleModelRefreshInProgress;
+    private bool _accessTokenModelRefreshInProgress;
     private bool _modelCatalogEditorDirty;
     private DateTimeOffset _nextAutomaticPriceCheckUtc;
     private DateTimeOffset _nextAutomaticCompatibleModelCheckUtc;
+    private DateTimeOffset _nextAutomaticAccessTokenModelCheckUtc;
     private Control? _modelCatalogPanel;
     private Label? _modelCatalogSourceLabel;
 
@@ -30,7 +32,9 @@ public partial class Form1
     }
 
     private Task RefreshAutomaticCatalogsAsync() => Task.WhenAll(
-        RefreshCompatibleModelsAutomaticallyAsync(), RefreshModelCatalogAutomaticallyAsync());
+        RefreshCompatibleModelsAutomaticallyAsync(),
+        RefreshAccessTokenModelsAutomaticallyAsync(),
+        RefreshModelCatalogAutomaticallyAsync());
 
     private async Task RefreshCompatibleModelsAutomaticallyAsync()
     {
@@ -87,6 +91,33 @@ public partial class Form1
         finally
         {
             _modelCatalogRefreshInProgress = false;
+        }
+    }
+
+    private async Task RefreshAccessTokenModelsAutomaticallyAsync()
+    {
+        if (IsDisposed || Disposing || _accessTokenModelRefreshInProgress ||
+            DateTimeOffset.UtcNow < _nextAutomaticAccessTokenModelCheckUtc) return;
+        _accessTokenModelRefreshInProgress = true;
+        _nextAutomaticAccessTokenModelCheckUtc = DateTimeOffset.UtcNow.AddMinutes(15);
+        var cancellationToken = _modelCatalogRefreshCancellation.Token;
+        try
+        {
+            // `codex debug models` reads the account's current entitlement catalog;
+            // it does not send a user prompt.  Keep it off the UI thread and let one
+            // unavailable PAT fall back to its last good catalog.
+            await Task.Run(
+                () => _codex.RefreshAllAccessTokenModelCatalogsAsync(cancellationToken),
+                cancellationToken);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            ManagerLifecycleDiagnostics.WriteException("access-token-model-auto-refresh-failed", ex);
+        }
+        finally
+        {
+            _accessTokenModelRefreshInProgress = false;
         }
     }
 }

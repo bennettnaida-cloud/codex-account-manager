@@ -57,6 +57,70 @@ static class Program
             try { Console.WriteLine("Model catalogs updated: " + new CodexCliService().SyncCompatibleModelCatalogs()); return 0; }
             catch { Console.Error.WriteLine("Model catalog synchronization failed; credentials were not changed."); return 1; }
         }
+        if (args.Contains("--sync-access-token-model-catalogs", StringComparer.OrdinalIgnoreCase))
+        {
+            try
+            {
+                Console.WriteLine("Access Token model catalogs updated: " +
+                                  new CodexCliService().SyncAccessTokenModelCatalogs());
+                return 0;
+            }
+            catch
+            {
+                Console.Error.WriteLine(
+                    "Access Token model catalog synchronization failed; credentials were not changed.");
+                return 1;
+            }
+        }
+        if (args.Contains("--refresh-access-token-model-catalogs", StringComparer.OrdinalIgnoreCase))
+        {
+            try
+            {
+                new CodexCliService()
+                    .RefreshAllAccessTokenModelCatalogsAsync(CancellationToken.None)
+                    .GetAwaiter()
+                    .GetResult();
+                Console.WriteLine("Access Token model catalogs refreshed.");
+                return 0;
+            }
+            catch
+            {
+                Console.Error.WriteLine(
+                    "Access Token model catalog refresh failed; credentials were not changed.");
+                return 1;
+            }
+        }
+        var refreshAccessTokenCatalogIndex = Array.FindIndex(
+            args,
+            argument => argument.Equals(
+                "--refresh-access-token-model-catalog",
+                StringComparison.OrdinalIgnoreCase));
+        if (refreshAccessTokenCatalogIndex >= 0)
+        {
+            if (refreshAccessTokenCatalogIndex + 1 >= args.Length ||
+                string.IsNullOrWhiteSpace(args[refreshAccessTokenCatalogIndex + 1]))
+            {
+                Console.Error.WriteLine(
+                    "--refresh-access-token-model-catalog requires an account name.");
+                return 2;
+            }
+            try
+            {
+                var count = new CodexCliService()
+                    .RefreshAccessTokenModelCatalogAsync(
+                        args[refreshAccessTokenCatalogIndex + 1])
+                    .GetAwaiter()
+                    .GetResult();
+                Console.WriteLine("Access Token model catalog refreshed: " + count);
+                return 0;
+            }
+            catch
+            {
+                Console.Error.WriteLine(
+                    "Access Token model catalog refresh failed; credentials were not changed.");
+                return 1;
+            }
+        }
         var refreshCompatibleCatalogIndex = Array.FindIndex(
             args,
             argument => argument.Equals(

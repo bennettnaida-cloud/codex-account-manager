@@ -9,8 +9,12 @@ public sealed partial class CodexCliService
     private const string ManagedModelCatalogMarker = " # codex-account-manager-model-catalog";
     private const string ManagedCompatibleModelCatalogFileName =
         ".codex-account-manager-compatible-models.json";
+    private const string ManagedAccessTokenModelCatalogFileName =
+        ".codex-account-manager-access-token-models.json";
     private const long ManagedCompatibleModelCatalogMaxBytes = 16 * 1024 * 1024;
+    private const long ManagedAccessTokenModelCatalogMaxBytes = 32 * 1024 * 1024;
     private static readonly object CompatibleModelCatalogLock = new();
+    private static readonly object AccessTokenModelCatalogLock = new();
 
     internal async Task<int> RefreshCompatibleModelCatalogAsync(
         string accountName,
@@ -87,6 +91,320 @@ public sealed partial class CodexCliService
             }
         }
         return updated;
+    }
+
+    /// <summary>
+    /// Refreshes the Codex model catalog for an Access Token account.  The CLI's
+    /// debug-models response is authoritative for that credential and is copied to
+    /// a manager-owned catalog file so the Windows client can discover every model
+    /// the account currently exposes (including models added after this build).
+    /// </summary>
+    internal async Task<int> RefreshAccessTokenModelCatalogAsync(
+        string accountName,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(accountName);
+        var matches = new AccountStore().LoadAccounts()
+            .Where(account => account.IsAccessToken &&
+                              account.Name.Equals(accountName.Trim(), StringComparison.Ordinal))
+            .Take(2)
+            .ToList();
+        if (matches.Count != 1)
+        {
+            throw new InvalidOperationException(
+                "Access Token account name is missing or ambiguous.");
+        }
+
+        var account = matches[0];
+        await RefreshAccessTokenModelCatalogAsync(
+            account,
+            cancellationToken,
+            requireConfiguredModel: true,
+            forceCliRefresh: true);
+        SyncAccessTokenModelCatalogs();
+        return TryReadAccessTokenModelCatalog(
+            ManagedAccessTokenModelCatalogPath(account), out var models)
+            ? models.Count
+            : 0;
+    }
+
+    internal async Task RefreshAllAccessTokenModelCatalogsAsync(CancellationToken cancellationToken)
+    {
+        var accounts = new AccountStore().LoadAccounts().Where(a => a.IsAccessToken).ToArray();
+        foreach (var account in accounts)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                await RefreshAccessTokenModelCatalogAsync(
+                    account,
+                    cancellationToken,
+                    requireConfiguredModel: false,
+                    forceCliRefresh: true);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // One expired/offline PAT must not prevent other accounts from refreshing.
+                ManagerLifecycleDiagnostics.WriteException("access-token-model-auto-refresh-failed", ex);
+            }
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        var updated = SyncAccessTokenModelCatalogs();
+        ManagerLifecycleDiagnostics.Write(
+            "access-token-model-auto-refresh-completed",
+            $"accounts={accounts.Length}; configs_updated={updated}");
+    }
+
+    internal int SyncAccessTokenModelCatalogs()
+    {
+        var updated = 0;
+        foreach (var account in new AccountStore().LoadAccounts().Where(a => a.IsAccessToken))
+        {
+            var catalog = ManagedAccessTokenModelCatalogPath(account);
+            if (!TryReadAccessTokenModelCatalog(catalog, out _)) continue;
+
+            var homes = new List<string> { account.CodexHome };
+            if (IsSharedActiveAccount(account)) homes.Add(GetDefaultCodexHome());
+            foreach (var home in homes.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                var path = Path.Combine(home, ConfigFileName);
+                if (!File.Exists(path)) continue;
+                var original = File.ReadAllText(path);
+                var cleaned = RemoveManagedModelCatalog(original);
+                // A user-authored catalog always wins over manager projection.
+                if (Regex.IsMatch(cleaned, @"(?m)^\s*model_catalog_json\s*=")) continue;
+                var projected = "model_catalog_json = " + TomlString(catalog) +
+                                ManagedModelCatalogMarker + Environment.NewLine + cleaned;
+                if (projected == original) continue;
+                var backup = Path.Combine(home, "backups", "model-catalog-" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(backup);
+                BackupFileIfPresent(path, backup);
+                WriteTextAtomically(path, projected);
+                updated++;
+            }
+        }
+        return updated;
+    }
+
+    private static async Task<bool> RefreshAccessTokenModelCatalogAsync(
+        AccountRecord account,
+        CancellationToken cancellationToken,
+        bool requireConfiguredModel,
+        bool forceCliRefresh)
+    {
+        ArgumentNullException.ThrowIfNull(account);
+        var catalogPath = ManagedAccessTokenModelCatalogPath(account);
+
+        // A fresh cache is already the result of the CLI's own catalog request.
+        // Materialize it locally without another network call when possible.
+        var cachePath = Path.Combine(account.CodexHome, "models_cache.json");
+        if (!forceCliRefresh && File.Exists(cachePath) &&
+            TryReadAccessTokenModelSource(
+                AtomicFilePersistence.ReadAllTextWithRetry(cachePath),
+                out _,
+                out var cachedEntries))
+        {
+            var cacheSupportsConfiguredModel = CatalogSupportsAccessTokenDefaults(
+                cachedEntries,
+                GetAccessTokenModel(account),
+                AccessTokenReasoningEffort);
+            if (!requireConfiguredModel || cacheSupportsConfiguredModel)
+            {
+                return WriteAccessTokenModelCatalog(catalogPath, cachedEntries);
+            }
+            else
+            {
+                throw new InvalidOperationException(
+                    $"Account {account.Name} does not currently offer {GetAccessTokenModel(account)} / {AccessTokenReasoningEffort}. " +
+                    "The shared Codex profile was not changed.");
+            }
+        }
+
+        var result = await RunCodexAsync("debug models", account.CodexHome, null);
+        JsonArray? models = null;
+        if (result.ExitCode == 0 &&
+            TryReadAccessTokenModelSource(result.StdOut, out _, out var stdoutModels))
+        {
+            models = stdoutModels;
+        }
+        else if (File.Exists(cachePath) &&
+                 TryReadAccessTokenModelSource(
+                     AtomicFilePersistence.ReadAllTextWithRetry(cachePath),
+                     out _, out var cacheModels))
+        {
+            // Some CLI versions refresh models_cache.json successfully but emit a
+            // warning/non-JSON diagnostic on stdout.  The cache is the same catalog
+            // the client will consume, so prefer it over rejecting a valid refresh.
+            models = cacheModels;
+        }
+
+        if (models == null)
+        {
+            throw new InvalidOperationException(
+                $"Account {account.Name} model catalog could not be loaded. The shared Codex profile was not changed.\n\n" +
+                string.Join(Environment.NewLine, new[] { result.StdOut, result.StdErr }
+                    .Where(s => !string.IsNullOrWhiteSpace(s))));
+        }
+
+        if (requireConfiguredModel &&
+            !CatalogSupportsAccessTokenDefaults(
+                models, GetAccessTokenModel(account), AccessTokenReasoningEffort))
+        {
+            throw new InvalidOperationException(
+                $"Account {account.Name} does not currently offer {GetAccessTokenModel(account)} / {AccessTokenReasoningEffort}. " +
+                "The shared Codex profile was not changed.");
+        }
+
+        return WriteAccessTokenModelCatalog(catalogPath, models);
+    }
+
+    private static string ManagedAccessTokenModelCatalogPath(AccountRecord account) =>
+        Path.Combine(account.CodexHome, ManagedAccessTokenModelCatalogFileName);
+
+    private static bool WriteAccessTokenModelCatalog(string path, JsonArray models)
+    {
+        if (models.Count == 0) return false;
+        // Serialize the array directly instead of DeepClone()'ing the full
+        // provider payload.  Some newer model entries contain extension nodes
+        // that JsonNode cannot clone after they have been materialized from a
+        // JsonDocument.  We only need an independent JSON document on disk;
+        // serializing the already validated array preserves every field without
+        // sharing mutable nodes with the source document.
+        var serializedModels = models.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+        var output = "{\"models\":" + serializedModels + "}" + Environment.NewLine;
+        lock (AccessTokenModelCatalogLock)
+        {
+            try
+            {
+                if (File.Exists(path) &&
+                    AtomicFilePersistence.ReadAllTextWithRetry(path).Equals(
+                        output, StringComparison.Ordinal))
+                {
+                    return false;
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+
+            AtomicFilePersistence.WriteAllText(path, output);
+            ManagerLifecycleDiagnostics.Write(
+                "access-token-model-catalog-updated", $"models={models.Count}");
+            return true;
+        }
+    }
+
+    private static bool TryReadAccessTokenModelCatalog(string path, out IReadOnlyList<string> models)
+    {
+        models = Array.Empty<string>();
+        try
+        {
+            var info = new FileInfo(path);
+            if (!info.Exists || info.Length is <= 0 or > ManagedAccessTokenModelCatalogMaxBytes)
+                return false;
+            return TryReadAccessTokenModelSource(
+                AtomicFilePersistence.ReadAllTextWithRetry(path), out models);
+        }
+        catch (Exception ex) when (
+            ex is IOException or UnauthorizedAccessException or JsonException or
+            InvalidOperationException or FormatException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryReadAccessTokenModelSource(string source, out IReadOnlyList<string> models) =>
+        TryReadAccessTokenModelSource(source, out models, out _);
+
+    private static bool TryReadAccessTokenModelSource(
+        string source,
+        out IReadOnlyList<string> modelIds,
+        out JsonArray modelEntries)
+    {
+        modelIds = Array.Empty<string>();
+        modelEntries = new JsonArray();
+        try
+        {
+            using var document = JsonDocument.Parse(source, new JsonDocumentOptions
+            {
+                AllowTrailingCommas = false,
+                CommentHandling = JsonCommentHandling.Disallow,
+                MaxDepth = 256
+            });
+            var root = document.RootElement;
+            var models = root.ValueKind == JsonValueKind.Array
+                ? root
+                : root.TryGetProperty("models", out var property) &&
+                  property.ValueKind == JsonValueKind.Array
+                    ? property
+                    : default;
+            if (models.ValueKind != JsonValueKind.Array) return false;
+
+            var ids = new List<string>();
+            foreach (var entry in models.EnumerateArray())
+            {
+                if (entry.ValueKind != JsonValueKind.Object ||
+                    !entry.TryGetProperty("slug", out var slugNode) ||
+                    slugNode.ValueKind != JsonValueKind.String)
+                    continue;
+                var slug = slugNode.GetString()?.Trim();
+                if (string.IsNullOrWhiteSpace(slug) ||
+                    !IsSafeAccessTokenModelId(slug) ||
+                    ids.Contains(slug, StringComparer.Ordinal))
+                    continue;
+                ids.Add(slug);
+                var parsedEntry = JsonNode.Parse(entry.GetRawText());
+                if (parsedEntry is JsonObject parsedObject)
+                {
+                    modelEntries.Add(parsedObject);
+                }
+            }
+
+            if (ids.Count == 0) return false;
+            modelIds = ids;
+            return true;
+        }
+        catch (Exception ex) when (
+            ex is JsonException or InvalidOperationException or FormatException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsSafeAccessTokenModelId(string model) =>
+        Regex.IsMatch(model, @"^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$");
+
+    private static bool CatalogSupportsAccessTokenDefaults(
+        JsonArray models,
+        string? model,
+        string? reasoningEffort)
+    {
+        var expectedModel = string.IsNullOrWhiteSpace(model) ? AccessTokenModel : model.Trim();
+        var expectedEffort = string.IsNullOrWhiteSpace(reasoningEffort)
+            ? AccessTokenReasoningEffort
+            : reasoningEffort.Trim();
+        foreach (var modelEntry in models.OfType<JsonObject>())
+        {
+            if (!string.Equals(
+                    modelEntry["slug"]?.GetValue<string>(),
+                    expectedModel,
+                    StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (modelEntry["supported_reasoning_levels"] is not JsonArray levels)
+                return true;
+            return levels.OfType<JsonObject>().Any(level =>
+                string.Equals(
+                    level["effort"]?.GetValue<string>(),
+                    expectedEffort,
+                    StringComparison.Ordinal));
+        }
+        return false;
     }
 
     private static string? ManagedCompatibleModelCatalogPath(AccountRecord account)
@@ -476,6 +794,92 @@ public sealed partial class CodexCliService
             {
                 // A self-test cleanup failure must not hide the catalog assertions.
             }
+        }
+    }
+
+    private static void ValidateAccessTokenModelCatalogProjection()
+    {
+        var fixtureHome = Path.Combine(
+            Path.GetTempPath(), "cam-access-token-model-catalog-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(fixtureHome);
+        try
+        {
+            var account = new AccountRecord
+            {
+                AuthKind = AccountAuthKind.AccessToken,
+                AccessTokenModel = "gpt-6-astra",
+                CodexHome = fixtureHome
+            };
+            const string source = """
+                {
+                  "models": [
+                    {"slug":"gpt-6-astra","supported_reasoning_levels":[{"effort":"medium"}]},
+                    {"slug":"gpt-99.1-sol","supported_reasoning_levels":[]},
+                    {"slug":"gpt-reserve","supported_reasoning_levels":[]},
+                    {"slug":"bad model","supported_reasoning_levels":[]}
+                  ]
+                }
+                """;
+            if (!TryReadAccessTokenModelSource(source, out var ids, out var entries) ||
+                !ids.SequenceEqual(
+                    new[] { "gpt-6-astra", "gpt-99.1-sol", "gpt-reserve" },
+                    StringComparer.Ordinal) ||
+                !CatalogSupportsAccessTokenDefaults(
+                    entries, "gpt-6-astra", "medium") ||
+                !WriteAccessTokenModelCatalog(
+                    ManagedAccessTokenModelCatalogPath(account), entries) ||
+                !TryReadAccessTokenModelCatalog(
+                    ManagedAccessTokenModelCatalogPath(account), out var written) ||
+                !written.SequenceEqual(ids, StringComparer.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "Access Token model catalog parsing or persistence regression.");
+            }
+
+            const string baseConfig =
+                "model = \"stale\"\n" +
+                "[features]\n" +
+                "js_repl = false\n";
+            var projected = ProjectWindowsClientConfigText(
+                baseConfig,
+                requiresOpenAiAuth: true,
+                modelOverride: GetAccessTokenModel(account),
+                modelCatalogPath: ManagedAccessTokenModelCatalogPath(account));
+            if (!projected.Contains(
+                    "model_catalog_json = " +
+                    TomlString(ManagedAccessTokenModelCatalogPath(account)) +
+                    ManagedModelCatalogMarker,
+                    StringComparison.Ordinal) ||
+                !string.Equals(
+                    projected,
+                    ProjectWindowsClientConfigText(
+                        projected,
+                        requiresOpenAiAuth: true,
+                        modelOverride: GetAccessTokenModel(account),
+                        modelCatalogPath: ManagedAccessTokenModelCatalogPath(account)),
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "Access Token model catalog projection is not idempotent.");
+            }
+
+            var custom = ProjectWindowsClientConfigText(
+                "model_catalog_json = \"C:/custom-models.json\"\n",
+                requiresOpenAiAuth: true,
+                modelCatalogPath: ManagedAccessTokenModelCatalogPath(account));
+            if (!custom.Contains(
+                    "model_catalog_json = \"C:/custom-models.json\"",
+                    StringComparison.Ordinal) ||
+                custom.Contains(ManagedModelCatalogMarker, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "User-authored model catalog was overwritten by Access Token projection.");
+            }
+        }
+        finally
+        {
+            try { Directory.Delete(fixtureHome, recursive: true); }
+            catch { }
         }
     }
 }

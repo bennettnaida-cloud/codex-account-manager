@@ -104,7 +104,6 @@ public sealed partial class CodexCliService
     private const string OfficialOAuthAuthorizationHost = "auth.openai.com";
     private const string OfficialDeviceAuthorizationHost = "auth.openai.com";
     private const string DeviceAuthBrowserProfilePrefix = "codex-account-manager-device-auth-";
-    private static readonly TimeSpan AccessTokenModelCacheLifetime = TimeSpan.FromHours(6);
     private static readonly TimeSpan AccessTokenSwitchValidationCacheLifetime = TimeSpan.FromMinutes(2);
     private static readonly TimeSpan CompatibleApiPreflightCacheLifetime = TimeSpan.FromMinutes(30);
     // A one-off successful probe may temporarily cover a provider whose /models catalog
@@ -359,7 +358,10 @@ public sealed partial class CodexCliService
                         providerBearerToken: token = ReadAccessTokenCredential(
                             Path.Combine(accountHome, AuthFileName)),
                         forceFileAuthStore: true,
-                        serviceTier: ReadDesktopServiceTier(current));
+                        serviceTier: ReadDesktopServiceTier(current),
+                        modelCatalogPath: account.IsAccessToken
+                            ? ManagedAccessTokenModelCatalogPath(account)
+                            : null);
             projected = PreserveSharedMcpServerSections(current, projected);
             projected = PreserveSharedDesktopRuntimeSections(current, projected);
             if (!string.Equals(current, projected, StringComparison.Ordinal))
@@ -3482,7 +3484,15 @@ public sealed partial class CodexCliService
             throw new InvalidOperationException(message);
         }
 
-        if (!localOnly && !localProjectionIsSufficient && !account.IsOfficialOAuth)
+        if (!localOnly && account.IsAccessToken)
+        {
+            // Access Token accounts own an account-scoped Codex model catalog.  Refresh
+            // it even when the shared desktop profile can be reused; otherwise a stale
+            // profile would hide models added or granted after the previous switch.
+            await EnsureAccountModelAvailableAsync(account);
+            ProjectAccessTokenSourceConfig(sourceConfigPath, account);
+        }
+        else if (!localOnly && !localProjectionIsSufficient && !account.IsOfficialOAuth)
         {
             await EnsureAccountModelAvailableAsync(account);
         }
@@ -3584,7 +3594,10 @@ public sealed partial class CodexCliService
                             Path.Combine(account.CodexHome, AuthFileName)),
                         forceFileAuthStore: true,
                         serviceTier: targetServiceTier,
-                        modelOverride: GetAccessTokenModel(account))
+                        modelOverride: GetAccessTokenModel(account),
+                        modelCatalogPath: account.IsAccessToken
+                            ? ManagedAccessTokenModelCatalogPath(account)
+                            : null)
                 : account.IsCompatibleApi
                     ? ProjectCompatibleApiConfigText(
                         sharedConfig,
@@ -3599,7 +3612,10 @@ public sealed partial class CodexCliService
                         desktopProviderName: account.Name,
                         forceFileAuthStore: true,
                         serviceTier: targetServiceTier,
-                        modelOverride: GetAccessTokenModel(account));
+                        modelOverride: GetAccessTokenModel(account),
+                        modelCatalogPath: account.IsAccessToken
+                            ? ManagedAccessTokenModelCatalogPath(account)
+                            : null);
             projectedSharedConfig = PreserveSharedMcpServerSections(
                 sharedConfig,
                 projectedSharedConfig);
@@ -4385,14 +4401,20 @@ public sealed partial class CodexCliService
                         providerBearerToken: ReadAccessTokenCredential(sourceAuthPath),
                         forceFileAuthStore: true,
                         serviceTier: ReadDesktopServiceTier(sourceConfig),
-                        modelOverride: GetAccessTokenModel(account))
+                        modelOverride: GetAccessTokenModel(account),
+                        modelCatalogPath: account.IsAccessToken
+                            ? ManagedAccessTokenModelCatalogPath(account)
+                            : null)
                     : ProjectWindowsClientConfigText(
                         sourceConfig,
                         requiresOpenAiAuth: true,
                         desktopProviderName: account.Name,
                         forceFileAuthStore: true,
                         serviceTier: ReadDesktopServiceTier(sourceConfig),
-                        modelOverride: GetAccessTokenModel(account));
+                        modelOverride: GetAccessTokenModel(account),
+                        modelCatalogPath: account.IsAccessToken
+                            ? ManagedAccessTokenModelCatalogPath(account)
+                            : null);
                 var currentConfig = File.Exists(configPath) ? File.ReadAllText(configPath) : "";
                 projectedConfig = PreserveSharedMcpServerSections(currentConfig, projectedConfig);
                 projectedConfig = PreserveSharedDesktopRuntimeSections(currentConfig, projectedConfig);
@@ -10171,85 +10193,11 @@ catch {
             await EnsureAccountCanRunMinimalRequestAsync(account);
             return;
         }
-
-        if (HasFreshAccessTokenModelCache(account))
-        {
-            return;
-        }
-
-        var result = await RunCodexAsync("debug models", account.CodexHome, null);
-        if (result.ExitCode != 0)
-        {
-            throw new InvalidOperationException(
-                $"Account {account.Name} model catalog could not be loaded. The shared Codex profile was not changed.\n\n" +
-                string.Join(Environment.NewLine, new[] { result.StdOut, result.StdErr }
-                    .Where(s => !string.IsNullOrWhiteSpace(s))));
-        }
-
-        try
-        {
-            using var document = JsonDocument.Parse(result.StdOut);
-            if (CatalogSupportsAccessTokenDefaults(
-                    document.RootElement,
-                    GetAccessTokenModel(account),
-                    AccessTokenReasoningEffort))
-            {
-                return;
-            }
-        }
-        catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException)
-        {
-            throw new InvalidOperationException(
-                $"Account {account.Name} returned an unreadable Codex model catalog.",
-                ex);
-        }
-
-        throw new InvalidOperationException(
-            $"Account {account.Name} does not currently offer {GetAccessTokenModel(account)} / {AccessTokenReasoningEffort}. " +
-            "The shared Codex profile was not changed.");
-    }
-
-    private static bool HasFreshAccessTokenModelCache(AccountRecord account)
-    {
-        var cachePath = Path.Combine(account.CodexHome, "models_cache.json");
-        var authPath = Path.Combine(account.CodexHome, AuthFileName);
-        if (!File.Exists(cachePath) || !File.Exists(authPath))
-        {
-            return false;
-        }
-
-        try
-        {
-            using var document = JsonDocument.Parse(File.ReadAllText(cachePath));
-            var root = document.RootElement;
-            if (!root.TryGetProperty("fetched_at", out var fetchedAtValue) ||
-                !DateTimeOffset.TryParse(fetchedAtValue.GetString(), out var fetchedAtUtc))
-            {
-                return false;
-            }
-
-            fetchedAtUtc = fetchedAtUtc.ToUniversalTime();
-            var age = DateTimeOffset.UtcNow - fetchedAtUtc;
-            if (age < TimeSpan.FromMinutes(-5) || age > AccessTokenModelCacheLifetime)
-            {
-                return false;
-            }
-
-            var authModifiedUtc = new DateTimeOffset(File.GetLastWriteTimeUtc(authPath), TimeSpan.Zero);
-            if (authModifiedUtc > fetchedAtUtc.AddSeconds(2))
-            {
-                return false;
-            }
-
-            return CatalogSupportsAccessTokenDefaults(
-                root,
-                GetAccessTokenModel(account),
-                AccessTokenReasoningEffort);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException)
-        {
-            return false;
-        }
+        await RefreshAccessTokenModelCatalogAsync(
+            account,
+            CancellationToken.None,
+            requireConfiguredModel: true,
+            forceCliRefresh: false);
     }
 
     private static bool CatalogSupportsAccessTokenDefaults(
@@ -11341,7 +11289,10 @@ catch {
         var projected = ProjectWindowsClientConfigText(
             currentConfig,
             requiresOpenAiAuth: true,
-            modelOverride: account?.IsAccessToken == true ? GetAccessTokenModel(account) : null);
+            modelOverride: account?.IsAccessToken == true ? GetAccessTokenModel(account) : null,
+            modelCatalogPath: account?.IsAccessToken == true
+                ? ManagedAccessTokenModelCatalogPath(account)
+                : null);
         if (!string.Equals(currentConfig, projected, StringComparison.Ordinal))
         {
             WriteTextAtomically(targetConfigPath, projected);
@@ -11364,6 +11315,7 @@ catch {
     {
         ValidateDesktopReasoningPreferences();
         ValidateCompatibleModelCatalogProjection();
+        ValidateAccessTokenModelCatalogProjection();
         var migratedFastAlias = UpsertDesktopServiceTier(
             "model = \"test\"\n\n[features]\njs_repl = false\n",
             "fast");
@@ -13682,9 +13634,13 @@ catch {
         string? providerBearerToken = null,
         bool forceFileAuthStore = false,
         string? serviceTier = null,
-        string? modelOverride = null)
+        string? modelOverride = null,
+        string? modelCatalogPath = null)
     {
         currentConfig = RemoveManagedModelCatalog(currentConfig);
+        var hasCustomModelCatalog = Regex.IsMatch(
+            currentConfig,
+            @"(?m)^\s*model_catalog_json\s*=");
         var desktopServiceTier = serviceTier == null
             ? ReadDesktopServiceTier(currentConfig)
             : NormalizeDesktopServiceTier(serviceTier);
@@ -13703,6 +13659,14 @@ catch {
             "model_reasoning_effort = " + TomlString(AccessTokenReasoningEffort),
             "chatgpt_base_url = " + TomlString(LocalPatGateway.ChatGptBaseUrl)
         };
+        if (!hasCustomModelCatalog &&
+            !string.IsNullOrWhiteSpace(modelCatalogPath) &&
+            File.Exists(modelCatalogPath))
+        {
+            output.Insert(
+                3,
+                "model_catalog_json = " + TomlString(modelCatalogPath) + ManagedModelCatalogMarker);
+        }
         if (forceFileAuthStore)
         {
             output.Add("cli_auth_credentials_store = \"file\"");
