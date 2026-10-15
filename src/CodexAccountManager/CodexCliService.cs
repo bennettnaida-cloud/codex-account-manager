@@ -10197,7 +10197,7 @@ catch {
             account,
             CancellationToken.None,
             requireConfiguredModel: true,
-            forceCliRefresh: false);
+            forceRemoteRefresh: false);
     }
 
     private static bool CatalogSupportsAccessTokenDefaults(
@@ -11316,6 +11316,7 @@ catch {
         ValidateDesktopReasoningPreferences();
         ValidateCompatibleModelCatalogProjection();
         ValidateAccessTokenModelCatalogProjection();
+        ValidateAccessTokenRemoteDiscoveryAsync().GetAwaiter().GetResult();
         var migratedFastAlias = UpsertDesktopServiceTier(
             "model = \"test\"\n\n[features]\njs_repl = false\n",
             "fast");

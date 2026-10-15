@@ -31,6 +31,11 @@ static class Program
             }
         }
 
+        if (args.Contains("--access-token-model-self-test", StringComparer.OrdinalIgnoreCase))
+        {
+            try { CodexCliService.ValidateAccessTokenRemoteDiscoveryAsync().GetAwaiter().GetResult(); return 0; }
+            catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }
+        }
         if (args.Contains("--startup-self-test", StringComparer.OrdinalIgnoreCase))
         {
             try

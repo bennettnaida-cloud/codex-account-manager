@@ -103,9 +103,9 @@ public partial class Form1
         var cancellationToken = _modelCatalogRefreshCancellation.Token;
         try
         {
-            // `codex debug models` reads the account's current entitlement catalog;
-            // it does not send a user prompt.  Keep it off the UI thread and let one
-            // unavailable PAT fall back to its last good catalog.
+            // Query the account's remote catalog independently of the static desktop
+            // catalog. No prompt is sent; failures retain the last good file and are
+            // counted as failures, never reported as a successful online refresh.
             await Task.Run(
                 () => _codex.RefreshAllAccessTokenModelCatalogsAsync(cancellationToken),
                 cancellationToken);
