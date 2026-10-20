@@ -246,7 +246,9 @@ class AccountStore {
         const realCandidate = fs.realpathSync(candidate);
         const relative = path.relative(realRoot, realCandidate);
         if (!relative || relative.startsWith('..') || path.isAbsolute(relative) || relative.includes(path.sep)) continue;
-        const lastChangedAt = Math.max(details.mtimeMs || 0, details.ctimeMs || 0);
+        // APFS exposes sub-millisecond timestamps; Date.now() uses whole
+        // milliseconds. Compare at the same precision, including a zero TTL.
+        const lastChangedAt = Math.floor(Math.max(details.mtimeMs || 0, details.ctimeMs || 0));
         if (cleanupNow - lastChangedAt < ttl) continue;
         fs.rmSync(realCandidate, { recursive: true, force: false });
         removedCount += 1;
