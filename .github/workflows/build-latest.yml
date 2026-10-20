@@ -1,4 +1,4 @@
-name: Build and publish latest Windows package
+name: Build and publish latest Windows and macOS packages
 
 on:
   push:
@@ -101,9 +101,62 @@ jobs:
             CodexAccountManager-Windows-${{ steps.release-version.outputs.version }}.zip.sha256
           if-no-files-found: error
 
+  build-macos:
+    name: Build and test Apple Silicon package
+    runs-on: macos-15
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Set up Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: macos/package-lock.json
+      - name: Verify platform and release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          node -e "const fs=require('fs');const v=fs.readFileSync('VERSION','utf8').trim();if(require('./macos/package.json').version!==v)throw Error('macOS version mismatch');"
+          echo "CAM_VERSION=$(tr -d '\r\n' < VERSION)" >> "$GITHUB_ENV"
+      - name: Install build dependencies and run macOS regressions
+        working-directory: macos
+        run: |
+          npm ci --ignore-scripts
+          npm test
+          bash -n packaging/一键安装.command packaging/卸载.command
+      - name: Download the pinned official Apple Silicon CLI
+        run: |
+          mkdir -p dist
+          curl --fail --location --retry 3 --output dist/openai-codex-0.154.0-darwin-arm64.tgz https://registry.npmjs.org/@openai/codex/-/codex-0.154.0-darwin-arm64.tgz
+      - name: Build and verify macOS package
+        working-directory: macos
+        run: |
+          npm run build:mac -- --output "../dist/CodexAccountManager-macOS-${CAM_VERSION}.zip"
+          npm run verify:mac -- "../dist/CodexAccountManager-macOS-${CAM_VERSION}.zip"
+      - name: Test native install and rendered application
+        working-directory: macos
+        run: node scripts/test-installed-macos.mjs "../dist/CodexAccountManager-macOS-${CAM_VERSION}.zip"
+      - name: Create latest macOS download alias
+        run: |
+          cp "dist/CodexAccountManager-macOS-${CAM_VERSION}.zip" dist/CodexAccountManager-macOS-latest.zip
+          cd dist
+          shasum -a 256 CodexAccountManager-macOS-latest.zip > CodexAccountManager-macOS-latest.zip.sha256
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-package
+          path: |
+            dist/CodexAccountManager-macOS-*.zip
+            dist/CodexAccountManager-macOS-*.zip.sha256
+          if-no-files-found: error
+
   publish:
     name: Publish rolling latest release
-    needs: build-windows
+    needs: [build-windows, build-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -142,6 +195,10 @@ jobs:
                       'name': f"CodexAccountManager-Windows-{os.environ['CAM_VERSION']}.zip",
                       'sha256': read_sha256(f"CodexAccountManager-Windows-{os.environ['CAM_VERSION']}.zip.sha256"),
                   },
+                  'macos': {
+                      'name': f"CodexAccountManager-macOS-{os.environ['CAM_VERSION']}.zip",
+                      'sha256': read_sha256(f"CodexAccountManager-macOS-{os.environ['CAM_VERSION']}.zip.sha256"),
+                  },
               },
           }
           (root / 'update-manifest.json').write_text(json.dumps(payload, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
@@ -158,16 +215,22 @@ jobs:
           body: |
             自动构建版本 `${{ env.CAM_VERSION }}`。
 
+            恢复 macOS Apple Silicon 下载并更新到 2.3.38：内置 Codex CLI 0.154.0、Electron 43.8.1，AT 和兼容 API 在线模型目录在启动及每 15 分钟同步。保留账号模型选择和自定义目录。macOS 与 Windows 必须都通过测试后才更新发布清单，后续发布保留两个平台。
+
             修复 2.3.37 的 Access Token 模型自动更新读回旧静态目录的问题。现在按账号凭据、工作区身份和绑定代理直接查询官方 Codex 模型目录，保留服务器返回的完整模型元数据，不再把 CLI 内置目录或旧缓存误报为在线刷新成功。
 
             AT 与兼容 API 模型在管理器启动及每 15 分钟后台检查。失败保留上一份目录；凭据变更后的旧请求不会覆盖新账号目录。保留默认模型、手动目录、OAuth 登录和现有启动功能。已打开的 Codex 可能需要自行重启才能显示新增模型，不强制关闭正在工作的客户端。
 
             发布流程执行完整自检、启动、AT 在线发现模拟回归、兼容 API 目录专项回归及安装包隐私检查。新模型的实际可用性取决于 Codex 授权、网络和客户端兼容性；Work 的模型列表不等同于 Codex 授权目录。本次不修改官网价格页面的 HTTP 403 行为。
+
+            Mac 包面向 Apple Silicon，安装脚本执行本机 ad-hoc 签名，未作 Developer ID 签名或公证。GitHub 原生 Mac 验证安装、签名、内置 CLI 和界面加载；真实账号登录、语音/手机及模型生成没有在用户 Mac 上实测，不能据此宣称与 Windows 所有功能一致。
           prerelease: true
           make_latest: false
           files: |
             release-assets/CodexAccountManager-Windows-${{ env.CAM_VERSION }}.zip
             release-assets/CodexAccountManager-Windows-${{ env.CAM_VERSION }}.zip.sha256
+            release-assets/CodexAccountManager-macOS-${{ env.CAM_VERSION }}.zip
+            release-assets/CodexAccountManager-macOS-${{ env.CAM_VERSION }}.zip.sha256
           fail_on_unmatched_files: true
 
       - name: Publish update manifest after versioned package
@@ -193,6 +256,8 @@ jobs:
           files: |
             release-assets/CodexAccountManager-Windows-latest.zip
             release-assets/CodexAccountManager-Windows-latest.zip.sha256
+            release-assets/CodexAccountManager-macOS-latest.zip
+            release-assets/CodexAccountManager-macOS-latest.zip.sha256
           fail_on_unmatched_files: true
 
       - name: Move rolling latest tag to the published commit
@@ -224,6 +289,10 @@ jobs:
               'CodexAccountManager-Windows-latest.zip.sha256',
               f'CodexAccountManager-Windows-{version}.zip',
               f'CodexAccountManager-Windows-{version}.zip.sha256',
+              'CodexAccountManager-macOS-latest.zip',
+              'CodexAccountManager-macOS-latest.zip.sha256',
+              f'CodexAccountManager-macOS-{version}.zip',
+              f'CodexAccountManager-macOS-{version}.zip.sha256',
           }
           present = {a['name'] for a in release['assets'] if a['state'] == 'uploaded' and a['size'] > 0}
           if not keep.issubset(present):

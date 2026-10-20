@@ -17,7 +17,7 @@ test('bundled catalog supplies one default model and long-context official rates
     configureModelCatalog(root);
     assert.equal(defaultModel(), 'gpt-5.6');
     assert.deepEqual(officialRates('gpt-5.6-terra', 1000), [2, 0.2, 2.5, 12]);
-    assert.deepEqual(officialRates('gpt-5.6', 300000), [10, 1, 12.5, 45]);
+    assert.deepEqual(officialRates('gpt-5.6', 300000), [8, 0.8, 10, 30]);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

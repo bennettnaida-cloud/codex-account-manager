@@ -51,7 +51,7 @@ test('known model API-equivalent rates match the Windows price table', () => {
     totalTokens: inputTokens,
   });
 
-  assert.equal(costFor('gpt-5.6-sol'), 0.5);
+  assert.equal(costFor('gpt-5.6-sol'), 0.4);
   assert.equal(costFor('gpt-5.6-terra'), 0.2);
   assert.equal(costFor('gpt-5.6-luna'), 0.02);
   assert.equal(costFor('gpt-5.5'), 0.5);

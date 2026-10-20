@@ -4,16 +4,16 @@ set -euo pipefail
 APP_DISPLAY_NAME="Codex Account Manager"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 PAYLOAD_DIR="$SCRIPT_DIR/payload"
-ELECTRON_ZIP="$PAYLOAD_DIR/electron-v43.1.1-darwin-arm64.zip"
-CODEX_CLI_TGZ="$PAYLOAD_DIR/openai-codex-0.144.1-darwin-arm64.tgz"
+ELECTRON_ZIP="$PAYLOAD_DIR/electron-v43.8.1-darwin-arm64.zip"
+CODEX_CLI_TGZ="$PAYLOAD_DIR/openai-codex-0.154.0-darwin-arm64.tgz"
 APP_ASAR="$PAYLOAD_DIR/app.asar"
 APP_ICON="$PAYLOAD_DIR/AppIcon.icns"
-APP_VERSION="1.1.5"
+APP_VERSION="2.3.38"
 if [[ -f "$SCRIPT_DIR/app-version.txt" ]]; then
   APP_VERSION="$(/usr/bin/tr -d '\r\n' < "$SCRIPT_DIR/app-version.txt")"
 fi
 APP_SHORT_VERSION="$APP_VERSION"
-APP_BUILD_VERSION="5"
+APP_BUILD_VERSION="$APP_VERSION"
 if [[ "$APP_VERSION" == *.*.*.* ]]; then
   APP_SHORT_VERSION="${APP_VERSION%.*}"
   APP_BUILD_VERSION="${APP_VERSION##*.}"
@@ -275,7 +275,7 @@ rm -f "$CUSTOM_APP/Contents/Resources/default_app.asar"
 /usr/bin/ditto "$APP_ASAR" "$CUSTOM_APP/Contents/Resources/app.asar"
 /usr/bin/ditto "$APP_ICON" "$CUSTOM_APP/Contents/Resources/electron.icns"
 
-echo "正在安装内置 Codex CLI 0.144.1……"
+echo "正在安装内置 Codex CLI 0.154.0……"
 /usr/bin/tar -xzf "$CODEX_CLI_TGZ" -C "$CLI_ROOT"
 CLI_PAYLOAD="$CLI_ROOT/package/vendor/aarch64-apple-darwin"
 for executable in \
@@ -334,6 +334,8 @@ BACKUP_CREATED=0
 echo "安装完成：$TARGET_APP"
 echo "账号、会话与 ~/.codex 数据均未被修改。"
 rm -rf "$WORK_ROOT"
-/usr/bin/open "$TARGET_APP"
+if [[ "${CAM_INSTALL_SKIP_LAUNCH:-0}" != "1" ]]; then
+  /usr/bin/open "$TARGET_APP"
+fi
 release_maintenance_lock
 trap - EXIT INT TERM

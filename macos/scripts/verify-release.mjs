@@ -8,10 +8,10 @@ import { fileURLToPath } from 'node:url';
 import { extractFile, listPackage } from '@electron/asar';
 import { isForbiddenPrivateFile, scanSensitiveTextFile } from './release-privacy.mjs';
 
-const ELECTRON_PAYLOAD = 'electron-v43.1.1-darwin-arm64.zip';
-const ELECTRON_SHA256 = 'd6d0598d042ef4d146278d08d84deac9dde145eae31eb4f32ef46206d6bd6169';
-const CODEX_CLI_PAYLOAD = 'openai-codex-0.144.1-darwin-arm64.tgz';
-const CODEX_CLI_SHA256 = '365a5685170f66bad58dd1dabb0462dfb824f82a870bcc8d9af2eb0a41cf2e18';
+const ELECTRON_PAYLOAD = 'electron-v43.8.1-darwin-arm64.zip';
+const ELECTRON_SHA256 = '01bb5d8756d220002ed5f8dccfb5a01391c4b919667af7156257cf5252e3e8ae';
+const CODEX_CLI_PAYLOAD = 'openai-codex-0.154.0-darwin-arm64.tgz';
+const CODEX_CLI_SHA256 = '2a98662d79316a59993c7233e3e25a1aa1d42da4b45904585d33a5a7da1cade1';
 const LOOSE_FILES = ['一键安装.command', '卸载.command', 'README.md', 'app-version.txt'];
 const EXPECTED_CHECKSUM_FILES = new Set([
   `payload/${ELECTRON_PAYLOAD}`,
@@ -126,12 +126,12 @@ function verifyCodexCliPayload(codexCliTgz) {
   const metadata = JSON.parse(runTar([
     '-xOzf', codexCliTgz, 'package/vendor/aarch64-apple-darwin/codex-package.json',
   ], { maxBuffer: 1_048_576 }));
-  if (packageJson?.name !== '@openai/codex' || packageJson?.version !== '0.144.1-darwin-arm64' ||
+  if (packageJson?.name !== '@openai/codex' || packageJson?.version !== '0.154.0-darwin-arm64' ||
       packageJson?.os?.length !== 1 || packageJson.os[0] !== 'darwin' ||
       packageJson?.cpu?.length !== 1 || packageJson.cpu[0] !== 'arm64' ||
-      metadata?.version !== '0.144.1' || metadata?.target !== 'aarch64-apple-darwin' ||
+      metadata?.version !== '0.154.0' || metadata?.target !== 'aarch64-apple-darwin' ||
       metadata?.entrypoint !== 'bin/codex') {
-    throw new Error('Codex CLI metadata 与固定的 0.144.1 Apple Silicon 版本不一致。');
+    throw new Error('Codex CLI metadata 与固定的 0.154.0 Apple Silicon 版本不一致。');
   }
 }
 
@@ -204,7 +204,11 @@ async function verifyInternalRelease(zipPath) {
     }
     const sourceRoot = path.resolve(SCRIPT_DIR, '..', 'src');
     const sourceTree = await collectTree(sourceRoot);
+    const templateRoot = path.resolve(SCRIPT_DIR, '..', '..', 'assets', 'codex-models');
+    const templateTree = await collectTree(templateRoot);
     const expectedAsarEntries = [
+      '/codex-models',
+      ...templateTree.files.map((relative) => `/codex-models/${relative}`),
       '/model-catalog.json',
       '/package.json',
       '/src',
@@ -214,6 +218,10 @@ async function verifyInternalRelease(zipPath) {
     const actualAsarEntries = listPackage(appAsar).map((entry) =>
       `/${String(entry).replaceAll('\\', '/').replace(/^\/+/, '')}`);
     assertExactSet(actualAsarEntries, expectedAsarEntries, 'app.asar');
+    for (const relative of templateTree.files) {
+      if (!extractFile(appAsar, `codex-models/${relative}`).equals(await readFile(path.join(templateRoot, relative))))
+        throw new Error(`app.asar 模型模板与源码不一致：${relative}`);
+    }
     for (const relative of sourceTree.files) {
       const packed = extractFile(appAsar, path.join('src', ...relative.split('/')));
       const source = await readFile(path.join(sourceRoot, ...relative.split('/')));

@@ -13,10 +13,11 @@ Codex Account Manager 是一个在本机运行的 Codex 多账号管理器。它
 | 平台 | 安装包 | 校验文件 | 要求 |
 | --- | --- | --- | --- |
 | Windows | [下载最新一键安装包](https://github.com/bennettnaida-cloud/codex-account-manager/releases/download/latest/CodexAccountManager-Windows-latest.zip) | [SHA-256](https://github.com/bennettnaida-cloud/codex-account-manager/releases/download/latest/CodexAccountManager-Windows-latest.zip.sha256) | Windows 10/11 x64 |
+| macOS | [下载最新 Apple Silicon 安装包](https://github.com/bennettnaida-cloud/codex-account-manager/releases/download/latest/CodexAccountManager-macOS-latest.zip) | [SHA-256](https://github.com/bennettnaida-cloud/codex-account-manager/releases/download/latest/CodexAccountManager-macOS-latest.zip.sha256) | macOS 12+，Apple Silicon |
 
 也可以打开 [Latest Release](https://github.com/bennettnaida-cloud/codex-account-manager/releases/tag/latest) 查看版本、发布时间和全部文件。
 
-当前版本为 Windows 2.3.38，内置 Codex CLI 0.154.0，无需另装 .NET。修复了 2.3.37 的 Access Token 自动刷新读回旧静态目录的问题：现在按该账号凭据、工作区和绑定代理直接读取官方 Codex 在线目录。AT 和兼容 API 目录在管理器启动及每 15 分钟后台检查，AT 启动时使用已验证的短期缓存或重新查询；网络失败保留旧目录，不误报在线成功。新模型在服务器向该账号开放且客户端兼容时可自动加入，不需要仅为增加模型名称重新打包管理器；已打开的 Codex 可能需自行重启才能显示更新。不改变默认模型或用户自定义目录，OAuth 继续使用官方客户端目录。详见 [2.3.38 修复与验证](docs/release-2.3.38.md)。保留普通/语音手机启动修复、六档推理选项和自定义偏好。旧 macOS 下载包已停止提供；仓库中的 macOS 源码保留，但不代表已同步验证本次 Windows 修复。
+当前 Windows 和 macOS 发布版本均为 2.3.38，内置 Codex CLI 0.154.0。Windows 无需另装 .NET；Mac 包为 Electron 43.8.1 的 Apple Silicon 原生版本，无需另装 Node.js 或 CLI。两个平台的 AT 与兼容 API 目录在管理器启动及每 15 分钟后台检查，网络失败保留旧目录，不误报在线成功。新模型在服务器向该账号开放且客户端兼容时可自动加入，已打开的 Codex 可能需自行重启才能显示更新。不改变默认模型或用户自定义目录，OAuth 继续使用官方客户端目录。Windows 保留普通/语音手机启动修复、六档推理选项和自定义偏好；Mac 保留独立的账号、终端和桌面启动实现，不代表已移植 Windows 的所有入口、轮换和侧栏增强。详见 [Windows 2.3.38](docs/release-2.3.38.md) 和 [macOS 2.3.38](docs/release-macos-2.3.38.md)。
 
 保留旧会话续聊用量统计、轮换、逐账号代理与模型目录，以及升级时同步桌面和任务栏快捷方式。当前本机桌面版本为 Windows OpenAI.Codex 26.1002.7124.0（ChatGPT.exe）；专项回归并不等于已在所有电脑上完成交互实测，未来版本及第三方上游仍需按实际协议验证。
 

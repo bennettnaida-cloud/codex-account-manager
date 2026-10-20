@@ -9,6 +9,7 @@ const {
   launchThenCommitAccount,
 } = require('./services/account-activation');
 const { AccountStore } = require('./services/account-store');
+const { AccountModelCatalogService } = require('./services/account-model-catalog');
 const { CodexCliService } = require('./services/codex-cli');
 const { getUsageStats } = require('./services/usage-stats');
 const { getQuotaStats, readRateLimitsViaAppServer } = require('./services/quota-service');
@@ -39,6 +40,8 @@ let cli = null;
 let themeService = null;
 let patGateway = null;
 let patGatewayNetworkSession = null;
+let accountModelCatalogs = null;
+const modelRefreshCancellation = new AbortController();
 const loginStatuses = new Map();
 const oauthDrafts = new Map();
 const oauthCleanupTasks = new Set();
@@ -56,6 +59,14 @@ let pendingUpdate = null;
 const isPatGatewayDaemon = process.argv.includes(DAEMON_ARGUMENT);
 
 app.setName('Codex Account Manager');
+// Used only by the isolated native release job; never use the real account home.
+const smokeRoot = process.env.CAM_RELEASE_SMOKE_ROOT || null;
+if (smokeRoot) {
+  const relative = path.relative(os.tmpdir(), path.resolve(smokeRoot));
+  if (relative.startsWith('..') || path.isAbsolute(relative) || !/^cam-macos-smoke-[a-zA-Z0-9-]+$/.test(path.basename(smokeRoot)))
+    throw new Error('Release smoke data root is invalid.');
+  app.setPath('userData', path.resolve(smokeRoot));
+}
 
 function publicAccount(account, currentAccountId) {
   return {
@@ -451,6 +462,7 @@ async function launchTerminalForAccount(account) {
   return runAccountActivation(async () => {
     const freshAccount = findAccount(account.id);
     const settings = store.loadSettings();
+    await accountModelCatalogs.refresh(freshAccount, { force: false, signal: modelRefreshCancellation.signal }).catch(() => {});
     const result = await launchThenCommitAccount({
       accountId: freshAccount.id,
       currentAccountId: settings.currentAccountId,
@@ -474,6 +486,7 @@ async function launchCodexAppForAccountUnlocked(account, {
   replaceRunningDesktop = false,
   selectAsCurrent = false,
 } = {}) {
+  await accountModelCatalogs.refresh(account, { force: false, signal: modelRefreshCancellation.signal }).catch(() => {});
   const settings = store.loadSettings();
   const applyConfiguredTheme = applySavedTheme && settings.codexThemeId !== 'official-default';
   const useThemeRuntime = enableThemeDebug || applyConfiguredTheme;
@@ -1280,6 +1293,35 @@ if (isPatGatewayDaemon) {
       patGateway,
     });
     themeService = new ThemeService();
+    accountModelCatalogs = new AccountModelCatalogService({
+      store,
+      clientVersion: async (account) => {
+        const result = await cli.run({ ...account, authKind: 'catalog-version' }, ['--version'], { timeoutMs: 5000 });
+        const version = /^codex-cli\s+(\S+)$/.exec(result.stdout.trim())?.[1];
+        if (result.code !== 0 || !version) throw new Error('无法读取 CLI 版本。');
+        return version;
+      },
+      fetchForAccount: async (account) => {
+        const partition = crypto.createHash('sha256').update(account.id).digest('hex').slice(0, 24);
+        const network = session.fromPartition(`cam-model-discovery-${partition}`, { cache: false });
+        const proxyUrl = formatProxyUrl(store.loadSettings());
+        const loopback = account.authKind === 'compatible_api' &&
+          ['localhost', '127.0.0.1', '[::1]'].includes(new URL(account.apiBaseUrl).hostname);
+        if (loopback) await network.setProxy({ mode: 'direct' });
+        else {
+          if (!proxyUrl) throw new Error('请先在系统配置中设置可用代理。');
+          await network.setProxy({ mode: 'fixed_servers', proxyRules: proxyUrl });
+        }
+        return async (url, options) => {
+          if (!loopback) {
+            const route = String(await network.resolveProxy(url));
+            if (!route.split(';').every((value) => /^(PROXY|HTTPS|SOCKS|SOCKS4|SOCKS5)\s+\S+$/i.test(value.trim())))
+              throw new Error('模型查询的代理规则不可用。');
+          }
+          return network.fetch(url, options);
+        };
+      },
+    });
     const settings = store.loadSettings();
     nativeTheme.themeSource = settings.theme;
     if (settings.proxyAutoDetect) detectAndSaveLocalProxy().catch(() => {});
@@ -1291,7 +1333,37 @@ if (isPatGatewayDaemon) {
     installIpcHandlers();
     createMenu();
     createWindow();
-    setTimeout(() => { promptForUpdate(false).catch(() => {}); }, 5000).unref();
+    if (smokeRoot) {
+      (async () => {
+        try {
+          const started = Date.now();
+          let rendererReady = false;
+          while (!rendererReady && Date.now() - started < 10_000) {
+            rendererReady = await mainWindow.webContents.executeJavaScript(
+              `Boolean(document.getElementById('versionLabel')?.textContent.includes(${JSON.stringify(app.getVersion())}))`).catch(() => false);
+            if (!rendererReady) await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+          if (!rendererReady || store.loadAccounts().length) throw new Error('Renderer or isolated account state is invalid.');
+          const version = await cli.run({ authKind: 'official_oauth', codexHome: smokeRoot }, ['--version'], { timeoutMs: 5000 });
+          if (version.code !== 0 || !/^codex-cli 0\.154\.0$/.test(version.stdout)) throw new Error('Installed CLI version failed.');
+          fs.writeFileSync(path.join(smokeRoot, 'result.json'), JSON.stringify({ passed: true, version: app.getVersion(), rendererReady, cli: version.stdout }));
+          app.quit();
+        } catch (error) {
+          fs.writeFileSync(path.join(smokeRoot, 'result.json'), JSON.stringify({ passed: false, error: String(error.message) }));
+          app.exit(1);
+        }
+      })();
+    }
+    const refreshModels = () => accountModelCatalogs.refreshAll({ signal: modelRefreshCancellation.signal })
+      .then((results) => {
+        const failed = results.filter((result) => result.status === 'rejected').length;
+        console.info(`Model catalogs: succeeded=${results.length - failed}; failed=${failed}`);
+      }).catch(() => {});
+    setTimeout(refreshModels, 1000).unref();
+    const modelTimer = setInterval(refreshModels, 15 * 60 * 1000);
+    modelTimer.unref();
+    app.once('will-quit', () => { clearInterval(modelTimer); modelRefreshCancellation.abort(); });
+    if (!smokeRoot) setTimeout(() => { promptForUpdate(false).catch(() => {}); }, 5000).unref();
     app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
   }).catch((error) => {
     const message = String(error?.message || '未知启动错误').replace(/[\r\n]+/g, ' ').slice(0, 800);

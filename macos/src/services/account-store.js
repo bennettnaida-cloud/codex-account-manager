@@ -62,7 +62,6 @@ function buildAccessTokenConfig() {
 review_model = "${model}"
 model_reasoning_effort = "${defaultReasoningEffort()}"
 chatgpt_base_url = "${ACCESS_TOKEN_CHATGPT_BASE_URL}"
-disable_response_storage = true
 model_provider = "codex_account_manager"
 service_tier = "default"
 model_auto_compact_token_limit = 1000000000
@@ -108,7 +107,19 @@ function preserveUnmanagedConfigSections(existingText) {
 
 function projectAccessTokenConfig(existingText = '') {
   const unmanaged = preserveUnmanagedConfigSections(existingText);
-  return `${buildAccessTokenConfig().trim()}\n${unmanaged ? `\n${unmanaged}\n` : ''}`;
+  return preserveModelSettings(existingText,
+    `${buildAccessTokenConfig().trim()}\n${unmanaged ? `\n${unmanaged}\n` : ''}`);
+}
+
+function preserveModelSettings(existing, generated, keys = ['model', 'review_model', 'model_reasoning_effort', 'model_catalog_json']) {
+  const root = String(existing).split(/^\s*\[/m)[0];
+  for (const key of keys) {
+    const line = root.split(/\r?\n/).find((value) => new RegExp(`^\\s*${key}\\s*=`).test(value));
+    if (!line) continue;
+    const pattern = new RegExp(`^\\s*${key}\\s*=.*$`, 'm');
+    generated = pattern.test(generated) ? generated.replace(pattern, () => line) : line + '\n' + generated;
+  }
+  return generated;
 }
 
 function credentialFingerprint(authPath) {
@@ -155,16 +166,14 @@ function isOfficialOAuthAuthFile(authPath) {
   }
 }
 
-function buildCompatibleApiConfig(account) {
+function buildCompatibleApiConfig(account, existingText = '') {
   const providerName = account.apiProviderName || 'OpenAI Compatible';
   const model = account.apiModel || defaultModel();
   const wireApi = 'responses';
-  return `model_provider = "codex_account_manager"
+  const generated = `model_provider = "codex_account_manager"
 model = ${tomlString(model)}
 review_model = ${tomlString(model)}
 model_reasoning_effort = "high"
-disable_response_storage = true
-network_access = "enabled"
 service_tier = "default"
 model_auto_compact_token_limit = 1000000000
 
@@ -184,6 +193,7 @@ supports_websockets = false
 stream_max_retries = 0
 request_max_retries = 1
 `;
+  return preserveModelSettings(existingText, generated, ['model_catalog_json']);
 }
 
 class AccountStore {
@@ -600,7 +610,7 @@ class AccountStore {
     const realHome = this.ensureSafeManagedAccountHome(account.codexHome);
     const configPath = path.join(realHome, 'config.toml');
     const existing = fs.existsSync(configPath) ? fs.readFileSync(configPath, 'utf8') : '';
-    const projected = buildCompatibleApiConfig(account);
+    const projected = buildCompatibleApiConfig(account, existing);
     if (existing.replace(/\r\n?/g, '\n') === projected) return false;
     atomicWriteText(configPath, projected);
     return true;

@@ -30,11 +30,14 @@ const PROJECT_DIR = path.resolve(MACOS_DIR, '..');
 const PACKAGING_DIR = path.join(MACOS_DIR, 'packaging');
 
 const APP_NAME = 'Codex Account Manager';
-const ELECTRON_VERSION = '43.1.1';
-const ELECTRON_PAYLOAD_SHA256 = 'd6d0598d042ef4d146278d08d84deac9dde145eae31eb4f32ef46206d6bd6169';
-const CODEX_CLI_VERSION = '0.144.1';
-const CODEX_CLI_PAYLOAD_SHA256 = '365a5685170f66bad58dd1dabb0462dfb824f82a870bcc8d9af2eb0a41cf2e18';
-const APP_VERSION = process.env.CAM_VERSION || '1.1.5';
+const ELECTRON_VERSION = '43.8.1';
+const ELECTRON_PAYLOAD_SHA256 = '01bb5d8756d220002ed5f8dccfb5a01391c4b919667af7156257cf5252e3e8ae';
+const CODEX_CLI_VERSION = '0.154.0';
+const CODEX_CLI_PAYLOAD_SHA256 = '2a98662d79316a59993c7233e3e25a1aa1d42da4b45904585d33a5a7da1cade1';
+const APP_VERSION = (await readFile(path.join(PROJECT_DIR, 'VERSION'), 'utf8')).trim();
+if ((process.env.CAM_VERSION && process.env.CAM_VERSION !== APP_VERSION) ||
+    JSON.parse(await readFile(path.join(MACOS_DIR, 'package.json'), 'utf8')).version !== APP_VERSION)
+  throw new Error('VERSION、CAM_VERSION 与 macOS package.json 版本不一致。');
 const RELEASE_PREFIX = 'CodexAccountManager-macOS-一键安装版';
 const ELECTRON_PAYLOAD_NAME = `electron-v${ELECTRON_VERSION}-darwin-arm64.zip`;
 const CODEX_CLI_PAYLOAD_NAME = `openai-codex-${CODEX_CLI_VERSION}-darwin-arm64.tgz`;
@@ -139,6 +142,7 @@ async function buildAppAsar(workRoot) {
     dereference: true,
   });
   await copyFile(path.join(PROJECT_DIR, 'assets', 'model-catalog.json'), path.join(sourceRoot, 'model-catalog.json'));
+  await cp(path.join(PROJECT_DIR, 'assets', 'codex-models'), path.join(sourceRoot, 'codex-models'), { recursive: true });
   await writeFile(path.join(sourceRoot, 'package.json'), `${JSON.stringify({
     name: 'codex-account-manager-macos',
     productName: APP_NAME,
