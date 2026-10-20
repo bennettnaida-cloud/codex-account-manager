@@ -49,7 +49,9 @@ function createCodexApplication(parentDirectory, {
     CFBundleIdentifier: bundleIdentifier,
     CFBundleExecutable: plistExecutableName,
   }));
-  return { appPath, executable };
+  // macOS /var is an alias for /private/var. Production launches the verified
+  // real executable, so mocked process listings must use that same identity.
+  return { appPath: fs.realpathSync(appPath), executable: fs.realpathSync(executable) };
 }
 
 function readTestApplicationInfoPlist(infoPlistPath) {
