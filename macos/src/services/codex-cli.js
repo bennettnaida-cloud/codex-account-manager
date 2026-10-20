@@ -2188,7 +2188,6 @@ function waitForTerminalOpen(child, timeoutMs) {
       }
       fail('等待 Terminal 接受 Codex 启动请求超时。');
     }, timeoutMs);
-    timer.unref?.();
     child.once('error', onError);
     child.once('close', onClose);
   });
@@ -2258,7 +2257,7 @@ function waitForOfficialOAuthAuth(authPath, timeoutMs = 5_000) {
         reject(new Error('官方登录完成后没有在独立目录生成可用凭据。'));
         return;
       }
-      setTimeout(check, 50).unref();
+      setTimeout(check, 50);
     };
     check();
   });
@@ -2342,7 +2341,6 @@ class AppServerOAuthSession {
     this.timeout = setTimeout(() => {
       this.fail(new Error('等待 ChatGPT 官方网页登录超时。'));
     }, this.timeoutMs);
-    this.timeout.unref();
 
     this.bootstrap().catch((error) => {
       this.fail(error instanceof Error ? error : new Error('无法初始化 Codex 官方登录服务。'));
@@ -2388,7 +2386,7 @@ class AppServerOAuthSession {
         this.pendingRequests.delete(id);
         reject(new Error(`Codex 官方登录请求超时（${method}）。`));
       }, Math.max(50, Number(timeoutMs) || this.loginStartTimeoutMs));
-      timer.unref?.();
+      // An awaited RPC deadline must keep the event loop alive until it settles.
       this.pendingRequests.set(id, { resolve, reject, timer });
       try {
         this.write({ id, method, ...(params == null ? {} : { params }) });

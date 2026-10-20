@@ -549,7 +549,6 @@ function waitForChildExit(child, timeoutMs) {
     };
     const onExit = () => finish(true);
     timer = setTimeout(() => finish(childHasExited(child)), timeoutMs);
-    timer.unref?.();
     child?.once?.('exit', onExit);
     child?.once?.('close', onExit);
   });
@@ -629,7 +628,6 @@ async function readRateLimitsViaAppServer(account, options = {}) {
       pending.delete(id);
       reject(new Error('Codex 官方额度接口响应超时。'));
     }, timeoutMs);
-    timer.unref?.();
     pending.set(id, { resolve, reject, timer });
     try {
       child.stdin.write(`${JSON.stringify({ id, method, ...(params === null ? {} : { params }) })}\n`);
