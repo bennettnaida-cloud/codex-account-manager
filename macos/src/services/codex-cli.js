@@ -2562,6 +2562,7 @@ class AppServerOAuthSession {
 }
 
 module.exports = {
+  BUNDLED_CODEX_VERSION,
   AppServerOAuthSession,
   CodexCliService,
   buildChildEnvironment,

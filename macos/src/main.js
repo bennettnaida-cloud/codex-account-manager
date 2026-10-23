@@ -10,7 +10,7 @@ const {
 } = require('./services/account-activation');
 const { AccountStore } = require('./services/account-store');
 const { AccountModelCatalogService } = require('./services/account-model-catalog');
-const { CodexCliService } = require('./services/codex-cli');
+const { CodexCliService, BUNDLED_CODEX_VERSION } = require('./services/codex-cli');
 const { getUsageStats } = require('./services/usage-stats');
 const { getQuotaStats, readRateLimitsViaAppServer } = require('./services/quota-service');
 const { HistoryService } = require('./services/history-service');
@@ -1345,7 +1345,8 @@ if (isPatGatewayDaemon) {
           }
           if (!rendererReady || store.loadAccounts().length) throw new Error('Renderer or isolated account state is invalid.');
           const version = await cli.run({ authKind: 'official_oauth', codexHome: smokeRoot }, ['--version'], { timeoutMs: 5000 });
-          if (version.code !== 0 || !/^codex-cli 0\.154\.0$/.test(version.stdout)) throw new Error('Installed CLI version failed.');
+          if (version.code !== 0 || version.stdout.trim() !== `codex-cli ${BUNDLED_CODEX_VERSION}`)
+            throw new Error('Installed CLI version failed.');
           fs.writeFileSync(path.join(smokeRoot, 'result.json'), JSON.stringify({ passed: true, version: app.getVersion(), rendererReady, cli: version.stdout }));
           app.quit();
         } catch (error) {

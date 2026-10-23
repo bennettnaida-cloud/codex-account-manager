@@ -29,9 +29,15 @@ try {
   run(process.execPath, [new URL('../../tools/Test-ConfiguredModelList.cjs', import.meta.url).pathname,
     cli, new URL('../../assets/codex-models/gpt-6.1-sol.json', import.meta.url).pathname,
     'gpt-6.1-sol', 'gpt-6.1-sol']);
-  run(path.join(installed, 'Contents/MacOS/Codex Account Manager'), [], {
-    timeout: 30_000, env: { ...process.env, CAM_RELEASE_SMOKE_ROOT: root },
-  });
+  try {
+    run(path.join(installed, 'Contents/MacOS/Codex Account Manager'), [], {
+      timeout: 30_000, env: { ...process.env, CAM_RELEASE_SMOKE_ROOT: root },
+    });
+  } catch (error) {
+    const report = path.join(root, 'result.json');
+    if (existsSync(report)) console.error('Isolated application smoke diagnostic:', readFileSync(report, 'utf8'));
+    throw error;
+  }
   const result = JSON.parse(readFileSync(path.join(root, 'result.json'), 'utf8'));
   assert.equal(result.passed, true, result.error);
   assert.equal(result.version, readFileSync(new URL('../../VERSION', import.meta.url), 'utf8').trim());
