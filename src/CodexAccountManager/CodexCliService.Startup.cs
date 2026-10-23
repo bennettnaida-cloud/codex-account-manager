@@ -25,6 +25,7 @@ public sealed partial class CodexCliService
         private readonly LaunchDiagnostics? _previous;
         internal string Id { get; } = Guid.NewGuid().ToString("N");
         internal string ProgressText = "正在检查配置与网关…";
+        internal string ModelCatalogWarning = "";
         internal long ElapsedSeconds => _clock.ElapsedMilliseconds / 1000;
         internal long ElapsedMilliseconds => _clock.ElapsedMilliseconds;
         internal TaskCompletionSource<string>? PageObservation { get; private set; }

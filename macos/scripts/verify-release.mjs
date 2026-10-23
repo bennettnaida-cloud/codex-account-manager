@@ -10,8 +10,9 @@ import { isForbiddenPrivateFile, scanSensitiveTextFile } from './release-privacy
 
 const ELECTRON_PAYLOAD = 'electron-v43.8.1-darwin-arm64.zip';
 const ELECTRON_SHA256 = '01bb5d8756d220002ed5f8dccfb5a01391c4b919667af7156257cf5252e3e8ae';
-const CODEX_CLI_PAYLOAD = 'openai-codex-0.154.0-darwin-arm64.tgz';
-const CODEX_CLI_SHA256 = '2a98662d79316a59993c7233e3e25a1aa1d42da4b45904585d33a5a7da1cade1';
+const CODEX_CLI_PAYLOAD = 'openai-codex-0.163.0-darwin-arm64.tgz';
+const CODEX_CLI_SHA256 = '1193ff4ce72387a5d6c34820b54a9dc57d007c67a958e8acb4715924facd3c31';
+const CODEX_CLI_FILES = JSON.parse(await readFile(new URL('./codex-cli-payload-files.json', import.meta.url), 'utf8'));
 const LOOSE_FILES = ['一键安装.command', '卸载.command', 'README.md', 'app-version.txt'];
 const EXPECTED_CHECKSUM_FILES = new Set([
   `payload/${ELECTRON_PAYLOAD}`,
@@ -110,15 +111,7 @@ function verifyZipExecutableModes(zipPath) {
 }
 
 function verifyCodexCliPayload(codexCliTgz) {
-  const expectedFiles = new Set([
-    'package/vendor/aarch64-apple-darwin/bin/codex',
-    'package/vendor/aarch64-apple-darwin/bin/codex-code-mode-host',
-    'package/vendor/aarch64-apple-darwin/codex-path/rg',
-    'package/vendor/aarch64-apple-darwin/codex-resources/zsh/bin/zsh',
-    'package/vendor/aarch64-apple-darwin/codex-package.json',
-    'package/package.json',
-    'package/README.md',
-  ]);
+  const expectedFiles = new Set(CODEX_CLI_FILES);
   const entries = runTar(['-tzf', codexCliTgz]).split(/\r?\n/).filter(Boolean);
   assertExactSet(entries, expectedFiles, 'Codex CLI payload');
 
@@ -126,12 +119,12 @@ function verifyCodexCliPayload(codexCliTgz) {
   const metadata = JSON.parse(runTar([
     '-xOzf', codexCliTgz, 'package/vendor/aarch64-apple-darwin/codex-package.json',
   ], { maxBuffer: 1_048_576 }));
-  if (packageJson?.name !== '@openai/codex' || packageJson?.version !== '0.154.0-darwin-arm64' ||
+  if (packageJson?.name !== '@openai/codex' || packageJson?.version !== '0.163.0-darwin-arm64' ||
       packageJson?.os?.length !== 1 || packageJson.os[0] !== 'darwin' ||
       packageJson?.cpu?.length !== 1 || packageJson.cpu[0] !== 'arm64' ||
-      metadata?.version !== '0.154.0' || metadata?.target !== 'aarch64-apple-darwin' ||
+      metadata?.version !== '0.163.0' || metadata?.target !== 'aarch64-apple-darwin' ||
       metadata?.entrypoint !== 'bin/codex') {
-    throw new Error('Codex CLI metadata 与固定的 0.154.0 Apple Silicon 版本不一致。');
+    throw new Error('Codex CLI metadata 与固定的 0.163.0 Apple Silicon 版本不一致。');
   }
 }
 

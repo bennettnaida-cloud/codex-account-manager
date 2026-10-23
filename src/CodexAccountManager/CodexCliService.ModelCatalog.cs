@@ -16,6 +16,42 @@ public sealed partial class CodexCliService
     private static readonly object CompatibleModelCatalogLock = new();
     private static readonly object AccessTokenModelCatalogLock = new();
 
+    private sealed class ModelCatalogProjectionLease : IDisposable
+    {
+        private readonly Mutex _mutex = new(false, WindowsClientSwitchMutexName);
+        internal bool Acquired { get; }
+        internal ModelCatalogProjectionLease()
+        {
+            try { Acquired = _mutex.WaitOne(TimeSpan.Zero); }
+            catch (AbandonedMutexException) { Acquired = true; }
+        }
+        public void Dispose() { if (Acquired) _mutex.ReleaseMutex(); _mutex.Dispose(); }
+    }
+
+    private static bool ModelCatalogUpdatedSince(string path, long? processStartTicks)
+    {
+        if (processStartTicks is not > 0) return false;
+        try { return File.Exists(path) && File.GetLastWriteTimeUtc(path).Ticks > processStartTicks.Value; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return false; }
+    }
+
+    private static bool RunningDesktopHasOlderAccountCatalog(AccountRecord account)
+    {
+        if (!account.IsAccessToken && !account.IsCompatibleApi) return false;
+        var config = Path.Combine(GetDefaultCodexHome(), ConfigFileName);
+        try
+        {
+            if (File.Exists(config) && HasTopLevelModelCatalog(RemoveManagedModelCatalog(File.ReadAllText(config))))
+                return false; // A user-authored override is not changed by our discovery.
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return false; }
+        var owner = FindExistingOfficialWindow();
+        if (owner == null) return false;
+        var path = account.IsAccessToken ? ManagedAccessTokenModelCatalogPath(account)
+            : ManagedCompatibleModelCatalogPath(account.CodexHome);
+        return ModelCatalogUpdatedSince(path, owner.StartTimeUtcTicks);
+    }
+
     internal async Task<int> RefreshCompatibleModelCatalogAsync(
         string accountName,
         CancellationToken cancellationToken = default)
@@ -34,7 +70,8 @@ public sealed partial class CodexCliService
 
         var account = matches[0];
         await RefreshOfficialCompatibleModelTemplatesAsync(cancellationToken);
-        await EnsureCompatibleApiLaunchPreflightAsync(account, cancellationToken, validateConfiguredModel: false);
+        await EnsureCompatibleApiLaunchPreflightAsync(account, cancellationToken,
+            validateConfiguredModel: false, requireRemoteCatalog: true);
         SyncCompatibleModelCatalogs();
         return GetCompatibleApiAllowedModels(account).Count;
     }
@@ -42,6 +79,7 @@ public sealed partial class CodexCliService
     internal async Task RefreshAllCompatibleModelCatalogsAsync(CancellationToken cancellationToken)
     {
         var accounts = new AccountStore().LoadAccounts().Where(a => a.IsCompatibleApi).ToArray();
+        var failed = 0;
         if (accounts.Length > 0) await RefreshOfficialCompatibleModelTemplatesAsync(cancellationToken);
         foreach (var account in accounts)
         {
@@ -49,11 +87,12 @@ public sealed partial class CodexCliService
             try
             {
                 await EnsureCompatibleApiLaunchPreflightAsync(
-                    account, cancellationToken, validateConfiguredModel: false);
+                    account, cancellationToken, validateConfiguredModel: false, requireRemoteCatalog: true);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
             catch (Exception ex)
             {
+                failed++;
                 // One offline account cannot prevent other providers from receiving new models.
                 // Never log credentials, provider response bodies or account names.
                 ManagerLifecycleDiagnostics.WriteException("compatible-model-auto-refresh-failed", ex);
@@ -62,11 +101,15 @@ public sealed partial class CodexCliService
         cancellationToken.ThrowIfCancellationRequested();
         var updated = SyncCompatibleModelCatalogs();
         ManagerLifecycleDiagnostics.Write("compatible-model-auto-refresh-completed",
-            $"accounts={accounts.Length}; configs_updated={updated}");
+            $"accounts={accounts.Length}; failed={failed}; configs_updated={updated}");
+        if (failed > 0)
+            throw new InvalidOperationException($"兼容 API 模型刷新：{failed} 个失败，失败账号保留旧目录。");
     }
 
     internal int SyncCompatibleModelCatalogs()
     {
+        using var lease = new ModelCatalogProjectionLease();
+        if (!lease.Acquired) return 0; // Never race a credential/profile switch.
         var updated = 0;
         foreach (var account in new AccountStore().LoadAccounts().Where(a => a.IsCompatibleApi))
         {
@@ -80,7 +123,7 @@ public sealed partial class CodexCliService
                 if (!File.Exists(path)) continue;
                 var original = File.ReadAllText(path);
                 var cleaned = RemoveManagedModelCatalog(original);
-                if (Regex.IsMatch(cleaned, @"(?m)^\s*model_catalog_json\s*=")) continue;
+                if (HasTopLevelModelCatalog(cleaned)) continue;
                 var projected = "model_catalog_json = " + TomlString(catalog) + ManagedModelCatalogMarker + Environment.NewLine + cleaned;
                 if (projected == original) continue;
                 var backup = Path.Combine(home, "backups", "model-catalog-" + Guid.NewGuid().ToString("N"));
@@ -168,6 +211,8 @@ public sealed partial class CodexCliService
 
     internal int SyncAccessTokenModelCatalogs()
     {
+        using var lease = new ModelCatalogProjectionLease();
+        if (!lease.Acquired) return 0;
         var updated = 0;
         foreach (var account in new AccountStore().LoadAccounts().Where(a => a.IsAccessToken))
         {
@@ -192,7 +237,7 @@ public sealed partial class CodexCliService
                 var original = File.ReadAllText(path);
                 var cleaned = RemoveManagedModelCatalog(original);
                 // A user-authored catalog always wins over manager projection.
-                if (Regex.IsMatch(cleaned, @"(?m)^\s*model_catalog_json\s*=")) continue;
+                if (HasTopLevelModelCatalog(cleaned)) continue;
                 var projected = "model_catalog_json = " + TomlString(catalog) +
                                 ManagedModelCatalogMarker + Environment.NewLine + cleaned;
                 if (projected == original) continue;
@@ -600,6 +645,10 @@ public sealed partial class CodexCliService
     // Only remove our generated override; a user's custom catalog remains their choice.
     private static string RemoveManagedModelCatalog(string config) =>
         Regex.Replace(config, @"(?m)^[ \t]*model_catalog_json[ \t]*=[^\r\n]* # codex-account-manager-model-catalog[ \t]*\r?\n?", "");
+
+    private static bool HasTopLevelModelCatalog(string config) => config.Replace("\r", "").Split('\n')
+        .TakeWhile(line => !line.TrimStart().StartsWith('['))
+        .Any(line => Regex.IsMatch(line, @"^\s*model_catalog_json\s*="));
 
     private static void ValidateCompatibleModelCatalogProjection()
     {

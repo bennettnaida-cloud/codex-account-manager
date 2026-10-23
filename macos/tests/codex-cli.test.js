@@ -74,7 +74,7 @@ test('packaged builds prefer the pinned bundled Apple Silicon CLI and reject dam
     fs.chmodSync(bundledCodex, 0o755);
     fs.writeFileSync(path.join(bundledRoot, 'codex-package.json'), JSON.stringify({
       layoutVersion: 1,
-      version: '0.154.0',
+      version: '0.163.0',
       target: 'aarch64-apple-darwin',
       entrypoint: 'bin/codex',
     }));

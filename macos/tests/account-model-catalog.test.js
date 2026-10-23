@@ -30,11 +30,15 @@ test('AT refresh bypasses static catalog/cache, uses the PAT workspace and prese
     assert.equal((await service.refresh(f.account)).count, 1);
     assert.equal(calls.length, 2);
     assert.equal(calls[1].headers['chatgpt-account-id'], 'fixture-workspace');
-    assert.match(calls[1].url, /client_version=0.154.0/);
+    assert.match(calls[1].url, /client_version=0.163.0/);
     assert.deepEqual(JSON.parse(fs.readFileSync(file)).models[0].future, { enabled: true });
     assert.match(fs.readFileSync(path.join(f.root, 'config.toml'), 'utf8'), /model = "gpt-6-astra"/);
     await service.refresh(f.account, { force: false });
     assert.equal(calls.length, 2, 'verified short-term cache should avoid another request');
+    service.clientVersion = async () => '0.164.0';
+    await service.refresh(f.account, { force: false });
+    assert.equal(calls.length, 4, 'client upgrade must invalidate an otherwise fresh receipt');
+    assert.match(calls[3].url, /client_version=0.164.0/);
     const good = fs.readFileSync(file, 'utf8');
     service.fetchForAccount = async () => async () => new Response('{}', { status: 401 });
     await assert.rejects(service.refresh(f.account), /HTTP 401/);

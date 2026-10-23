@@ -77,7 +77,7 @@ async function responseJson(fetchImpl, url, headers, signal) {
 }
 
 class AccountModelCatalogService {
-  constructor({ store, fetchForAccount, clientVersion = async () => '0.154.0' }) {
+  constructor({ store, fetchForAccount, clientVersion = async () => '0.163.0' }) {
     this.store = store;
     this.fetchForAccount = fetchForAccount;
     this.clientVersion = clientVersion;
@@ -106,6 +106,8 @@ class AccountModelCatalogService {
     if (!isCurrent()) throw new Error('账号已变化，已取消模型查询。');
     const catalogPath = path.join(account.codexHome, FILE_NAME);
     const receiptPath = `${catalogPath}.refresh.json`;
+    const version = account.authKind === 'access_token' ? await this.clientVersion(account) : null;
+    if (version !== null && !/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(version)) throw new Error('无法读取 CLI 版本。');
     let cached = null;
     try {
       const info = fs.statSync(catalogPath);
@@ -115,7 +117,7 @@ class AccountModelCatalogService {
       const age = Date.now() - receipt.fetchedAt;
       if (receipt.identity === identity && receipt.hash === hash(text) && age >= 0) {
         cached = { models: validModels(JSON.parse(text)), age };
-        if (!force && age < REFRESH_MS) { this.syncConfig(account, catalogPath); return { cached: true, count: cached.models.length }; }
+        if (!force && age < REFRESH_MS && receipt.clientVersion === version) { this.syncConfig(account, catalogPath); return { cached: true, count: cached.models.length }; }
       }
     } catch { /* A legacy or another credential's file is never online proof. */ }
     const deadline = AbortSignal.timeout(20_000);
@@ -124,8 +126,6 @@ class AccountModelCatalogService {
       const fetchImpl = await this.fetchForAccount(account);
       let models;
       if (account.authKind === 'access_token') {
-        const version = await this.clientVersion(account);
-        if (!/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(version)) throw new Error('无法读取 CLI 版本。');
         const headers = { Authorization: `Bearer ${auth.token}`, Accept: 'application/json', originator: 'codex_cli_rs',
           version, 'User-Agent': `codex_cli_rs/${version} (Mac OS; arm64) codex-account-manager` };
         const who = await responseJson(fetchImpl, 'https://auth.openai.com/api/accounts/v1/user-auth-credential/whoami', headers, cancellation);
@@ -148,7 +148,7 @@ class AccountModelCatalogService {
       if (!isCurrent()) throw new Error('账号或凭据已变化，已丢弃过期的模型结果。');
       const text = JSON.stringify({ models }, null, 2) + '\n';
       atomicWriteText(catalogPath, text);
-      atomicWriteText(receiptPath, JSON.stringify({ identity, hash: hash(text), fetchedAt: Date.now() }));
+      atomicWriteText(receiptPath, JSON.stringify({ identity, hash: hash(text), fetchedAt: Date.now(), clientVersion: version }));
       this.syncConfig(account, catalogPath);
       return { count: models.length, refreshed: true };
     } catch (error) {

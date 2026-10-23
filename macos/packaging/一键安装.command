@@ -5,7 +5,7 @@ APP_DISPLAY_NAME="Codex Account Manager"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 PAYLOAD_DIR="$SCRIPT_DIR/payload"
 ELECTRON_ZIP="$PAYLOAD_DIR/electron-v43.8.1-darwin-arm64.zip"
-CODEX_CLI_TGZ="$PAYLOAD_DIR/openai-codex-0.154.0-darwin-arm64.tgz"
+CODEX_CLI_TGZ="$PAYLOAD_DIR/openai-codex-0.163.0-darwin-arm64.tgz"
 APP_ASAR="$PAYLOAD_DIR/app.asar"
 APP_ICON="$PAYLOAD_DIR/AppIcon.icns"
 APP_VERSION="2.3.38"
@@ -275,14 +275,14 @@ rm -f "$CUSTOM_APP/Contents/Resources/default_app.asar"
 /usr/bin/ditto "$APP_ASAR" "$CUSTOM_APP/Contents/Resources/app.asar"
 /usr/bin/ditto "$APP_ICON" "$CUSTOM_APP/Contents/Resources/electron.icns"
 
-echo "正在安装内置 Codex CLI 0.154.0……"
+echo "正在安装内置 Codex CLI 0.163.0……"
 /usr/bin/tar -xzf "$CODEX_CLI_TGZ" -C "$CLI_ROOT"
 CLI_PAYLOAD="$CLI_ROOT/package/vendor/aarch64-apple-darwin"
 for executable in \
   "$CLI_PAYLOAD/bin/codex" \
   "$CLI_PAYLOAD/bin/codex-code-mode-host" \
   "$CLI_PAYLOAD/codex-path/rg" \
-  "$CLI_PAYLOAD/codex-resources/zsh/bin/zsh"; do
+  "$CLI_PAYLOAD/codex-resources/voice/bin/codex-voice-host"; do
   if [[ ! -f "$executable" || -L "$executable" ]]; then
     echo "Codex CLI payload 结构异常：$executable" >&2
     exit 1
@@ -297,7 +297,7 @@ chmod 755 \
   "$CUSTOM_APP/Contents/Resources/codex-cli/bin/codex" \
   "$CUSTOM_APP/Contents/Resources/codex-cli/bin/codex-code-mode-host" \
   "$CUSTOM_APP/Contents/Resources/codex-cli/codex-path/rg" \
-  "$CUSTOM_APP/Contents/Resources/codex-cli/codex-resources/zsh/bin/zsh"
+  "$CUSTOM_APP/Contents/Resources/codex-cli/codex-resources/voice/bin/codex-voice-host"
 
 INFO_PLIST="$CUSTOM_APP/Contents/Info.plist"
 PLIST_BUDDY="/usr/libexec/PlistBuddy"

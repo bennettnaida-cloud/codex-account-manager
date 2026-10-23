@@ -52,7 +52,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path '.tools/codex-cli' | Out-Null
-          npm install --prefix '.tools/codex-cli' --no-package-lock --ignore-scripts '@openai/codex@0.154.0'
+          npm install --prefix '.tools/codex-cli' --no-package-lock --ignore-scripts '@openai/codex@0.163.0'
 
       - name: Build and package Windows
         shell: pwsh
@@ -131,7 +131,7 @@ jobs:
       - name: Download the pinned official Apple Silicon CLI
         run: |
           mkdir -p dist
-          curl --fail --location --retry 3 --output dist/openai-codex-0.154.0-darwin-arm64.tgz https://registry.npmjs.org/@openai/codex/-/codex-0.154.0-darwin-arm64.tgz
+          curl --fail --location --retry 3 --output dist/openai-codex-0.163.0-darwin-arm64.tgz https://registry.npmjs.org/@openai/codex/-/codex-0.163.0-darwin-arm64.tgz
       - name: Build and verify macOS package
         working-directory: macos
         run: |
@@ -215,7 +215,7 @@ jobs:
           body: |
             自动构建版本 `${{ env.CAM_VERSION }}`。
 
-            恢复 macOS Apple Silicon 下载并更新到 2.3.38：内置 Codex CLI 0.154.0、Electron 43.8.1，AT 和兼容 API 在线模型目录在启动及每 15 分钟同步。保留账号模型选择和自定义目录。macOS 与 Windows 必须都通过测试后才更新发布清单，后续发布保留两个平台。
+            2.3.39 修复 AT 两种桌面入口跳过模型同步的问题，客户端升级使旧目录失效；系统配置新增独立的账号模型同步与逐账号结果。AT/API 目录与价格更新分离，失败保留旧目录并明确提示，不伪造授权、不自动关闭 Codex。Windows 与 macOS 内置 CLI 更新到 0.163.0，保留两个平台的测试和安装验证。
 
             修复 2.3.37 的 Access Token 模型自动更新读回旧静态目录的问题。现在按账号凭据、工作区身份和绑定代理直接查询官方 Codex 模型目录，保留服务器返回的完整模型元数据，不再把 CLI 内置目录或旧缓存误报为在线刷新成功。
 

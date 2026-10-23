@@ -2538,6 +2538,29 @@ public sealed partial class CodexCliService
         });
         LaunchPhase("launch-local-validation-complete", "本地凭据已核对，正在准备所选节点…",
             "online_login_probe=false; online_pat_model_probe=false");
+        if (account.IsAccessToken)
+        {
+            // Both desktop entry points use localOnly validation. Do not let that
+            // optimization skip model discovery: the renderer reads a custom catalog
+            // at process startup, so a later background write is too late for this launch.
+            // This sends metadata GETs only, before closing any working client.
+            LaunchPhase("launch-at-model-discovery-start", "正在同步此 AT 账号的可用模型（不发送聊天请求）…");
+            using var modelDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(25));
+            try
+            {
+                await Task.Run(async () =>
+                {
+                    await RefreshAccessTokenModelCatalogAsync(account, modelDeadline.Token,
+                        requireConfiguredModel: false, forceRemoteRefresh: false);
+                    ProjectAccessTokenSourceConfig(Path.Combine(account.CodexHome, ConfigFileName), account);
+                }, modelDeadline.Token);
+            }
+            catch (OperationCanceledException) when (modelDeadline.IsCancellationRequested)
+            {
+                throw new TimeoutException("AT 模型同步在 25 秒内未完成；当前 Codex 和共享登录凭据未切换。请检查此账号绑定的节点后重试。");
+            }
+            LaunchPhase("launch-at-model-discovery-complete", "AT 账号模型已准备，正在准备桌面启动…");
+        }
         if (account.IsCompatibleApi)
         {
             // A compatible-API switch is destructive to the currently open client once the
@@ -2608,14 +2631,19 @@ public sealed partial class CodexCliService
                 // An explicit recovery caller may request a restart even if the projected
                 // account already matches. Ordinary launches and request-boundary rotation
                 // keep the healthy process alive when the shared profile can be reused.
-                var switchRequired = forceClientRestart ||
+                // A running app-server retains a custom catalog in memory. Only an
+                // explicit launch with a verifiably newer account catalog reloads it;
+                // background discovery never closes a window on its own.
+                var modelCatalogRequiresRestart = mode == WindowsClientMode.OfficialCodex &&
+                    sharedProfileAlreadySelected && RunningDesktopHasOlderAccountCatalog(account);
+                var switchRequired = forceClientRestart || modelCatalogRequiresRestart ||
                                      RequiresWindowsClientShutdown(sharedProfileAlreadySelected);
                 var launchGeneration = !switchRequired && HasPendingOfficialStartup()
                     ? Volatile.Read(ref _windowsClientLaunchGeneration)
                     : BeginWindowsClientLaunchGeneration();
                 LaunchPhase("launch-restart-decision", switchRequired
                     ? "配置检查完成，正在关闭旧 Codex…" : "配置检查完成，正在打开或复用 Codex…",
-                    $"restart={switchRequired}; profile_match={sharedProfileAlreadySelected}; sidebar_changed={forceClientRestart}");
+                    $"restart={switchRequired}; profile_match={sharedProfileAlreadySelected}; sidebar_changed={forceClientRestart}; model_catalog_changed={modelCatalogRequiresRestart}");
                 var shutdownTargets = switchRequired
                     ? CaptureWindowsClientProcessSnapshots()
                     : Array.Empty<WindowsClientProcessSnapshot>();
@@ -10301,7 +10329,8 @@ catch {
     private static async Task EnsureCompatibleApiLaunchPreflightAsync(
         AccountRecord account,
         CancellationToken cancellationToken = default,
-        bool validateConfiguredModel = true)
+        bool validateConfiguredModel = true,
+        bool requireRemoteCatalog = false)
     {
         var modelError = GetCompatibleApiModelIdValidationError(account.ApiModel);
         if (modelError != null)
@@ -10407,6 +10436,8 @@ catch {
             // model-ID validation above remains in force for those services.
             if (response.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.MethodNotAllowed)
             {
+                if (requireRemoteCatalog)
+                    throw new InvalidDataException("此兼容 API 未提供可读取的 /models；保留旧目录，未将其视为同步成功。");
                 return;
             }
 
@@ -10419,6 +10450,7 @@ catch {
 
             if (response.Content.Headers.ContentLength is > CompatibleApiModelCatalogMaxBytes)
             {
+                if (requireRemoteCatalog) throw new InvalidDataException("模型响应过大；保留旧目录。");
                 return;
             }
 
@@ -10449,8 +10481,14 @@ catch {
 
             if (body == null || !TryReadCompatibleApiModelIds(body, out var modelIds))
             {
+                if (requireRemoteCatalog) throw new InvalidDataException("模型响应为空或格式无效；保留旧目录。");
                 return;
             }
+
+            if (requireRemoteCatalog && !modelIds.Any(IsUserSelectableCompatibleApiModelId))
+                throw new InvalidDataException("接口未返回可用于 Codex 的模型；保留旧目录。");
+            if (requireRemoteCatalog && !IsCompatibleModelCatalogIdentityCurrent(account, catalogIdentity))
+                throw new InvalidOperationException("账号地址或凭据已变化，已丢弃过期的模型结果。");
 
             RefreshManagedCompatibleModelCatalog(account, modelIds,
                 () => IsCompatibleModelCatalogIdentityCurrent(account, catalogIdentity));
@@ -13639,9 +13677,7 @@ catch {
         string? modelCatalogPath = null)
     {
         currentConfig = RemoveManagedModelCatalog(currentConfig);
-        var hasCustomModelCatalog = Regex.IsMatch(
-            currentConfig,
-            @"(?m)^\s*model_catalog_json\s*=");
+        var hasCustomModelCatalog = HasTopLevelModelCatalog(currentConfig);
         var desktopServiceTier = serviceTier == null
             ? ReadDesktopServiceTier(currentConfig)
             : NormalizeDesktopServiceTier(serviceTier);
@@ -13803,7 +13839,7 @@ catch {
             "model_reasoning_effort = " + TomlString(CompatibleApiReasoningEffort)
         };
         var catalogPath = ManagedCompatibleModelCatalogPath(account);
-        if (catalogPath != null && !Regex.IsMatch(currentConfig, @"(?m)^\s*model_catalog_json\s*="))
+        if (catalogPath != null && !HasTopLevelModelCatalog(currentConfig))
             output.Insert(3, "model_catalog_json = " + TomlString(catalogPath) + ManagedModelCatalogMarker);
         if (forceFileAuthStore)
         {

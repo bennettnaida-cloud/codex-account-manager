@@ -77,6 +77,11 @@ public sealed partial class CodexCliService
             var receipt = File.ReadAllText(path + ".refresh.json");
             Check(!await Refresh(false, true) && requests == 2, "fresh verified cache reuse");
             Check(!await Refresh() && requests == 4, "forced refresh must query even an unchanged catalog");
+            var beforeUpgrade = requests;
+            Check(!await RefreshAccessTokenCatalogCoreAsync(account, "fixture-identity", true, false, () => current,
+                async token => (await FetchAccessTokenRemoteModelsAsync(client, "at-fixture-not-a-real-token", "0.154.0", token), "0.163.0"),
+                CancellationToken.None, "0.163.0") && requests == beforeUpgrade + 2,
+                "client upgrade invalidates a fresh receipt instead of reusing an old server-filtered catalog");
             receipt = File.ReadAllText(path + ".refresh.json");
             foreach (var failure in new[] { "401", "503", "malformed", "empty", "oversized", "identity-changed" })
             {
@@ -101,8 +106,21 @@ public sealed partial class CodexCliService
             await ExpectFailure(Refresh(false, true));
             Check(ReadVerifiedAccessTokenCatalog(path, "fixture-identity", out var updated) != null &&
                 updated > stale.FetchedAtUtc, "unsupported default must not prevent discovery of other newly authorized models");
+            using (var trace = BeginLaunchDiagnostics("model-default-fixture"))
+            {
+                Check(!await Refresh(false, false) && !string.IsNullOrWhiteSpace(trace.ModelCatalogWarning),
+                    "desktop discovery warns about an unsupported default but still lets the user pick another authorized model");
+            }
             File.AppendAllText(path, " ");
             Check(ReadVerifiedAccessTokenCatalog(path, "fixture-identity", out _) == null, "receipt detects external catalog edits");
+            Check(HasTopLevelModelCatalog("model_catalog_json = \"custom.json\"\n[profiles.old]\n") &&
+                !HasTopLevelModelCatalog("[profiles.old] # unused\nmodel_catalog_json = \"old.json\"\n"),
+                "an inactive profile catalog must not suppress the active account's root catalog");
+            Check(ModelCatalogUpdatedSince(path, DateTime.UtcNow.AddMinutes(-1).Ticks) &&
+                !ModelCatalogUpdatedSince(path, DateTime.UtcNow.AddMinutes(1).Ticks) &&
+                !ModelCatalogUpdatedSince(path, null) &&
+                !ModelCatalogUpdatedSince(Path.Combine(directory, "missing.json"), DateTime.UtcNow.AddMinutes(-1).Ticks),
+                "only a newer catalog and a known exact process identity justify reload on an explicit launch");
             Console.WriteLine("PASS: AT remote discovery, static-cache bypass, future metadata, workspace isolation, cancellation, last-good retention, stale/default handling");
         }
         finally { Directory.Delete(directory, recursive: true); }

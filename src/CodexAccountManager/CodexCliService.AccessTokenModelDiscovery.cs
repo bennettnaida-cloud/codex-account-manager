@@ -29,6 +29,7 @@ public sealed partial class CodexCliService
             var authPath = Path.Combine(account.CodexHome, AuthFileName);
             var identity = Convert.ToHexString(BuildCanonicalJsonSha256(authPath));
             var token = ReadQuotaTestCredential(account, authPath).Token;
+            var version = await GetModelDiscoveryCliVersionAsync(cancellationToken);
             bool IsCurrent()
             {
                 try
@@ -45,7 +46,6 @@ public sealed partial class CodexCliService
             return await RefreshAccessTokenCatalogCoreAsync(account, identity, requireConfiguredModel,
                 forceRemoteRefresh, IsCurrent, async ct =>
                 {
-                    var version = await GetModelDiscoveryCliVersionAsync(ct);
                     using var resolver = new AccountProxyResolver(new AccountStore().RootPath);
                     var route = resolver.Resolve(AccountProxyResolver.AccountKeyFor(account));
                     if (!route.Success) throw new InvalidOperationException(route.Error);
@@ -58,24 +58,35 @@ public sealed partial class CodexCliService
                     }
                     catch (OperationCanceledException) when (!ct.IsCancellationRequested)
                     { throw new TimeoutException("AT 在线模型查询超时；已保留上一份目录，未改动账号或默认模型。"); }
-                }, cancellationToken);
+                }, cancellationToken, version);
         }
         finally { gate.Release(); }
     }
 
     private static async Task<bool> RefreshAccessTokenCatalogCoreAsync(AccountRecord account, string identity,
         bool requireConfiguredModel, bool forceRemoteRefresh, Func<bool> isCurrent,
-        Func<CancellationToken, Task<(JsonArray Models, string Version)>> fetch, CancellationToken cancellationToken)
+        Func<CancellationToken, Task<(JsonArray Models, string Version)>> fetch, CancellationToken cancellationToken,
+        string? expectedClientVersion = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (!isCurrent()) throw new InvalidOperationException("AT 账号或凭据已变化；未发送模型查询。");
         var path = ManagedAccessTokenModelCatalogPath(account);
-        var cached = ReadVerifiedAccessTokenCatalog(path, identity, out var fetchedAt);
+        var cached = ReadVerifiedAccessTokenCatalog(path, identity, out var fetchedAt, out var cachedVersion);
         bool SupportsDefaults(JsonArray models) => CatalogSupportsAccessTokenDefaults(
             models, GetAccessTokenModel(account), AccessTokenReasoningEffort);
+        void ReportDefaultMismatch(JsonArray models)
+        {
+            if (!requireConfiguredModel && !SupportsDefaults(models) && CurrentLaunch.Value is { } trace)
+                trace.ModelCatalogWarning += " 当前默认模型或推理档位不在此账号目录中；目录已保留，请在 Codex 中选择该账号支持的模型与档位。";
+        }
         var usable = cached != null && (!requireConfiguredModel || SupportsDefaults(cached));
-        if (!forceRemoteRefresh && usable && DateTimeOffset.UtcNow - fetchedAt < TimeSpan.FromMinutes(15) && isCurrent())
+        if (!forceRemoteRefresh && usable &&
+            (expectedClientVersion == null || expectedClientVersion == cachedVersion) &&
+            DateTimeOffset.UtcNow - fetchedAt < TimeSpan.FromMinutes(15) && isCurrent())
+        {
+            ReportDefaultMismatch(cached!);
             return false;
+        }
 
         (JsonArray Models, string Version) remote;
         try { remote = await fetch(cancellationToken); }
@@ -85,6 +96,9 @@ public sealed partial class CodexCliService
             // Startup can use this exact credential's last verified catalog while offline.
             // A forced/background refresh must still report failure, not stale success.
             ManagerLifecycleDiagnostics.Write("access-token-model-refresh-stale", "last_verified_catalog_retained=true");
+            if (CurrentLaunch.Value is { } trace)
+                trace.ModelCatalogWarning = "模型在线查询失败，正在使用该账号上次验证的目录；新增模型尚未确认，请在系统配置中重试同步。";
+            ReportDefaultMismatch(cached!);
             return false;
         }
         cancellationToken.ThrowIfCancellationRequested();
@@ -104,6 +118,7 @@ public sealed partial class CodexCliService
         // Never silently change the user's selected model or claim it is authorized.
         if (requireConfiguredModel && !SupportsDefaults(remote.Models))
             throw new InvalidOperationException("AT 在线目录已更新，但不包含当前默认模型或推理档位；请重新选择。共享登录凭据未切换。");
+        ReportDefaultMismatch(remote.Models);
         return changed;
     }
 
@@ -112,8 +127,13 @@ public sealed partial class CodexCliService
             (int)http.StatusCode is 408 or 429 or >= 500);
 
     private static JsonArray? ReadVerifiedAccessTokenCatalog(string path, string identity, out DateTimeOffset fetchedAt)
+        => ReadVerifiedAccessTokenCatalog(path, identity, out fetchedAt, out _);
+
+    private static JsonArray? ReadVerifiedAccessTokenCatalog(string path, string identity,
+        out DateTimeOffset fetchedAt, out string clientVersion)
     {
         fetchedAt = default;
+        clientVersion = "";
         try
         {
             var file = new FileInfo(path);
@@ -127,6 +147,7 @@ public sealed partial class CodexCliService
                 receipt.FetchedAtUtc > DateTimeOffset.UtcNow || receipt.FetchedAtUtc == default) return null;
             if (!TryReadAccessTokenModelSource(Encoding.UTF8.GetString(bytes), out _, out var models)) return null;
             fetchedAt = receipt.FetchedAtUtc;
+            clientVersion = receipt.ClientVersion;
             return models;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException) { return null; }

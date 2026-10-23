@@ -32,8 +32,8 @@ const PACKAGING_DIR = path.join(MACOS_DIR, 'packaging');
 const APP_NAME = 'Codex Account Manager';
 const ELECTRON_VERSION = '43.8.1';
 const ELECTRON_PAYLOAD_SHA256 = '01bb5d8756d220002ed5f8dccfb5a01391c4b919667af7156257cf5252e3e8ae';
-const CODEX_CLI_VERSION = '0.154.0';
-const CODEX_CLI_PAYLOAD_SHA256 = '2a98662d79316a59993c7233e3e25a1aa1d42da4b45904585d33a5a7da1cade1';
+const CODEX_CLI_VERSION = '0.163.0';
+const CODEX_CLI_PAYLOAD_SHA256 = '1193ff4ce72387a5d6c34820b54a9dc57d007c67a958e8acb4715924facd3c31';
 const APP_VERSION = (await readFile(path.join(PROJECT_DIR, 'VERSION'), 'utf8')).trim();
 if ((process.env.CAM_VERSION && process.env.CAM_VERSION !== APP_VERSION) ||
     JSON.parse(await readFile(path.join(MACOS_DIR, 'package.json'), 'utf8')).version !== APP_VERSION)
@@ -220,15 +220,7 @@ async function validateCodexCliPayload(codexCliTgz) {
     throw new Error(`无法检查 Codex CLI 官方 payload 结构：${listing.error?.message || listing.stderr || 'tar failed'}`);
   }
   const entries = String(listing.stdout || '').split(/\r?\n/).filter(Boolean);
-  const expected = new Set([
-    'package/vendor/aarch64-apple-darwin/bin/codex',
-    'package/vendor/aarch64-apple-darwin/bin/codex-code-mode-host',
-    'package/vendor/aarch64-apple-darwin/codex-path/rg',
-    'package/vendor/aarch64-apple-darwin/codex-resources/zsh/bin/zsh',
-    'package/vendor/aarch64-apple-darwin/codex-package.json',
-    'package/package.json',
-    'package/README.md',
-  ]);
+  const expected = new Set(JSON.parse(await readFile(new URL('./codex-cli-payload-files.json', import.meta.url), 'utf8')));
   if (entries.length !== expected.size || entries.some((entry) => !expected.has(entry))) {
     throw new Error('Codex CLI 官方 payload 文件清单与固定版本不一致。');
   }

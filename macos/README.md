@@ -2,7 +2,7 @@
 
 这是 Codex Account Manager 的独立 macOS Electron 构建。最终用户不需要源码、Node.js，也不需要另行安装 Codex CLI；安装包内置并优先使用固定版本的官方 Apple Silicon CLI。系统中已有的 CLI 仅作为开发版或内置载荷不可用时的后备。
 
-macOS 当前版本为 2.3.38，保留账号独立用量与额度、状态与凭据、聊天记录、项目与代理设置、官方 OAuth、桌面/终端启动和主题功能。新增 AT、兼容 API 在线模型目录同步：启动管理器及每 15 分钟检查，启动账号时复用短期有效目录或重新查询，保留模型选择与手动目录；网络失败不覆盖旧目录。AT 查询不读取静态目录来判断服务器模型，按自己的凭据和工作区请求官方接口。macOS 使用系统配置中的代理，暂未移植 Windows 的逐账号节点管理、双登录入口、轮换和侧栏增强。
+macOS 当前版本为 2.3.39，保留账号独立用量与额度、状态与凭据、聊天记录、项目与代理设置、官方 OAuth、桌面/终端启动和主题功能。AT、兼容 API 在线模型目录在启动管理器及每 15 分钟检查，启动账号时复用短期有效目录或重新查询；客户端版本变化时重新验证目录，保留模型选择与手动目录。网络失败不覆盖旧目录。AT 查询不读取静态目录来判断服务器模型，按自己的凭据和工作区请求官方接口。macOS 使用系统配置中的代理，暂未移植 Windows 的逐账号节点管理、双登录入口、轮换和侧栏增强。
 
 每个账号使用独立 `CODEX_HOME`。桌面应用发现兼容 `ChatGPT.app` 与旧版 `Codex.app`，并校验 Codex Bundle ID、Apple 代码签名和 OpenAI Team ID。默认主题启动不会开放远程调试端口，只有主题操作使用独立调试配置。
 
@@ -11,7 +11,7 @@ Access Token 账号通过独立后台网关访问 `127.0.0.1:8317`。网关只�
 ## 版本固定
 
 - Electron `43.8.1`
-- Codex CLI `0.154.0`
+- Codex CLI `0.163.0`
 - `@electron/get` `5.0.0`
 - 目标架构：`darwin-arm64`（Apple Silicon）
 - 最低系统：macOS 12
@@ -42,7 +42,7 @@ Windows 构建机不会展开 macOS `.app`，因此不需要 Windows 符号链�
 ## 发布内容
 
 - `payload/electron-v43.8.1-darwin-arm64.zip`
-- `payload/openai-codex-0.154.0-darwin-arm64.tgz`
+- `payload/openai-codex-0.163.0-darwin-arm64.tgz`
 - `payload/app.asar`
 - `payload/AppIcon.icns`
 - `一键安装.command`

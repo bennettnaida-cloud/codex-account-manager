@@ -16638,7 +16638,8 @@ public partial class Form1 : Form
                 // Keep the click guard and progress alive through the actual observation.
                 var result = await observation.Task;
                 launchProgress.Stop();
-                if (!IsDisposed && !Disposing) _statusBox.Text = result;
+                if (!IsDisposed && !Disposing) _statusBox.Text = result +
+                    (string.IsNullOrEmpty(launchTrace.ModelCatalogWarning) ? "" : " " + launchTrace.ModelCatalogWarning);
             }
             return launched;
         }

@@ -25,7 +25,10 @@ try {
   run('/usr/bin/codesign', ['--verify', '--deep', '--strict', installed]);
   const cli = path.join(installed, 'Contents/Resources/codex-cli/bin/codex');
   assert.match(run('/usr/bin/lipo', ['-archs', cli]), /arm64/);
-  assert.equal(run(cli, ['--version']).trim(), 'codex-cli 0.154.0');
+  assert.equal(run(cli, ['--version']).trim(), 'codex-cli 0.163.0');
+  run(process.execPath, [new URL('../../tools/Test-ConfiguredModelList.cjs', import.meta.url).pathname,
+    cli, new URL('../../assets/codex-models/gpt-6.1-sol.json', import.meta.url).pathname,
+    'gpt-6.1-sol', 'gpt-6.1-sol']);
   run(path.join(installed, 'Contents/MacOS/Codex Account Manager'), [], {
     timeout: 30_000, env: { ...process.env, CAM_RELEASE_SMOKE_ROOT: root },
   });

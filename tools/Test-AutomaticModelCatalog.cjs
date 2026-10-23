@@ -63,9 +63,9 @@ async function refresh(index=0, expectedCode=0) {
   const good=fs.readFileSync(path.join(accounts[0].codexHome,catalogName),'utf8');
   for(const [name,handler,code] of [
     ['401',(_req,res)=>{res.statusCode=401;res.end('{}');},1],
-    ['empty',(_req,res)=>res.end('{"data":[]}'),0],
-    ['malformed',(_req,res)=>res.end('not-json'),0],
-    ['unsupported',(_req,res)=>res.end(JSON.stringify({data:[{id:'gpt-image-1'},{id:'gpt-6-audio'},{id:'gpt-9/../../secret'}]})),0],
+    ['empty',(_req,res)=>res.end('{"data":[]}'),1],
+    ['malformed',(_req,res)=>res.end('not-json'),1],
+    ['unsupported',(_req,res)=>res.end(JSON.stringify({data:[{id:'gpt-image-1'},{id:'gpt-6-audio'},{id:'gpt-9/../../secret'}]})),1],
     ['timeout',()=>{},1]]) {
     responder=handler;await refresh(0,code);assert.equal(fs.readFileSync(path.join(accounts[0].codexHome,catalogName),'utf8'),good,`${name} must retain last good catalog`);
   }
@@ -74,15 +74,23 @@ async function refresh(index=0, expectedCode=0) {
   await refresh(1);assert.deepEqual(readModels(1).map(x=>x.slug),['gpt-6-sol']);assert.equal(fs.readFileSync(path.join(accounts[0].codexHome,catalogName),'utf8'),good);
   console.log('PASS: account/provider whitelist isolation');
   responder=(_req,res)=>{accounts[0].apiBaseUrl=`http://127.0.0.1:${port}/changed`;writeAccounts();res.end(JSON.stringify({data:[{id:'gpt-9.7-sol'}]}));};
-  await refresh();assert.equal(fs.readFileSync(path.join(accounts[0].codexHome,catalogName),'utf8'),good);
+  await refresh(0,1);assert.equal(fs.readFileSync(path.join(accounts[0].codexHome,catalogName),'utf8'),good);
   responder=(_req,res)=>{fs.writeFileSync(path.join(accounts[0].codexHome,'auth.json'),JSON.stringify({OPENAI_API_KEY:'changed-fixture-key'}));res.end(JSON.stringify({data:[{id:'gpt-9.7-sol'}]}));};
-  await refresh();assert.equal(fs.readFileSync(path.join(accounts[0].codexHome,catalogName),'utf8'),good);
+  await refresh(0,1);assert.equal(fs.readFileSync(path.join(accounts[0].codexHome,catalogName),'utf8'),good);
   console.log('PASS: results fetched before endpoint/key changes cannot overwrite the current catalog');
   fs.writeFileSync(path.join(accounts[0].codexHome,'auth.json'),JSON.stringify({OPENAI_API_KEY:'fixture-key'}));
   accounts[0].useBundledCompatibleApiModelCatalog=true;writeAccounts();
   responder=(_req,res)=>res.end(JSON.stringify({data:[{id:'gpt-9.9-sol'},{id:'gpt-9.9-sol'}]}));
   await refresh();assert.equal(readModels().filter(x=>x.slug==='gpt-9.9-sol').length,1);
-  responder=(_req,res)=>res.end('{"data":[]}');await refresh();assert(readModels().some(x=>x.slug==='gpt-9.9-sol'));
+  responder=(_req,res)=>res.end('{"data":[]}');await refresh(0,1);assert(readModels().some(x=>x.slug==='gpt-9.9-sol'));
   console.log('PASS: bundled mode retains newly discovered models and removes duplicates');
+  if(codex){
+    const atPath=path.join(root,'at-catalog-fixture.json');
+    const entries=['gpt-6.1-sol','gpt-99.123-sol','gpt-6-astra'].map(slug=>({...seed,slug,display_name:slug,visibility:'list',future_metadata:{preserved:true}}));
+    entries.push({...seed,slug:'codex-auto-review',visibility:'hide'});
+    fs.writeFileSync(atPath,JSON.stringify({models:entries}));
+    const result=await run(process.execPath,[path.join(__dirname,'Test-ConfiguredModelList.cjs'),codex,atPath,'gpt-6.1-sol','gpt-6.1-sol,gpt-99.123-sol,gpt-6-astra']);
+    assert.equal(result.code,0,result.output);console.log('PASS: AT-shaped full metadata, hidden entries, pagination, GPT 6.1 and future-model consumer compatibility');console.log(result.output.trim());
+  }
  } finally {server.closeAllConnections();await new Promise(resolve=>server.close(resolve));fs.rmSync(root,{recursive:true,force:true});}
 })().catch(error=>{console.error(error);process.exitCode=1;});

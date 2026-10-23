@@ -25,7 +25,7 @@ public partial class Form1
         var panel = new RoundedPanel
         {
             Width = width,
-            Height = 578,
+            Height = 654,
             Radius = 16,
             BorderColor = _palette.BorderColor,
             BackColor = _palette.CardColor,
@@ -191,17 +191,30 @@ public partial class Form1
         };
         panel.Controls.Add(automatic);
 
+        var refreshModels = MakeActionButton("同步账号可用模型", innerLeft, 520, 180, true);
+        refreshModels.AccessibleName = "从各账号接口同步可用模型，与官网价格检查相互独立";
+        refreshModels.Click += async (_, _) => await RefreshAccountModelsManuallyAsync(refreshModels);
+        panel.Controls.Add(refreshModels);
         var discovery = new Label
         {
-            Text = "可选模型在启动时及每 15 分钟自动同步；已打开的 Codex 重启后显示新增模型。",
-            Left = innerLeft,
+            Text = "AT/API 模型启动前及后台每 15 分钟同步，与价格无关。OAuth 使用官方目录。已打开的 Codex 可能需手动重启；不会自动关闭窗口。",
+            Left = innerLeft + 192,
             Top = 520,
-            Width = innerWidth,
-            Height = 38,
+            Width = innerWidth - 192,
+            Height = 66,
             Font = new Font(Font.FontFamily, 8.3F)
         };
         ThemeStyler.ApplyLabel(discovery, _palette, true);
         panel.Controls.Add(discovery);
+        var discoveryStatus = new Label
+        {
+            Text = _accountModelRefreshStatus,
+            Left = innerLeft, Top = 590, Width = innerWidth, Height = 44,
+            Font = new Font(Font.FontFamily, 8.3F), AutoEllipsis = true
+        };
+        ThemeStyler.ApplyLabel(discoveryStatus, _palette, true);
+        _accountModelRefreshStatusLabel = discoveryStatus;
+        panel.Controls.Add(discoveryStatus);
 
         return panel;
     }

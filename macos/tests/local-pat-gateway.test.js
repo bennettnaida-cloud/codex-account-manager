@@ -158,7 +158,7 @@ test('PAT gateway resolves workspace identity once and forwards only to fixed Ch
     assert.equal(fetchCalls[1].headers['x-openai-fedramp'], 'true');
     assert.equal(fetchCalls[1].headers['x-codex-trace-id'], 'trace-1');
     assert.equal(fetchCalls[1].headers['x-codex-account-manager-secret'], undefined);
-    assert.equal(fetchCalls[1].headers.version, '0.154.0');
+    assert.equal(fetchCalls[1].headers.version, '0.163.0');
     assert.match(fetchCalls[1].headers['openai-beta'], /responses=experimental/);
 
     const second = await requestGateway(address, {
