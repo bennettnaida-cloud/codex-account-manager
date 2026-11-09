@@ -37,6 +37,8 @@ internal static partial class AccountFileImportTests
             }) Check(AccountFileImport.Parse(invalid).Entries.Count == 0, "invalid credential rejection");
             var pat = AccountFileImport.Parse("{\"personal_access_token\":\"at-fixture-pat-import-only-123456789\",\"name\":\"../outside\"}");
             Check(pat.Entries.Count == 1 && pat.Entries[0].AuthKind == AccountAuthKind.AccessToken, "PAT classification");
+            using (var auth = JsonDocument.Parse(pat.Entries[0].AuthJson))
+                Check(auth.RootElement.GetProperty("auth_mode").GetString() == "personalAccessToken", "native CLI PAT auth mode");
             store.ImportAccounts(pat.Entries);
             Check(store.LoadAccounts().Single(a => a.Name == "../outside").CodexHome.StartsWith(Path.Combine(root, "accounts") + Path.DirectorySeparatorChar), "imported names cannot choose paths");
             var zipPath = Path.Combine(root, "CPA.zip");

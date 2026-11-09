@@ -118,7 +118,7 @@ internal static class AccountFileImport
         {
             if (CodexCliService.GetAccessTokenInputError(pat) != null)
                 throw new InvalidDataException("PAT 格式无效或导出内容已脱敏。");
-            return Entry(AccountAuthKind.AccessToken, new JsonObject { ["auth_mode"] = "personal_access_token", ["personal_access_token"] = pat }, "", "", pat);
+            return Entry(AccountAuthKind.AccessToken, new JsonObject { ["auth_mode"] = "personalAccessToken", ["personal_access_token"] = pat }, "", "", pat);
         }
         if (refresh.Length > 0 || access.Length > 0 || credentials.TryGetProperty("tokens", out _))
         {
