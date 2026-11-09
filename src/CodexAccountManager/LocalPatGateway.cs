@@ -71,7 +71,9 @@ internal static class LocalPatGateway
     // directly projected backup API profile to return to the primary pool at a request boundary.
     internal const string LegacyV11RotationProtocolValue = "request-boundary-v11";
     internal const string LegacyV12RotationProtocolValue = "request-boundary-v12";
-    internal const string RotationProtocolValue = "request-boundary-v13";
+    // v14 pins browser Session workspace identity and rejects expired Session credentials.
+    internal const string LegacyV13RotationProtocolValue = "request-boundary-v13";
+    internal const string RotationProtocolValue = "request-boundary-v14";
     private static readonly SemaphoreSlim StartupLock = new(1, 1);
     private static readonly TimeSpan StartupLockTimeout = TimeSpan.FromSeconds(8);
     private static readonly TimeSpan DesktopStartupTimeout = TimeSpan.FromSeconds(12);
@@ -1000,6 +1002,7 @@ internal static class LocalPatGateway
 
     internal static bool IsCompatibleRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV13RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV12RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV11RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, SuccessfulActivityRotationProtocolValue, StringComparison.Ordinal) ||
@@ -1016,12 +1019,14 @@ internal static class LocalPatGateway
     // new executable waits for a request-boundary listener hand-off.
     internal static bool IsCurrentRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV13RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV12RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, SuccessfulActivityRotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, SafeContentEncodingRotationProtocolValue, StringComparison.Ordinal);
 
     internal static bool IsTransparentRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV13RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV12RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV11RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, SuccessfulActivityRotationProtocolValue, StringComparison.Ordinal) ||
@@ -1033,6 +1038,7 @@ internal static class LocalPatGateway
 
     internal static bool IsConfirmedQuotaRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV13RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV12RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV11RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, SuccessfulActivityRotationProtocolValue, StringComparison.Ordinal) ||
@@ -1069,6 +1075,7 @@ internal static class LocalPatGateway
                         string.Equals(value, SafeContentEncodingRotationProtocolValue, StringComparison.Ordinal) ||
                         string.Equals(value, "request-boundary-v9", StringComparison.Ordinal) ||
                         string.Equals(value, LegacyV11RotationProtocolValue, StringComparison.Ordinal) ||
+                        string.Equals(value, LegacyV13RotationProtocolValue, StringComparison.Ordinal) ||
                         string.Equals(value, LegacyV12RotationProtocolValue, StringComparison.Ordinal) ||
                         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal));
         }
@@ -2352,7 +2359,7 @@ internal sealed partial class LocalPatGatewayHost
                     context.Request, _controlSecret, LocalPatGateway.QuotaTestProofPurpose(credential.Token));
             if (ShouldRejectSharedOAuthModelRequest(
                     isModelRequest,
-                    credential.IsPersonalAccessToken || credential.IsCompatibleApi,
+                    credential.IsPersonalAccessToken || credential.IsCompatibleApi || credential.IsWebSession,
                     CodexCliService.IsSharedDualLoginModeConfigured(),
                     authenticatedAccountProbe))
             {
@@ -4597,6 +4604,13 @@ internal sealed partial class LocalPatGatewayHost
         }
         var account = matches[0];
 
+        if (account.IsWebSession)
+        {
+            var session = WebSessionCredential.ReadStored(Path.Combine(account.CodexHome, "auth.json"));
+            return new GatewayCredential(session.AccessToken, IsPersonalAccessToken: false,
+                AccountKey: accountKey, ChatGptAccountId: session.AccountId, AllowIncomingChatGptIdentity: false, IsWebSession: true);
+        }
+
         if (account.IsOfficialOAuth)
         {
             // Resolve OAuth before reading the generic access-token field. The account
@@ -4898,6 +4912,14 @@ internal sealed partial class LocalPatGatewayHost
 
         var matched = matchingAccounts[0];
         var accountKey = QuotaAccountIdentity.CreateKey(matched);
+        if (matched.IsWebSession)
+        {
+            var session = WebSessionCredential.ReadStored(Path.Combine(matched.CodexHome, "auth.json"));
+            if (!TokenHashesEqual(credential.Token, session.AccessToken))
+                throw new InvalidDataException("Session 凭据已变化，请重新启动该账号。");
+            return credential with { AccountKey = accountKey, ChatGptAccountId = session.AccountId,
+                AllowIncomingChatGptIdentity = false, IsWebSession = true };
+        }
         return matched.IsOfficialOAuth
             ? credential with
             {
@@ -7351,7 +7373,8 @@ internal sealed partial class LocalPatGatewayHost
         string? AccountKey = null,
         string? ChatGptAccountId = null,
         bool AllowIncomingChatGptIdentity = true,
-        IReadOnlySet<string>? CompatibleApiModels = null)
+        IReadOnlySet<string>? CompatibleApiModels = null,
+        bool IsWebSession = false)
     {
         internal bool IsCompatibleApi =>
             CompatibleApiBaseUri != null && !string.IsNullOrWhiteSpace(CompatibleApiModel);

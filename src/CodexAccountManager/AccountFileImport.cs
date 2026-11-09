@@ -74,6 +74,7 @@ internal static class AccountFileImport
         var problems = new List<AccountImportProblem>();
         try
         {
+            if (Encoding.UTF8.GetByteCount(json) > MaxFileBytes) throw new InvalidDataException("JSON 内容过大。");
             using var document = JsonDocument.Parse(json, new JsonDocumentOptions { MaxDepth = 32 });
             RejectDuplicateKeys(document.RootElement);
             var root = document.RootElement;
@@ -96,6 +97,13 @@ internal static class AccountFileImport
     private static AccountImportEntry ParseEntry(JsonElement item, string fallbackName, int index)
     {
         if (item.ValueKind != JsonValueKind.Object) throw new InvalidDataException("账号记录必须是 JSON 对象。");
+        if (item.TryGetProperty("accessToken", out _))
+            return WebSessionCredential.ParseImport(item, fallbackName + "-" + (index + 1));
+        if (item.TryGetProperty("web_session", out _))
+        {
+            var session = WebSessionCredential.ReadStored(item);
+            return session.ToImportEntry(fallbackName + "-" + (index + 1));
+        }
         var platform = Text(item, "platform").ToLowerInvariant();
         var type = Text(item, "type").ToLowerInvariant();
         if (platform.Length > 0 && platform is not ("openai" or "codex") ||
@@ -187,7 +195,7 @@ internal static class AccountFileImport
         }
         catch (Exception ex) when (ex is FormatException or JsonException) { return ""; }
     }
-    private static void RejectDuplicateKeys(JsonElement node)
+    internal static void RejectDuplicateKeys(JsonElement node)
     {
         if (node.ValueKind == JsonValueKind.Object)
         {

@@ -4,6 +4,39 @@ namespace CodexAccountManager;
 
 public sealed partial class AccountStore
 {
+    internal void UpdateWebSession(AccountRecord expected, string name, AccountImportEntry? entry)
+    {
+        var accounts = LoadAccounts();
+        var current = accounts.SingleOrDefault(a => a.IsWebSession && a.Name == expected.Name &&
+            PathsEqual(a.CodexHome, expected.CodexHome))
+            ?? throw new InvalidDataException("Session 账号已变化，请重新打开账号编辑窗口。");
+        name = name.Trim();
+        if (name.Length is < 1 or > 80 || name.Any(char.IsControl) ||
+            accounts.Any(a => a != current && a.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
+            throw new InvalidDataException("账号名称为空、过长或已被使用，请重新填写。");
+        var path = Path.Combine(current.CodexHome, "auth.json");
+        var previous = File.ReadAllText(path);
+        if (entry != null)
+        {
+            using var doc = JsonDocument.Parse(entry.AuthJson);
+            var replacement = WebSessionCredential.ReadStored(doc.RootElement);
+            var original = WebSessionCredential.ReadStored(path, requireCurrent: false);
+            if (entry.AuthKind != AccountAuthKind.WebSession || replacement.AccountId != original.AccountId)
+                throw new InvalidDataException("新 Session 属于不同的 ChatGPT 工作区，请通过“新增账号”单独导入。");
+        }
+        try
+        {
+            if (entry != null) AtomicFilePersistence.WriteAllText(path, entry.AuthJson);
+            current.Name = name;
+            SaveAccounts(accounts);
+        }
+        catch
+        {
+            if (entry != null) AtomicFilePersistence.WriteAllText(path, previous);
+            throw;
+        }
+    }
+
     internal (int Added, int Duplicates) ImportAccounts(IReadOnlyList<AccountImportEntry> entries)
     {
         var accounts = LoadAccounts();
@@ -15,7 +48,9 @@ public sealed partial class AccountStore
                 using var doc = JsonDocument.Parse(File.ReadAllText(Path.Combine(account.CodexHome, "auth.json")));
                 var root = doc.RootElement;
                 string identity;
-                if (account.IsOfficialOAuth && root.TryGetProperty("tokens", out var tokens))
+                if (account.IsWebSession)
+                    identity = WebSessionCredential.ReadStored(root, requireCurrent: false).Identity;
+                else if (account.IsOfficialOAuth && root.TryGetProperty("tokens", out var tokens))
                     identity = AccountFileImport.Text(tokens, "refresh_token") + "\n" + AccountFileImport.Text(tokens, "account_id");
                 else
                 {
@@ -24,7 +59,7 @@ public sealed partial class AccountStore
                 }
                 fingerprints.Add(AccountFileImport.Fingerprint(account.AuthKind, identity));
             }
-            catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException) { }
+            catch (Exception ex) when (ex is IOException or InvalidDataException or JsonException or UnauthorizedAccessException) { }
         }
         var created = new List<string>();
         var duplicates = 0;

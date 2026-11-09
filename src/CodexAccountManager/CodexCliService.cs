@@ -903,6 +903,17 @@ public sealed partial class CodexCliService
 
     public async Task<LoginStatus> GetLoginStatusAsync(AccountRecord account)
     {
+        if (account.IsWebSession)
+        {
+            try
+            {
+                var session = WebSessionCredential.ReadStored(Path.Combine(account.CodexHome, AuthFileName));
+                EnsureLocalPatAccountConfig(account);
+                return new LoginStatus { ExitCode = 0, Text = $"网页版 Session 已保存，有效期至 {session.ExpiresAt.ToLocalTime():yyyy-MM-dd HH:mm}；启动时在线验证。" };
+            }
+            catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException or JsonException)
+            { return new LoginStatus { ExitCode = 1, Text = "网页版 Session 无效或已过期，请重新导入。" }; }
+        }
         if (account.IsCompatibleApi)
         {
             var configPath = Path.Combine(account.CodexHome, ConfigFileName);
@@ -957,7 +968,7 @@ public sealed partial class CodexCliService
 
     public async Task<LoginStatus> LoginWithAccessTokenAsync(AccountRecord account, string accessToken)
     {
-        if (!account.IsAccessToken)
+        if (!account.IsAccessToken || account.IsWebSession)
         {
             throw new InvalidOperationException(
                 "只有 Access Token 账号使用 codex login --with-access-token；通过 ChatGPT 登录的账号请使用官方浏览器登录。"
@@ -1660,7 +1671,8 @@ public sealed partial class CodexCliService
                     command,
                     account.CodexHome,
                     initializeTimeout,
-                    cancellationToken);
+                    cancellationToken,
+                    account.IsWebSession ? WebSessionCredential.ReadStored(authPath) : null);
             }
             catch (TimeoutException) when (!fastFail && attempt == 0)
             {
@@ -2257,7 +2269,8 @@ public sealed partial class CodexCliService
         string command,
         string codexHome,
         TimeSpan initializeTimeout,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        WebSessionCredential? webSession = null)
     {
         var startInfo = BuildUsageLimitResetProcessStartInfo(command, codexHome);
 
@@ -2276,6 +2289,7 @@ public sealed partial class CodexCliService
         try
         {
             await session.InitializeAsync(initializeTimeout, cancellationToken);
+            if (webSession != null) await session.LoginWebSessionAsync(webSession, cancellationToken);
             return session;
         }
         catch
@@ -17141,6 +17155,11 @@ catch {
         string authPath)
     {
         ArgumentNullException.ThrowIfNull(account);
+        if (account.IsWebSession)
+        {
+            var session = WebSessionCredential.ReadStored(authPath);
+            return new QuotaTestCredential(session.AccessToken, session.AccountId);
+        }
         _ = BuildCanonicalJsonSha256(authPath);
         using var input = new FileStream(
             authPath,

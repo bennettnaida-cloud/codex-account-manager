@@ -145,6 +145,16 @@ public sealed class UsageLimitResetSession : IAsyncDisposable
         await WriteJsonLineAsync(new JsonObject { ["method"] = "initialized" }, cancellationToken);
     }
 
+    internal async Task LoginWebSessionAsync(WebSessionCredential credential, CancellationToken cancellationToken)
+    {
+        // Native app-server external-token auth is in-memory and needs no forged ID/refresh token.
+        await RequestAsync("account/login/start", new JsonObject
+        {
+            ["type"] = "chatgptAuthTokens", ["accessToken"] = credential.AccessToken,
+            ["chatgptAccountId"] = credential.AccountId
+        }, ReadTimeout, cancellationToken);
+    }
+
     public async Task<UsageLimitResetInfo> ReadAsync(CancellationToken cancellationToken = default)
     {
         var result = await RequestAsync(

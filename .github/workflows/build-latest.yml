@@ -88,6 +88,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Automatic model catalog regression test failed.' }
           & node .\tools\Test-LaunchModelPreflight.cjs $startupExe
           if ($LASTEXITCODE -ne 0) { throw 'Launch model preflight regression test failed.' }
+          & node .\tools\Test-WebSessionAuth.cjs $catalogCli
+          if ($LASTEXITCODE -ne 0) { throw 'Browser Session native authentication regression test failed.' }
           & .\Build-OneClickInstallerPackage.ps1 -OutputPath (Join-Path $PWD 'CodexAccountManager-Windows-latest.zip')
           if ($LASTEXITCODE -ne 0) { throw 'Windows installer package build failed.' }
           $versionedPackage = 'CodexAccountManager-Windows-{0}.zip' -f $env:CAM_VERSION
@@ -223,7 +225,11 @@ jobs:
           body: |
             自动构建版本 `${{ env.CAM_VERSION }}`。
 
-            Windows 2.3.41：每次启动官方 ChatGPT OAuth、PAT 或兼容 API 账号时，先在线获取该账号的模型目录，再启动桌面或终端客户端。PAT 不再跳过 15 分钟缓存内的启动查询，OAuth 使用独立凭据及工作区，API 使用所配置站点的 /models。
+            Windows 2.3.42：新增“新增账号 → 网页版 Session”，支持粘贴 https://chatgpt.com/api/auth/session 返回的完整 JSON；文件导入也支持相同 JSON、数组和 ZIP。自动读取邮箱、工作区与有效期，提供“更新 Session”，同一工作区更新保留账号目录与设置。
+
+            Session 使用独立的短期 Bearer 凭据，经本地网关固定到所属工作区；启动前在线查询模型，支持额度查询及轮换。Session 不能自动续期，到期后需重新导入；上游仍需授予 Codex 权限。不保存 Cookie，不伪造 id_token 或 refresh_token。
+
+            保留每次启动官方 ChatGPT OAuth、PAT 或兼容 API 账号前的在线模型同步。PAT 不跳过 15 分钟缓存内的启动查询，OAuth 使用独立凭据及工作区，API 使用所配置站点的 /models。
 
             新增“新增账号 → 从文件导入”：支持 sub2api、CPA Codex、原生 auth.json、PAT 和含地址的 API Key；支持多选 JSON 与 ZIP，提供预览、凭据去重、同名重命名及独立目录。OAuth 过期或缺少 id_token 时在启动前刷新。导入不会覆盖已有账号，不会自动导入代理、分组或轮换设置。
 

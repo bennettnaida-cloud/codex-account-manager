@@ -55,12 +55,14 @@ public sealed partial class CodexCliService
                     deadline.CancelAfter(TimeSpan.FromSeconds(20));
                     try
                     {
-                        return (account.IsOfficialOAuth
+                        return (account.IsOfficialOAuth || account.IsWebSession
                             ? await FetchOfficialOAuthRemoteModelsAsync(client, token, credential.AccountId!, version, deadline.Token)
                             : await FetchAccessTokenRemoteModelsAsync(client, token, version, deadline.Token), version);
                     }
                     catch (OperationCanceledException) when (!ct.IsCancellationRequested)
                     { throw new TimeoutException("AT 在线模型查询超时；已保留上一份目录，未改动账号或默认模型。"); }
+                    catch (HttpRequestException ex) when (account.IsWebSession && ex.StatusCode is System.Net.HttpStatusCode.Unauthorized or System.Net.HttpStatusCode.Forbidden)
+                    { throw new InvalidOperationException("网页版 Session 已失效或没有 Codex 访问权限，请更新 Session 或使用官方网页登录；未切换当前账号。"); }
                 }, cancellationToken, version);
         }
         finally { gate.Release(); }

@@ -2,6 +2,37 @@ namespace CodexAccountManager;
 
 public partial class Form1
 {
+    private void ImportWebSession(AccountRecord? existing = null)
+    {
+        using var dialog = new WebSessionImportDialog(_palette, existing);
+        while (dialog.ShowDialog(this) == DialogResult.OK)
+        {
+            try
+            {
+                if (existing != null)
+                {
+                    _store.UpdateWebSession(existing, dialog.AccountName, dialog.Entry);
+                    _statusCache.Remove(existing.Name);
+                    if (dialog.Entry != null) InvalidateQuotaRuntimeState(existing);
+                    _selectedAccountName = dialog.AccountName;
+                    _statusBox.Text = "网页版 Session 账号已保存；下次启动先在线获取模型，Session 到期后需重新导入。";
+                }
+                else
+                {
+                    var result = _store.ImportAccounts([dialog.Entry!]);
+                    _statusBox.Text = result.Added == 0 ? "此 Session 已导入，已跳过重复凭据。"
+                        : "网页版 Session 已导入；启动前会在线获取模型，Session 到期后需重新导入。";
+                }
+                LoadAccounts();
+                return;
+            }
+            catch (InvalidDataException ex)
+            { MessageBox.Show(this, ex.Message, "Session 未保存", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException or System.Text.Json.JsonException)
+            { MessageBox.Show(this, "Session 未保存。请检查账号名称、目录权限与磁盘空间。", "导入失败", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+        }
+    }
+
     private void ImportAccountFiles()
     {
         using var picker = new OpenFileDialog
@@ -21,7 +52,7 @@ public partial class Form1
             };
             ThemeStyler.ApplyDialog(preview, _palette);
             var note = new Label { Dock = DockStyle.Top, Height = 74, Padding = new Padding(14),
-                Text = $"识别到 {batch.Entries.Count} 个账号，{batch.Problems.Count} 项无法导入。重复凭据将跳过，同名账号自动重命名。\n支持 sub2api、CPA Codex 和 auth.json；代理、分组与轮换设置需在管理器中配置。" };
+                Text = $"识别到 {batch.Entries.Count} 个账号，{batch.Problems.Count} 项无法导入。重复凭据将跳过，同名账号自动重命名。\n支持 sub2api、CPA Codex、auth.json 和网页版 Session；Session 到期需重新导入。" };
             var list = new ListView { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true,
                 GridLines = true, HideSelection = false };
             list.Columns.Add("账号 / 来源", 290);
@@ -30,6 +61,7 @@ public partial class Form1
                 list.Items.Add(new ListViewItem(new[] { entry.Name, entry.AuthKind switch
                 {
                     AccountAuthKind.OfficialOAuth => "ChatGPT OAuth（启动时验证 / 刷新）",
+                    AccountAuthKind.WebSession => "网页版 Session（到期需重新导入）",
                     AccountAuthKind.CompatibleApi => "兼容 API", _ => "PAT"
                 } }));
             foreach (var problem in batch.Problems)

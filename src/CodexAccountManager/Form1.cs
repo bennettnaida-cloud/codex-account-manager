@@ -8974,6 +8974,7 @@ public partial class Form1 : Form
 
     private string GetCredentialStateText(AccountRecord account, bool authReady)
     {
+        if (account.IsWebSession) return $"Session 到期：{_store.GetExpiryLabel(account.Name)}";
         if (account.IsOfficialOAuth)
         {
             return _codex.HasOfficialChatGptLogin(account) ? "ChatGPT 已登录"
@@ -9000,13 +9001,13 @@ public partial class Form1 : Form
             ? account.ApiBaseUrl
             : _store.GetExpiryLabel(account.Name);
 
-    private static string GetCredentialBadgeText(AccountRecord account) => account.IsOfficialOAuth
+    private static string GetCredentialBadgeText(AccountRecord account) => account.IsWebSession ? "SESSION" : account.IsOfficialOAuth
         ? "CHATGPT"
         : account.IsCompatibleApi
             ? "API KEY"
             : "TOKEN";
 
-    private static string GetCredentialActionText(AccountRecord account) => account.IsOfficialOAuth
+    private static string GetCredentialActionText(AccountRecord account) => account.IsWebSession ? "更新 Session" : account.IsOfficialOAuth
         ? "通过 ChatGPT 登录"
         : account.IsCompatibleApi
             ? "编辑 API"
@@ -15875,6 +15876,7 @@ public partial class Form1 : Form
         {
             var result = dialog.ShowDialog(this);
             if (result == DialogResult.Retry) { ImportAccountFiles(); return; }
+            if (result == DialogResult.Ignore) { ImportWebSession(); return; }
             if (result != DialogResult.OK) return;
             var account = CreateAccountFromDialog(dialog);
             try
@@ -15910,6 +15912,7 @@ public partial class Form1 : Form
 
     private async Task EditAccountAsync(AccountRecord account)
     {
+        if (account.IsWebSession) { ImportWebSession(account); return; }
         using var dialog = new AccountDialog(
             account,
             _store.RootPath,
@@ -19198,6 +19201,7 @@ public partial class Form1 : Form
 
     private async Task UpdateTokenAsync(AccountRecord account)
     {
+        if (account.IsWebSession) { ImportWebSession(account); return; }
         if (account.IsOfficialOAuth)
         {
             await LoginWithChatGptAsync(account);

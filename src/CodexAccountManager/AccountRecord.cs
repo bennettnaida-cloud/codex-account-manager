@@ -54,11 +54,13 @@ public sealed class AccountRecord
     public bool IsCompatibleApi =>
         AuthKind.Equals(AccountAuthKind.CompatibleApi, StringComparison.OrdinalIgnoreCase);
 
+    public bool IsWebSession => AuthKind.Equals(AccountAuthKind.WebSession, StringComparison.OrdinalIgnoreCase);
+
     // Unknown legacy values historically followed the Access Token path. Keep that
-    // fallback while giving official OAuth an explicit branch of its own.
+    // fallback. Browser Session accounts also use the local bearer-token transport.
     public bool IsAccessToken => !IsOfficialOAuth && !IsCompatibleApi;
 
-    public string AuthKindLabel => IsOfficialOAuth
+    public string AuthKindLabel => IsWebSession ? "网页版 Session" : IsOfficialOAuth
         ? "通过 ChatGPT 登录（官方）"
         : IsCompatibleApi
             ? "兼容 API"
@@ -70,6 +72,7 @@ public static class AccountAuthKind
     public const string AccessToken = "access_token";
     public const string OfficialOAuth = "official_oauth";
     public const string CompatibleApi = "compatible_api";
+    public const string WebSession = "web_session";
 
     public static string Normalize(string? value)
     {
@@ -79,6 +82,7 @@ public static class AccountAuthKind
         }
 
         var candidate = value.Trim();
+        if (candidate.Equals(WebSession, StringComparison.OrdinalIgnoreCase)) return WebSession;
         if (candidate.Equals(AccessToken, StringComparison.OrdinalIgnoreCase))
         {
             return AccessToken;

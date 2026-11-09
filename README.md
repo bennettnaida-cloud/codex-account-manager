@@ -17,7 +17,7 @@ Codex Account Manager 是一个在本机运行的 Codex 多账号管理器。它
 
 也可以打开 [Latest Release](https://github.com/bennettnaida-cloud/codex-account-manager/releases/tag/latest) 查看版本、发布时间和全部文件。
 
-当前发布版本为 2.3.41，内置 Codex CLI 0.163.0。Windows 每次从管理器启动官方 OAuth、PAT 或兼容 API 账号时，都会先在线获取该账号的模型目录，再启动客户端，不跳过最近 15 分钟内的查询。查询失败保留旧目录与现有客户端，并提示重试。“新增账号 → 从文件导入”支持 sub2api、CPA Codex、原生 auth.json、多选 JSON 及 ZIP，提供导入预览、凭据去重与独立目录。保留 5h 剩余 ≤10%、仅周额度剩余 ≤3% 的轮换暂停规则。详见 [2.3.41 更新说明](docs/release-2.3.41.md)。Windows 无需另装 .NET；macOS 包仍为 Electron 43.8.1 的 Apple Silicon 原生版本，保持原有独立实现，本次 Windows 启动与文件导入功能尚未移植到 Mac。
+当前发布版本为 2.3.42，内置 Codex CLI 0.163.0。Windows 新增“新增账号 → 网页版 Session”：在已登录 ChatGPT 的浏览器打开 `https://chatgpt.com/api/auth/session`，将完整 JSON 粘贴到导入窗口，也可通过文件导入 JSON/ZIP。自动读取邮箱、工作区和有效期；到期后使用“更新 Session”重新导入，不自动续期。Session 经本地网关使用，启动前在线获取模型，并保留额度查询、账号代理和轮换。每次启动 OAuth、PAT、Session 或兼容 API 账号前都会在线同步该账号模型，查询失败保留旧目录与现有客户端。文件导入继续支持 sub2api、CPA Codex、原生 auth.json；5h ≤10%、仅周额度 ≤3% 的轮换规则保持不变。详见 [2.3.42 更新说明](docs/release-2.3.42.md)。Windows 无需另装 .NET；macOS 同步版本号并保持原有功能，Windows 启动同步与文件/Session 导入尚未移植。
 
 保留旧会话续聊用量统计、轮换、逐账号代理与模型目录，以及升级时同步桌面和任务栏快捷方式。当前本机桌面版本为 Windows OpenAI.Codex 26.1002.7124.0（ChatGPT.exe）；专项回归并不等于已在所有电脑上完成交互实测，未来版本及第三方上游仍需按实际协议验证。
 

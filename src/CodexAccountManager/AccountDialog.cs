@@ -155,6 +155,16 @@ public sealed class AccountDialog : Form
         if (_isNewAccount)
         {
             safetyBadge.Visible = false;
+            heading.Width = 470;
+            var sessionButton = new ModernButton
+            {
+                Text = "网页版 Session", Left = 514, Top = 25, Width = 188, Height = 40,
+                Anchor = AnchorStyles.Top | AnchorStyles.Right, Radius = 12,
+                AccessibleName = "从网页版 api/auth/session JSON 导入账号"
+            };
+            ThemeStyler.ApplyPrimaryButton(sessionButton, palette);
+            sessionButton.Click += (_, _) => { DialogResult = DialogResult.Ignore; Close(); };
+            _heroCard.Controls.Add(sessionButton);
             var importButton = new ModernButton
             {
                 Text = "从文件导入", Left = 714, Top = 25, Width = 186, Height = 40,
