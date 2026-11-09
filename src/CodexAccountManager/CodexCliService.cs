@@ -350,7 +350,8 @@ public sealed partial class CodexCliService
                     ? ProjectOfficialOAuthConfigText(
                         current,
                         ReadAccountServiceTier(accountHome),
-                        routeThroughGateway: true)
+                        routeThroughGateway: true,
+                        modelCatalogPath: OfficialOAuthModelCatalogPath(account))
                     : ProjectWindowsClientConfigText(
                         current,
                         requiresOpenAiAuth: true,
@@ -2245,7 +2246,7 @@ public sealed partial class CodexCliService
         Directory.CreateDirectory(account.CodexHome);
         var configPath = Path.Combine(account.CodexHome, ConfigFileName);
         var current = File.Exists(configPath) ? File.ReadAllText(configPath) : "";
-        var projected = ProjectOfficialOAuthConfigText(current);
+        var projected = ProjectOfficialOAuthConfigText(current, modelCatalogPath: OfficialOAuthModelCatalogPath(account));
         if (!string.Equals(current, projected, StringComparison.Ordinal))
         {
             WriteTextAtomically(configPath, projected);
@@ -2313,6 +2314,9 @@ public sealed partial class CodexCliService
 
     public async Task<WindowsClientAccountProjection> PrepareWindowsClientAccountAsync(AccountRecord account)
     {
+        using var modelDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(50));
+        await EnsureOfficialOAuthLaunchCredentialAsync(account, modelDeadline.Token);
+        await PrepareLaunchModelCatalogAsync(account, modelDeadline.Token);
         return await Task.Run(() =>
         {
             using var switchMutex = new Mutex(false, WindowsClientSwitchMutexName);
@@ -2336,6 +2340,7 @@ public sealed partial class CodexCliService
                 PersistSharedServiceTierToSelectedAccount();
                 var status = ValidateWindowsClientAccountAsync(
                         account,
+                        localOnly: true,
                         accessTokenMode: AccessTokenSharedProfileMode.ApiCompatible)
                     .GetAwaiter()
                     .GetResult();
@@ -2524,6 +2529,8 @@ public sealed partial class CodexCliService
         // models, or a minimal model request here could consume quota and block this click for
         // one or more 120-second CLI timeouts. Codex++ performs the online validation when the
         // user opens it; explicit status/login actions remain available separately.
+        using var modelDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(50));
+        await EnsureOfficialOAuthLaunchCredentialAsync(account, modelDeadline.Token);
         LaunchPhase("launch-local-validation-start", "正在读取和校验本地账号配置…");
         var status = await Task.Run(async () =>
         {
@@ -2538,39 +2545,9 @@ public sealed partial class CodexCliService
         });
         LaunchPhase("launch-local-validation-complete", "本地凭据已核对，正在准备所选节点…",
             "online_login_probe=false; online_pat_model_probe=false");
-        if (account.IsAccessToken)
-        {
-            // Both desktop entry points use localOnly validation. Do not let that
-            // optimization skip model discovery: the renderer reads a custom catalog
-            // at process startup, so a later background write is too late for this launch.
-            // This sends metadata GETs only, before closing any working client.
-            LaunchPhase("launch-at-model-discovery-start", "正在同步此 AT 账号的可用模型（不发送聊天请求）…");
-            using var modelDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(25));
-            try
-            {
-                await Task.Run(async () =>
-                {
-                    await RefreshAccessTokenModelCatalogAsync(account, modelDeadline.Token,
-                        requireConfiguredModel: false, forceRemoteRefresh: false);
-                    ProjectAccessTokenSourceConfig(Path.Combine(account.CodexHome, ConfigFileName), account);
-                }, modelDeadline.Token);
-            }
-            catch (OperationCanceledException) when (modelDeadline.IsCancellationRequested)
-            {
-                throw new TimeoutException("AT 模型同步在 25 秒内未完成；当前 Codex 和共享登录凭据未切换。请检查此账号绑定的节点后重试。");
-            }
-            LaunchPhase("launch-at-model-discovery-complete", "AT 账号模型已准备，正在准备桌面启动…");
-        }
-        if (account.IsCompatibleApi)
-        {
-            // A compatible-API switch is destructive to the currently open client once the
-            // switch lock is taken.  Verify the configured proxy, endpoint and model catalog
-            // first so a stopped v2rayN/Clash process or a mistyped model cannot leave the user
-            // looking at a blank Codex window after the old profile has already been replaced.
-            LaunchPhase("launch-compatible-preflight-start", "正在核对兼容 API 的网络与模型目录…");
-            await EnsureCompatibleApiLaunchPreflightAsync(account);
-            LaunchPhase("launch-compatible-preflight-complete", "兼容 API 检查完成…");
-        }
+        try { await PrepareLaunchModelCatalogAsync(account, modelDeadline.Token); }
+        catch (OperationCanceledException) when (modelDeadline.IsCancellationRequested)
+        { throw new TimeoutException("启动前模型同步超时；当前 Codex 与共享凭据未切换，请检查所选账号的节点后重试。"); }
         // Resolve/start the selected node BEFORE closing the old client. A functioning
         // model gateway alone does not configure Chromium's OAuth/feature bootstrap.
         var desktopProxy = mode == WindowsClientMode.OfficialCodex
@@ -3384,6 +3361,7 @@ public sealed partial class CodexCliService
             ApiBaseUrl = account.ApiBaseUrl,
             ApiModel = account.ApiModel,
             AccessTokenModel = account.AccessTokenModel,
+            DiscoverDefaultModelOnLaunch = account.DiscoverDefaultModelOnLaunch,
             ApiWireApi = account.ApiWireApi,
             QuotaLimitType = account.QuotaLimitType,
             QuotaPrimaryWindowMinutes = account.QuotaPrimaryWindowMinutes,
@@ -4133,7 +4111,8 @@ public sealed partial class CodexCliService
                 ProjectOfficialOAuthConfigText(
                     current,
                     targetServiceTier,
-                    routeThroughGateway),
+                    routeThroughGateway,
+                    OfficialOAuthModelCatalogPath(account)),
                 StringComparison.Ordinal);
         }
         catch (Exception ex) when (
@@ -4201,7 +4180,8 @@ public sealed partial class CodexCliService
             var projectedConfig = ProjectOfficialOAuthConfigText(
                 currentConfig,
                 ReadAccountServiceTier(accountHome),
-                routeThroughGateway);
+                routeThroughGateway,
+                OfficialOAuthModelCatalogPath(account));
             if (!string.Equals(currentConfig, projectedConfig, StringComparison.Ordinal))
             {
                 WriteTextAtomically(sharedConfigPath, projectedConfig);
@@ -10495,6 +10475,23 @@ catch {
 
             if (!validateConfiguredModel) return;
 
+            if (account.DiscoverDefaultModelOnLaunch)
+            {
+                var discovered = modelIds.FirstOrDefault(IsUserSelectableCompatibleApiModelId)
+                    ?? throw new InvalidDataException("中转站没有返回可用于 Codex 的模型，未完成首次模型选择。");
+                if (!IsCompatibleModelCatalogIdentityCurrent(account, catalogIdentity))
+                    throw new InvalidOperationException("账号配置已变化，未修改默认模型。");
+                var store = new AccountStore();
+                var accounts = store.LoadAccounts();
+                var stored = accounts.Single(a => a.CodexHome.Equals(account.CodexHome, StringComparison.OrdinalIgnoreCase));
+                stored.ApiModel = discovered;
+                stored.DiscoverDefaultModelOnLaunch = false;
+                store.SaveAccounts(accounts);
+                account.ApiModel = discovered;
+                account.DiscoverDefaultModelOnLaunch = false;
+                return;
+            }
+
             if (modelIds.Contains(configuredModel, StringComparer.Ordinal) ||
                 GetCompatibleApiAllowedModels(account).Contains(configuredModel))
             {
@@ -13447,7 +13444,8 @@ catch {
     internal static string ProjectOfficialOAuthConfigText(
         string currentConfig,
         string? serviceTier = null,
-        bool routeThroughGateway = false)
+        bool routeThroughGateway = false,
+        string? modelCatalogPath = null)
     {
         currentConfig = RemoveManagedModelCatalog(currentConfig);
         var desktopServiceTier = serviceTier == null
@@ -13462,6 +13460,8 @@ catch {
             "forced_login_method = \"chatgpt\"",
             "service_tier = " + TomlString(desktopServiceTier)
         };
+        if (modelCatalogPath != null && !HasTopLevelModelCatalog(currentConfig))
+            output.Insert(0, "model_catalog_json = " + TomlString(modelCatalogPath) + ManagedModelCatalogMarker);
         // Existing desktop tasks can retain the built-in OpenAI provider. Both
         // OAuth entry points must reach the gateway when rotation is enabled.
         if (routeThroughGateway)

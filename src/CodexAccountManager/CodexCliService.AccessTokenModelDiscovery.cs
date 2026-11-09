@@ -24,11 +24,12 @@ public sealed partial class CodexCliService
         await gate.WaitAsync(cancellationToken);
         try
         {
-            // Read only this account's PAT. In particular, never borrow the shared
+            // Read only this account's credential. In particular, never borrow the shared
             // desktop's OAuth identity, environment API key or rotated gateway route.
             var authPath = Path.Combine(account.CodexHome, AuthFileName);
             var identity = Convert.ToHexString(BuildCanonicalJsonSha256(authPath));
-            var token = ReadQuotaTestCredential(account, authPath).Token;
+            var credential = ReadQuotaTestCredential(account, authPath);
+            var token = credential.Token;
             var version = await GetModelDiscoveryCliVersionAsync(cancellationToken);
             bool IsCurrent()
             {
@@ -36,7 +37,7 @@ public sealed partial class CodexCliService
                 {
                     var matches = new AccountStore().LoadAccounts().Where(a =>
                         a.CodexHome.Equals(account.CodexHome, StringComparison.OrdinalIgnoreCase)).ToArray();
-                    return matches.Length == 1 && matches[0].IsAccessToken &&
+                    return matches.Length == 1 && matches[0].AuthKind == account.AuthKind &&
                            Convert.ToHexString(BuildCanonicalJsonSha256(authPath)) == identity;
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
@@ -54,7 +55,9 @@ public sealed partial class CodexCliService
                     deadline.CancelAfter(TimeSpan.FromSeconds(20));
                     try
                     {
-                        return (await FetchAccessTokenRemoteModelsAsync(client, token, version, deadline.Token), version);
+                        return (account.IsOfficialOAuth
+                            ? await FetchOfficialOAuthRemoteModelsAsync(client, token, credential.AccountId!, version, deadline.Token)
+                            : await FetchAccessTokenRemoteModelsAsync(client, token, version, deadline.Token), version);
                     }
                     catch (OperationCanceledException) when (!ct.IsCancellationRequested)
                     { throw new TimeoutException("AT 在线模型查询超时；已保留上一份目录，未改动账号或默认模型。"); }
@@ -72,7 +75,7 @@ public sealed partial class CodexCliService
         if (!isCurrent()) throw new InvalidOperationException("AT 账号或凭据已变化；未发送模型查询。");
         var path = ManagedAccessTokenModelCatalogPath(account);
         var cached = ReadVerifiedAccessTokenCatalog(path, identity, out var fetchedAt, out var cachedVersion);
-        bool SupportsDefaults(JsonArray models) => CatalogSupportsAccessTokenDefaults(
+        bool SupportsDefaults(JsonArray models) => account.IsOfficialOAuth || CatalogSupportsAccessTokenDefaults(
             models, GetAccessTokenModel(account), AccessTokenReasoningEffort);
         void ReportDefaultMismatch(JsonArray models)
         {

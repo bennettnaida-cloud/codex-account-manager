@@ -121,7 +121,40 @@ public sealed partial class CodexCliService
                 !ModelCatalogUpdatedSince(path, null) &&
                 !ModelCatalogUpdatedSince(Path.Combine(directory, "missing.json"), DateTime.UtcNow.AddMinutes(-1).Ticks),
                 "only a newer catalog and a known exact process identity justify reload on an explicit launch");
-            Console.WriteLine("PASS: AT remote discovery, static-cache bypass, future metadata, workspace isolation, cancellation, last-good retention, stale/default handling");
+            var oauthCalls = 0;
+            handler.Respond = (request, ct) =>
+            {
+                oauthCalls++;
+                Check(request.RequestUri!.Host == "chatgpt.com" && request.RequestUri.AbsolutePath == "/backend-api/codex/models",
+                    "OAuth models must not call PAT whoami or borrow an API provider endpoint");
+                Check(request.Headers.Authorization?.ToString() == "Bearer oauth-fixture-only" &&
+                      request.Headers.GetValues("chatgpt-account-id").Single() == "oauth-fixture-account", "OAuth identity isolation");
+                return Task.FromResult(Response(HttpStatusCode.OK, remoteJson));
+            };
+            var oauthModels = await FetchOfficialOAuthRemoteModelsAsync(client, "oauth-fixture-only", "oauth-fixture-account", "0.163.0", CancellationToken.None);
+            Check(oauthCalls == 1 && oauthModels.Count == remote.Count, "OAuth discovery preserves new model metadata");
+            var oauthConfig = ProjectOfficialOAuthConfigText("", modelCatalogPath: path);
+            Check(oauthConfig.Contains(TomlString(path)) &&
+                ProjectOfficialOAuthConfigText(oauthConfig, modelCatalogPath: path) == oauthConfig, "OAuth catalog projection and idempotence");
+            Check(ProjectOfficialOAuthConfigText("model_catalog_json = \"custom.json\"\n", modelCatalogPath: path).Contains("\"custom.json\""),
+                "explicit user model catalog remains intact");
+            var oauthAuth = JsonNode.Parse("""{"tokens":{"access_token":"old-fixture","refresh_token":"fixture-refresh-only","id_token":"","account_id":"oauth-fixture-account"}}""")!.AsObject();
+            handler.Respond = async (request, ct) =>
+            {
+                Check(request.Method == HttpMethod.Post && request.RequestUri!.AbsoluteUri == "https://auth.openai.com/oauth/token", "fixed OAuth refresh endpoint");
+                var form = await request.Content!.ReadAsStringAsync(ct);
+                Check(form.Contains("grant_type=refresh_token") && form.Contains(CodexOAuthClientId), "Codex refresh grant");
+                return Response(HttpStatusCode.OK, """{"access_token":"refreshed-fixture","id_token":"id-fixture","refresh_token":"rotated-fixture"}""");
+            };
+            await RefreshOfficialOAuthCredentialCoreAsync(oauthAuth, client, CancellationToken.None);
+            Check(oauthAuth["tokens"]!["refresh_token"]!.GetValue<string>() == "rotated-fixture" &&
+                  oauthAuth["tokens"]!["id_token"]!.GetValue<string>() == "id-fixture", "refresh completes imported OAuth and retains rotated refresh token");
+            var beforeFailure = oauthAuth.ToJsonString();
+            handler.Respond = (_, _) => Task.FromResult(Response(HttpStatusCode.BadRequest, "sensitive-provider-body"));
+            try { await RefreshOfficialOAuthCredentialCoreAsync(oauthAuth, client, CancellationToken.None); throw new Exception("refresh unexpectedly succeeded"); }
+            catch (InvalidOperationException ex) { Check(!ex.Message.Contains("sensitive-provider-body"), "OAuth errors redact provider bodies"); }
+            Check(oauthAuth.ToJsonString() == beforeFailure, "failed refresh preserves credentials");
+            Console.WriteLine("PASS: PAT/OAuth remote discovery, fresh-cache bypass, future metadata, identity isolation, cancellation, last-good retention, OAuth refresh and projection");
         }
         finally { Directory.Delete(directory, recursive: true); }
 

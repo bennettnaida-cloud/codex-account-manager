@@ -8639,7 +8639,7 @@ public partial class Form1 : Form
         _patAutoRotationThresholdButton.Radius = 12;
         _patAutoRotationThresholdButton.Font = new Font(Font.FontFamily, 8.6F);
         _patAutoRotationThresholdButton.MinimumFontSize = 7.8F;
-        _patAutoRotationThresholdButton.AccessibleName = "自动计算的账号轮换动态安全余量";
+        _patAutoRotationThresholdButton.AccessibleName = "轮换保留线：5h 剩余 10%，仅周额度剩余 3%";
         ThemeStyler.ApplySoftButton(_patAutoRotationThresholdButton, _palette);
         panel.Controls.Add(_patAutoRotationThresholdButton);
 
@@ -8660,7 +8660,7 @@ public partial class Form1 : Form
 
         var note = new Label
         {
-            Text = "5h 剩余额度进入动态安全余量并经官方只读监控确认后，仅标记待轮换；当前响应会继续，下一次模型请求按使用池、备用池顺序切换。不会关闭 Codex，也不会自动重发上一条消息。",
+            Text = "5h 剩余 ≤10%、仅周额度剩余 ≤3% 时暂停该账号，新请求按使用池、备用池顺序换号。以最新官方额度为准；当前响应继续完成，额度恢复后重新可选。",
             Left = innerLeft,
             Top = 478,
             Width = innerWidth,
@@ -8968,7 +8968,7 @@ public partial class Form1 : Form
     private bool HasUsableAccountCredential(AccountRecord account)
     {
         return account.IsOfficialOAuth
-            ? _codex.HasOfficialChatGptLogin(account)
+            ? _codex.HasOfficialChatGptLogin(account) || CodexCliService.HasRefreshableOfficialOAuthCredential(account)
             : File.Exists(Path.Combine(account.CodexHome, "auth.json"));
     }
 
@@ -8976,7 +8976,8 @@ public partial class Form1 : Form
     {
         if (account.IsOfficialOAuth)
         {
-            return authReady ? "ChatGPT 已登录" : "等待 ChatGPT 登录";
+            return _codex.HasOfficialChatGptLogin(account) ? "ChatGPT 已登录"
+                : authReady ? "已导入 · 启动时刷新凭据" : "等待 ChatGPT 登录";
         }
         if (account.IsCompatibleApi)
         {
@@ -10587,6 +10588,15 @@ public partial class Form1 : Form
             // not make every account appear to have the selected account's empty state.
             // The store contains no token and silently degrades if the cache is unavailable.
             _quotaSnapshotStore.Save(account, info, observedAtUtc);
+            var rotationWindow = PatAutoRotationPolicy.SelectRotationWindow(info);
+            if (rotationWindow?.UsedPercent != null &&
+                !PatAutoRotationPolicy.EvaluateQuotaSafety(rotationWindow, null, null, observedAtUtc).ShouldRotate &&
+                (rotationWindow.ResetsAtUtc == null || rotationWindow.ResetsAtUtc > observedAtUtc))
+            {
+                // A fresh official read above the reserve also releases a persisted
+                // pause (including a manual quota reset); missing data does not.
+                RecordPatRotationAccountAvailable(account);
+            }
         }
         catch
         {
@@ -15861,8 +15871,11 @@ public partial class Form1 : Form
             _palette,
             _accounts.Select(account => account.CodexHome),
             _codex);
-        while (dialog.ShowDialog(this) == DialogResult.OK)
+        while (true)
         {
+            var result = dialog.ShowDialog(this);
+            if (result == DialogResult.Retry) { ImportAccountFiles(); return; }
+            if (result != DialogResult.OK) return;
             var account = CreateAccountFromDialog(dialog);
             try
             {
@@ -17415,7 +17428,7 @@ public partial class Form1 : Form
         }
 
         var accountKey = QuotaAccountIdentity.CreateKey(account);
-        var fiveHourWindow = PatAutoRotationPolicy.SelectFiveHourWindow(info);
+        var fiveHourWindow = PatAutoRotationPolicy.SelectRotationWindow(info);
         LocalPatGatewayActivitySnapshot? activity = null;
         try
         {
@@ -17521,13 +17534,11 @@ public partial class Form1 : Form
 
         if (transparentGatewayRetry)
         {
-            // v5/v6 select and validate the next credential inside the real model request.
-            // The quota observer may persist the source as exhausted, but it must never
-            // create a manager-side cancellation/Prepare task: doing so would pre-activate
-            // a route merely because the official quota endpoint reported a low margin.
+            // The gateway enforces the reserve before the next real model request.
+            // Keep in-flight responses running and commit only a successful candidate.
             _statusBox.Text =
-                $"{account.Name} 的官方 5h 额度已连续确认用尽；" +
-                "已记录其重置时间。下一次真实模型请求由透明网关按轮换顺序试号，" +
+                $"{account.Name} 的剩余额度已达到保留线（5h 10% / 仅周额度 3%）；" +
+                "已暂停该账号。下一次模型请求由网关按轮换顺序换号，" +
                 "只有完整成功的候选才会成为当前账号。";
             UpdatePatAutoRotationControls();
             return;
@@ -17536,7 +17547,7 @@ public partial class Form1 : Form
         var cancellation = new CancellationTokenSource();
         _patAutoRotationBoundaryCancellation = cancellation;
         _statusBox.Text =
-            $"{account.Name} 的官方 5h 额度已确认达到 100%；" +
+            $"{account.Name} 的剩余额度已达到保留线；" +
             "正在校验下一个轮换账号，当前响应不会被关闭或重放。";
         UpdatePatAutoRotationControls();
         _ = PreparePatAutoRotationAsync(accountKey, now, cancellation);
@@ -17642,7 +17653,7 @@ public partial class Form1 : Form
                         return true;
                     }
                     return snapshots.TryGetValue(key, out var snapshot) &&
-                           PatAutoRotationPolicy.HasLocallyAvailableFiveHourQuota(
+                           PatAutoRotationPolicy.HasLocallyAvailableRotationQuota(
                                snapshot,
                                confirmedExhaustions.GetValueOrDefault(key),
                                nowUtc);
@@ -17924,7 +17935,7 @@ public partial class Form1 : Form
                 cancellationToken: timeout.Token);
             CacheUsageLimitResetInfo(candidate, info);
 
-            var fiveHour = PatAutoRotationPolicy.SelectFiveHourWindow(info);
+            var fiveHour = PatAutoRotationPolicy.SelectRotationWindow(info);
             if (fiveHour != null)
             {
                 if (!fiveHour.UsedPercent.HasValue)
@@ -18099,7 +18110,8 @@ public partial class Form1 : Form
             var usage = _quotaUsageCache == null
                 ? null
                 : FindUsageForAccount(_quotaUsageCache, account);
-            var resetAtUtc = usage?.GetQuotaWindow(AccountQuotaWindowKind.FiveHour)?.ResetAtUtc;
+            var resetAtUtc = (usage?.GetQuotaWindow(AccountQuotaWindowKind.FiveHour)
+                              ?? usage?.GetQuotaWindow(AccountQuotaWindowKind.Weekly))?.ResetAtUtc;
             if (!resetAtUtc.HasValue &&
                 _appSettings.AccountRotationResetAtUtc.TryGetValue(accountKey, out var persistedReset))
             {
@@ -20162,7 +20174,7 @@ public partial class Form1 : Form
         else
         {
             _statusBox.Text =
-                "已开启账号轮换；5h 剩余额度进入动态安全余量并连续确认后，" +
+                "已开启账号轮换；5h 剩余 ≤10%、仅周额度剩余 ≤3% 时暂停并换号，" +
                 "当前响应继续运行，下一次模型请求按轮换池顺序切换。";
         }
         UpdatePatAutoRotationControls();
@@ -20172,9 +20184,7 @@ public partial class Form1 : Form
     {
         if (!_patAutoRotationThresholdButton.IsDisposed)
         {
-            _patAutoRotationThresholdButton.Text = _patAutoRotationLastDecision is { } decision
-                ? $"动态余量 {decision.SafetyMarginPercent:0.#}%"
-                : "动态余量";
+            _patAutoRotationThresholdButton.Text = "保留 10% / 3%";
             _patAutoRotationThresholdButton.Enabled = false;
         }
         if (!_patAutoRotationToggleButton.IsDisposed)
@@ -20189,7 +20199,7 @@ public partial class Form1 : Form
                 ? "已关闭"
                 : _patAutoRotationState switch
                 {
-                    PatAutoRotationState.PendingQuotaExhaustion => "进入安全余量 · 校验候选账号",
+                    PatAutoRotationState.PendingQuotaExhaustion => "已达保留线 · 等待请求换号",
                     PatAutoRotationState.WaitingForRequestBoundary => "已就绪 · 下一次请求切换",
                     PatAutoRotationState.Switching => "正在准备下一个账号",
                     PatAutoRotationState.FallbackApi => "已进入备用轮换池",

@@ -33,6 +33,9 @@ public sealed class AccountRecord
     [JsonPropertyName("useBundledCompatibleApiModelCatalog")]
     public bool UseBundledCompatibleApiModelCatalog { get; set; }
 
+    [JsonPropertyName("discoverDefaultModelOnLaunch")]
+    public bool DiscoverDefaultModelOnLaunch { get; set; }
+
     [JsonPropertyName("quotaLimitType")]
     public string QuotaLimitType { get; set; } = AccountQuotaLimitType.Unknown;
 

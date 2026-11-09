@@ -37,7 +37,6 @@ public sealed partial class CodexCliService
 
     private static bool RunningDesktopHasOlderAccountCatalog(AccountRecord account)
     {
-        if (!account.IsAccessToken && !account.IsCompatibleApi) return false;
         var config = Path.Combine(GetDefaultCodexHome(), ConfigFileName);
         try
         {
@@ -47,7 +46,7 @@ public sealed partial class CodexCliService
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return false; }
         var owner = FindExistingOfficialWindow();
         if (owner == null) return false;
-        var path = account.IsAccessToken ? ManagedAccessTokenModelCatalogPath(account)
+        var path = !account.IsCompatibleApi ? ManagedAccessTokenModelCatalogPath(account)
             : ManagedCompatibleModelCatalogPath(account.CodexHome);
         return ModelCatalogUpdatedSince(path, owner.StartTimeUtcTicks);
     }

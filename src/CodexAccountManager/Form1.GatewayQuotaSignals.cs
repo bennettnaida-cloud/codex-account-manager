@@ -948,11 +948,11 @@ public partial class Form1
             return false;
         }
 
-        // A newer official quota read showing a live, sub-100% five-hour window is stronger
+        // A newer official quota read above the reserve is stronger
         // evidence than an older gateway event.  This is the switch-time re-review that
         // prevents one historical 429 from continuing to eject a recovered account.
         return fiveHourWindow?.UsedPercent is { } usedPercent &&
-               usedPercent < 100D &&
+               !PatAutoRotationPolicy.EvaluateQuotaSafety(fiveHourWindow, null, null, nowUtc).ShouldRotate &&
                (fiveHourWindow.ResetsAtUtc == null ||
                 fiveHourWindow.ResetsAtUtc > nowUtc);
     }
@@ -1035,23 +1035,15 @@ public partial class Form1
             return null;
         }
 
-        if (AccountQuotaLimitType.ClassifyWindow(snapshot.WindowMinutes) ==
-            AccountQuotaWindowKind.FiveHour)
-        {
-            return new UsageRateLimitWindow(
+        return PatAutoRotationPolicy.SelectRotationWindow(
+            new UsageRateLimitWindow(
                 NormalizeGatewaySignalUsedPercent(snapshot.UsedPercent),
                 snapshot.WindowMinutes,
-                snapshot.ResetsAtUtc);
-        }
-        if (AccountQuotaLimitType.ClassifyWindow(snapshot.SecondaryWindowMinutes) ==
-            AccountQuotaWindowKind.FiveHour)
-        {
-            return new UsageRateLimitWindow(
+                snapshot.ResetsAtUtc),
+            new UsageRateLimitWindow(
                 NormalizeGatewaySignalUsedPercent(snapshot.SecondaryUsedPercent),
                 snapshot.SecondaryWindowMinutes,
-                snapshot.SecondaryResetsAtUtc);
-        }
-        return null;
+                snapshot.SecondaryResetsAtUtc));
     }
 
     private static int? NormalizeGatewaySignalUsedPercent(double? value) =>

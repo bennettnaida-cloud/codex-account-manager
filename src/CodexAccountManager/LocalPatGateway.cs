@@ -2571,6 +2571,7 @@ internal sealed partial class LocalPatGatewayHost
             var globalRouteQuotaSeen = false;
             HttpResponseMessage? finalUpstreamResponse = null;
             var hadSuccessfulTransparentRetry = false;
+            var rotatedForQuotaReserve = false;
             var transient429CandidateFailoverCount = 0;
             var preserveAffinityBindingOnSuccess = false;
             string? successfulProxyNodeId = null;
@@ -2578,6 +2579,34 @@ internal sealed partial class LocalPatGatewayHost
 
             while (finalUpstreamResponse == null)
             {
+                // Admission happens before sending any bytes, including ordinary sticky
+                // routes and fallback attempts. Reserve pauses are not synthetic 429s and
+                // must never be persisted as upstream-confirmed quota exhaustion.
+                if (isModelRequest && !isIndependentAccountProbe && IsQuotaReservePausedForRotation(credential))
+                {
+                    if (strictResponseAffinity || !(affinityRequest?.AllowCrossAccountReplay ?? true) ||
+                        (context.Request.HasEntityBody && replayableBody == null))
+                    {
+                        await WriteErrorAsync(response, HttpStatusCode.Conflict,
+                            "原账号已达到额度保留线，当前续聊不能安全跨账号。请等待额度恢复，或开始新会话。");
+                        return;
+                    }
+                    if (!string.IsNullOrWhiteSpace(credential.AccountKey))
+                        attemptedAccountKeys.Add(credential.AccountKey);
+                    if (!TrySelectNextTransparentRotationCredential(credential, attemptedAccountKeys,
+                            allowCompatibleApiRetry, out var reserveCandidate, out var reserveOrdinal, out _))
+                    {
+                        await WriteErrorAsync(response, HttpStatusCode.ServiceUnavailable,
+                            "轮换池暂无可用账号：5h 剩余 ≤10%、仅周额度剩余 ≤3% 的账号已暂停。请等待额度恢复或添加可用账号。");
+                        return;
+                    }
+                    globalRouteQuotaSeen |= string.Equals(credential.AccountKey,
+                        globalRouteSourceAccountKey, StringComparison.Ordinal);
+                    credential = reserveCandidate!;
+                    rotatedForQuotaReserve = true;
+                    WriteTransparentRotationDiagnostic("quota-reserve", reserveOrdinal, "official-quota-reserve");
+                    continue;
+                }
                 modelRequestActivity?.UpdateAccountKey(credential.AccountKey);
                 upstreamUri = chatGptUpstreamUri;
                 if (credential.IsCompatibleApi &&
@@ -3496,7 +3525,7 @@ internal sealed partial class LocalPatGatewayHost
                         "durable_quota_marker=false; global_cursor_advance=false; " +
                         "downstream_bytes=0");
                 }
-                hadSuccessfulTransparentRetry = lastQuotaResponse != null;
+                hadSuccessfulTransparentRetry = lastQuotaResponse != null || rotatedForQuotaReserve;
                 if (lastQuotaResponse != null)
                 {
                     lastQuotaResponse.Dispose();
@@ -3742,6 +3771,11 @@ internal sealed partial class LocalPatGatewayHost
             new
             {
                 status = proxy == null ? "proxy_required" : "ready",
+                quotaReserve = new
+                {
+                    fiveHourRemainingPercent = PatAutoRotationPolicy.FiveHourRemainingReserve,
+                    weeklyOnlyRemainingPercent = PatAutoRotationPolicy.WeeklyOnlyRemainingReserve
+                },
                 proxyConfigured = proxy != null,
                 listen = $"127.0.0.1:{LocalPatGateway.Port}",
                 activity = new
@@ -4359,6 +4393,7 @@ internal sealed partial class LocalPatGatewayHost
         AccountRotationConfiguration.MarkUsed(settings, currentAccount);
         var now = DateTimeOffset.UtcNow;
         var unavailable = new HashSet<string>(attemptedAccountKeys, StringComparer.Ordinal);
+        var reservePaused = GetQuotaReservePausedAccountKeys(accounts, now);
         foreach (var pair in _quotaLimitedAccounts.ToArray())
         {
             if (!IsQuotaLimitObservationActive(pair.Value, now))
@@ -4384,7 +4419,8 @@ internal sealed partial class LocalPatGatewayHost
                     hasUsableCredential: static _ => true,
                     out var candidate,
                     out pool,
-                    canSelectAccount: account => allowCompatibleApi || !account.IsCompatibleApi,
+                    canSelectAccount: account => (allowCompatibleApi || !account.IsCompatibleApi) &&
+                        !reservePaused.Contains(QuotaAccountIdentity.CreateKey(account)),
                     hardUnavailableAccountKeys: attemptedAccountKeys))
             {
                 return false;

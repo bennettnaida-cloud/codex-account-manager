@@ -74,12 +74,20 @@ jobs:
           $atTest = Start-Process -FilePath $startupExe -ArgumentList '--access-token-model-self-test' -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput 'at-model-self-test.out' -RedirectStandardError 'at-model-self-test.err'
           Get-Content 'at-model-self-test.out','at-model-self-test.err'
           if ($atTest.ExitCode -ne 0) { throw 'AT remote model discovery regression test failed.' }
+          $importTest = Start-Process -FilePath $startupExe -ArgumentList '--account-import-self-test' -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput 'import-self-test.out' -RedirectStandardError 'import-self-test.err'
+          Get-Content 'import-self-test.out','import-self-test.err'
+          if ($importTest.ExitCode -ne 0) { throw 'Account file import regression test failed.' }
+          $rotationTest = Start-Process -FilePath $startupExe -ArgumentList '--gateway-rotation-self-test' -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput 'rotation-self-test.out' -RedirectStandardError 'rotation-self-test.err'
+          Get-Content 'rotation-self-test.out','rotation-self-test.err'
+          if ($rotationTest.ExitCode -ne 0) { throw 'Quota reserve rotation regression test failed.' }
           $catalogCli = Join-Path $env:CODEX_ACCOUNT_MANAGER_CODEX_RUNTIME '@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe'
           if (-not (Test-Path -LiteralPath $catalogCli -PathType Leaf)) {
             throw 'Bundled Codex CLI is missing; model catalog verification cannot run.'
           }
           & node .\tools\Test-AutomaticModelCatalog.cjs $startupExe $catalogCli
           if ($LASTEXITCODE -ne 0) { throw 'Automatic model catalog regression test failed.' }
+          & node .\tools\Test-LaunchModelPreflight.cjs $startupExe
+          if ($LASTEXITCODE -ne 0) { throw 'Launch model preflight regression test failed.' }
           & .\Build-OneClickInstallerPackage.ps1 -OutputPath (Join-Path $PWD 'CodexAccountManager-Windows-latest.zip')
           if ($LASTEXITCODE -ne 0) { throw 'Windows installer package build failed.' }
           $versionedPackage = 'CodexAccountManager-Windows-{0}.zip' -f $env:CAM_VERSION

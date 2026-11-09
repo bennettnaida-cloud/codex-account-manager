@@ -224,6 +224,30 @@ static class Program
         {
             return RunGatewayQuotaSignalSelfTest();
         }
+        var preflightIndex = Array.FindIndex(args, a => a == "--launch-model-preflight");
+        if (preflightIndex >= 0)
+        {
+            try
+            {
+                if (preflightIndex + 1 >= args.Length) return 2;
+                var account = new AccountStore().LoadAccounts().Single(a => a.Name == args[preflightIndex + 1]);
+                using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(50));
+                new CodexCliService().PrepareLaunchModelCatalogAsync(account, deadline.Token).GetAwaiter().GetResult();
+                Console.WriteLine("Launch model preflight passed.");
+                return 0;
+            }
+            catch
+            {
+                Console.Error.WriteLine("Launch model preflight failed; shared credentials were not changed.");
+                return 1;
+            }
+        }
+        if (args.Contains("--account-import-self-test", StringComparer.OrdinalIgnoreCase))
+        {
+            AccountFileImportTests.Validate();
+            Console.WriteLine("Account file import self-test passed.");
+            return 0;
+        }
         if (args.Contains("--gateway-rotation-self-test", StringComparer.OrdinalIgnoreCase))
         {
             CodexCliService.ValidateOfficialOAuthProfileProjection();

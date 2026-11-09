@@ -3,7 +3,7 @@ using System.Text.Json;
 
 namespace CodexAccountManager;
 
-public sealed class AccountStore
+public sealed partial class AccountStore
 {
     internal const string ManagedProviderId = "codex_account_manager";
     internal const string CompatibleApiProviderId = ManagedProviderId;

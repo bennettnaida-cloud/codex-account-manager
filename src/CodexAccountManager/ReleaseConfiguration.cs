@@ -7,8 +7,8 @@ namespace CodexAccountManager;
 /// </summary>
 internal static class ReleaseConfiguration
 {
-    internal const string Version = "2.3.39";
-    // Startup/catalog changes do not change the wire protocol; keep the compatible 2.3.24 listener
+    internal const string Version = "2.3.41";
+    // Reserve admission does not change the wire protocol; keep the compatible 2.3.24 listener
     // and persisted routing state so upgrading the UI does not interrupt requests.
     internal const int GatewayPort = 8341;
     internal const string GatewayPortText = "8341";

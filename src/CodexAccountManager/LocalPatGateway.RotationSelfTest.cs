@@ -21,10 +21,16 @@ internal sealed partial class LocalPatGatewayHost
         await ValidateCaseAsync(403, AccountRotationPool.Primary, true, authorizationError: true);
         await ValidateCaseAsync(402, AccountRotationPool.Primary, true, manual: true);
         await ValidateCaseAsync(402, AccountRotationPool.Primary, true, manual: true, oauthSource: true);
+        await ValidateCaseAsync(402, AccountRotationPool.Primary, true, reserveUsed: 90);
+        await ValidateCaseAsync(402, AccountRotationPool.Backup, true, reserveUsed: 97, reserveMinutes: 10080);
+        await ValidateCaseAsync(402, AccountRotationPool.None, true, reserveUsed: 90);
+        await ValidateCaseAsync(402, AccountRotationPool.Primary, true, reserveUsed: 90, strictContinuation: true);
+        await ValidateCaseAsync(402, AccountRotationPool.Primary, true, reserveUsed: 90, targetFailure: true);
 
         static async Task ValidateCaseAsync(
             int status, AccountRotationPool targetPool, bool enabled, bool authorizationError = false, bool manual = false,
-            bool oauthSource = false)
+            bool oauthSource = false, int? reserveUsed = null, long reserveMinutes = 300,
+            bool strictContinuation = false, bool targetFailure = false)
         {
             var root = Path.Combine(Path.GetTempPath(), "cam-rotation-test-" + Guid.NewGuid().ToString("N"));
             var previousRoot = Environment.GetEnvironmentVariable("CODEX_ACCOUNT_MANAGER_HOME");
@@ -52,14 +58,35 @@ internal sealed partial class LocalPatGatewayHost
                             refresh_token = "fixture-only", account_id = "fixture-account" }
                     }));
                 }
-                var accounts = new[] { source, target };
+                var pausedCandidate = MakeAccount("paused-candidate");
+                if (reserveUsed.HasValue)
+                {
+                    source.AuthKind = AccountAuthKind.AccessToken;
+                    sourceToken = "at-source-reserve-fixture-only";
+                    File.WriteAllText(Path.Combine(source.CodexHome, "auth.json"),
+                        JsonSerializer.Serialize(new { OPENAI_API_KEY = sourceToken }));
+                    pausedCandidate.AuthKind = AccountAuthKind.AccessToken;
+                    // An invalid credential proves quota filtering precedes credential use.
+                    File.WriteAllText(Path.Combine(pausedCandidate.CodexHome, "auth.json"), "{}");
+                }
+                var accounts = reserveUsed.HasValue ? new[] { source, pausedCandidate, target } : new[] { source, target };
                 File.WriteAllText(Path.Combine(root, "accounts.json"), JsonSerializer.Serialize(accounts));
                 var settings = new AppSettings { AccountRotationEnabled = true, PatGatewayProxyAutoDetect = false };
                 AccountRotationConfiguration.SetPool(settings, accounts, source, AccountRotationPool.Primary);
+                if (reserveUsed.HasValue)
+                    AccountRotationConfiguration.SetPool(settings, accounts, pausedCandidate, AccountRotationPool.Primary);
                 AccountRotationConfiguration.SetPool(settings, accounts, target, targetPool);
                 settings.AccountRotationEnabled = enabled;
                 settings.PatAutoRotationEnabled = enabled;
                 new ThemeService(root).SaveSettings(settings);
+                var quotaStore = new QuotaSnapshotStore(root);
+                if (reserveUsed.HasValue)
+                {
+                    var info = new UsageLimitResetInfo(null, [], null,
+                        new UsageRateLimitWindow(reserveUsed, reserveMinutes, null), null, null, null);
+                    quotaStore.Save(source, info, DateTimeOffset.UtcNow);
+                    quotaStore.Save(pausedCandidate, info, DateTimeOffset.UtcNow);
+                }
 
                 var seen = new List<string>();
                 upstreamTask = Task.Run(async () =>
@@ -74,7 +101,7 @@ internal sealed partial class LocalPatGatewayHost
                             throw new InvalidOperationException("Failover changed the model or request input.");
                         var isSource = context.Request.Headers["Authorization"] == "Bearer sk-source-fixture-only";
                         seen.Add(isSource ? "source" : "target");
-                        context.Response.StatusCode = isSource ? status : 200;
+                        context.Response.StatusCode = isSource ? status : targetFailure ? 500 : 200;
                         context.Response.ContentType = "application/json";
                         var errorCode = authorizationError ? "permission_denied" : "insufficient_balance";
                         var payload = isSource
@@ -85,6 +112,13 @@ internal sealed partial class LocalPatGatewayHost
                     }
                 });
                 host = new LocalPatGatewayHost("X-Rotation-Fixture", "1", new Uri(gateway.Prefixes.Single()).Port);
+                if (reserveUsed.HasValue)
+                {
+                    var lease = host._sessionAffinityStore.ResolveOrClaim(
+                        [PatGatewaySessionAffinityKey.Session("reserve-session")], QuotaAccountIdentity.CreateKey(source));
+                    host._sessionAffinityStore.ConfirmAndBindResponses(lease, ["resp_reserve_source"],
+                        QuotaAccountIdentity.CreateKey(source));
+                }
                 if (manual)
                     host._rotationStore.Arm(QuotaAccountIdentity.CreateKey(source),
                         QuotaAccountIdentity.CreateKey(target), DateTimeOffset.UtcNow);
@@ -94,11 +128,38 @@ internal sealed partial class LocalPatGatewayHost
                 using var request = new HttpRequestMessage(HttpMethod.Post,
                     gateway.Prefixes.Single() + "backend-api/codex/responses");
                 request.Headers.Authorization = new("Bearer", sourceToken);
+                if (reserveUsed.HasValue) request.Headers.Add("session_id", "reserve-session");
                 request.Content = new StringContent(
-                    "{\"model\":\"gpt-6-astra\",\"input\":\"rotation fixture\",\"stream\":false}", Encoding.UTF8, "application/json");
+                    "{\"model\":\"gpt-6-astra\",\"input\":\"rotation fixture\",\"stream\":false" +
+                    (strictContinuation ? ",\"previous_response_id\":\"resp_reserve_source\"" : "") + "}", Encoding.UTF8, "application/json");
                 using var response = await client.SendAsync(request, cancellation.Token);
                 var responseText = await response.Content.ReadAsStringAsync(cancellation.Token);
                 await handle.WaitAsync(cancellation.Token);
+                if (reserveUsed.HasValue)
+                {
+                    var dispatched = targetPool != AccountRotationPool.None && !strictContinuation;
+                    var successful = dispatched && !targetFailure;
+                    var expectedStatus = strictContinuation ? 409 : !dispatched ? 503 : targetFailure ? 500 : 200;
+                    if ((int)response.StatusCode != expectedStatus ||
+                        !seen.SequenceEqual(dispatched ? new[] { "target" } : Array.Empty<string>()))
+                        throw new InvalidOperationException($"Reserve admission failed: {response.StatusCode}; {responseText}");
+                    if (host._quotaSignalStore.ReadLatestForAccount(QuotaAccountIdentity.CreateKey(source), DateTimeOffset.UtcNow) != null)
+                        throw new InvalidOperationException("Reserve admission fabricated a quota-exhaustion signal.");
+                    if ((host._rotationStore.Load().Status == PatGatewayRotationStatus.Active) != successful)
+                        throw new InvalidOperationException("Reserve rotation must commit only a completed successful response.");
+                    var binding = host._sessionAffinityStore.ResolveOrClaim(
+                        [PatGatewaySessionAffinityKey.Session("reserve-session")], QuotaAccountIdentity.CreateKey(source));
+                    if (binding.AccountKey != QuotaAccountIdentity.CreateKey(successful ? target : source))
+                        throw new InvalidOperationException("Reserve rotation did not preserve/advance ordinary session affinity correctly.");
+                    host._sessionAffinityStore.ReleaseFailed(binding);
+                    quotaStore.Save(source, new UsageLimitResetInfo(null, [],
+                        new UsageRateLimitWindow(0, reserveMinutes, DateTimeOffset.UtcNow.AddDays(1)), null, null, null, null),
+                        DateTimeOffset.UtcNow);
+                    if (host.IsQuotaReservePausedForRotation(host.ResolveRotationCredential(QuotaAccountIdentity.CreateKey(source))))
+                        throw new InvalidOperationException("A fresh recovered snapshot must release a reserve pause without restarting.");
+                    Console.WriteLine($"Reserve admission: {reserveMinutes}m used={reserveUsed}, pool={targetPool}, strict={strictContinuation}, failure={targetFailure}: passed");
+                    return;
+                }
                 var shouldRotate = enabled && targetPool != AccountRotationPool.None && !authorizationError;
                 var expected = manual ? new[] { "target" } : shouldRotate ? new[] { "source", "target" } : new[] { "source" };
                 if (!seen.SequenceEqual(expected) || (int)response.StatusCode != (shouldRotate ? 200 : status))

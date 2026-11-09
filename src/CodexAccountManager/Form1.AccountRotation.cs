@@ -308,7 +308,7 @@ public partial class Form1
             _appSettings.AccountRotationBackupCursorAccountKey);
         // Keep each pool on its own line.  A single combined line silently clipped the
         // backup cursor when either account name was long or Windows text scaling was high.
-        return $"上次位置\r\n使用轮换池：{primary}\r\n备用轮换池：{backup}";
+        return $"暂停并换号：5h 剩余 ≤10% / 仅周额度剩余 ≤3%\r\n使用轮换池：{primary}\r\n备用轮换池：{backup}";
     }
 
     private string ResolveAccountRotationCursorName(string? accountKey)
@@ -685,19 +685,27 @@ public partial class Form1
             parts.Add("当前使用");
         }
 
-        var fiveHourWindow = quotaUsage?.GetQuotaWindow(AccountQuotaWindowKind.FiveHour);
-        if (fiveHourWindow?.UsedPercent is { } usedPercent && double.IsFinite(usedPercent))
+        var quotaWindow = quotaUsage?.GetQuotaWindow(AccountQuotaWindowKind.FiveHour)
+                          ?? quotaUsage?.GetQuotaWindow(AccountQuotaWindowKind.Weekly);
+        var quotaLabel = quotaWindow?.Kind == AccountQuotaWindowKind.Weekly ? "周额度" : "5h";
+        if (quotaWindow?.UsedPercent is { } usedPercent && double.IsFinite(usedPercent))
         {
             var remainingPercent = Math.Clamp(100D - usedPercent, 0D, 100D);
-            parts.Add($"5h 剩余 {remainingPercent:0.#}%");
+            parts.Add($"{quotaLabel}剩余 {remainingPercent:0.#}%");
+            var reserve = quotaWindow.Kind == AccountQuotaWindowKind.Weekly
+                ? PatAutoRotationPolicy.WeeklyOnlyRemainingReserve
+                : PatAutoRotationPolicy.FiveHourRemainingReserve;
+            if (remainingPercent <= reserve &&
+                (quotaWindow.ResetAtUtc == null || quotaWindow.ResetAtUtc > DateTimeOffset.UtcNow))
+                parts.Add("已达保留线，暂停轮换使用");
         }
         else
         {
-            parts.Add("5h 剩余 —");
+            parts.Add($"{quotaLabel}剩余 —");
         }
-        parts.Add(fiveHourWindow?.ResetAtUtc is { } resetAtUtc
-            ? $"5h 重置 {resetAtUtc.ToLocalTime():MM-dd HH:mm}"
-            : "5h 重置 —");
+        parts.Add(quotaWindow?.ResetAtUtc is { } resetAtUtc
+            ? $"{quotaLabel}重置 {resetAtUtc.ToLocalTime():MM-dd HH:mm}"
+            : $"{quotaLabel}重置 —");
 
         return string.Join("  ·  ", parts);
     }

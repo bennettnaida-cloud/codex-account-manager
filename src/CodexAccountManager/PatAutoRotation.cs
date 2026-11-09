@@ -125,9 +125,10 @@ internal sealed class QuotaSafetyMarginTracker
 
 internal static class PatAutoRotationPolicy
 {
-    // Retained only for loading pre-2.2.4 settings. 2.2.8 never rotates early at 98%
-    // or on a historical 429: only an official 100% observation is exhaustion here.
+    // Retained only for loading legacy settings. The reserve policy below is authoritative.
     internal const double DefaultUsedPercentThreshold = 98D;
+    internal const double FiveHourRemainingReserve = 10D;
+    internal const double WeeklyOnlyRemainingReserve = 3D;
     internal const int RequiredConsecutiveOfficialObservations = 2;
     internal static readonly TimeSpan MinimumOfficialObservationSpacing = TimeSpan.FromSeconds(5);
     internal static readonly TimeSpan GatewayQuietPeriod = TimeSpan.FromSeconds(3);
@@ -155,6 +156,25 @@ internal static class PatAutoRotationPolicy
         return null;
     }
 
+    internal static UsageRateLimitWindow? SelectRotationWindow(UsageLimitResetInfo info) =>
+        SelectRotationWindow(info.Primary, info.Secondary);
+
+    internal static UsageRateLimitWindow? SelectRotationWindow(
+        UsageRateLimitWindow? primary, UsageRateLimitWindow? secondary)
+    {
+        // Classify by duration, never by primary/secondary position or account plan.
+        // The 3% reserve applies only when there is no five-hour window.
+        var windows = new[] { primary, secondary };
+        return windows.FirstOrDefault(window =>
+                   AccountQuotaLimitType.ClassifyWindow(window?.WindowMinutes) == AccountQuotaWindowKind.FiveHour)
+               ?? windows.FirstOrDefault(window =>
+                   AccountQuotaLimitType.ClassifyWindow(window?.WindowMinutes) == AccountQuotaWindowKind.Weekly);
+    }
+
+    internal static bool IsReservePaused(PersistedQuotaSnapshot snapshot, DateTimeOffset nowUtc) =>
+        EvaluateQuotaSafety(SelectRotationWindow(snapshot.Primary, snapshot.Secondary),
+            null, null, nowUtc).ShouldRotate;
+
     internal static bool CanRetryCompatiblePrimary(
         DateTimeOffset resetAtUtc, PatGatewayQuotaSignal? exhaustion, DateTimeOffset now)
     {
@@ -166,18 +186,15 @@ internal static class PatAutoRotationPolicy
             : exhaustion.ObservedAtUtc + QuotaLimitedSignalLifetime <= now;
     }
 
-    internal static bool HasLocallyAvailableFiveHourQuota(
+    internal static bool HasLocallyAvailableRotationQuota(
         PersistedQuotaSnapshot snapshot,
         PatGatewayQuotaSignal? latestConfirmedExhaustion,
         DateTimeOffset nowUtc)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
         var now = nowUtc.ToUniversalTime();
-        var window = new[] { snapshot.Primary, snapshot.Secondary }
-            .FirstOrDefault(candidate =>
-                AccountQuotaLimitType.ClassifyWindow(candidate?.WindowMinutes) ==
-                AccountQuotaWindowKind.FiveHour);
-        if (window == null)
+        var window = SelectRotationWindow(snapshot.Primary, snapshot.Secondary);
+        if (window == null || IsReservePaused(snapshot, now))
         {
             return false;
         }
@@ -195,8 +212,7 @@ internal static class PatAutoRotationPolicy
             return true;
         }
         if (window.UsedPercent is not { } usedPercent ||
-            !double.IsFinite(usedPercent) ||
-            usedPercent >= 100D)
+            !double.IsFinite(usedPercent))
         {
             return false;
         }
@@ -245,12 +261,17 @@ internal static class PatAutoRotationPolicy
             ? Math.Clamp(rawUsed, 0D, 100D)
             : (double?)null;
         var estimate = NormalizeRecentRequestEstimate(recentRequestUsedPercent);
-        const double margin = 0D;
+        var margin = AccountQuotaLimitType.ClassifyWindow(window?.WindowMinutes) switch
+        {
+            AccountQuotaWindowKind.FiveHour => FiveHourRemainingReserve,
+            AccountQuotaWindowKind.Weekly => WeeklyOnlyRemainingReserve,
+            _ => 0D
+        };
         var remaining = usedPercent.HasValue
             ? Math.Max(0D, 100D - usedPercent.Value)
             : (double?)null;
 
-        if (usedPercent >= 100D)
+        if (remaining <= margin)
         {
             return new QuotaRotationDecision(
                 true,
@@ -259,7 +280,7 @@ internal static class PatAutoRotationPolicy
                 remaining,
                 margin,
                 estimate,
-                "official-100-percent");
+                usedPercent >= 100D ? "official-100-percent" : "official-quota-reserve");
         }
 
         return new QuotaRotationDecision(
@@ -415,7 +436,7 @@ internal static class PatAutoRotationPolicy
             lastQuotaLimitedAtUtc: null,
             now);
         var availableDecision = EvaluateQuotaSafety(
-            new UsageRateLimitWindow(97, 300, now.AddHours(2)),
+            new UsageRateLimitWindow(89, 300, now.AddHours(2)),
             recentRequestUsedPercent: 0.5D,
             lastQuotaLimitedAtUtc: null,
             now);
@@ -469,7 +490,7 @@ internal static class PatAutoRotationPolicy
             Primary = new UsageRateLimitWindow(100, 300, now.AddMinutes(-2))
         };
         if (SelectFiveHourWindow(reversed)?.UsedPercent != 98 ||
-            IsThresholdReached(SelectFiveHourWindow(reversed), 98, now) ||
+            !IsThresholdReached(SelectFiveHourWindow(reversed), 98, now) ||
             !IsThresholdReached(
                 new UsageRateLimitWindow(100, 300, now.AddHours(2)),
                 98,
@@ -478,8 +499,8 @@ internal static class PatAutoRotationPolicy
                 new UsageRateLimitWindow(100, 300, now.AddSeconds(-1)),
                 98,
                 now) ||
-            dynamicDecision.ShouldRotate ||
-            dynamicDecision.SafetyMarginPercent != 0D ||
+            !dynamicDecision.ShouldRotate ||
+            dynamicDecision.SafetyMarginPercent != FiveHourRemainingReserve ||
             availableDecision.ShouldRotate ||
             limitedDecision.ShouldRotate ||
             limitedDecision.IsImmediatelyExhausted ||
@@ -491,12 +512,12 @@ internal static class PatAutoRotationPolicy
             !exhaustedDecision.ShouldRotate ||
             exhaustedDecision.IsImmediatelyExhausted ||
             exhaustedDecision.Reason != "official-100-percent" ||
-            !HasLocallyAvailableFiveHourQuota(localAvailableSnapshot, null, now) ||
-            HasLocallyAvailableFiveHourQuota(
+            !HasLocallyAvailableRotationQuota(localAvailableSnapshot, null, now) ||
+            HasLocallyAvailableRotationQuota(
                 localAvailableSnapshot,
                 newerConfirmedExhaustion,
                 now) ||
-            !HasLocallyAvailableFiveHourQuota(elapsedLocalSnapshot, null, now) ||
+            !HasLocallyAvailableRotationQuota(elapsedLocalSnapshot, null, now) ||
             IsGatewayQuiet(
                 new LocalPatGatewayActivitySnapshot(1, now, null, null),
                 now.AddSeconds(10)) ||
@@ -507,6 +528,31 @@ internal static class PatAutoRotationPolicy
             throw new InvalidOperationException(
                 "PAT automatic rotation quota-window or request-boundary policy failed.");
         }
+
+        foreach (var (minutes, used, paused) in new (long, int?, bool)[]
+                 { (300, 89, false), (300, 90, true), (300, 91, true),
+                   (10080, 96, false), (10080, 97, true), (10080, 98, true),
+                   (300, null, false), (10080, null, false) })
+        {
+            var window = new UsageRateLimitWindow(used, minutes, now.AddDays(1));
+            var snapshot = localAvailableSnapshot with { Primary = null, Secondary = window };
+            if (IsReservePaused(snapshot, now) != paused ||
+                IsReservePaused(snapshot with { Secondary = window with { ResetsAtUtc = now.AddSeconds(-1) } }, now) ||
+                IsReservePaused(snapshot with { Secondary = window with { ResetsAtUtc = null } }, now) != paused)
+                throw new InvalidOperationException("Quota reserve boundary/reset/unknown policy failed.");
+        }
+        var dualWindow = localAvailableSnapshot with
+        {
+            Primary = new UsageRateLimitWindow(99, 10080, now.AddDays(2)),
+            Secondary = new UsageRateLimitWindow(89, 300, now.AddHours(1))
+        };
+        if (IsReservePaused(dualWindow, now) ||
+            !IsReservePaused(dualWindow with { Secondary = dualWindow.Secondary with { UsedPercent = 90 } }, now) ||
+            !HasLocallyAvailableRotationQuota(localAvailableSnapshot with
+                { Primary = new UsageRateLimitWindow(96, 10080, now.AddDays(1)) }, null, now) ||
+            HasLocallyAvailableRotationQuota(localAvailableSnapshot with
+                { Primary = new UsageRateLimitWindow(97, 10080, now.AddDays(1)) }, null, now))
+            throw new InvalidOperationException("Five-hour precedence or weekly-only recovery failed.");
 
         var tracker = new QuotaSafetyMarginTracker();
         var trackerKey = new string('A', 64);

@@ -152,6 +152,19 @@ public sealed class AccountDialog : Form
             UseMnemonic = false
         };
         _heroCard.Controls.Add(safetyBadge);
+        if (_isNewAccount)
+        {
+            safetyBadge.Visible = false;
+            var importButton = new ModernButton
+            {
+                Text = "从文件导入", Left = 714, Top = 25, Width = 186, Height = 40,
+                Anchor = AnchorStyles.Top | AnchorStyles.Right, Radius = 12,
+                AccessibleName = "从 sub2api 或 CPA 文件批量导入账号"
+            };
+            ThemeStyler.ApplyPrimaryButton(importButton, palette);
+            importButton.Click += (_, _) => { DialogResult = DialogResult.Retry; Close(); };
+            _heroCard.Controls.Add(importButton);
+        }
 
         _formCard.SetBounds(16, 112, 928, 582);
         _formCard.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
