@@ -890,16 +890,7 @@ public sealed partial class CodexCliService
     public async Task<LoginStatus> GetLoginStatusAsync(AccountRecord account)
     {
         if (account.IsWebSession)
-        {
-            try
-            {
-                var session = WebSessionCredential.ReadStored(Path.Combine(account.CodexHome, AuthFileName));
-                EnsureLocalPatAccountConfig(account);
-                return new LoginStatus { ExitCode = 0, Text = $"网页版 Session 已保存，有效期至 {session.ExpiresAt.ToLocalTime():yyyy-MM-dd HH:mm}；模型调用权限仍由官方服务端确认。" };
-            }
-            catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException or JsonException)
-            { return new LoginStatus { ExitCode = 1, Text = "网页版 Session 无效或已过期，请重新导入。" }; }
-        }
+            return new LoginStatus { ExitCode = 1, Text = AccountAuthKind.WebSessionRemovedMessage };
         if (account.IsCompatibleApi)
         {
             var configPath = Path.Combine(account.CodexHome, ConfigFileName);
@@ -954,7 +945,7 @@ public sealed partial class CodexCliService
 
     public async Task<LoginStatus> LoginWithAccessTokenAsync(AccountRecord account, string accessToken)
     {
-        if (!account.IsAccessToken || account.IsWebSession)
+        if (!account.IsAccessToken)
         {
             throw new InvalidOperationException(
                 "只有 Access Token 账号使用 codex login --with-access-token；通过 ChatGPT 登录的账号请使用官方浏览器登录。"
@@ -1610,6 +1601,7 @@ public sealed partial class CodexCliService
         bool preserveRunningGateway = true,
         CancellationToken cancellationToken = default)
     {
+        if (account.IsWebSession) throw new InvalidDataException(AccountAuthKind.WebSessionRemovedMessage);
         if (account.IsCompatibleApi)
         {
             throw new InvalidOperationException("兼容 API/API Key 账号不支持 Codex 套餐用量重置次数。");
@@ -1777,6 +1769,7 @@ public sealed partial class CodexCliService
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(account);
+        if (account.IsWebSession) throw new InvalidDataException(AccountAuthKind.WebSessionRemovedMessage);
         if (account.IsCompatibleApi)
         {
             throw new InvalidOperationException(
@@ -1898,8 +1891,7 @@ public sealed partial class CodexCliService
                 : Encoding.UTF8.GetString(bytes);
             throw new InvalidOperationException(BuildMinimalQuotaTestFailureMessage(
                 account,
-                detail,
-                response.StatusCode));
+                detail));
         }
 
         await using var stream = await response.Content.ReadAsStreamAsync(timeout.Token);
@@ -1969,8 +1961,7 @@ public sealed partial class CodexCliService
         status.Equals("incomplete", StringComparison.OrdinalIgnoreCase) ||
         status.Equals("cancelled", StringComparison.OrdinalIgnoreCase);
 
-    private static string BuildMinimalQuotaTestFailureMessage(AccountRecord account, string detail,
-        HttpStatusCode? statusCode = null)
+    private static string BuildMinimalQuotaTestFailureMessage(AccountRecord account, string detail)
     {
         var diagnostic = ExtractMinimalQuotaTestJsonError(detail) ?? detail.Trim();
         if (diagnostic.Contains(
@@ -1991,16 +1982,6 @@ public sealed partial class CodexCliService
         {
             return $"账号 {account.Name} 的测试进程没有加载到可识别的 PAT/OAuth 凭据。" +
                    "请在“状态与凭据”中重新登录或更新 Token 后重试。";
-        }
-
-        if (account.IsWebSession &&
-            (statusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden ||
-             statusCode == null && (diagnostic.Equals("Unauthorized", StringComparison.OrdinalIgnoreCase) ||
-                                    diagnostic.Equals("Forbidden", StringComparison.OrdinalIgnoreCase))))
-        {
-            var code = statusCode.HasValue ? (int)statusCode.Value :
-                diagnostic.Equals("Forbidden", StringComparison.OrdinalIgnoreCase) ? 403 : 401;
-            return $"账号 {account.Name}：" + WebSessionCredential.AccessRejectedMessage(code, "模型接口");
         }
 
         if (IsPersonalAccessTokenMetadataRequestFailure(detail))
@@ -2234,20 +2215,6 @@ public sealed partial class CodexCliService
         {
             throw new InvalidOperationException("Minimal quota-test pretty JSON error self-test failed.");
         }
-        var sessionAccount = new AccountRecord { Name = "session-fixture", AuthKind = AccountAuthKind.WebSession };
-        foreach (var code in new[] { HttpStatusCode.Unauthorized, HttpStatusCode.Forbidden })
-        {
-            var explanation = BuildMinimalQuotaTestFailureMessage(sessionAccount,
-                "{\"detail\":\"fixture-sensitive-upstream-text\"}", code);
-            if (!explanation.Contains($"HTTP {(int)code}") || !explanation.Contains("通过 ChatGPT 登录（官方）") ||
-                explanation.Contains("fixture-sensitive-upstream-text"))
-                throw new InvalidOperationException("Session denial must explain upstream authorization without exposing response bodies.");
-        }
-        var bareDenied = BuildMinimalQuotaTestFailureMessage(sessionAccount, "{\"detail\":\"Unauthorized\"}");
-        if (!bareDenied.Contains("HTTP 401") ||
-            BuildMinimalQuotaTestFailureMessage(sessionAccount, "rate limited", HttpStatusCode.TooManyRequests)
-                .Contains("通过 ChatGPT 登录（官方）"))
-            throw new InvalidOperationException("Session authorization diagnostics must distinguish denial from rate limiting.");
     }
 
     internal void EnsureLocalPatAccountConfig(AccountRecord account)
@@ -2343,6 +2310,7 @@ public sealed partial class CodexCliService
 
     public async Task<WindowsClientAccountProjection> PrepareWindowsClientAccountAsync(AccountRecord account)
     {
+        if (account.IsWebSession) throw new InvalidDataException(AccountAuthKind.WebSessionRemovedMessage);
         if (RequiresDesktopGateway(account))
             await LocalPatGateway.EnsureReadyForDesktopLaunchAsync();
         using var modelDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(50));
@@ -2531,6 +2499,7 @@ public sealed partial class CodexCliService
         bool routeOfficialOAuthThroughGateway,
         bool forceClientRestart)
     {
+        if (account.IsWebSession) throw new InvalidDataException(AccountAuthKind.WebSessionRemovedMessage);
         using var launchLease = new DesktopLaunchLease();
         using var diagnosticScope = CurrentLaunch.Value == null
             ? BeginLaunchDiagnostics(chatGptFeatureAccount == null ? "ordinary" : "voice-mobile") : null;
@@ -4563,6 +4532,7 @@ public sealed partial class CodexCliService
 
     public void LaunchPowerShell(AccountRecord account, string projectPath, string codexHome)
     {
+        if (account.IsWebSession) throw new InvalidDataException(AccountAuthKind.WebSessionRemovedMessage);
         if (!Directory.Exists(projectPath))
         {
             throw new DirectoryNotFoundException($"项目目录不存在：{projectPath}");
@@ -15625,11 +15595,7 @@ public sealed partial class CodexCliService
         string authPath)
     {
         ArgumentNullException.ThrowIfNull(account);
-        if (account.IsWebSession)
-        {
-            var session = WebSessionCredential.ReadStored(authPath);
-            return new QuotaTestCredential(session.AccessToken, session.AccountId);
-        }
+        if (account.IsWebSession) throw new InvalidDataException(AccountAuthKind.WebSessionRemovedMessage);
         _ = BuildCanonicalJsonSha256(authPath);
         using var input = new FileStream(
             authPath,

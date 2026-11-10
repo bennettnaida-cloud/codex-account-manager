@@ -165,7 +165,7 @@ internal static class AccountRotationConfiguration
     }
 
     internal static AccountRotationPool GetPool(AppSettings settings, AccountRecord account) =>
-        GetPool(settings, QuotaAccountIdentity.CreateKey(account));
+        account.IsWebSession ? AccountRotationPool.None : GetPool(settings, QuotaAccountIdentity.CreateKey(account));
 
     internal static AccountRotationPool GetPool(AppSettings settings, string accountKey)
     {

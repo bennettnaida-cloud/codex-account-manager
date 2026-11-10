@@ -91,8 +91,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Automatic model catalog regression test failed.' }
           & node .\tools\Test-LaunchModelPreflight.cjs $startupExe
           if ($LASTEXITCODE -ne 0) { throw 'Launch model preflight regression test failed.' }
-          & node .\tools\Test-WebSessionAuth.cjs $catalogCli
-          if ($LASTEXITCODE -ne 0) { throw 'Browser Session native authentication regression test failed.' }
           & .\Build-OneClickInstallerPackage.ps1 -OutputPath (Join-Path $PWD 'CodexAccountManager-Windows-latest.zip')
           if ($LASTEXITCODE -ne 0) { throw 'Windows installer package build failed.' }
           $versionedPackage = 'CodexAccountManager-Windows-{0}.zip' -f $env:CAM_VERSION
@@ -228,13 +226,13 @@ jobs:
           body: |
             自动构建版本 `${{ env.CAM_VERSION }}`。
 
-            Windows 2.3.47：Session 网页入口改为可选中复制的完整地址，点击地址全选后可使用 Ctrl+C，不再直接启动浏览器。
+            Windows 2.3.47：移除网页版 Session 的导入、编辑和更新入口，文件导入也不再接受网页 Session JSON。
 
-            Session 模型请求返回 401/403 时显示中文原因与官方 ChatGPT 登录指引。导入成功、Token 未到期或额度查询成功不保证模型调用授权；本版本不改变服务端授权，也不将网页 Session 伪装成可刷新的 OAuth 凭据。
+            已有 Session 账号数据继续保留，显示为已停用，不再参与启动、额度查询或网关轮换。请在新增账号中选择“通过 ChatGPT 登录（官方）”重新添加账号。
 
-            保留 2.3.46 的 Session 下拉入口及表单布局修复、2.3.45 的本地中转兼容修复、在线模型同步、文件导入、逐账号代理和 10%/3% 轮换。
+            保留 PAT、官方 ChatGPT OAuth、兼容 API、sub2api/CPA/官方 OAuth 文件导入、启动前在线模型同步、逐账号代理和 10%/3% 轮换，以及表单布局和本地中转兼容修复。
 
-            Windows 发布执行完整自检、Session 导入与原生认证、模型、启动、轮换和中转兼容回归，以及安装包隐私扫描和隔离安装。内置 Codex CLI 0.163.0；macOS 仅同步版本号。
+            Windows 发布执行完整自检、旧 Session 停用及数据保留、模型、启动、轮换和中转兼容回归，以及安装包隐私扫描和隔离安装。内置 Codex CLI 0.163.0；macOS 仅同步版本号。
           prerelease: true
           make_latest: false
           files: |

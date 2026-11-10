@@ -122,6 +122,7 @@ public sealed partial class AccountStore
         string? officialOAuthCredentialSourcePath = null)
     {
         NormalizeAccount(account);
+        if (account.IsWebSession) throw new InvalidOperationException(AccountAuthKind.WebSessionRemovedMessage);
         account.Name = account.Name.Trim();
         account.CodexHome = account.CodexHome.Trim();
 
@@ -533,11 +534,7 @@ public sealed partial class AccountStore
     public string GetExpiryLabel(string accountName)
     {
         var sessionAccount = LoadAccounts().FirstOrDefault(a => a.IsWebSession && a.Name.Equals(accountName, StringComparison.OrdinalIgnoreCase));
-        if (sessionAccount != null)
-        {
-            try { return WebSessionCredential.ReadStored(Path.Combine(sessionAccount.CodexHome, "auth.json"), requireCurrent: false).ExpiresAt.ToString("u"); }
-            catch (Exception ex) when (ex is IOException or InvalidDataException or JsonException or UnauthorizedAccessException) { return "Session 无效，请重新导入"; }
-        }
+        if (sessionAccount != null) return "已停用，请使用官方登录";
         var metadata = LoadTokenMetadata();
         if (!metadata.TryGetValue(accountName, out var entry) ||
             string.IsNullOrWhiteSpace(entry.ExpiresAtUtc))

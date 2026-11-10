@@ -94,16 +94,18 @@ internal static class AccountFileImport
         return new(entries, problems);
     }
 
+    internal static void RejectWebSession(JsonElement item)
+    {
+        if (item.ValueKind == JsonValueKind.Object &&
+            (item.TryGetProperty("accessToken", out _) || item.TryGetProperty("web_session", out _) ||
+             Text(item, "authKind", "auth_kind").Equals(AccountAuthKind.WebSession, StringComparison.OrdinalIgnoreCase)))
+            throw new InvalidDataException(AccountAuthKind.WebSessionRemovedMessage);
+    }
+
     private static AccountImportEntry ParseEntry(JsonElement item, string fallbackName, int index)
     {
         if (item.ValueKind != JsonValueKind.Object) throw new InvalidDataException("账号记录必须是 JSON 对象。");
-        if (item.TryGetProperty("accessToken", out _))
-            return WebSessionCredential.ParseImport(item, fallbackName + "-" + (index + 1));
-        if (item.TryGetProperty("web_session", out _))
-        {
-            var session = WebSessionCredential.ReadStored(item);
-            return session.ToImportEntry(fallbackName + "-" + (index + 1));
-        }
+        RejectWebSession(item);
         var platform = Text(item, "platform").ToLowerInvariant();
         var type = Text(item, "type").ToLowerInvariant();
         if (platform.Length > 0 && platform is not ("openai" or "codex") ||
@@ -111,6 +113,8 @@ internal static class AccountFileImport
             throw new InvalidDataException("仅支持 OpenAI/Codex 账号，已跳过其它平台。");
         var credentials = item.TryGetProperty("credentials", out var c) && c.ValueKind == JsonValueKind.Object ? c : item;
         var tokens = credentials.TryGetProperty("tokens", out var t) && t.ValueKind == JsonValueKind.Object ? t : credentials;
+        RejectWebSession(credentials);
+        RejectWebSession(tokens);
         var name = Text(item, "name", "email");
         if (name.Length == 0) name = Text(credentials, "email");
         if (name.Length == 0) name = fallbackName + "-" + (index + 1);

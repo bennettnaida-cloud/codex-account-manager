@@ -74,8 +74,9 @@ internal static class LocalPatGateway
     // v14 pins browser Session workspace identity and rejects expired Session credentials.
     internal const string LegacyV13RotationProtocolValue = "request-boundary-v13";
     internal const string LegacyV14RotationProtocolValue = "request-boundary-v14";
-    // v15 removes only Desktop's two null Page snapshots before HTTP forwarding.
-    internal const string RotationProtocolValue = "request-boundary-v15";
+    internal const string LegacyV15RotationProtocolValue = "request-boundary-v15";
+    // v16 retires browser Session credentials without modifying stored accounts.
+    internal const string RotationProtocolValue = "request-boundary-v16";
     private static readonly SemaphoreSlim StartupLock = new(1, 1);
     private static readonly TimeSpan StartupLockTimeout = TimeSpan.FromSeconds(8);
     private static readonly TimeSpan DesktopStartupTimeout = TimeSpan.FromSeconds(12);
@@ -165,10 +166,10 @@ internal static class LocalPatGateway
         // proxy or credential is read/changed by these tests.
         using (var legacy = new HttpResponseMessage())
         {
-            legacy.Headers.Add(RotationProtocolHeader, LegacyV14RotationProtocolValue);
+            legacy.Headers.Add(RotationProtocolHeader, LegacyV15RotationProtocolValue);
             Require(HasCompatibleRotationProtocol(legacy) && !HasExpectedRotationProtocol(legacy) &&
-                IsCurrentRotationProtocolValue(LegacyV14RotationProtocolValue),
-                "v14 status must remain readable but require an upgrade before launch");
+                IsCurrentRotationProtocolValue(LegacyV15RotationProtocolValue),
+                "v15 status must remain readable but require an upgrade before launch");
         }
         using (var current = new HttpResponseMessage())
         {
@@ -1016,6 +1017,7 @@ internal static class LocalPatGateway
 
     internal static bool IsCompatibleRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV15RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV14RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV13RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV12RotationProtocolValue, StringComparison.Ordinal) ||
@@ -1034,6 +1036,7 @@ internal static class LocalPatGateway
     // new executable waits for a request-boundary listener hand-off.
     internal static bool IsCurrentRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV15RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV14RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV13RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV12RotationProtocolValue, StringComparison.Ordinal) ||
@@ -1042,6 +1045,7 @@ internal static class LocalPatGateway
 
     internal static bool IsTransparentRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV15RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV14RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV13RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV12RotationProtocolValue, StringComparison.Ordinal) ||
@@ -1055,6 +1059,7 @@ internal static class LocalPatGateway
 
     internal static bool IsConfirmedQuotaRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV15RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV14RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV13RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV12RotationProtocolValue, StringComparison.Ordinal) ||
@@ -1093,6 +1098,7 @@ internal static class LocalPatGateway
                         string.Equals(value, SafeContentEncodingRotationProtocolValue, StringComparison.Ordinal) ||
                         string.Equals(value, "request-boundary-v9", StringComparison.Ordinal) ||
                         string.Equals(value, LegacyV11RotationProtocolValue, StringComparison.Ordinal) ||
+                        string.Equals(value, LegacyV15RotationProtocolValue, StringComparison.Ordinal) ||
                         string.Equals(value, LegacyV14RotationProtocolValue, StringComparison.Ordinal) ||
                         string.Equals(value, LegacyV13RotationProtocolValue, StringComparison.Ordinal) ||
                         string.Equals(value, LegacyV12RotationProtocolValue, StringComparison.Ordinal) ||
@@ -2378,7 +2384,7 @@ internal sealed partial class LocalPatGatewayHost
                     context.Request, _controlSecret, LocalPatGateway.QuotaTestProofPurpose(credential.Token));
             if (ShouldRejectSharedOAuthModelRequest(
                     isModelRequest,
-                    credential.IsPersonalAccessToken || credential.IsCompatibleApi || credential.IsWebSession,
+                    credential.IsPersonalAccessToken || credential.IsCompatibleApi,
                     CodexCliService.IsSharedDualLoginModeConfigured(),
                     authenticatedAccountProbe))
             {
@@ -4635,12 +4641,7 @@ internal sealed partial class LocalPatGatewayHost
         }
         var account = matches[0];
 
-        if (account.IsWebSession)
-        {
-            var session = WebSessionCredential.ReadStored(Path.Combine(account.CodexHome, "auth.json"));
-            return new GatewayCredential(session.AccessToken, IsPersonalAccessToken: false,
-                AccountKey: accountKey, ChatGptAccountId: session.AccountId, AllowIncomingChatGptIdentity: false, IsWebSession: true);
-        }
+        if (account.IsWebSession) throw new InvalidDataException(AccountAuthKind.WebSessionRemovedMessage);
 
         if (account.IsOfficialOAuth)
         {
@@ -4936,6 +4937,8 @@ internal sealed partial class LocalPatGatewayHost
 
         // Duplicate local records for one credential are intentionally treated as
         // ambiguous. A per-account opt-in must never inherit another record's setting.
+        if (matchingAccounts.Any(account => account.IsWebSession))
+            throw new InvalidDataException(AccountAuthKind.WebSessionRemovedMessage);
         if (matchingAccounts.Count != 1)
         {
             return credential;
@@ -4943,14 +4946,6 @@ internal sealed partial class LocalPatGatewayHost
 
         var matched = matchingAccounts[0];
         var accountKey = QuotaAccountIdentity.CreateKey(matched);
-        if (matched.IsWebSession)
-        {
-            var session = WebSessionCredential.ReadStored(Path.Combine(matched.CodexHome, "auth.json"));
-            if (!TokenHashesEqual(credential.Token, session.AccessToken))
-                throw new InvalidDataException("Session 凭据已变化，请重新启动该账号。");
-            return credential with { AccountKey = accountKey, ChatGptAccountId = session.AccountId,
-                AllowIncomingChatGptIdentity = false, IsWebSession = true };
-        }
         return matched.IsOfficialOAuth
             ? credential with
             {
@@ -7405,8 +7400,7 @@ internal sealed partial class LocalPatGatewayHost
         string? AccountKey = null,
         string? ChatGptAccountId = null,
         bool AllowIncomingChatGptIdentity = true,
-        IReadOnlySet<string>? CompatibleApiModels = null,
-        bool IsWebSession = false)
+        IReadOnlySet<string>? CompatibleApiModels = null)
     {
         internal bool IsCompatibleApi =>
             CompatibleApiBaseUri != null && !string.IsNullOrWhiteSpace(CompatibleApiModel);

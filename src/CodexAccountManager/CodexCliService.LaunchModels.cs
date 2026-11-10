@@ -111,6 +111,7 @@ public sealed partial class CodexCliService
 
     internal async Task PrepareLaunchModelCatalogAsync(AccountRecord account, CancellationToken cancellationToken)
     {
+        if (account.IsWebSession) throw new InvalidDataException(AccountAuthKind.WebSessionRemovedMessage);
         LaunchPhase("launch-model-discovery-start", "正在获取所选账号的最新模型，完成后启动…");
         if (account.IsCompatibleApi)
         {

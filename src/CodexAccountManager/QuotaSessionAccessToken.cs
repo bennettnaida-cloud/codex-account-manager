@@ -12,11 +12,7 @@ internal sealed record QuotaSessionAccessToken(string AccessToken, string Accoun
 {
     internal static QuotaSessionAccessToken? Read(AccountRecord account, string path)
     {
-        if (account.IsWebSession)
-        {
-            var session = WebSessionCredential.ReadStored(path);
-            return new(session.AccessToken, session.AccountId);
-        }
+        if (account.IsWebSession) throw new InvalidDataException(AccountAuthKind.WebSessionRemovedMessage);
         if (!account.IsOfficialOAuth) return null;
         if (new FileInfo(path).Length > AccountFileImport.MaxFileBytes)
             throw new InvalidDataException("OAuth 凭据文件过大。");

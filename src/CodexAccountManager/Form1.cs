@@ -8965,7 +8965,7 @@ public partial class Form1 : Form
 
     private string GetCredentialStateText(AccountRecord account, bool authReady)
     {
-        if (account.IsWebSession) return $"Session 到期：{_store.GetExpiryLabel(account.Name)}";
+        if (account.IsWebSession) return "已停用；请使用官方 ChatGPT 登录";
         if (account.IsOfficialOAuth)
         {
             return _codex.HasOfficialChatGptLogin(account) ? "ChatGPT 已登录"
@@ -8992,13 +8992,13 @@ public partial class Form1 : Form
             ? account.ApiBaseUrl
             : _store.GetExpiryLabel(account.Name);
 
-    private static string GetCredentialBadgeText(AccountRecord account) => account.IsWebSession ? "SESSION" : account.IsOfficialOAuth
+    private static string GetCredentialBadgeText(AccountRecord account) => account.IsWebSession ? "已停用" : account.IsOfficialOAuth
         ? "CHATGPT"
         : account.IsCompatibleApi
             ? "API KEY"
             : "TOKEN";
 
-    private static string GetCredentialActionText(AccountRecord account) => account.IsWebSession ? "更新 Session" : account.IsOfficialOAuth
+    private static string GetCredentialActionText(AccountRecord account) => account.IsWebSession ? "登录指引" : account.IsOfficialOAuth
         ? "通过 ChatGPT 登录"
         : account.IsCompatibleApi
             ? "编辑 API"
@@ -15860,22 +15860,6 @@ public partial class Form1 : Form
             var result = dialog.ShowDialog(this);
             if (result == DialogResult.Retry) { ImportAccountFiles(); return; }
             if (result != DialogResult.OK) return;
-            if (dialog.SessionEntry is { } sessionEntry)
-            {
-                try
-                {
-                    var imported = _store.ImportAccounts([sessionEntry]);
-                    LoadAccounts();
-                    _statusBox.Text = imported.Added == 0 ? "此 Session 已导入，已跳过重复凭据。"
-                        : WebSessionCredential.ImportedMessage;
-                    return;
-                }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException or System.Text.Json.JsonException)
-                {
-                    MessageBox.Show(this, "Session 未保存。请检查账号名称、目录权限与磁盘空间。", "导入失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    continue;
-                }
-            }
             var account = CreateAccountFromDialog(dialog);
             try
             {
@@ -15910,7 +15894,7 @@ public partial class Form1 : Form
 
     private async Task EditAccountAsync(AccountRecord account)
     {
-        if (account.IsWebSession) { ImportWebSession(account); return; }
+        if (account.IsWebSession) { ShowRetiredWebSessionMessage(); return; }
         using var dialog = new AccountDialog(
             account,
             _store.RootPath,
@@ -18894,8 +18878,12 @@ public partial class Form1 : Form
             failed.Count == 0 ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
     }
 
+    private void ShowRetiredWebSessionMessage() =>
+        MessageBox.Show(this, AccountAuthKind.WebSessionRemovedMessage, "登录方式已移除", MessageBoxButtons.OK, MessageBoxIcon.Information);
+
     private async Task SendMinimalQuotaTestAsync(AccountRecord account)
     {
+        if (account.IsWebSession) { ShowRetiredWebSessionMessage(); return; }
         if (account.IsCompatibleApi)
         {
             MessageBox.Show(
@@ -19207,7 +19195,7 @@ public partial class Form1 : Form
 
     private async Task UpdateTokenAsync(AccountRecord account)
     {
-        if (account.IsWebSession) { ImportWebSession(account); return; }
+        if (account.IsWebSession) { ShowRetiredWebSessionMessage(); return; }
         if (account.IsOfficialOAuth)
         {
             await LoginWithChatGptAsync(account);

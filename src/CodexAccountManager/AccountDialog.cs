@@ -5,7 +5,6 @@ public sealed class AccountDialog : Form
     private const int AccessTokenAuthIndex = 0;
     private const int CompatibleApiAuthIndex = 1;
     private const int OfficialOAuthAuthIndex = 2;
-    private const int WebSessionAuthIndex = 3;
 
     private readonly TextBox _nameBox = new();
     private readonly TextBox _homeBox = new();
@@ -29,9 +28,6 @@ public sealed class AccountDialog : Form
     private readonly ModernButton _saveButton = new();
     private readonly ModernButton _cancelButton = new();
     private readonly Panel _footerDivider = new();
-    private readonly WebSessionInput _sessionInput = new();
-    private readonly Label _sessionHomeNote = new();
-    internal AccountImportEntry? SessionEntry { get; private set; }
     private readonly ModernInputShell _nameShell;
     private readonly ModernInputShell _homeShell;
     private readonly ModernInputShell _authKindShell;
@@ -247,19 +243,11 @@ public sealed class AccountDialog : Form
             }
         };
         _formCard.Controls.Add(_browseButton);
-        _sessionHomeNote.SetBounds(164, 92, 744, 44);
-        _sessionHomeNote.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
-        _sessionHomeNote.Text = "导入时自动创建独立账号目录";
-        _sessionHomeNote.TextAlign = ContentAlignment.MiddleLeft;
-        ThemeStyler.ApplyLabel(_sessionHomeNote, palette, true);
-        _formCard.Controls.Add(_sessionHomeNote);
-
         var authLabel = MakeLabel("登录方式", 22, 195, 124);
         _formCard.Controls.Add(authLabel);
 
         _authKindBox.DropDownStyle = ComboBoxStyle.DropDownList;
         _authKindBox.Items.AddRange(["Access Token", "兼容 API", "通过 ChatGPT 登录（官方）"]);
-        if (_isNewAccount) _authKindBox.Items.Add("网页版 Session（JSON 导入）");
         _authKindBox.SelectedIndex = account?.IsOfficialOAuth == true
             ? OfficialOAuthAuthIndex
             : account?.IsCompatibleApi == true
@@ -396,10 +384,6 @@ public sealed class AccountDialog : Form
             providerLabel, _providerShell, wireApiLabel, _wireApiShell,
             baseUrlLabel, _baseUrlShell, modelLabel, _modelShell, _apiNoteCard
         ];
-        _sessionInput.SetBounds(164, 240, 744, 400);
-        _sessionInput.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
-        _formCard.Controls.Add(_sessionInput);
-
         _footerDivider.SetBounds(16, 704, 928, 1);
         _footerDivider.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         _footerDivider.BackColor = UiDesign.Blend(palette.DividerColor, palette.PrimaryColor, 0.10F);
@@ -448,7 +432,6 @@ public sealed class AccountDialog : Form
     {
         CompatibleApiAuthIndex => AccountAuthKind.CompatibleApi,
         OfficialOAuthAuthIndex => AccountAuthKind.OfficialOAuth,
-        WebSessionAuthIndex => AccountAuthKind.WebSession,
         _ => AccountAuthKind.AccessToken
     };
     public string AccessTokenValue => IsAccessTokenSelected
@@ -467,29 +450,11 @@ public sealed class AccountDialog : Form
     private bool IsAccessTokenSelected => _authKindBox.SelectedIndex == AccessTokenAuthIndex;
     private bool IsCompatibleApiSelected => _authKindBox.SelectedIndex == CompatibleApiAuthIndex;
     private bool IsOfficialOAuthSelected => _authKindBox.SelectedIndex == OfficialOAuthAuthIndex;
-    private bool IsWebSessionSelected => _authKindBox.SelectedIndex == WebSessionAuthIndex;
-
-    protected override void OnFormClosing(FormClosingEventArgs e)
-    {
-        SessionEntry = null;
-        if (DialogResult == DialogResult.OK && IsWebSessionSelected)
-        {
-            try { SessionEntry = _sessionInput.ParseEntry(AccountNameValue); }
-            catch (InvalidDataException ex)
-            {
-                e.Cancel = true;
-                DialogResult = DialogResult.None;
-                MessageBox.Show(this, ex.Message, "无法导入 Session", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            }
-        }
-        base.OnFormClosing(e);
-    }
 
     protected override void Dispose(bool disposing)
     {
         if (disposing)
         {
-            SessionEntry = null;
             _oauthCancellation?.Cancel();
             ClearOAuthLoginClipboard();
             ScheduleOAuthDraftCleanup();
@@ -517,7 +482,6 @@ public sealed class AccountDialog : Form
                 AuthKind = AccountAuthKind.AccessToken
             };
             var palette = new ThemeService(root).GetPalette(ThemeMode.Light);
-            WebSessionImportDialog.ValidateLayout(palette);
             using var dialog = new AccountDialog(
                 account,
                 root,
@@ -572,20 +536,9 @@ public sealed class AccountDialog : Form
 
             newDialog._authKindBox.SelectedIndex = CompatibleApiAuthIndex;
             ValidateDialogGeometry(newDialog, AccountAuthKind.CompatibleApi);
-            newDialog._authKindBox.SelectedIndex = WebSessionAuthIndex;
-            newDialog._sessionInput.JsonBox.Text = AccountFileImportTests.SessionFixture();
-            var sessionEntry = newDialog._sessionInput.ParseEntry("");
-            if (newDialog.AuthKindValue != AccountAuthKind.WebSession ||
-                sessionEntry.Name != "session@example.invalid" || !newDialog._sessionInput.Enabled ||
-                newDialog._secretBox.Enabled || newDialog._apiControls.Any(control => control.Enabled) ||
-                newDialog._saveButton.Text != "导入 Session" ||
-                !ButtonTextFits(newDialog._saveButton) ||
-                newDialog._sessionInput.Bottom >= newDialog._formCard.Height ||
-                newDialog._saveButton.Bottom > newDialog.ClientSize.Height)
-                throw new InvalidOperationException("Session mode must expose JSON import and visible confirmation without mixing credential types.");
+            if (newDialog._authKindBox.Items.Count != 3)
+                throw new InvalidOperationException("Only PAT, compatible API and official OAuth may be selected.");
             newDialog._authKindBox.SelectedIndex = OfficialOAuthAuthIndex;
-            if (newDialog._sessionInput.JsonBox.Text.Length != 0)
-                throw new InvalidOperationException("Changing authentication kind must clear pasted Session data.");
             if (newDialog.AuthKindValue != AccountAuthKind.OfficialOAuth ||
                 !string.IsNullOrEmpty(newDialog.AccessTokenValue) ||
                 !string.IsNullOrEmpty(newDialog.ApiKeyValue) ||
@@ -641,9 +594,6 @@ public sealed class AccountDialog : Form
         ValidateDialogGeometry(dialog, AccountAuthKind.CompatibleApi);
         dialog._authKindBox.SelectedIndex = OfficialOAuthAuthIndex;
         ValidateDialogGeometry(dialog, AccountAuthKind.OfficialOAuth);
-        dialog._authKindBox.SelectedIndex = WebSessionAuthIndex;
-        if (!ButtonTextFits(dialog._saveButton) || dialog._saveButton.Bottom > dialog.ClientSize.Height)
-            throw new InvalidOperationException($"Session confirmation is clipped at scale {scale}.");
         dialog._authKindBox.SelectedIndex = AccessTokenAuthIndex;
         ValidateDialogGeometry(dialog, AccountAuthKind.AccessToken);
     }
@@ -1207,17 +1157,8 @@ public sealed class AccountDialog : Form
     {
         var isApi = IsCompatibleApiSelected;
         var isOAuth = IsOfficialOAuthSelected;
-        var isSession = IsWebSessionSelected;
-        _sessionInput.Visible = isSession;
-        _sessionInput.Enabled = isSession;
-        _sessionHomeNote.Visible = isSession;
-        _homeShell.Visible = _browseButton.Visible = !isSession;
-        _nameBox.MaxLength = isSession ? 80 : 32767;
-        _nameBox.PlaceholderText = isSession ? "留空时使用 Session 中的邮箱" : "";
-        _saveButton.Text = isSession ? "导入 Session" : "保存账号";
-        if (!isSession) { _sessionInput.JsonBox.Clear(); SessionEntry = null; }
         var useTokenUpdateButton = IsAccessTokenSelected && !_isNewAccount;
-        _credentialSectionBadge.Text = isSession ? "网页导入" : isApi
+        _credentialSectionBadge.Text = isApi
             ? "API 连接"
             : isOAuth
                 ? "官方登录"
@@ -1238,13 +1179,12 @@ public sealed class AccountDialog : Form
             isApi ? 70 : 82);
         _secretNoteCard.PerformLayout();
 
-        _secretNoteCard.Visible = !isSession;
-        _secretLabel.Visible = !isOAuth && !isSession;
-        _secretLabel.Enabled = !isOAuth && !isSession;
-        _secretShell.Visible = !isOAuth && !isSession && !useTokenUpdateButton;
-        _secretShell.Enabled = !isOAuth && !isSession && !useTokenUpdateButton;
-        _secretBox.Visible = !isOAuth && !isSession && !useTokenUpdateButton;
-        _secretBox.Enabled = !isOAuth && !isSession && !useTokenUpdateButton;
+        _secretLabel.Visible = !isOAuth;
+        _secretLabel.Enabled = !isOAuth;
+        _secretShell.Visible = !isOAuth && !useTokenUpdateButton;
+        _secretShell.Enabled = !isOAuth && !useTokenUpdateButton;
+        _secretBox.Visible = !isOAuth && !useTokenUpdateButton;
+        _secretBox.Enabled = !isOAuth && !useTokenUpdateButton;
         _updateTokenButton.Visible = useTokenUpdateButton;
         _updateTokenButton.Enabled = useTokenUpdateButton;
         _generateLoginLinkButton.Visible = isOAuth;
@@ -1343,7 +1283,7 @@ public sealed class AccountDialog : Form
             TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding).Width;
         _saveButton.Width = Math.Max((int)Math.Ceiling(140 * scale),
             saveTextWidth + 2 * Math.Max(10, _saveButton.Padding.Horizontal / 2) + (int)Math.Ceiling(8 * scale));
-        var contentBottom = isSession ? _sessionInput.Bottom : isApi ? _apiNoteCard.Bottom : _secretNoteCard.Bottom;
+        var contentBottom = isApi ? _apiNoteCard.Bottom : _secretNoteCard.Bottom;
         _formCard.Height = contentBottom + cardBottomPadding;
         _footerDivider.Top = _formCard.Bottom + Math.Max(6, (int)Math.Ceiling(8 * scale));
         _saveButton.Top = _formCard.Bottom + footerGap;

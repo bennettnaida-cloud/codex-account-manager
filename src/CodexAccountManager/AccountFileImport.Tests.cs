@@ -11,8 +11,8 @@ internal static partial class AccountFileImportTests
         Directory.CreateDirectory(root);
         try
         {
-            ValidateWebSessionImport(root);
-            LocalPatGatewayHost.ValidateWebSessionRouting();
+            ValidateRetiredWebSession(root);
+            LocalPatGatewayHost.ValidateRetiredWebSessionRouting();
             var native = """{"auth_mode":"chatgpt","tokens":{"id_token":"fixture-id-token","access_token":"fixture-access-token","refresh_token":"fixture-refresh-token","account_id":"fixture-account"}}""";
             var cpa = """{"type":"codex","email":"fixture@example.invalid","access_token":"fixture-access-token","refresh_token":"fixture-refresh-token","id_token":"fixture-id-token","account_id":"fixture-account"}""";
             var sub = """{"type":"sub2api-data","version":1,"accounts":[{"name":"fixture","platform":"openai","type":"oauth","credentials":{"access_token":"fixture-access-token","refresh_token":"fixture-refresh-token-2","chatgpt_account_id":"fixture-account-2"}},{"name":"fixture","platform":"openai","type":"apikey","credentials":{"api_key":"sk-fixture-only-123456","base_url":"https://example.invalid/v1","model":"gpt-99-test"}},{"name":"ignored","platform":"anthropic","credentials":{"api_key":"sk-fixture-other"}}]}""";

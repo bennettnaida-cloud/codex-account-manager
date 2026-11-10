@@ -133,26 +133,6 @@ public sealed partial class CodexCliService
             };
             var oauthModels = await FetchOfficialOAuthRemoteModelsAsync(client, "oauth-fixture-only", "oauth-fixture-account", "0.163.0", CancellationToken.None);
             Check(oauthCalls == 1 && oauthModels.Count == remote.Count, "OAuth discovery preserves new model metadata");
-            var sessionEntry = AccountFileImport.Parse(AccountFileImportTests.SessionFixture()).Entries.Single();
-            var sessionAccount = new AccountRecord { AuthKind = AccountAuthKind.WebSession, CodexHome = directory, AccessTokenModel = "gpt-6-astra" };
-            var sessionAuthPath = Path.Combine(directory, AuthFileName);
-            File.WriteAllText(sessionAuthPath, sessionEntry.AuthJson);
-            var sessionCredential = ReadQuotaTestCredential(sessionAccount, sessionAuthPath);
-            var sessionCalls = 0;
-            handler.Respond = (request, _) =>
-            {
-                sessionCalls++;
-                Check(request.RequestUri!.Host == "chatgpt.com" && request.RequestUri.AbsolutePath == "/backend-api/codex/models" &&
-                    request.Headers.Authorization?.Parameter == sessionCredential.Token &&
-                    request.Headers.GetValues("chatgpt-account-id").Single() == "session-workspace", "Session model request workspace and token isolation");
-                return Task.FromResult(Response(HttpStatusCode.OK, remoteJson));
-            };
-            for (var n = 0; n < 2; n++)
-                await RefreshAccessTokenCatalogCoreAsync(sessionAccount, "session-identity", false, true, () => true,
-                    async ct => (await FetchOfficialOAuthRemoteModelsAsync(client, sessionCredential.Token, sessionCredential.AccountId!, "0.163.0", ct), "0.163.0"), CancellationToken.None);
-            Check(sessionCalls == 2 && File.ReadAllText(sessionAuthPath) == sessionEntry.AuthJson, "Session always queries online without OAuth refresh or credential rewrite");
-            ProjectAccessTokenSourceConfig(Path.Combine(directory, ConfigFileName), sessionAccount);
-            Check(File.ReadAllText(Path.Combine(directory, ConfigFileName)).Contains(TomlString(path)), "Session model catalog projected to gateway client");
             var oauthConfig = ProjectOfficialOAuthConfigText("", modelCatalogPath: path);
             Check(oauthConfig.Contains(TomlString(path)) &&
                 ProjectOfficialOAuthConfigText(oauthConfig, modelCatalogPath: path) == oauthConfig, "OAuth catalog projection and idempotence");

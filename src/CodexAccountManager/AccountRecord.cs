@@ -57,10 +57,10 @@ public sealed class AccountRecord
     public bool IsWebSession => AuthKind.Equals(AccountAuthKind.WebSession, StringComparison.OrdinalIgnoreCase);
 
     // Unknown legacy values historically followed the Access Token path. Keep that
-    // fallback. Browser Session accounts also use the local bearer-token transport.
-    public bool IsAccessToken => !IsOfficialOAuth && !IsCompatibleApi;
+    // fallback, but retired browser Session records must never become PAT accounts.
+    public bool IsAccessToken => !IsOfficialOAuth && !IsCompatibleApi && !IsWebSession;
 
-    public string AuthKindLabel => IsWebSession ? "网页版 Session" : IsOfficialOAuth
+    public string AuthKindLabel => IsWebSession ? "网页版 Session（已停用）" : IsOfficialOAuth
         ? "通过 ChatGPT 登录（官方）"
         : IsCompatibleApi
             ? "兼容 API"
@@ -72,7 +72,9 @@ public static class AccountAuthKind
     public const string AccessToken = "access_token";
     public const string OfficialOAuth = "official_oauth";
     public const string CompatibleApi = "compatible_api";
+    // Retained only to recognize existing records without changing or deleting their data.
     public const string WebSession = "web_session";
+    internal const string WebSessionRemovedMessage = "网页版 Session 导入功能已移除，原有账号数据仍保留。请在“新增账号”中选择“通过 ChatGPT 登录（官方）”重新添加账号。";
 
     public static string Normalize(string? value)
     {
