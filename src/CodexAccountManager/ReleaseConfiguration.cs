@@ -7,7 +7,7 @@ namespace CodexAccountManager;
 /// </summary>
 internal static class ReleaseConfiguration
 {
-    internal const string Version = "2.3.45";
+    internal const string Version = "2.3.46";
     // Reserve admission does not change the wire protocol; keep the compatible 2.3.24 listener
     // and persisted routing state so upgrading the UI does not interrupt requests.
     internal const int GatewayPort = 8341;
