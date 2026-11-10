@@ -17,7 +17,7 @@ Codex Account Manager 是一个在本机运行的 Codex 多账号管理器。它
 
 也可以打开 [Latest Release](https://github.com/bennettnaida-cloud/codex-account-manager/releases/tag/latest) 查看版本、发布时间和全部文件。
 
-当前发布版本为 2.3.44，内置 Codex CLI 0.163.0。Windows 已移除 Codex++ 启动按钮、启动器、增强桥接等待和隐藏任务生成逻辑；新配置及旧版启动设置统一使用官方 Codex。合并 2.3.43 的导入 OAuth 额度读取修复，兼容缺少 `last_refresh` 的有效凭据，不改写原始 Token 或伪造刷新时间。保留网页版 Session、sub2api/CPA 文件导入、启动前在线模型同步、逐账号代理和 5h ≤10% / 仅周额度 ≤3% 轮换。详见 [2.3.44 更新说明](docs/release-2.3.44.md)。Windows 无需另装 .NET；macOS 同步版本号并保持原有功能，Windows 启动同步与文件/Session 导入尚未移植。
+当前发布版本为 2.3.45，内置 Codex CLI 0.163.0。Windows 新增本地 HTTP 兼容修复：仅移除 Codex Desktop 自动附带的两种无调用编号的空页面状态，避免兼容中转报 `function_call_output requires call_id`。API 账号启动统一经过本地网关，换用其他中转也能应用此修复；保留账号自身的上游地址、密钥、模型和代理配置。详见 [2.3.45 更新说明](docs/release-2.3.45.md)。Windows 无需另装 .NET；macOS 仅同步版本号，本次兼容修复尚未移植。
 
 保留旧会话续聊用量统计、轮换、逐账号代理与模型目录，以及升级时同步桌面和任务栏快捷方式。当前本机桌面版本为 Windows OpenAI.Codex 26.1002.7124.0（ChatGPT.exe）；专项回归并不等于已在所有电脑上完成交互实测，未来版本及第三方上游仍需按实际协议验证。
 
@@ -46,7 +46,7 @@ Codex Account Manager 是一个在本机运行的 Codex 多账号管理器。它
 - 会话与 response 粘性缓存只持久化 HMAC 摘要和账号哈希，不保存原始 session、conversation、prompt-cache 或 response ID。
 - 从本地 JSONL 与 SQLite 日志统计 Token、缓存写入和逐模型 API 等值成本。
 - 提供 1h、5h、今天、本周、本月趋势、模型分布和 CSV 导出。
-- 在系统配置中管理项目目录、启动目录、HTTP/SOCKS5 上游代理和自动检测；本地 PAT 网关默认随软件启动，也可手动打开或关闭。
+- 在系统配置中管理项目目录、启动目录、HTTP/SOCKS5 上游代理和自动检测；本地账号网关默认随软件启动，也可手动打开或关闭；PAT、Session 和 API 账号启动需要开启网关。
 - 通过代理检查官网模型及价格；价格表可手动编辑、恢复内置值，并按最新模型优先显示。
 - 支持浅色、深色、跟随系统以及可选的 Codex 主题。
 - 从 GitHub `latest` Release 检查更新，显示下载进度，校验 SHA-256 后原位升级并自动重启。
@@ -64,20 +64,22 @@ flowchart LR
     H --> C["Codex App / CLI"]
     C --> L["共享聊天记录与本地用量日志"]
     L --> S["额度与成本统计"]
-    M --> G["本机 PAT 网关"]
+    C --> G["本机账号网关（PAT / Session / API）"]
     G --> X["配置的上游代理"]
-    X --> O["官方服务"]
+    X --> O["官方服务 / 所选 API 上游"]
 ```
 
 ### 1. 凭据隔离与聊天共享
 
 账号目录只保存该账号的登录凭据和账号配置。真正启动 Codex 时，管理器会先备份需要保护的现有登录状态，再把当前账号的必要配置原子投放到共享 `%USERPROFILE%\.codex`。历史会话不会随账号切换，也不会因为切换凭据而删除。
 
-### 2. Access Token 本机网关
+### 2. 本机账号网关与中转兼容
 
 Access Token 模式使用只监听回环地址的本机网关。网关校验当前账号及工作区标识，并将请求转发到固定的官方后端；如果配置了上游代理，请求会通过该代理发送。网关不向局域网开放，也不会把多个账号合并成同一份凭据。
 
-兼容 API 账号则使用各自配置的 API 地址、API Key 和模型，不经过 Access Token 账号的额度逻辑。
+Windows 兼容 API 账号同样经过本机网关，再转发至账号自身配置的 API 地址，使用其 API Key、模型和代理。仅清理已确认的两种空页面状态，不生成调用编号，不删除真实工具结果或页面内容，并保留续聊关联。此修复独立于中转站服务器补丁；其他协议差异仍由具体上游决定。
+
+升级后请自行重启管理器，再点击所用 API 账号的启动按钮，使旧版直连配置迁移到本机网关。网关关闭或等待升级时会明确提示，不静默退回直连。
 
 ### 3. 官方 Codex 的 Standard/Fast 兼容层
 

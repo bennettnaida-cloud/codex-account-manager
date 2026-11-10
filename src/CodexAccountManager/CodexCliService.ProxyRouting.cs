@@ -45,12 +45,15 @@ public sealed partial class CodexCliService
     // Chromium login/feature requests also need an explicit proxy on cold activation.
     internal static bool RequiresDesktopGateway(AccountRecord account, bool requested = false)
     {
+        // All API launches must pass through the local Responses compatibility layer,
+        // even with rotation disabled and no fixed proxy. Keep the upstream on the
+        // account record; the gateway selects its endpoint and credential at runtime.
         if (requested || account.IsAccessToken) return true;
         var store = new ProxyNodeStore();
         var binding = store.GetBinding(AccountProxyResolver.AccountKeyFor(account));
         if (store.BindingsLoadFailed)
             throw new InvalidDataException("无法读取账号代理绑定；为避免绕过独立节点，已取消启动。请检查代理绑定文件后重试。");
-        return binding?.Mode is ProxyBindingMode.FixedNode or ProxyBindingMode.Disabled;
+        return account.IsCompatibleApi || binding?.Mode is ProxyBindingMode.FixedNode or ProxyBindingMode.Disabled;
     }
 
     private static void ValidateBoundDesktopProxyProjection(AccountRecord api, AccountRecord oauth)
@@ -63,15 +66,15 @@ public sealed partial class CodexCliService
             Environment.SetEnvironmentVariable("CODEX_ACCOUNT_MANAGER_HOME", fixture);
             var store = new ProxyNodeStore(fixture);
             var service = new CodexCliService();
-            if (RequiresDesktopGateway(api) || !RequiresDesktopGateway(api, requested: true))
-                throw new InvalidOperationException("Unbound API routing no longer respects the caller's rotation request.");
+            if (!RequiresDesktopGateway(api) || !RequiresDesktopGateway(api, requested: true) || RequiresDesktopGateway(oauth))
+                throw new InvalidOperationException("API compatibility routing must be independent of rotation while unbound OAuth stays native.");
 
-            foreach (var bindingMode in new[] { ProxyBindingMode.FixedNode, ProxyBindingMode.Disabled })
+            foreach (var bindingMode in new[] { ProxyBindingMode.InheritGlobal, ProxyBindingMode.FixedNode, ProxyBindingMode.Disabled })
             {
-                // Begin with the exact old direct profile. Binding a node must invalidate
-                // both strict and relaxed voice/mobile reuse, including harmless text drift.
+                // Begin with the old direct profile. Every API launch must migrate it,
+                // including strict/relaxed voice/mobile reuse and harmless text drift.
                 store.SaveBindings([]);
-                ProjectWindowsClientAccount(api, new LoginStatus(), AccessTokenSharedProfileMode.ChatGptDesktop, oauth);
+                ProjectCompatibleApiAccount(api, new LoginStatus(), AccessTokenSharedProfileMode.ChatGptDesktop, oauth, routeThroughGateway: false);
                 File.AppendAllText(Path.Combine(GetDefaultCodexHome(), ConfigFileName), "\n# runtime drift\n");
                 store.SetBinding(new AccountProxyBinding
                 {
@@ -112,6 +115,6 @@ public sealed partial class CodexCliService
             Directory.Delete(fixture, recursive: true);
         }
         // Leave the enclosing credential/projection test in its original unbound state.
-        ProjectCompatibleApiAccount(api, new LoginStatus(), AccessTokenSharedProfileMode.ChatGptDesktop, oauth);
+        ProjectWindowsClientAccount(api, new LoginStatus(), AccessTokenSharedProfileMode.ChatGptDesktop, oauth);
     }
 }

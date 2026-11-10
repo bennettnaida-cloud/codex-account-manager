@@ -259,6 +259,12 @@ static class Program
             Console.WriteLine("Gateway rotation and compatible quota classification self-test passed.");
             return 0;
         }
+        if (args.Contains("--companion-compatibility-self-test", StringComparer.OrdinalIgnoreCase))
+        {
+            CodexEmptyCompanionSnapshotsTests.Validate();
+            LocalPatGatewayHost.ValidateCompanionCompatibilityAsync().GetAwaiter().GetResult();
+            return 0;
+        }
         if (args.Contains("--oauth-link-probe", StringComparer.OrdinalIgnoreCase))
         {
             return RunOAuthLinkProbeAsync().GetAwaiter().GetResult();
@@ -674,6 +680,7 @@ static class Program
             CodexCliService.ValidateDesktopStateRewrite();
             CodexCliService.ValidateCompatibleApiLaunchPreflight();
             ThemeService.ValidateOfficialClientMigration();
+            CodexEmptyCompanionSnapshotsTests.Validate();
             CodexCliService.ValidateProxyEnvironmentProjection();
             AccountAuthKind.ValidateAuthenticationKinds();
             AccountStore.ValidateOfficialOAuthAccountStorage();

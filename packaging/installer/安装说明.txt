@@ -33,6 +33,10 @@ API Key 或 PAT 写成官方 Codex App 可识别的 auth_mode=apikey 登录文�
 重复输入密钥。Access Token 的模型请求仍由本机 PAT 网关转发并使用该账号的月额度；
 已有 ChatGPT OAuth 会先备份，但不是启动前置条件。
 
+Windows 2.3.45 中转兼容修复：API 账号启动需要开启本地账号网关。升级后重新打开管理器，
+再点击所用 API 账号的启动按钮，旧版直连配置才会迁移。网关转发至账号自身的上游地址，
+仅清理 Codex Desktop 两种无调用编号的空页面状态，真实工具结果和页面内容会保留。
+
 通过“Codex 启动”打开 PAT/API 账号后，Standard/Fast 选择器显示在官方 Codex 内。
 这是不修改 Codex 签名文件的非官方本地兼容层；Fast/priority 是否受支持及如何计费
 仍由实际服务端决定。

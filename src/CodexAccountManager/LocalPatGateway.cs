@@ -73,7 +73,9 @@ internal static class LocalPatGateway
     internal const string LegacyV12RotationProtocolValue = "request-boundary-v12";
     // v14 pins browser Session workspace identity and rejects expired Session credentials.
     internal const string LegacyV13RotationProtocolValue = "request-boundary-v13";
-    internal const string RotationProtocolValue = "request-boundary-v14";
+    internal const string LegacyV14RotationProtocolValue = "request-boundary-v14";
+    // v15 removes only Desktop's two null Page snapshots before HTTP forwarding.
+    internal const string RotationProtocolValue = "request-boundary-v15";
     private static readonly SemaphoreSlim StartupLock = new(1, 1);
     private static readonly TimeSpan StartupLockTimeout = TimeSpan.FromSeconds(8);
     private static readonly TimeSpan DesktopStartupTimeout = TimeSpan.FromSeconds(12);
@@ -161,6 +163,18 @@ internal static class LocalPatGateway
         }
         // Only injected gates/preparation callbacks are used: no real listener, account,
         // proxy or credential is read/changed by these tests.
+        using (var legacy = new HttpResponseMessage())
+        {
+            legacy.Headers.Add(RotationProtocolHeader, LegacyV14RotationProtocolValue);
+            Require(HasCompatibleRotationProtocol(legacy) && !HasExpectedRotationProtocol(legacy) &&
+                IsCurrentRotationProtocolValue(LegacyV14RotationProtocolValue),
+                "v14 status must remain readable but require an upgrade before launch");
+        }
+        using (var current = new HttpResponseMessage())
+        {
+            current.Headers.Add(RotationProtocolHeader, RotationProtocolValue);
+            Require(HasExpectedRotationProtocol(current), "current compatibility gateway was rejected");
+        }
         foreach (var health in new[] { GatewayHealth.Ready, GatewayHealth.ProxyMismatch })
         {
             var calls = 0;
@@ -225,7 +239,7 @@ internal static class LocalPatGateway
         if (!IsEnabledBySettings())
         {
             throw new InvalidOperationException(
-                "本地网关已在系统配置中关闭；Access Token、独立代理或轮换需要网关，请先在系统配置中开启网关。");
+                "本地网关已在系统配置中关闭；PAT、Session、API 兼容处理、独立代理或轮换需要网关，请先在系统配置中开启网关。");
         }
 
         await AcquireStartupLockAsync(StartupLock, StartupLockTimeout, cancellationToken).ConfigureAwait(false);
@@ -282,7 +296,7 @@ internal static class LocalPatGateway
                 if (!await ShutdownIfRunningAsync(cancellationToken))
                 {
                     throw new InvalidOperationException(
-                        "检测到不支持无缝轮换的旧版 PAT 网关，但无法安全升级；请退出旧版管理器后重试。");
+                        "当前账号网关需要升级以支持新的请求兼容处理，但无法安全升级；请退出旧版管理器后重试。");
                 }
 
                 await Task.Delay(120, cancellationToken);
@@ -1002,6 +1016,7 @@ internal static class LocalPatGateway
 
     internal static bool IsCompatibleRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV14RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV13RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV12RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV11RotationProtocolValue, StringComparison.Ordinal) ||
@@ -1019,6 +1034,7 @@ internal static class LocalPatGateway
     // new executable waits for a request-boundary listener hand-off.
     internal static bool IsCurrentRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV14RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV13RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV12RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, SuccessfulActivityRotationProtocolValue, StringComparison.Ordinal) ||
@@ -1026,6 +1042,7 @@ internal static class LocalPatGateway
 
     internal static bool IsTransparentRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV14RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV13RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV12RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV11RotationProtocolValue, StringComparison.Ordinal) ||
@@ -1038,6 +1055,7 @@ internal static class LocalPatGateway
 
     internal static bool IsConfirmedQuotaRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV14RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV13RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV12RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV11RotationProtocolValue, StringComparison.Ordinal) ||
@@ -1075,6 +1093,7 @@ internal static class LocalPatGateway
                         string.Equals(value, SafeContentEncodingRotationProtocolValue, StringComparison.Ordinal) ||
                         string.Equals(value, "request-boundary-v9", StringComparison.Ordinal) ||
                         string.Equals(value, LegacyV11RotationProtocolValue, StringComparison.Ordinal) ||
+                        string.Equals(value, LegacyV14RotationProtocolValue, StringComparison.Ordinal) ||
                         string.Equals(value, LegacyV13RotationProtocolValue, StringComparison.Ordinal) ||
                         string.Equals(value, LegacyV12RotationProtocolValue, StringComparison.Ordinal) ||
                         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal));
@@ -2411,6 +2430,17 @@ internal sealed partial class LocalPatGatewayHost
                     return;
                 }
             }
+            if (replayableBody != null &&
+                upstreamUri.AbsolutePath.EndsWith("/responses", StringComparison.OrdinalIgnoreCase))
+            {
+                var normalized = CodexEmptyCompanionSnapshots.Normalize(
+                    replayableBody.Bytes, context.Request.UserAgent, out var removed);
+                if (removed > 0)
+                {
+                    replayableBody = replayableBody with { Bytes = normalized, WasCompanionNormalized = true };
+                    ManagerLifecycleDiagnostics.Write("gateway-empty-page-snapshots-removed", $"count={removed}");
+                }
+            }
             var globalRouteCredential = credential;
             var globalRouteSourceAccountKey = credential.AccountKey;
             SessionAffinityRequest? affinityRequest = null;
@@ -2857,7 +2887,8 @@ internal sealed partial class LocalPatGatewayHost
                 // normalization as a rewrite for header/content-length handling; this
                 // also makes retries deterministic because every attempt uses the same
                 // replay buffer.
-                var requestBodyWasRewritten = replayableBody?.WasContentDecoded == true;
+                var requestBodyWasRewritten = replayableBody?.WasContentDecoded == true ||
+                                              replayableBody?.WasCompanionNormalized == true;
                 var fingerprintPlan = ResolveCodexFingerprintPlan(credential, context.Request);
                 if (credential.IsCompatibleApi)
                 {
@@ -7343,7 +7374,8 @@ internal sealed partial class LocalPatGatewayHost
     private sealed record ReplayableModelRequestBody(
         byte[] Bytes,
         bool WasContentDecoded = false,
-        string? OriginalContentEncoding = null);
+        string? OriginalContentEncoding = null,
+        bool WasCompanionNormalized = false);
     private sealed record Upstream429Classification(
         bool IsQuotaExhausted,
         string Reason,

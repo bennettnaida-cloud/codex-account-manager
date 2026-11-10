@@ -2316,6 +2316,8 @@ public sealed partial class CodexCliService
 
     public async Task<WindowsClientAccountProjection> PrepareWindowsClientAccountAsync(AccountRecord account)
     {
+        if (RequiresDesktopGateway(account))
+            await LocalPatGateway.EnsureReadyForDesktopLaunchAsync();
         using var modelDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(50));
         await EnsureOfficialOAuthLaunchCredentialAsync(account, modelDeadline.Token);
         await PrepareLaunchModelCatalogAsync(account, modelDeadline.Token);
@@ -4538,9 +4540,9 @@ public sealed partial class CodexCliService
         {
             throw new DirectoryNotFoundException($"项目目录不存在：{projectPath}");
         }
-        if (account.IsAccessToken)
+        if (RequiresDesktopGateway(account))
         {
-            LocalPatGateway.EnsureRunning();
+            LocalPatGateway.EnsureReadyForDesktopLaunchAsync().GetAwaiter().GetResult();
         }
 
         var scriptLines = new List<string>
@@ -10592,7 +10594,7 @@ public sealed partial class CodexCliService
 
             var cockpitAuthPath = Path.Combine(sharedHome, CockpitAuthFileName);
             File.WriteAllText(cockpitAuthPath, "virtual-cockpit-marker");
-            var apiProjection = ProjectCompatibleApiAccount(
+            var apiProjection = ProjectWindowsClientAccount(
                 apiAccount,
                 new LoginStatus(),
                 AccessTokenSharedProfileMode.ChatGptDesktop);
@@ -10668,7 +10670,8 @@ public sealed partial class CodexCliService
                     apiAccount,
                     requiresOpenAiAuth: true,
                     providerBearerToken: "virtual-api",
-                    forceFileAuthStore: true));
+                    forceFileAuthStore: true,
+                    routeThroughGateway: true));
             reprojectedSharedApiConfig = PreserveSharedDesktopRuntimeSections(
                 sharedApiConfig, reprojectedSharedApiConfig);
             if (!string.Equals(
@@ -10872,12 +10875,16 @@ public sealed partial class CodexCliService
                     !IsAccessTokenDesktopAuthSelected(
                         Path.Combine(apiHome, AuthFileName),
                         sharedAuthPath) ||
-                    !service.IsSharedProfileAlreadySelected(apiAccount))
+                    service.IsSharedProfileAlreadySelected(apiAccount))
                 {
                     throw new InvalidOperationException(
-                        "One-click compatible-API projection did not write a reusable official-App API-key login.");
+                        "Legacy API projection lost its credential or bypassed the required gateway migration.");
                 }
             }
+            ProjectWindowsClientAccount(apiAccount, new LoginStatus(), AccessTokenSharedProfileMode.ApiCompatible);
+            if (!service.IsSharedProfileAlreadySelected(apiAccount) ||
+                !File.ReadAllText(sharedConfigPath).Contains("base_url = " + TomlString(LocalPatGateway.ProviderBaseUrl), StringComparison.Ordinal))
+                throw new InvalidOperationException("API launch did not migrate the old direct profile to the compatibility gateway.");
         }
         finally
         {
@@ -11260,7 +11267,7 @@ public sealed partial class CodexCliService
             }
 
             service.PrepareChatGptFeatureAccount(apiAccount, oauthA);
-            var apiProjection = ProjectCompatibleApiAccount(
+            var apiProjection = ProjectWindowsClientAccount(
                 apiAccount,
                 new LoginStatus(),
                 AccessTokenSharedProfileMode.ChatGptDesktop,
@@ -11338,7 +11345,7 @@ public sealed partial class CodexCliService
                     "Deleting a selected API model left a bearer behind or deleted the OAuth owner.");
             }
 
-            _ = ProjectCompatibleApiAccount(
+            _ = ProjectWindowsClientAccount(
                 apiAccount,
                 new LoginStatus(),
                 AccessTokenSharedProfileMode.ChatGptDesktop,
