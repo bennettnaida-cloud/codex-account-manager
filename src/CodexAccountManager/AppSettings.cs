@@ -6,7 +6,7 @@ public sealed class AppSettings
 {
     public ThemeMode ThemeMode { get; set; } = ThemeMode.System;
     public WindowsClientMode WindowsClientMode { get; set; } =
-        global::CodexAccountManager.WindowsClientMode.CodexPlusPlus;
+        global::CodexAccountManager.WindowsClientMode.OfficialCodex;
     public bool UseCodexDreamSkin { get; set; }
     public string CodexAppearancePresetId { get; set; } = "preset-midnight-aurora";
     public CustomCodexTheme CustomCodexTheme { get; set; } = new();
@@ -89,7 +89,6 @@ public sealed class CustomCodexTheme
 
 public enum WindowsClientMode
 {
-    CodexPlusPlus = 0,
     OfficialCodex = 1
 }
 
@@ -179,6 +178,8 @@ public sealed class ThemeService
             {
                 var json = AtomicFilePersistence.ReadAllTextWithRetry(_settingsPath, attempts: 1);
                 settings = JsonSerializer.Deserialize<AppSettings>(json) ?? new AppSettings();
+                // Legacy value 0 selected the retired client; all desktop launches now use official Codex.
+                settings.WindowsClientMode = WindowsClientMode.OfficialCodex;
                 return true;
             }
             catch (Exception ex) when (
@@ -198,6 +199,7 @@ public sealed class ThemeService
     public void SaveSettings(AppSettings settings)
     {
         ArgumentNullException.ThrowIfNull(settings);
+        settings.WindowsClientMode = WindowsClientMode.OfficialCodex;
         Directory.CreateDirectory(Path.GetDirectoryName(_settingsPath)!);
         var mutexAcquired = false;
         try
@@ -232,6 +234,41 @@ public sealed class ThemeService
                     // The mutex can be abandoned while the process is shutting down.
                 }
             }
+        }
+    }
+
+    internal static void ValidateOfficialClientMigration()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "codex-client-migration-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(root);
+            var service = new ThemeService(root);
+            var path = Path.Combine(root, "appsettings.json");
+            foreach (var json in new[]
+            {
+                "{}",
+                "{\"WindowsClientMode\":0,\"CurrentAccountName\":\"fixture\"}",
+                "{\"WindowsClientMode\":1,\"CurrentAccountName\":\"fixture\"}"
+            })
+            {
+                File.WriteAllText(path, json);
+                if (!service.TryLoadSettings(out var settings, out _) ||
+                    settings.WindowsClientMode != WindowsClientMode.OfficialCodex ||
+                    (json != "{}" && settings.CurrentAccountName != "fixture"))
+                    throw new InvalidOperationException("Official client migration changed account selection or retained a retired client.");
+                service.SaveSettings(settings);
+                using var saved = JsonDocument.Parse(File.ReadAllText(path));
+                if (saved.RootElement.GetProperty("WindowsClientMode").GetInt32() != 1)
+                    throw new InvalidOperationException("Official client migration was not persisted.");
+            }
+            if (new AppSettings().WindowsClientMode != WindowsClientMode.OfficialCodex ||
+                new WindowsClientAccountProjection().ClientMode != WindowsClientMode.OfficialCodex)
+                throw new InvalidOperationException("New settings and account projections must default to official Codex.");
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
         }
     }
 

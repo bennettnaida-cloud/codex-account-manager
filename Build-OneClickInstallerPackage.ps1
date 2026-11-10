@@ -485,7 +485,7 @@ try {
 
     $forbiddenFiles = Get-ChildItem -LiteralPath $packageRoot -Recurse -Force -File |
         Where-Object {
-            $_.Name -match '^(auth\.json|\.cockpit_codex_auth\.json|config\.toml|history\.jsonl|quota-capacity-measurements\.json|quota-probe-usage\.json|quota-monitor-settings\.json|quota-dollar-calibration\.json|usage-file-index-v1\.json|\.codex-global-state\.json|\.codex-account-manager-api-preflight\.json|models_cache\.json|codex-account-manager-usage-switches\.json|account-manager-deleted-threads\.json|shared-history-merge\.json|backup-manifest\.json|latest-status\.json|codex-plus-plus-launch(?:-result)?\.json|codex-plus-plus-launch-diagnostics\.log|state_.*\.sqlite.*)$' -or
+            $_.Name -match '^(auth\.json|\.cockpit_codex_auth\.json|config\.toml|history\.jsonl|quota-capacity-measurements\.json|quota-probe-usage\.json|quota-monitor-settings\.json|quota-dollar-calibration\.json|usage-file-index-v1\.json|\.codex-global-state\.json|\.codex-account-manager-api-preflight\.json|models_cache\.json|codex-account-manager-usage-switches\.json|account-manager-deleted-threads\.json|shared-history-merge\.json|backup-manifest\.json|latest-status\.json|codex-plus-plus-launch(?:-result)?\.json|codex-plus-plus-launch-diagnostics\.log|windows-client-launch-diagnostics\.log|state_.*\.sqlite.*)$' -or
             $_.Name -match '^(?:\.env(?:\..*)?|credentials?\.json|cookies?\.json)$' -or
             $_.Name -match '\.sqlite(?:$|[-.])' -or
             $_.Extension -eq '.jsonl' -or

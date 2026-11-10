@@ -9,7 +9,7 @@
 3. 点击“新增账号”，为每个账号设置不同的凭据目录。
 4. 聊天记录默认保存在你自己电脑的 `%USERPROFILE%\.codex`，不会写入本便携包。
 
-程序已经包含 Windows x64 Codex CLI 运行组件。每张账号卡都提供“Codex++ 启动”和“Codex 启动”；没有安装 Codex++ 时可直接选择官方 Codex。
+程序已经包含 Windows x64 Codex CLI 运行组件。每张账号卡都提供“Codex 启动”，直接使用官方 Codex；旧版启动设置会自动迁移。
 
 API Key 与 Access Token 账号都采用一键凭据投放：点击启动时，管理器会把所选账号的密钥写成官方 Codex App 可识别的 `auth_mode=apikey` 登录文件。Access Token 的模型请求仍经本机 PAT 网关使用月额度；无需在 App 内重复输入密钥，已有 ChatGPT OAuth 会先备份但不是启动前置条件。
 

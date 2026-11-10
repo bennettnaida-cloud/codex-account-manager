@@ -225,19 +225,13 @@ jobs:
           body: |
             自动构建版本 `${{ env.CAM_VERSION }}`。
 
-            Windows 2.3.42：新增“新增账号 → 网页版 Session”，支持粘贴 https://chatgpt.com/api/auth/session 返回的完整 JSON；文件导入也支持相同 JSON、数组和 ZIP。自动读取邮箱、工作区与有效期，提供“更新 Session”，同一工作区更新保留账号目录与设置。
+            Windows 2.3.44：移除 Codex++ 启动按钮、启动器、增强桥接等待、隐藏计划任务生成及修复入口，旧配置自动迁移到官方 Codex。保留官方 Codex、CLI 和“语音 / 手机”入口，以及独立的官方客户端外观功能。
 
-            Session 使用独立的短期 Bearer 凭据，经本地网关固定到所属工作区；启动前在线查询模型，支持额度查询及轮换。Session 不能自动续期，到期后需重新导入；上游仍需授予 Codex 权限。不保存 Cookie，不伪造 id_token 或 refresh_token。
+            合并 2.3.43 的导入 OAuth 额度读取修复：有效凭据缺少 last_refresh 时，额度查询通过 app-server 在内存中绑定 Bearer 和所属工作区，不改写原始 Token 或伪造刷新时间。
 
-            保留每次启动官方 ChatGPT OAuth、PAT 或兼容 API 账号前的在线模型同步。PAT 不跳过 15 分钟缓存内的启动查询，OAuth 使用独立凭据及工作区，API 使用所配置站点的 /models。
+            保留 OAuth、PAT、Session、API 账号每次启动前的在线模型同步、网页版 Session 与 sub2api/CPA 文件导入、账号代理，以及 5h 剩余 ≤10%、仅周额度剩余 ≤3% 的轮换暂停规则。
 
-            新增“新增账号 → 从文件导入”：支持 sub2api、CPA Codex、原生 auth.json、PAT 和含地址的 API Key；支持多选 JSON 与 ZIP，提供预览、凭据去重、同名重命名及独立目录。OAuth 过期或缺少 id_token 时在启动前刷新。导入不会覆盖已有账号，不会自动导入代理、分组或轮换设置。
-
-            保留 5h 剩余 ≤10%、仅周额度剩余 ≤3% 的轮换暂停规则。启动前模型查询失败会停止本次启动并保留旧目录、共享凭据与现有客户端。新模型须对账号开放并被客户端支持；发现新模型不会自动替换已有默认模型，显式自定义模型目录优先。不提供 /models 的中转站会明确提示无法完成查询。
-
-            发布流程执行完整自检、启动、PAT/OAuth 在线发现、账号文件导入、轮换、真实本地 HTTP 启动查询和模型目录消费测试，以及安装包隐私检查。内置 Codex CLI 0.163.0。
-
-            macOS 同步版本号并保留原有功能，本次 Windows 启动与文件导入功能尚未移植。Mac 包面向 Apple Silicon，安装脚本执行本机 ad-hoc 签名，未作 Developer ID 签名或公证；GitHub 原生 Mac 验证安装、签名、内置 CLI 和界面加载。
+            发布执行完整自检、启动、账号导入、在线模型发现和额度轮换回归，以及安装包隐私检查。内置 Codex CLI 0.163.0。macOS 同步版本号并保留原有功能，Windows 专属改动尚未移植；Mac 包面向 Apple Silicon，采用本机 ad-hoc 签名。
           prerelease: true
           make_latest: false
           files: |

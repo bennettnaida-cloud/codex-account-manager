@@ -314,10 +314,6 @@ static class Program
         {
             return RunResetCreditsRead(args);
         }
-        if (args.Contains("--repair-codex-plus-plus-task", StringComparer.OrdinalIgnoreCase))
-        {
-            return RunCodexPlusPlusTaskRepair();
-        }
 
         // Only the GUI branch is single-instance. Gateway, helper and self-test
         // arguments have all returned above and must remain runnable as child processes.
@@ -362,23 +358,6 @@ static class Program
         Application.ThreadException += OnApplicationThreadException;
         AppDomain.CurrentDomain.UnhandledException += OnCurrentDomainUnhandledException;
         TaskScheduler.UnobservedTaskException += OnUnobservedTaskException;
-        // Refresh only the launcher files.  Do not repair/register the scheduled task here:
-        // that operation can require elevation and must never stop an already running
-        // Codex or gateway process.  The generated launcher validates PID, start time,
-        // executable path, and the manager PID before it can stop a prior client.
-        try
-        {
-            new CodexCliService().RefreshCodexPlusPlusTaskLauncherFiles();
-            ManagerLifecycleDiagnostics.Write("codex-plus-plus-launcher-files-refreshed");
-        }
-        catch (Exception ex)
-        {
-            // A read-only/locked LocalAppData directory must not prevent the manager UI
-            // from opening.  The next launch or an explicit repair can retry the refresh.
-            ManagerLifecycleDiagnostics.WriteException(
-                "codex-plus-plus-launcher-files-refresh-failed",
-                ex);
-        }
         ManagerLifecycleDiagnostics.Write(
             "manager-message-loop-started",
             $"preserve_gateway={preserveExistingPatGateway}; refresh_bridge={refreshNativeFastBridge}");
@@ -523,21 +502,6 @@ static class Program
             }
 
             Console.WriteLine($"Local PAT account configs migrated: {migrated}");
-            return 0;
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine(ex.Message);
-            return 1;
-        }
-    }
-
-    private static int RunCodexPlusPlusTaskRepair()
-    {
-        try
-        {
-            new CodexCliService().RepairCodexPlusPlusScheduledTask();
-            Console.WriteLine("Codex++ hidden scheduled task is current.");
             return 0;
         }
         catch (Exception ex)
@@ -709,13 +673,14 @@ static class Program
             CodexCliService.ValidateOfficialOAuthProfileProjection();
             CodexCliService.ValidateDesktopStateRewrite();
             CodexCliService.ValidateCompatibleApiLaunchPreflight();
-            CodexCliService.ValidateCodexPlusPlusTaskLauncherScript();
+            ThemeService.ValidateOfficialClientMigration();
             CodexCliService.ValidateProxyEnvironmentProjection();
             AccountAuthKind.ValidateAuthenticationKinds();
             AccountStore.ValidateOfficialOAuthAccountStorage();
             AccountStore.ValidatePermanentAccountDeletion();
             UsageLimitResetSession.ValidateProtocolParsing();
             CodexCliService.ValidateUsageLimitResetGatewaySafety();
+            QuotaSessionAccessToken.ValidateImportedOAuth();
             CodexCliService.ValidateMinimalQuotaTestParsing();
             QuotaSnapshotStore.ValidateAccountIsolation();
             ProbeUsageLedger.ValidateLedger();

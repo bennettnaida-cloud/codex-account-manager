@@ -145,7 +145,7 @@ public sealed class UsageLimitResetSession : IAsyncDisposable
         await WriteJsonLineAsync(new JsonObject { ["method"] = "initialized" }, cancellationToken);
     }
 
-    internal async Task LoginWebSessionAsync(WebSessionCredential credential, CancellationToken cancellationToken)
+    internal async Task LoginAccessTokenAsync(QuotaSessionAccessToken credential, CancellationToken cancellationToken)
     {
         // Native app-server external-token auth is in-memory and needs no forged ID/refresh token.
         await RequestAsync("account/login/start", new JsonObject

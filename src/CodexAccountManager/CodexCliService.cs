@@ -59,10 +59,7 @@ public sealed partial class CodexCliService
     private static readonly Regex DeviceAuthorizationCodePattern = new(
         "(?<![A-Z0-9])[A-Z0-9]{4}-[A-Z0-9]{4,8}(?![A-Z0-9])",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    private const string CodexPlusPlusLauncherFileName = "codex-plus-plus.exe";
-    private const string CodexPlusPlusTaskName = "CodexAccountManagerCodexPlusPlus";
     private const string WindowsClientSwitchMutexName = "Local\\CodexAccountManager.WindowsClientSwitch";
-    private const string CodexPlusPlusTaskHiddenWindowArgument = "-WindowStyle Hidden";
     private const string AuthFileName = "auth.json";
     private const string CockpitAuthFileName = ".cockpit_codex_auth.json";
     private const string ConfigFileName = "config.toml";
@@ -170,7 +167,7 @@ public sealed partial class CodexCliService
     private static readonly object AccessTokenSwitchValidationCacheLock = new();
     private static readonly Dictionary<string, AccessTokenSwitchValidationCacheEntry> AccessTokenSwitchValidationCache =
         new(StringComparer.OrdinalIgnoreCase);
-    private static readonly object CodexPlusPlusLaunchDiagnosticLock = new();
+    private static readonly object WindowsClientLaunchDiagnosticLock = new();
     private static readonly Regex CdpIdentityPattern = new(
         "^[A-Za-z0-9._-]{1,200}$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
@@ -178,20 +175,9 @@ public sealed partial class CodexCliService
     private static long _windowsClientLaunchGeneration;
     private static long _officialAccountDisplayGeneration;
     private static readonly SemaphoreSlim OfficialAccountDisplayGate = new(1, 1);
-    private static readonly SemaphoreSlim CodexPlusPlusTaskOperationLock = new(1, 1);
-    private static readonly TimeSpan CodexPlusPlusOpenThreadTimeout = TimeSpan.FromSeconds(12);
-    // Codex++ 1.2.x can spend close to a minute discovering the packaged Codex app and
-    // bringing up its CDP/helper bridge.  A 20-second foreground deadline produced a false
-    // failure even though the elevated launcher had been accepted and was still progressing.
-    private static readonly TimeSpan CodexPlusPlusLaunchReadyTimeout = TimeSpan.FromSeconds(120);
-    private static readonly TimeSpan CodexPlusPlusLauncherExitProbeTimeout = TimeSpan.FromMilliseconds(1500);
-    private static readonly TimeSpan CodexPlusPlusShutdownDrainTimeout = TimeSpan.FromSeconds(8);
     private static readonly TimeSpan WindowsClientGracefulShutdownTimeout = TimeSpan.FromSeconds(8);
     private static readonly TimeSpan WindowsClientForceShutdownTimeout = TimeSpan.FromSeconds(4);
     private static readonly TimeSpan WindowsClientRuntimeStableDuration = TimeSpan.FromSeconds(3);
-    private static readonly TimeSpan CodexPlusPlusTaskResultTimeout = TimeSpan.FromSeconds(20);
-    private static readonly TimeSpan CodexPlusPlusTaskRequestLifetime = TimeSpan.FromSeconds(45);
-    private const int CodexPlusPlusLauncherGuardPortBase = 57320;
     private static bool _sqliteProviderInitialized;
     private static readonly string LocalCodexCliRelativePath = Path.Combine(
         ".tools",
@@ -381,7 +367,7 @@ public sealed partial class CodexCliService
                     routeThroughGateway: true);
             if (ready)
             {
-                WriteCodexPlusPlusLaunchDiagnostic(
+                WriteWindowsClientLaunchDiagnostic(
                     "selected-live-gateway-route-projected",
                     $"account={GetDesktopAccountKey(account)}; type={accountKind}; " +
                     $"port={LocalPatGateway.Port}; codex_restart=false");
@@ -393,7 +379,7 @@ public sealed partial class CodexCliService
             InvalidDataException or FormatException or ArgumentException or
             NotSupportedException)
         {
-            WriteCodexPlusPlusLaunchDiagnostic(
+            WriteWindowsClientLaunchDiagnostic(
                 "selected-live-gateway-route-projection-failed",
                 $"type={accountKind}; error={ex.GetType().Name}");
             return false;
@@ -1650,6 +1636,7 @@ public sealed partial class CodexCliService
                 authPath);
         }
 
+        var sessionCredential = QuotaSessionAccessToken.Read(account, authPath);
         var command = ResolveCodexCliCommand();
         if (string.IsNullOrWhiteSpace(command))
         {
@@ -1672,7 +1659,7 @@ public sealed partial class CodexCliService
                     account.CodexHome,
                     initializeTimeout,
                     cancellationToken,
-                    account.IsWebSession ? WebSessionCredential.ReadStored(authPath) : null);
+                    sessionCredential);
             }
             catch (TimeoutException) when (!fastFail && attempt == 0)
             {
@@ -2270,7 +2257,7 @@ public sealed partial class CodexCliService
         string codexHome,
         TimeSpan initializeTimeout,
         CancellationToken cancellationToken,
-        WebSessionCredential? webSession = null)
+        QuotaSessionAccessToken? sessionCredential = null)
     {
         var startInfo = BuildUsageLimitResetProcessStartInfo(command, codexHome);
 
@@ -2289,7 +2276,8 @@ public sealed partial class CodexCliService
         try
         {
             await session.InitializeAsync(initializeTimeout, cancellationToken);
-            if (webSession != null) await session.LoginWebSessionAsync(webSession, cancellationToken);
+            if (sessionCredential != null)
+                await session.LoginAccessTokenAsync(sessionCredential, cancellationToken);
             return session;
         }
         catch
@@ -2413,7 +2401,7 @@ public sealed partial class CodexCliService
         return SwitchWindowsClientAccountAsync(
             account,
             projectPath,
-            WindowsClientMode.CodexPlusPlus);
+            WindowsClientMode.OfficialCodex);
     }
 
     public async Task<WindowsClientAccountProjection> SwitchWindowsClientAccountAsync(
@@ -2541,7 +2529,7 @@ public sealed partial class CodexCliService
         // represented by this click.
         // A normal desktop switch only validates local files. Running login status, debug
         // models, or a minimal model request here could consume quota and block this click for
-        // one or more 120-second CLI timeouts. Codex++ performs the online validation when the
+        // one or more 120-second CLI timeouts. The official client performs the online validation when the
         // user opens it; explicit status/login actions remain available separately.
         using var modelDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(50));
         await EnsureOfficialOAuthLaunchCredentialAsync(account, modelDeadline.Token);
@@ -2615,7 +2603,7 @@ public sealed partial class CodexCliService
                     // active-account state still prove this is the same dual-login profile, so
                     // preserve the healthy process instead of closing it merely to canonicalize
                     // unrelated config text.
-                    WriteCodexPlusPlusLaunchDiagnostic(
+                    WriteWindowsClientLaunchDiagnostic(
                         "official-dual-profile-reused-with-runtime-drift",
                         "the verified model/OAuth owners were unchanged; existing Codex was preserved");
                 }
@@ -2754,7 +2742,7 @@ public sealed partial class CodexCliService
                     {
                         var previousClientRelaunchStarted = profileRestored &&
                             TryLaunchOfficialCodexFallback(projectPath, launchGeneration);
-                        WriteCodexPlusPlusLaunchDiagnostic(
+                        WriteWindowsClientLaunchDiagnostic(
                             profileRestored
                                 ? "official-dual-projection-rolled-back"
                                 : "official-dual-projection-rollback-failed",
@@ -2786,7 +2774,7 @@ public sealed partial class CodexCliService
                     routeOfficialOAuthThroughGateway))
             {
                 projection.ClientLaunchStarted = false;
-                projection.CodexPlusPlusLaunchStarted = false;
+
                 projection.ClientLaunchError =
                     "双登录模型凭据二次校验失败：共享配置中的 provider、base_url、model 或 PAT Bearer 与所选账号不一致；" +
                     "已阻止启动并恢复切换前状态。";
@@ -2817,13 +2805,12 @@ public sealed partial class CodexCliService
                 {
                     successfulLaunchGeneration = launchGeneration;
                 }
-                projection.CodexPlusPlusLaunchStarted =
-                    mode == WindowsClientMode.CodexPlusPlus && projection.ClientLaunchStarted;
+
             }
             catch (CodexDreamSkinApplyException ex)
             {
                 projection.ClientLaunchStarted = ex.OfficialClientRelaunched;
-                projection.CodexPlusPlusLaunchStarted = false;
+
                 projection.ClientLaunchError = MaskSensitive(ex.Message);
                 projection.CodexDreamSkinFailed = true;
                 projection.CodexOfficialAppearanceRestored = ex.OfficialAppearanceRestored;
@@ -2831,7 +2818,7 @@ public sealed partial class CodexCliService
             catch (Exception ex)
             {
                 projection.ClientLaunchStarted = false;
-                projection.CodexPlusPlusLaunchStarted = false;
+
                 projection.ClientLaunchError = MaskSensitive(ex.Message);
             }
 
@@ -2957,7 +2944,7 @@ public sealed partial class CodexCliService
                 "失败的 Codex 进程或端口未完全释放，未在运行中的客户端下回写旧凭据。";
             projection.ClientLaunchError = targetLaunchError + "；" +
                                            projection.FailedLaunchRecoveryError;
-            WriteCodexPlusPlusLaunchDiagnostic(
+            WriteWindowsClientLaunchDiagnostic(
                 "official-dual-launch-rollback-quiescence-failed",
                 $"process_count={failedLaunchTargets.Count}; data_preserved=true");
             return;
@@ -2982,7 +2969,7 @@ public sealed partial class CodexCliService
                 (projection.PreviousClientRelaunchStarted
                     ? "已恢复切换前凭据，并自动请求重新打开原 Codex"
                     : "已恢复切换前凭据，但原 Codex 未能自动重新打开");
-            WriteCodexPlusPlusLaunchDiagnostic(
+            WriteWindowsClientLaunchDiagnostic(
                 "official-dual-launch-rolled-back",
                 $"previous_client_relaunch_started={projection.PreviousClientRelaunchStarted}; " +
                 "shared_profile_verified=true");
@@ -2992,7 +2979,7 @@ public sealed partial class CodexCliService
             projection.FailedLaunchRecoveryError = MaskSensitive(ex.Message);
             projection.ClientLaunchError = targetLaunchError +
                 "；切换前凭据恢复失败：" + projection.FailedLaunchRecoveryError;
-            WriteCodexPlusPlusLaunchDiagnostic(
+            WriteWindowsClientLaunchDiagnostic(
                 "official-dual-launch-rollback-failed",
                 $"error_type={ex.GetType().Name}; data_preserved=true");
         }
@@ -3080,7 +3067,7 @@ public sealed partial class CodexCliService
                 var oauthSelections = oauthAccounts
                     .Where(account => CanReuseOfficialOAuthSharedProfile(account))
                     .ToArray();
-                WriteCodexPlusPlusLaunchDiagnostic(
+                WriteWindowsClientLaunchDiagnostic(
                     "official-account-display-discovery",
                     $"oauth_count={oauthAccounts.Length}; " +
                     $"dual_selection_count={dualSelections.Count}; " +
@@ -3115,7 +3102,7 @@ public sealed partial class CodexCliService
             }
             catch (Exception ex)
             {
-                WriteCodexPlusPlusLaunchDiagnostic(
+                WriteWindowsClientLaunchDiagnostic(
                     "official-account-display-discovery-unavailable",
                     "stage failed with " + ex.GetType().Name);
             }
@@ -3171,7 +3158,7 @@ public sealed partial class CodexCliService
                     }
                 }
 
-                WriteCodexPlusPlusLaunchDiagnostic(
+                WriteWindowsClientLaunchDiagnostic(
                     "official-account-display-hot-rotation",
                     $"selected_profile_count={selectedProfiles.Count}; " +
                     $"target_kind={(targetSnapshot.IsCompatibleApi ? "api" : "pat")}");
@@ -3192,7 +3179,7 @@ public sealed partial class CodexCliService
             }
             catch (Exception ex)
             {
-                WriteCodexPlusPlusLaunchDiagnostic(
+                WriteWindowsClientLaunchDiagnostic(
                     "official-account-display-hot-rotation-unavailable",
                     "stage failed with " + ex.GetType().Name);
             }
@@ -3231,7 +3218,7 @@ public sealed partial class CodexCliService
                 identityAfter == null ||
                 !identityBefore.Equals(identityAfter, StringComparison.Ordinal))
             {
-                WriteCodexPlusPlusLaunchDiagnostic(
+                WriteWindowsClientLaunchDiagnostic(
                     "official-account-display-skipped",
                     "the OAuth account/read identity did not remain bound to one account_id");
                 return;
@@ -3253,7 +3240,7 @@ public sealed partial class CodexCliService
                 }
                 if (!mutexAcquired)
                 {
-                    WriteCodexPlusPlusLaunchDiagnostic(
+                    WriteWindowsClientLaunchDiagnostic(
                         "official-account-display-deferred",
                         "an account switch owns the identity display gate");
                     return;
@@ -3274,7 +3261,7 @@ public sealed partial class CodexCliService
                     finalIdentityBinding == null ||
                     !identityAfter.Equals(finalIdentityBinding, StringComparison.Ordinal))
                 {
-                    WriteCodexPlusPlusLaunchDiagnostic(
+                    WriteWindowsClientLaunchDiagnostic(
                         "official-account-display-skipped",
                         "the shared model/OAuth projection changed before display injection");
                     return;
@@ -3293,7 +3280,7 @@ public sealed partial class CodexCliService
                 }
                 if (endpoints.Count != 1)
                 {
-                    WriteCodexPlusPlusLaunchDiagnostic(
+                    WriteWindowsClientLaunchDiagnostic(
                         "official-account-display-deferred",
                         $"verified_endpoint_count={endpoints.Count}; exactly one official owner is required");
                     return;
@@ -3327,7 +3314,7 @@ public sealed partial class CodexCliService
                     .GetResult();
                 if (!applied)
                 {
-                    WriteCodexPlusPlusLaunchDiagnostic(
+                    WriteWindowsClientLaunchDiagnostic(
                         "official-account-display-deferred",
                         "the unique verified primary Codex renderer rejected the optional identity display");
                 }
@@ -3342,7 +3329,7 @@ public sealed partial class CodexCliService
         }
         catch (OperationCanceledException)
         {
-            WriteCodexPlusPlusLaunchDiagnostic(
+            WriteWindowsClientLaunchDiagnostic(
                 "official-account-display-unavailable",
                 "optional identity display timed out or was superseded");
         }
@@ -3350,7 +3337,7 @@ public sealed partial class CodexCliService
         {
             // Identity decoration is optional. It must never turn an otherwise healthy launch
             // into a failure or expose an email/token in diagnostics.
-            WriteCodexPlusPlusLaunchDiagnostic(
+            WriteWindowsClientLaunchDiagnostic(
                 "official-account-display-unavailable",
                 "stage failed with " + ex.GetType().Name);
         }
@@ -3487,7 +3474,7 @@ public sealed partial class CodexCliService
                 ExitCode = 0,
                 Text = sharedProfileCanBeReused
                     ? $"共享 Codex 已在使用 {account.Name} 的同一份凭据，已跳过重复网络预检。"
-                    : $"共享 Codex 尚未登录，已使用 {account.Name} 的本地凭据直接准备 Codex++。"
+                    : $"共享 Codex 尚未登录，已使用 {account.Name} 的本地凭据直接准备官方 Codex。"
             }
             : account.IsCompatibleApi || account.IsOfficialOAuth
                 ? await GetLoginStatusAsync(account)
@@ -4611,7 +4598,7 @@ public sealed partial class CodexCliService
             account,
             projectPath,
             codexHome,
-            WindowsClientMode.CodexPlusPlus);
+            WindowsClientMode.OfficialCodex);
     }
 
     public bool LaunchWindowsClient(
@@ -4669,7 +4656,7 @@ public sealed partial class CodexCliService
                 hasExistingOfficialWindow: true,
                 allowOfficialRendererPatch) && TryReuseExistingOfficialClient())
         {
-            WriteCodexPlusPlusLaunchDiagnostic(
+            WriteWindowsClientLaunchDiagnostic(
                 "official-same-profile-window-preserved",
                 "existing instance preserved; renderer reload, project navigation and shutdown disabled");
             return true;
@@ -4681,12 +4668,6 @@ public sealed partial class CodexCliService
 
         return mode switch
         {
-            WindowsClientMode.CodexPlusPlus => LaunchCodexPlusPlus(
-                projectPath,
-                codexHome,
-                shutdownTargets,
-                switchRequired,
-                launchGeneration),
             WindowsClientMode.OfficialCodex => LaunchOfficialCodex(
                 projectPath,
                 useDreamSkin,
@@ -4720,119 +4701,6 @@ public sealed partial class CodexCliService
         return OfficialCodexStartupReadinessPolicy.PreserveActivationAndObserveInBackground;
     }
 
-    private bool LaunchCodexPlusPlus(
-        string projectPath,
-        string codexHome,
-        IReadOnlyList<WindowsClientProcessSnapshot> shutdownTargets,
-        bool switchRequired,
-        long launchGeneration)
-    {
-        // Apply the Codex++ service-tier control preference before the ready fast path too.
-        // Existing Codex++ processes otherwise skip the settings sync and can keep the picker
-        // hidden after an older manager build wrote `codexAppServiceTierControls=false`.
-        var clientPathForInjection = ResolveCodexWindowsClientPath();
-        var clientAppDir = string.IsNullOrWhiteSpace(clientPathForInjection)
-            ? null
-            : Path.GetDirectoryName(clientPathForInjection);
-        var serviceTierControlsChanged = EnsureCodexPlusPlusSafeSettings(clientAppDir);
-
-        if (IsCodexPlusPlusReady() && !serviceTierControlsChanged)
-        {
-            Process.Start(new ProcessStartInfo(BuildNewThreadDeepLink(projectPath))
-            {
-                UseShellExecute = true
-            });
-            return true;
-        }
-        if (serviceTierControlsChanged && IsCodexPlusPlusReady())
-        {
-            // Codex++ loads backend settings only during startup. This one-time restart is
-            // required when upgrading from an older manager that persisted the control as off.
-            StopWindowsClientProcesses(CaptureWindowsClientProcessSnapshots());
-        }
-
-        var codexPlusPlusPath = ResolveCodexPlusPlusLauncherPath();
-        if (!string.IsNullOrWhiteSpace(codexPlusPlusPath))
-        {
-            // Codex++ 1.2.34 does not reliably forward the launcher's --app-path to its
-            // manager.  Persisting the already resolved package app directory avoids a slow
-            // Get-AppxPackage discovery path that has taken 52-66 seconds on this machine.
-            var launchStartedUtc = DateTime.UtcNow;
-            if (TryLaunchCodexPlusPlusViaScheduledTask(
-                    codexPlusPlusPath,
-                    clientAppDir,
-                    projectPath,
-                    codexHome,
-                    shutdownTargets,
-                    switchRequired))
-            {
-                // The elevated helper has accepted the launch and already captured immediate
-                // failures.  Bridge injection can take much longer than opening the app; keep
-                // that readiness/deep-link step in the background instead of blocking this
-                // button for one or two minutes.
-                OpenNewTaskAfterCodexPlusPlusLaunchInBackground(
-                    projectPath,
-                    launchStartedUtc,
-                    launchGeneration);
-                return true;
-            }
-
-            var startInfo = new ProcessStartInfo(codexPlusPlusPath)
-            {
-                WorkingDirectory = projectPath,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WindowStyle = ProcessWindowStyle.Hidden,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            };
-
-            if (!string.IsNullOrWhiteSpace(clientAppDir))
-            {
-                startInfo.ArgumentList.Add("--app-path");
-                startInfo.ArgumentList.Add(clientAppDir);
-            }
-
-            startInfo.Environment["CODEX_HOME"] = codexHome;
-            startInfo.Environment["CODEX_SQLITE_HOME"] = codexHome;
-            startInfo.Environment["CODEX_PROJECT_PATH"] = projectPath;
-            ApplyProxyEnvironment(startInfo);
-            try
-            {
-                using var launcherProcess = Process.Start(startInfo) ??
-                    throw new InvalidOperationException("Codex++ 启动器没有返回进程句柄。");
-                _ = launcherProcess.StandardOutput.ReadToEndAsync();
-                var launcherStandardError = launcherProcess.StandardError.ReadToEndAsync();
-                var exitedDuringProbe = launcherProcess.WaitForExit(
-                    (int)CodexPlusPlusLauncherExitProbeTimeout.TotalMilliseconds);
-                if (exitedDuringProbe && launcherProcess.ExitCode != 0)
-                {
-                    var error = launcherStandardError.IsCompletedSuccessfully
-                        ? MaskSensitive(launcherStandardError.Result).Trim()
-                        : "";
-                    throw new InvalidOperationException(
-                        $"Codex++ 启动失败（启动器退出代码 {launcherProcess.ExitCode}）。" +
-                        (string.IsNullOrWhiteSpace(error) ? "" : "\n" + error));
-                }
-                OpenNewTaskAfterCodexPlusPlusLaunchInBackground(
-                    projectPath,
-                    launchStartedUtc,
-                    launchGeneration);
-                return true;
-            }
-            catch (Win32Exception ex) when (ex.NativeErrorCode == 740)
-            {
-                throw new InvalidOperationException(
-                    "Codex++ 需要管理员权限，但普通账号启动不会隐式打开管理员 PowerShell。" +
-                    "请先显式执行一次“修复 Codex++ 隐藏启动任务”，或把启动方式改为官方 Codex。",
-                    ex);
-            }
-        }
-
-        throw new InvalidOperationException(
-            "找不到已安装的 Codex++。为确保聊天记录管理增强功能可用，本次没有绕过 Codex++ 直接启动 Codex。");
-    }
-
     private static bool LaunchOfficialCodexWithLegacyRendererReload(
         string projectPath,
         bool useDreamSkin,
@@ -4861,7 +4729,7 @@ public sealed partial class CodexCliService
                         out var dreamSkinFastReady) ||
                  !dreamSkinFastReady))
             {
-                WriteCodexPlusPlusLaunchDiagnostic(
+                WriteWindowsClientLaunchDiagnostic(
                     "dream-skin-native-fast-unavailable",
                     "no verified Dream Skin Codex renderer accepted the native Fast bridge");
             }
@@ -4904,7 +4772,7 @@ public sealed partial class CodexCliService
             {
                 // Native Fast is additive.  If CDP activation itself is unavailable, open the
                 // signed client without debugging and still require its primary ready handshake.
-                WriteCodexPlusPlusLaunchDiagnostic(
+                WriteWindowsClientLaunchDiagnostic(
                     "official-native-fast-unavailable",
                     MaskSensitive(nativeFastError.Message));
                 nativeFastPort = null;
@@ -4938,7 +4806,7 @@ public sealed partial class CodexCliService
                 launchStartedUtc,
                 activationIdentity,
                 launchGeneration);
-            WriteCodexPlusPlusLaunchDiagnostic(
+            WriteWindowsClientLaunchDiagnostic(
                 "official-non-destructive-readiness-observer-started",
                 $"pid={activationIdentity.ProcessId}; patch=false; restart_on_ready_timeout=false");
             return true;
@@ -5006,7 +4874,7 @@ public sealed partial class CodexCliService
         }
         if (initialReadiness != OfficialCodexMainPageWaitOutcome.Ready)
         {
-            WriteCodexPlusPlusLaunchDiagnostic(
+            WriteWindowsClientLaunchDiagnostic(
                 "official-primary-page-not-ready",
                 $"stage=before-patch; outcome={initialReadiness}; pid={activationIdentity.ProcessId}");
             if (ShouldDeferOfficialCodexReadinessFailure(
@@ -5018,7 +4886,7 @@ public sealed partial class CodexCliService
                     new DateTime(activationIdentity.StartTimeUtcTicks ?? launchLogBaseline.CapturedAtUtcTicks, DateTimeKind.Utc),
                     activationIdentity,
                     launchGeneration);
-                WriteCodexPlusPlusLaunchDiagnostic(
+                WriteWindowsClientLaunchDiagnostic(
                     "official-readiness-timeout-preserved",
                     $"stage=before-patch; outcome={initialReadiness}; restart_on_ready_timeout=false");
                 return OfficialCodexLaunchAttemptOutcome.ReadyWithoutRendererPatch;
@@ -5033,7 +4901,7 @@ public sealed partial class CodexCliService
                 // The ordinary Codex entry deliberately keeps the signed client renderer
                 // unchanged. Keep the verified CDP owner for optional account-label injection,
                 // but do not reload it merely to add the PAT/API Fast picker.
-                WriteCodexPlusPlusLaunchDiagnostic(
+                WriteWindowsClientLaunchDiagnostic(
                     "official-renderer-patch-not-required",
                     $"pid={activationIdentity.ProcessId}; port={nativeFastPort.Value}; primary-ready=true");
             }
@@ -5052,7 +4920,7 @@ public sealed partial class CodexCliService
         {
             // Without a complete cursor, pre-patch bytes could be mistaken for post-reload
             // readiness. Keep the already-ready unmodified page and do not start the bridge.
-            WriteCodexPlusPlusLaunchDiagnostic(
+            WriteWindowsClientLaunchDiagnostic(
                 "official-post-patch-baseline-unavailable",
                 "the fresh log cursor was incomplete; renderer patch was skipped before reload");
             if (!IsWindowsClientActivationIdentityAlive(activationIdentity))
@@ -5090,7 +4958,7 @@ public sealed partial class CodexCliService
         {
             // No bridge process reached the controlled-reload phase. Keep the primary page that
             // already completed routes + IPC instead of restarting a healthy unsupported build.
-            WriteCodexPlusPlusLaunchDiagnostic(
+            WriteWindowsClientLaunchDiagnostic(
                 "official-native-fast-unpatched",
                 "the primary page is ready, but the optional reviewed renderer patch was unavailable");
             if (!IsWindowsClientActivationIdentityAlive(activationIdentity))
@@ -5114,7 +4982,7 @@ public sealed partial class CodexCliService
         }
         if (postPatchReadiness != OfficialCodexMainPageWaitOutcome.Ready)
         {
-            WriteCodexPlusPlusLaunchDiagnostic(
+            WriteWindowsClientLaunchDiagnostic(
                 "official-post-patch-page-not-ready",
                 $"outcome={postPatchReadiness}; attach={nativeFastAttachOutcome}; " +
                 $"pid={activationIdentity.ProcessId}; port={nativeFastPort.Value}");
@@ -5127,7 +4995,7 @@ public sealed partial class CodexCliService
                     new DateTime(activationIdentity.StartTimeUtcTicks ?? launchLogBaseline.CapturedAtUtcTicks, DateTimeKind.Utc),
                     activationIdentity,
                     launchGeneration);
-                WriteCodexPlusPlusLaunchDiagnostic(
+                WriteWindowsClientLaunchDiagnostic(
                     "official-readiness-timeout-preserved",
                     $"stage=after-patch; outcome={postPatchReadiness}; restart_on_ready_timeout=false");
                 return OfficialCodexLaunchAttemptOutcome.ReadyWithoutRendererPatch;
@@ -5137,7 +5005,7 @@ public sealed partial class CodexCliService
 
         if (!IsVerifiedOfficialNativeFastEndpointOwner(nativeFastPort.Value, activationIdentity))
         {
-            WriteCodexPlusPlusLaunchDiagnostic(
+            WriteWindowsClientLaunchDiagnostic(
                 "official-post-patch-owner-lost",
                 $"pid={activationIdentity.ProcessId}; port={nativeFastPort.Value}");
             return OfficialCodexLaunchAttemptOutcome.RecoverableFailure;
@@ -5228,7 +5096,7 @@ public sealed partial class CodexCliService
                 snapshot.ProcessId == failedActivationIdentity.ProcessId &&
                 snapshot.StartTimeUtcTicks == failedActivationIdentity.StartTimeUtcTicks.Value))
         {
-            WriteCodexPlusPlusLaunchDiagnostic(
+            WriteWindowsClientLaunchDiagnostic(
                 "official-clean-restart-refused",
                 "the failed activation PID/start-time identity was not present in the exact shutdown snapshot");
             return false;
@@ -5245,7 +5113,7 @@ public sealed partial class CodexCliService
             return false;
         }
 
-        WriteCodexPlusPlusLaunchDiagnostic(
+        WriteWindowsClientLaunchDiagnostic(
             "official-clean-restart-started",
             $"pid={failedActivationIdentity.ProcessId}; port={failedNativeFastPort?.ToString() ?? "none"}; patch=disabled-on-retry");
         StopWindowsClientProcesses(shutdownTargets);
@@ -5258,7 +5126,7 @@ public sealed partial class CodexCliService
                 launchGeneration,
                 OfficialCodexRecoveryReleaseTimeout))
         {
-            WriteCodexPlusPlusLaunchDiagnostic(
+            WriteWindowsClientLaunchDiagnostic(
                 "official-clean-restart-release-timeout",
                 "the failed process tree did not become globally quiescent, or its CDP listener did not release cleanly; retry activation was suppressed");
             return false;
@@ -5277,7 +5145,7 @@ public sealed partial class CodexCliService
         }
         catch (Exception ex)
         {
-            WriteCodexPlusPlusLaunchDiagnostic(
+            WriteWindowsClientLaunchDiagnostic(
                 "official-clean-restart-activation-failed",
                 MaskSensitive(ex.Message));
             return false;
@@ -5295,7 +5163,7 @@ public sealed partial class CodexCliService
             observedRetryProcessTree);
         var succeeded = retryOutcome is OfficialCodexLaunchAttemptOutcome.Ready or
             OfficialCodexLaunchAttemptOutcome.ReadyWithoutRendererPatch;
-        WriteCodexPlusPlusLaunchDiagnostic(
+        WriteWindowsClientLaunchDiagnostic(
             succeeded ? "official-clean-restart-ready" : "official-clean-restart-not-ready",
             $"outcome={retryOutcome}; pid={retryIdentity.ProcessId}; retryCount=1");
         if (!succeeded &&
@@ -5337,7 +5205,7 @@ public sealed partial class CodexCliService
         if (!IsCurrentWindowsClientLaunchGeneration(launchGeneration) ||
             !retryIdentity.StartTimeUtcTicks.HasValue)
         {
-            WriteCodexPlusPlusLaunchDiagnostic(
+            WriteWindowsClientLaunchDiagnostic(
                 "official-clean-restart-cleanup-refused",
                 "the retry activation no longer owned the launch generation or lacked a PID/start-time identity");
             return;
@@ -5351,7 +5219,7 @@ public sealed partial class CodexCliService
                 snapshot.ProcessId == retryIdentity.ProcessId &&
                 snapshot.StartTimeUtcTicks == retryIdentity.StartTimeUtcTicks.Value))
         {
-            WriteCodexPlusPlusLaunchDiagnostic(
+            WriteWindowsClientLaunchDiagnostic(
                 "official-clean-restart-cleanup-refused",
                 "the retry PID/start-time identity was not present in its exact process-tree snapshot");
             return;
@@ -5364,7 +5232,7 @@ public sealed partial class CodexCliService
             releasePorts,
             launchGeneration,
             OfficialCodexRecoveryReleaseTimeout);
-        WriteCodexPlusPlusLaunchDiagnostic(
+        WriteWindowsClientLaunchDiagnostic(
             released
                 ? "official-clean-restart-cleanup-complete"
                 : "official-clean-restart-cleanup-timeout",
@@ -5579,7 +5447,7 @@ public sealed partial class CodexCliService
         if (!CanSubmitStartupNavigation(launchGeneration, identityAlive: true,
                 windowVisible: process.MainWindowHandle != IntPtr.Zero))
         {
-            WriteCodexPlusPlusLaunchDiagnostic("official-late-navigation-suppressed",
+            WriteWindowsClientLaunchDiagnostic("official-late-navigation-suppressed",
                 $"pid={activationIdentity.ProcessId}; reason=visible-or-already-delivered-or-superseded");
             return;
         }
@@ -5595,7 +5463,7 @@ public sealed partial class CodexCliService
         {
             // The application-ready official client remains usable if the optional project
             // selection activation cannot be delivered.
-            WriteCodexPlusPlusLaunchDiagnostic(
+            WriteWindowsClientLaunchDiagnostic(
                 "official-project-deep-link-unavailable",
                 MaskSensitive(ex.Message));
         }
@@ -5849,7 +5717,7 @@ public sealed partial class CodexCliService
                 {
                     if (IsCurrentWindowsClientLaunchGeneration(launchGeneration))
                     {
-                        WriteCodexPlusPlusLaunchDiagnostic(
+                        WriteWindowsClientLaunchDiagnostic(
                             "official-runtime-not-ready",
                             "renderer/app-server did not become stable before the deep-link deadline");
                     }
@@ -5917,7 +5785,7 @@ public sealed partial class CodexCliService
                     "Windows did not return a process ID after official Codex activation.");
             }
 
-            WriteCodexPlusPlusLaunchDiagnostic("official-package-activation-accepted",
+            WriteWindowsClientLaunchDiagnostic("official-package-activation-accepted",
                 $"pid={processId}; debugging={nativeFastCdpPort.HasValue}");
             return CaptureWindowsClientActivationIdentity(processId, cleanupUnverifiableIdentity);
         }
@@ -6187,7 +6055,7 @@ public sealed partial class CodexCliService
                             NativeFastPatchWaitOutcome.SkippedWithoutReload or
                             NativeFastPatchWaitOutcome.TimedOutWithoutReload)
                         {
-                            WriteCodexPlusPlusLaunchDiagnostic(
+                            WriteWindowsClientLaunchDiagnostic(
                                 patchOutcome == NativeFastPatchWaitOutcome.SkippedWithoutReload
                                     ? "official-native-fast-renderer-skipped"
                                     : "official-native-fast-renderer-timeout-no-reload",
@@ -6209,7 +6077,7 @@ public sealed partial class CodexCliService
                             throw new InvalidOperationException(
                                 $"Unsupported native Fast patch outcome: {patchOutcome}.");
                         }
-                        WriteCodexPlusPlusLaunchDiagnostic(
+                        WriteWindowsClientLaunchDiagnostic(
                             "official-native-fast-renderer-timeout",
                             $"verified bridge attempted renderer reload but did not report readiness on port {port}");
                         // Only the owner-scoped ReloadAttempted event permits this recovery path.
@@ -6222,7 +6090,7 @@ public sealed partial class CodexCliService
                 }
                 if (IsCurrentWindowsClientLaunchGeneration(launchGeneration))
                 {
-                    WriteCodexPlusPlusLaunchDiagnostic(
+                    WriteWindowsClientLaunchDiagnostic(
                         "official-native-fast-endpoint-timeout",
                         $"no verified official Codex app page CDP endpoint appeared on port {port}");
                 }
@@ -6232,7 +6100,7 @@ public sealed partial class CodexCliService
             {
                 // Fast remains additive. A validation or bridge-process failure must not affect
                 // the already running signed official client.
-                WriteCodexPlusPlusLaunchDiagnostic(
+                WriteWindowsClientLaunchDiagnostic(
                     "official-native-fast-attach-unavailable",
                     MaskSensitive(ex.Message));
                 var reloadMayHaveStarted = false;
@@ -6332,7 +6200,7 @@ public sealed partial class CodexCliService
             if (!bridgeProcess.WaitForExit(
                     (int)OfficialNativeFastBridgeStopTimeout.TotalMilliseconds))
             {
-                WriteCodexPlusPlusLaunchDiagnostic(
+                WriteWindowsClientLaunchDiagnostic(
                     "official-native-fast-helper-stop-timeout",
                     "the exact helper did not confirm exit before final reload-state inspection");
                 return false;
@@ -6342,7 +6210,7 @@ public sealed partial class CodexCliService
         catch (Exception ex) when (
             ex is InvalidOperationException or Win32Exception or NotSupportedException)
         {
-            WriteCodexPlusPlusLaunchDiagnostic(
+            WriteWindowsClientLaunchDiagnostic(
                 "official-native-fast-helper-stop-unavailable",
                 ex.GetType().Name);
             return false;
@@ -6376,7 +6244,7 @@ public sealed partial class CodexCliService
             }
             if (!mutexAcquired)
             {
-                WriteCodexPlusPlusLaunchDiagnostic(
+                WriteWindowsClientLaunchDiagnostic(
                     "official-native-fast-update-refresh-deferred",
                     "an account switch owns the renderer readiness gate");
                 return false;
@@ -6390,7 +6258,7 @@ public sealed partial class CodexCliService
         }
         catch (Exception ex)
         {
-            WriteCodexPlusPlusLaunchDiagnostic(
+            WriteWindowsClientLaunchDiagnostic(
                 "official-native-fast-update-refresh-unavailable",
                 MaskSensitive(ex.Message));
             return false;
@@ -6450,7 +6318,7 @@ public sealed partial class CodexCliService
                         TimeSpan.FromSeconds(5));
                 if (!rendererReady)
                 {
-                    WriteCodexPlusPlusLaunchDiagnostic(
+                    WriteWindowsClientLaunchDiagnostic(
                         "official-native-fast-existing-renderer-timeout",
                         $"verified bridge did not report a patched renderer on port {port}");
                 }
@@ -6460,7 +6328,7 @@ public sealed partial class CodexCliService
                 // A healthy CDP-enabled Codex is still preferable to restarting a same-account
                 // client merely because the optional bridge child could not be created. A later
                 // explicit start operation will retry the idempotent, identity-scoped bridge.
-                WriteCodexPlusPlusLaunchDiagnostic(
+                WriteWindowsClientLaunchDiagnostic(
                     "official-native-fast-existing-attach-unavailable",
                     MaskSensitive(ex.Message));
             }
@@ -6794,35 +6662,6 @@ public sealed partial class CodexCliService
         };
     }
 
-    public void RepairCodexPlusPlusScheduledTask()
-    {
-        var launcherPath = ResolveCodexPlusPlusLauncherPath();
-        if (string.IsNullOrWhiteSpace(launcherPath))
-        {
-            throw new FileNotFoundException("找不到已安装的 Codex++，无法修复隐藏启动任务。");
-        }
-
-        EnsureCodexPlusPlusTaskFiles();
-        if (!ScheduledTaskUsesHiddenPowerShell(CodexPlusPlusTaskName, out _))
-        {
-            InstallCodexPlusPlusScheduledTaskElevated();
-        }
-    }
-
-    /// <summary>
-    /// Refreshes the PowerShell launcher and installer scripts used by the existing
-    /// Codex++ scheduled task without touching the task registration or any process.
-    ///
-    /// Older installations can retain a launcher generated by a previous version.
-    /// Keeping this operation separate from <see cref="RepairCodexPlusPlusScheduledTask"/>
-    /// lets the normal UI startup update the script in place without prompting for
-    /// elevation or restarting Codex/Account Manager.
-    /// </summary>
-    public void RefreshCodexPlusPlusTaskLauncherFiles()
-    {
-        EnsureCodexPlusPlusTaskFiles();
-    }
-
     internal static string BuildThreadDeepLink(string threadId)
     {
         if (!Guid.TryParse(threadId, out var parsedThreadId))
@@ -7039,12 +6878,6 @@ public sealed partial class CodexCliService
                 allowOfficialRendererPatch: false) ||
             ShouldPreserveExistingOfficialWindow(
                 switchRequired: false,
-                mode: WindowsClientMode.CodexPlusPlus,
-                useDreamSkin: false,
-                hasExistingOfficialWindow: true,
-                allowOfficialRendererPatch: false) ||
-            ShouldPreserveExistingOfficialWindow(
-                switchRequired: false,
                 mode: WindowsClientMode.OfficialCodex,
                 useDreamSkin: false,
                 hasExistingOfficialWindow: false,
@@ -7110,8 +6943,7 @@ public sealed partial class CodexCliService
         if (protectedShutdownNames.Any(name =>
                 !IsProtectedWindowsClientShutdownProcessName(name)) ||
             IsProtectedWindowsClientShutdownProcessName("ChatGPT") ||
-            IsProtectedWindowsClientShutdownProcessName("Codex") ||
-            IsProtectedWindowsClientShutdownProcessName("codex-plus-plus-manager"))
+            IsProtectedWindowsClientShutdownProcessName("Codex"))
         {
             throw new InvalidOperationException(
                 "Exact Codex shutdown must protect Account Manager and terminal hosts without excluding reviewed Codex executables.");
@@ -7268,25 +7100,6 @@ public sealed partial class CodexCliService
         }
     }
 
-    public Task OpenWindowsClientThreadAsync(
-        string threadId,
-        CancellationToken cancellationToken = default)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        var threadUrl = BuildThreadDeepLink(threadId);
-        if (!IsCodexPlusPlusReady())
-        {
-            throw new InvalidOperationException(
-                "Codex++ 增强桥接尚未就绪。请先手动打开 Codex++，再打开聊天记录。不会请求管理员 PowerShell。");
-        }
-
-        Process.Start(new ProcessStartInfo(threadUrl)
-        {
-            UseShellExecute = true
-        });
-        return Task.CompletedTask;
-    }
-
     public Task OpenOfficialCodexThreadAsync(
         string threadId,
         CancellationToken cancellationToken = default)
@@ -7298,262 +7111,6 @@ public sealed partial class CodexCliService
             UseShellExecute = true
         });
         return Task.CompletedTask;
-    }
-
-    public void OpenWindowsClientThread(string threadId)
-    {
-        OpenWindowsClientThreadAsync(threadId).GetAwaiter().GetResult();
-    }
-
-    private static void OpenNewTaskAfterWindowsClientLaunch(
-        string projectPath,
-        DateTime launchStartedUtc,
-        bool requireCodexPlusPlusEnhancements)
-    {
-        if (!WaitForWindowsClientMainWindow(launchStartedUtc, TimeSpan.FromSeconds(45)))
-        {
-            throw new TimeoutException(
-                "Codex++ started, but the new Codex window did not become ready within 45 seconds.");
-        }
-
-        if (requireCodexPlusPlusEnhancements)
-        {
-            WaitForCodexPlusPlusEnhancements(launchStartedUtc, TimeSpan.FromSeconds(55));
-        }
-
-        var startInfo = new ProcessStartInfo(BuildNewThreadDeepLink(projectPath))
-        {
-            UseShellExecute = true
-        };
-        Process.Start(startInfo);
-    }
-
-    private void OpenNewTaskAfterCodexPlusPlusLaunchInBackground(
-        string projectPath,
-        DateTime launchStartedUtc,
-        long launchGeneration)
-    {
-        _ = Task.Run(() =>
-        {
-            try
-            {
-                if (!IsCurrentWindowsClientLaunchGeneration(launchGeneration))
-                {
-                    return;
-                }
-
-                WaitForCodexPlusPlusLaunchReady(
-                    launchStartedUtc,
-                    CodexPlusPlusLaunchReadyTimeout,
-                    launcherProcess: null,
-                    launcherStandardError: null,
-                    launchGeneration);
-                if (!IsCurrentWindowsClientLaunchGeneration(launchGeneration))
-                {
-                    return;
-                }
-
-                Process.Start(new ProcessStartInfo(BuildNewThreadDeepLink(projectPath))
-                {
-                    UseShellExecute = true
-                });
-                WriteCodexPlusPlusLaunchDiagnostic(
-                    "background-ready",
-                    $"elapsed={(DateTime.UtcNow - launchStartedUtc).TotalSeconds:0.0}s");
-            }
-            catch (OperationCanceledException)
-            {
-                WriteCodexPlusPlusLaunchDiagnostic(
-                    "background-superseded",
-                    "a newer Windows client launch replaced this delayed deep-link request");
-            }
-            catch (Exception ex)
-            {
-                // Credential projection and the accepted Codex++ launch remain valid.  A
-                // delayed bridge/deep-link failure is diagnostic only and must never freeze
-                // the Account Manager UI or close the newly launched Codex process.
-                WriteCodexPlusPlusLaunchDiagnostic(
-                    "background-ready-failed",
-                    MaskSensitive(ex.Message));
-            }
-        });
-    }
-
-    private static void OpenNewTaskAfterWindowsClientLaunchInBackground(
-        string projectPath,
-        DateTime launchStartedUtc,
-        bool requireCodexPlusPlusEnhancements)
-    {
-        _ = Task.Run(() =>
-        {
-            try
-            {
-                OpenNewTaskAfterWindowsClientLaunch(
-                    projectPath,
-                    launchStartedUtc,
-                    requireCodexPlusPlusEnhancements);
-            }
-            catch
-            {
-                // Codex++ itself has already been launched. A delayed deep-link
-                // failure must not keep Account Manager blocked for up to 100 s.
-            }
-        });
-    }
-
-    private static void WaitForCodexPlusPlusEnhancements(DateTime launchStartedUtc, TimeSpan timeout)
-    {
-        var statusPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".codex-session-delete",
-            "latest-status.json");
-        var earliestStartMs = new DateTimeOffset(launchStartedUtc.AddSeconds(-2)).ToUnixTimeMilliseconds();
-        var deadline = launchStartedUtc + timeout;
-        var lastStatus = "waiting for Codex++ status";
-        using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };
-        while (DateTime.UtcNow < deadline)
-        {
-            try
-            {
-                var status = JsonNode.Parse(File.ReadAllText(statusPath)) as JsonObject;
-                var startedAtMs = status?["started_at_ms"]?.GetValue<long>() ?? 0;
-                var state = status?["status"]?.GetValue<string>() ?? "unknown";
-                var message = status?["message"]?.GetValue<string>() ?? "";
-                lastStatus = state + ": " + message;
-                if (startedAtMs >= earliestStartMs && state.Equals("running", StringComparison.Ordinal))
-                {
-                    var helperPort = status?["helper_port"]?.GetValue<int>() ?? 0;
-                    if (helperPort > 0)
-                    {
-                        using var body = new StringContent("{}", Encoding.UTF8, "application/json");
-                        using var response = client.PostAsync(
-                                $"http://127.0.0.1:{helperPort}/backend/status",
-                                body)
-                            .GetAwaiter()
-                            .GetResult();
-                        if (response.IsSuccessStatusCode)
-                        {
-                            return;
-                        }
-
-                        lastStatus = $"helper returned HTTP {(int)response.StatusCode}";
-                    }
-                }
-            }
-            catch (Exception ex) when (ex is IOException or JsonException or HttpRequestException or TaskCanceledException)
-            {
-                lastStatus = ex.Message;
-            }
-
-            Thread.Sleep(250);
-        }
-
-        throw new TimeoutException("Codex++ page enhancements did not become ready: " + lastStatus);
-    }
-
-    private void WaitForCodexPlusPlusLaunchReady(
-        DateTime launchStartedUtc,
-        TimeSpan timeout,
-        Process? launcherProcess,
-        Task<string>? launcherStandardError,
-        long launchGeneration)
-    {
-        var earliestStartUtc = launchStartedUtc.AddSeconds(-2);
-        var deadline = DateTime.UtcNow + timeout;
-        var windowReady = false;
-        var bridgeReady = false;
-        int? launcherExitCode = null;
-        var bridgeStatus = "等待 Codex++ 生成新的增强桥接状态";
-        while (DateTime.UtcNow < deadline)
-        {
-            if (!IsCurrentWindowsClientLaunchGeneration(launchGeneration))
-            {
-                throw new OperationCanceledException(
-                    "A newer Windows client launch superseded this readiness wait.");
-            }
-
-            windowReady = windowReady || HasWindowsClientMainWindowSince(earliestStartUtc);
-            bridgeReady = bridgeReady || IsCodexPlusPlusReadySince(earliestStartUtc, out bridgeStatus);
-            if (windowReady && bridgeReady)
-            {
-                return;
-            }
-
-            if (launcherProcess != null && launcherExitCode == null)
-            {
-                try
-                {
-                    if (launcherProcess.HasExited)
-                    {
-                        launcherExitCode = launcherProcess.ExitCode;
-                        if (launcherExitCode != 0)
-                        {
-                            var error = launcherStandardError?.IsCompletedSuccessfully == true
-                                ? MaskSensitive(launcherStandardError.Result).Trim()
-                                : "";
-                            WriteCodexPlusPlusLaunchDiagnostic(
-                                "launcher-exit",
-                                $"exitCode={launcherExitCode}; stderr={error}");
-                            throw new InvalidOperationException(
-                                $"Codex++ 启动失败（启动器退出代码 {launcherExitCode}）。\n" +
-                                "账号凭据已保留，无需重新登录。\n" +
-                                "请稍后重试；详细原因已写入本地启动诊断日志。");
-                        }
-                    }
-                }
-                catch (InvalidOperationException)
-                {
-                    throw;
-                }
-                catch (Exception ex) when (ex is Win32Exception or NotSupportedException)
-                {
-                    bridgeStatus = "无法读取 Codex++ 启动器退出状态：" + MaskSensitive(ex.Message);
-                }
-            }
-
-            Thread.Sleep(200);
-        }
-
-        var windowText = windowReady ? "已就绪" : "未就绪";
-        var bridgeText = bridgeReady ? "已就绪" : "未就绪";
-        var launcherText = launcherExitCode.HasValue
-            ? $"exited({launcherExitCode.Value})"
-            : launcherProcess == null ? "scheduled-task-accepted" : "running";
-        WriteCodexPlusPlusLaunchDiagnostic(
-            "readiness-timeout",
-            $"timeout={timeout.TotalSeconds:0}s; window={windowText}; bridge={bridgeText}; " +
-            $"launcher={launcherText}; bridgeDetail={MaskSensitive(bridgeStatus)}");
-        throw new TimeoutException(
-            $"Codex++ 尚未完全启动（窗口：{windowText}；增强桥接：{bridgeText}）。\n" +
-            "账号凭据已保留，无需重新登录。\n" +
-            "请稍后重试；详细原因已写入本地启动诊断日志。" );
-    }
-
-    private static bool HasWindowsClientMainWindowSince(DateTime earliestStartUtc)
-    {
-        var packageRoot = Path.GetDirectoryName(ResolveCodexWindowsClientPath());
-        foreach (var process in Process.GetProcessesByName("ChatGPT"))
-        {
-            using (process)
-            {
-                try
-                {
-                    if (!process.HasExited &&
-                        IsCodexWindowsClientProcess(process, packageRoot) &&
-                        process.MainWindowHandle != IntPtr.Zero &&
-                        process.StartTime.ToUniversalTime() >= earliestStartUtc)
-                    {
-                        return true;
-                    }
-                }
-                catch
-                {
-                    // A process may exit while Codex++ is replacing the desktop client.
-                }
-            }
-        }
-
-        return false;
     }
 
     private static bool IsWindowsClientRuntimeHealthySince(DateTime earliestStartUtc)
@@ -7860,894 +7417,6 @@ public sealed partial class CodexCliService
         return false;
     }
 
-    private static bool WaitForWindowsClientMainWindow(DateTime launchStartedUtc, TimeSpan timeout)
-    {
-        var earliestStartUtc = launchStartedUtc.AddSeconds(-2);
-        var deadline = DateTime.UtcNow + timeout;
-        while (DateTime.UtcNow < deadline)
-        {
-            foreach (var process in Process.GetProcessesByName("ChatGPT"))
-            {
-                using (process)
-                {
-                    try
-                    {
-                        if (!process.HasExited &&
-                            process.MainWindowHandle != IntPtr.Zero &&
-                            process.StartTime.ToUniversalTime() >= earliestStartUtc)
-                        {
-                            return true;
-                        }
-                    }
-                    catch
-                    {
-                        // A process may exit or become inaccessible while the new window starts.
-                    }
-                }
-            }
-
-            Thread.Sleep(250);
-        }
-
-        return false;
-    }
-
-    private static bool TryLaunchCodexPlusPlusViaScheduledTask(
-        string codexPlusPlusPath,
-        string? clientAppDir,
-        string projectPath,
-        string codexHome,
-        IReadOnlyList<WindowsClientProcessSnapshot> shutdownTargets,
-        bool switchRequired)
-    {
-        CodexPlusPlusTaskOperationLock.Wait();
-        try
-        {
-            EnsureCodexPlusPlusTaskFiles();
-            var taskUsesHiddenPowerShell = ScheduledTaskUsesHiddenPowerShell(
-                CodexPlusPlusTaskName,
-                out var taskExists);
-            if (!taskExists)
-            {
-                return false;
-            }
-
-            // Never repair or elevate implicitly from an account-switch click. An old task that
-            // can show a console is treated as unavailable until the user explicitly repairs it.
-            if (!taskUsesHiddenPowerShell)
-            {
-                return false;
-            }
-
-            var requestId = WriteCodexPlusPlusLaunchRequest(
-                codexPlusPlusPath,
-                clientAppDir,
-                projectPath,
-                codexHome,
-                shutdownTargets,
-                switchRequired);
-
-            var result = RunProcess(
-                "schtasks.exe",
-                "/Run /TN " + QuoteProcessArgument(CodexPlusPlusTaskName),
-                TimeSpan.FromSeconds(3));
-            if (result.ExitCode != 0)
-            {
-                return false;
-            }
-
-            if (WaitForCodexPlusPlusTaskResult(requestId, CodexPlusPlusTaskResultTimeout))
-            {
-                return true;
-            }
-
-            WriteCodexPlusPlusLaunchDiagnostic(
-                "scheduled-result-timeout",
-                $"requestId={requestId}; timeout={CodexPlusPlusTaskResultTimeout.TotalSeconds:0}s");
-            throw new TimeoutException(
-                "Codex++ 启动任务未及时确认。\n" +
-                "账号凭据已保留，无需重新登录。\n" +
-                "请稍后重试；详细原因已写入本地启动诊断日志。");
-        }
-        finally
-        {
-            CodexPlusPlusTaskOperationLock.Release();
-        }
-    }
-
-    private static bool WaitForCodexPlusPlusTaskResult(string requestId, TimeSpan timeout)
-    {
-        var resultPath = CodexPlusPlusTaskResultPath();
-        var deadline = DateTime.UtcNow + timeout;
-        while (DateTime.UtcNow < deadline)
-        {
-            if (File.Exists(resultPath))
-            {
-                try
-                {
-                    var result = JsonNode.Parse(File.ReadAllText(resultPath)) as JsonObject;
-                    if (!string.Equals(
-                            result?["requestId"]?.GetValue<string>(),
-                            requestId,
-                            StringComparison.Ordinal) ||
-                        !string.Equals(
-                            result?["operation"]?.GetValue<string>(),
-                            "launch",
-                            StringComparison.Ordinal))
-                    {
-                        Thread.Sleep(50);
-                        continue;
-                    }
-
-                    var succeeded = result?["succeeded"]?.GetValue<bool>() == true;
-                    var enhancementsReady = result?["enhancementsReady"]?.GetValue<bool>() == true;
-                    var launchAccepted = result?["launchAccepted"]?.GetValue<bool>() == true;
-                    var processId = result?["processId"]?.GetValue<int>() ?? 0;
-                    var launcherProcessId = result?["launcherProcessId"]?.GetValue<int>() ?? 0;
-                    var launcherExited = result?["launcherExited"]?.GetValue<bool>() == true;
-                    var launcherExitCode = result?["launcherExitCode"]?.GetValue<int?>();
-                    var launcherStandardError = MaskSensitive(
-                        result?["launcherStandardError"]?.GetValue<string>() ?? "").Trim();
-                    if (!succeeded)
-                    {
-                        var error = MaskSensitive(result?["error"]?.GetValue<string>() ?? "").Trim();
-                        var detail = string.IsNullOrWhiteSpace(error)
-                            ? launcherStandardError
-                            : error;
-                        WriteCodexPlusPlusLaunchDiagnostic(
-                            "scheduled-launch-failed",
-                            $"exitCode={launcherExitCode?.ToString() ?? "unknown"}; detail={detail}");
-                        throw new InvalidOperationException(
-                            "Codex++ 启动失败（隐藏启动任务未能完成）。\n" +
-                            "账号凭据已保留，无需重新登录。\n" +
-                            "请稍后重试；详细原因已写入本地启动诊断日志。");
-                    }
-                    if (launcherExited && launcherExitCode is not null and not 0)
-                    {
-                        WriteCodexPlusPlusLaunchDiagnostic(
-                            "scheduled-launcher-exit",
-                            $"exitCode={launcherExitCode.Value}; stderr={launcherStandardError}");
-                        throw new InvalidOperationException(
-                            $"Codex++ 启动失败（启动器退出代码 {launcherExitCode.Value}）。\n" +
-                            "账号凭据已保留，无需重新登录。\n" +
-                            "请稍后重试；详细原因已写入本地启动诊断日志。");
-                    }
-                    if (!launchAccepted && !enhancementsReady)
-                    {
-                        throw new InvalidOperationException(
-                            "Codex++ 隐藏启动任务返回了不完整的本次启动结果。");
-                    }
-
-                    if (launchAccepted)
-                    {
-                        // The elevated helper has already spawned Codex++. Window and enhancement
-                        // readiness continue inside that helper and are intentionally not a UI gate.
-                        return true;
-                    }
-
-                    var liveProcessId = processId > 0 ? processId : launcherProcessId;
-                    if (liveProcessId > 0)
-                    {
-                        using var process = Process.GetProcessById(liveProcessId);
-                        return !process.HasExited;
-                    }
-                }
-                catch (ArgumentException)
-                {
-                    return false;
-                }
-                catch (JsonException)
-                {
-                    // The elevated task may still be completing its atomic result write.
-                }
-                catch (IOException)
-                {
-                    // The elevated task may still have the result file open.
-                }
-            }
-
-            Thread.Sleep(100);
-        }
-
-        return false;
-    }
-
-    private static void InstallCodexPlusPlusScheduledTaskElevated()
-    {
-        EnsureCodexPlusPlusTaskFiles();
-        var installerPath = CodexPlusPlusTaskInstallerPath();
-        var startInfo = new ProcessStartInfo("powershell.exe")
-        {
-            UseShellExecute = true,
-            Verb = "runas",
-            WindowStyle = ProcessWindowStyle.Hidden,
-            Arguments =
-                "-NoProfile -NoLogo -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File " +
-                QuoteProcessArgument(installerPath)
-        };
-
-        try
-        {
-            using var process = Process.Start(startInfo);
-            if (process != null && !process.WaitForExit(15000))
-            {
-                throw new TimeoutException("Codex++ 隐藏启动任务安装超过 15 秒，已停止前台等待。");
-            }
-        }
-        catch (Win32Exception ex) when (ex.NativeErrorCode == 1223)
-        {
-            throw new InvalidOperationException("需要安装一次 Codex++ 免 UAC 启动任务，但你取消了 Windows UAC 提示。默认 Codex 凭据已经切换完成。", ex);
-        }
-
-        if (!ScheduledTaskUsesHiddenPowerShell(CodexPlusPlusTaskName, out _))
-        {
-            throw new InvalidOperationException("Codex++ 免 UAC 隐藏启动任务没有安装成功。默认 Codex 凭据已经切换完成，可以稍后重试启动。");
-        }
-    }
-
-    private static void EnsureCodexPlusPlusTaskFiles()
-    {
-        var dir = CodexPlusPlusTaskDirectory();
-        Directory.CreateDirectory(dir);
-        WriteTextAtomically(CodexPlusPlusTaskLauncherScriptPath(), BuildCodexPlusPlusTaskLauncherScript());
-        WriteTextAtomically(CodexPlusPlusTaskInstallerPath(), BuildCodexPlusPlusTaskInstallerScript());
-    }
-
-    private static string WriteCodexPlusPlusLaunchRequest(
-        string codexPlusPlusPath,
-        string? clientAppDir,
-        string projectPath,
-        string codexHome,
-        IReadOnlyList<WindowsClientProcessSnapshot> shutdownTargets,
-        bool switchRequired)
-    {
-        var resultPath = CodexPlusPlusTaskResultPath();
-        if (File.Exists(resultPath))
-        {
-            File.Delete(resultPath);
-        }
-
-        var requestId = Guid.NewGuid().ToString("N");
-        var createdAtUtc = DateTimeOffset.UtcNow;
-        var serializedShutdownTargets = new JsonArray();
-        if (switchRequired)
-        {
-            foreach (var target in shutdownTargets)
-            {
-                serializedShutdownTargets.Add(new JsonObject
-                {
-                    ["processId"] = target.ProcessId,
-                    ["startTimeUtcTicks"] = target.StartTimeUtcTicks,
-                    ["processName"] = target.ProcessName,
-                    ["executablePath"] = target.ExecutablePath
-                });
-            }
-        }
-        var request = new JsonObject
-        {
-            ["operation"] = "launch",
-            ["requestId"] = requestId,
-            ["createdAtUtc"] = createdAtUtc.ToString("O"),
-            ["expiresAtUtc"] = createdAtUtc.Add(CodexPlusPlusTaskRequestLifetime).ToString("O"),
-            ["managerProcessId"] = Environment.ProcessId,
-            ["switchRequired"] = switchRequired,
-            ["shutdownTargets"] = serializedShutdownTargets,
-            ["codexPlusPlusPath"] = codexPlusPlusPath,
-            ["codexAppDir"] = clientAppDir ?? "",
-            ["projectPath"] = projectPath,
-            ["codexHome"] = codexHome,
-            ["codexSqliteHome"] = codexHome,
-            ["proxyUri"] = GetConfiguredProxyUri() ?? "",
-            ["newThreadUrl"] = BuildNewThreadDeepLink(projectPath)
-        };
-        WriteTextAtomically(
-            CodexPlusPlusTaskRequestPath(),
-            request.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
-        return requestId;
-    }
-
-    private static void WriteCodexPlusPlusOpenThreadRequest(string requestId, string threadUrl)
-    {
-        var resultPath = CodexPlusPlusTaskResultPath();
-        if (File.Exists(resultPath))
-        {
-            File.Delete(resultPath);
-        }
-
-        var request = new JsonObject
-        {
-            ["operation"] = "openThread",
-            ["requestId"] = requestId,
-            ["threadUrl"] = threadUrl
-        };
-        WriteTextAtomically(
-            CodexPlusPlusTaskRequestPath(),
-            request.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
-    }
-
-    private static async Task WaitForCodexPlusPlusOpenThreadResultAsync(
-        string requestId,
-        TimeSpan timeout,
-        CancellationToken cancellationToken)
-    {
-        var resultPath = CodexPlusPlusTaskResultPath();
-        var deadline = DateTime.UtcNow + timeout;
-        string? lastReadError = null;
-        while (DateTime.UtcNow < deadline)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (File.Exists(resultPath))
-            {
-                try
-                {
-                    var result = JsonNode.Parse(File.ReadAllText(resultPath)) as JsonObject;
-                    if (string.Equals(
-                            result?["requestId"]?.GetValue<string>(),
-                            requestId,
-                            StringComparison.Ordinal))
-                    {
-                        var succeeded = result?["succeeded"]?.GetValue<bool>() == true;
-                        var threadOpened = result?["threadOpened"]?.GetValue<bool>() == true;
-                        var operation = result?["operation"]?.GetValue<string>() ?? "";
-                        if (succeeded &&
-                            threadOpened &&
-                            operation.Equals("openThread", StringComparison.Ordinal))
-                        {
-                            return;
-                        }
-
-                        var error = result?["error"]?.GetValue<string>();
-                        throw new InvalidOperationException(
-                            string.IsNullOrWhiteSpace(error)
-                                ? "Codex++ 最高权限任务没有确认聊天记录已打开。"
-                                : "Codex++ 无法打开聊天记录：" + error);
-                    }
-                }
-                catch (JsonException ex)
-                {
-                    lastReadError = ex.Message;
-                }
-                catch (IOException ex)
-                {
-                    lastReadError = ex.Message;
-                }
-            }
-
-            await Task.Delay(100, cancellationToken);
-        }
-
-        throw new TimeoutException(
-            "等待 Codex++ 打开聊天记录超时。" +
-            (string.IsNullOrWhiteSpace(lastReadError) ? "" : " 最后读取错误：" + lastReadError));
-    }
-
-    private static bool ScheduledTaskUsesHiddenPowerShell(string taskName, out bool taskExists)
-    {
-        var result = RunProcess(
-            "schtasks.exe",
-            "/Query /TN " + QuoteProcessArgument(taskName) + " /XML",
-            TimeSpan.FromSeconds(3));
-        taskExists = result.ExitCode == 0;
-        if (!taskExists)
-        {
-            return false;
-        }
-
-        return result.StdOut.Contains("<Command>powershell.exe</Command>", StringComparison.OrdinalIgnoreCase) &&
-               result.StdOut.Contains(CodexPlusPlusTaskHiddenWindowArgument, StringComparison.OrdinalIgnoreCase) &&
-               result.StdOut.Contains("<RunLevel>HighestAvailable</RunLevel>", StringComparison.OrdinalIgnoreCase) &&
-               result.StdOut.Contains(
-                   Path.GetFileName(CodexPlusPlusTaskLauncherScriptPath()),
-                   StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static ProcessRunResult RunProcess(string fileName, string arguments, TimeSpan timeout)
-    {
-        var startInfo = new ProcessStartInfo(fileName, arguments)
-        {
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true
-        };
-        using var process = Process.Start(startInfo) ?? throw new InvalidOperationException($"无法启动进程：{fileName}");
-        var stdoutTask = process.StandardOutput.ReadToEndAsync();
-        var stderrTask = process.StandardError.ReadToEndAsync();
-        if (!process.WaitForExit(timeout))
-        {
-            try
-            {
-                process.Kill(entireProcessTree: true);
-                process.WaitForExit(1000);
-            }
-            catch
-            {
-                // Process may already have exited.
-            }
-            return new ProcessRunResult(
-                -1,
-                GetCompletedProcessOutput(stdoutTask),
-                GetCompletedProcessOutput(stderrTask));
-        }
-
-        return new ProcessRunResult(
-            process.ExitCode,
-            GetCompletedProcessOutput(stdoutTask),
-            GetCompletedProcessOutput(stderrTask));
-    }
-
-    private static string GetCompletedProcessOutput(Task<string> outputTask)
-    {
-        try
-        {
-            return outputTask.Wait(TimeSpan.FromSeconds(1)) ? outputTask.Result : "";
-        }
-        catch
-        {
-            return "";
-        }
-    }
-
-    private static string BuildCodexPlusPlusTaskInstallerScript()
-    {
-        return $$"""
-$ErrorActionPreference = 'Stop'
-$taskName = '{{CodexPlusPlusTaskName}}'
-$launcherPath = '{{CodexPlusPlusTaskLauncherScriptPath().Replace("'", "''")}}'
-$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -NoLogo -NonInteractive {{CodexPlusPlusTaskHiddenWindowArgument}} -ExecutionPolicy Bypass -File "' + $launcherPath + '"')
-$principal = New-ScheduledTaskPrincipal -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Highest
-$trigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddYears(10))
-Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Trigger $trigger -Force | Out-Null
-""";
-    }
-
-    private static string BuildCodexPlusPlusTaskLauncherScript()
-    {
-        return $$"""
-$ErrorActionPreference = 'Stop'
-$requestPath = '{{CodexPlusPlusTaskRequestPath().Replace("'", "''")}}'
-$resultPath = '{{CodexPlusPlusTaskResultPath().Replace("'", "''")}}'
-$launchStartedAt = $null
-$process = $null
-$window = $null
-$enhancementsReady = $false
-$launcherExited = $false
-$launcherExitCode = $null
-$launcherStandardError = ''
-$requestId = ''
-$operation = 'launch'
-$windowHiderAvailable = $false
-try {
-    Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-public static class CodexAccountManagerWindowHider
-{
-    [DllImport("user32.dll")]
-    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-}
-'@ -ErrorAction Stop
-    $windowHiderAvailable = $true
-}
-catch {
-    $windowHiderAvailable = $false
-}
-function Hide-CodexPlusPlusManagerWindows {
-    if (-not $windowHiderAvailable) {
-        return
-    }
-    Get-Process -Name 'codex-plus-plus-manager' -ErrorAction SilentlyContinue | ForEach-Object {
-        try {
-            if ($_.MainWindowHandle -ne [IntPtr]::Zero) {
-                [void][CodexAccountManagerWindowHider]::ShowWindow($_.MainWindowHandle, 0)
-            }
-        }
-        catch {
-        }
-    }
-}
-function Test-LoopbackPortAvailable([int]$Port) {
-    $listener = $null
-    try {
-        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
-        $listener.Start()
-        return $true
-    }
-    catch {
-        return $false
-    }
-    finally {
-        if ($null -ne $listener) {
-            $listener.Stop()
-        }
-    }
-}
-function Get-CurrentLaunchRequest {
-    if (-not (Test-Path -LiteralPath $requestPath -PathType Leaf)) {
-        throw "Codex++ launch request disappeared."
-    }
-    return Get-Content -LiteralPath $requestPath -Raw | ConvertFrom-Json
-}
-function Assert-LaunchRequestCurrent([string]$ExpectedRequestId, [DateTimeOffset]$ExpiresAtUtc) {
-    if ([DateTimeOffset]::UtcNow -gt $ExpiresAtUtc) {
-        throw "Codex++ launch request expired before execution."
-    }
-    $currentRequest = Get-CurrentLaunchRequest
-    if ([string]$currentRequest.requestId -ne $ExpectedRequestId -or [string]$currentRequest.operation -ne 'launch') {
-        throw "Codex++ launch request was superseded by a newer generation."
-    }
-}
-function Get-SnapshotProcess($Target) {
-    try {
-        $candidate = [System.Diagnostics.Process]::GetProcessById([int]$Target.processId)
-        $protectedNames = @('CodexAccountManager', 'WindowsTerminal', 'powershell', 'pwsh', 'cmd', 'conhost', 'OpenConsole')
-        $candidateName = [string]$candidate.ProcessName
-        $expectedPath = [string]$Target.executablePath
-        $actualPath = [string]$candidate.MainModule.FileName
-        if ($candidate.HasExited -or
-            [int]$candidate.Id -eq [int]$request.managerProcessId -or
-            $protectedNames -icontains $candidateName -or
-            $candidateName -ine [string]$Target.processName -or
-            $candidate.StartTime.ToUniversalTime().Ticks -ne [long]$Target.startTimeUtcTicks -or
-            [string]::IsNullOrWhiteSpace($expectedPath) -or
-            [string]::IsNullOrWhiteSpace($actualPath) -or
-            -not [string]::Equals(
-                [System.IO.Path]::GetFullPath($actualPath),
-                [System.IO.Path]::GetFullPath($expectedPath),
-                [StringComparison]::OrdinalIgnoreCase)) {
-            $candidate.Dispose()
-            return $null
-        }
-        return $candidate
-    }
-    catch {
-        return $null
-    }
-}
-try {
-    if (-not (Test-Path -LiteralPath $requestPath -PathType Leaf)) {
-        throw "Missing Codex++ launch request: $requestPath"
-    }
-    $request = Get-Content -LiteralPath $requestPath -Raw | ConvertFrom-Json
-    $requestId = [string]$request.requestId
-    $operation = [string]$request.operation
-    if ([string]::IsNullOrWhiteSpace($operation)) {
-        $operation = 'launch'
-    }
-    # OPEN_THREAD_OPERATION_BEGIN
-    if ($operation -eq 'openThread') {
-        $threadUrl = [string]$request.threadUrl
-        $threadPrefix = 'codex://threads/'
-        if ([string]::IsNullOrWhiteSpace($requestId)) {
-            throw "Missing open-thread request id."
-        }
-        if ([string]::IsNullOrWhiteSpace($threadUrl) -or -not $threadUrl.StartsWith($threadPrefix, [StringComparison]::OrdinalIgnoreCase)) {
-            throw "Invalid Codex task deep link."
-        }
-        $threadId = $threadUrl.Substring($threadPrefix.Length)
-        $parsedThreadId = [Guid]::Empty
-        if (-not [Guid]::TryParseExact($threadId, 'D', [ref]$parsedThreadId) -or $threadUrl -ne ($threadPrefix + $threadId)) {
-            throw "Invalid Codex task id."
-        }
-        $threadStartInfo = New-Object System.Diagnostics.ProcessStartInfo
-        $threadStartInfo.FileName = $threadUrl
-        $threadStartInfo.UseShellExecute = $true
-        [void][System.Diagnostics.Process]::Start($threadStartInfo)
-        @{ succeeded = $true; operation = $operation; requestId = $requestId; threadOpened = $true; processId = 0; launcherProcessId = 0; enhancementsReady = $false; newThreadOpened = $false; error = ''; completedAtUtc = [DateTime]::UtcNow.ToString('o') } |
-            ConvertTo-Json | Set-Content -LiteralPath $resultPath -Encoding UTF8
-        exit 0
-    }
-    # OPEN_THREAD_OPERATION_END
-    if ($operation -ne 'launch') {
-        throw "Unsupported Codex++ task operation: $operation"
-    }
-    if ([string]::IsNullOrWhiteSpace($requestId)) {
-        throw "Missing Codex++ launch request id."
-    }
-    $expiresAtUtc = [DateTimeOffset]::MinValue
-    if (-not [DateTimeOffset]::TryParse([string]$request.expiresAtUtc, [ref]$expiresAtUtc)) {
-        throw "Missing or invalid Codex++ launch request expiry."
-    }
-    Assert-LaunchRequestCurrent $requestId $expiresAtUtc
-    $exe = [string]$request.codexPlusPlusPath
-    if ([string]::IsNullOrWhiteSpace($exe) -or -not (Test-Path -LiteralPath $exe -PathType Leaf)) {
-        throw "Missing Codex++ launcher: $exe"
-    }
-    $projectPath = [string]$request.projectPath
-    if ([string]::IsNullOrWhiteSpace($projectPath) -or -not (Test-Path -LiteralPath $projectPath -PathType Container)) {
-        $projectPath = Split-Path -Parent $exe
-    }
-    $newThreadUrl = [string]$request.newThreadUrl
-    if ([string]::IsNullOrWhiteSpace($newThreadUrl) -or -not $newThreadUrl.StartsWith('codex://threads/new?path=')) {
-        throw "Missing Codex new-task deep link."
-    }
-    $codexHome = [string]$request.codexHome
-    if ([string]::IsNullOrWhiteSpace($codexHome) -or -not (Test-Path -LiteralPath $codexHome -PathType Container)) {
-        throw "Missing account CODEX_HOME: $codexHome"
-    }
-    $codexSqliteHome = [string]$request.codexSqliteHome
-    if ([string]::IsNullOrWhiteSpace($codexSqliteHome)) {
-        $codexSqliteHome = $codexHome
-    }
-    if (-not (Test-Path -LiteralPath $codexSqliteHome -PathType Container)) {
-        throw "Missing shared CODEX_SQLITE_HOME: $codexSqliteHome"
-    }
-    # Only a real credential change may close the previous client. Targets are immutable
-    # PID/start-time snapshots captured before projection; never enumerate by process name
-    # here, because a delayed task must not terminate a newer Codex generation.
-    $switchRequired = [bool]$request.switchRequired
-    $shutdownTargets = @($request.shutdownTargets)
-    $launcherGuardHash = [uint16]0
-    foreach ($usernameByte in [System.Text.Encoding]::UTF8.GetBytes([string]$env:USERNAME)) {
-        $launcherGuardHash = [uint16](($launcherGuardHash + [uint16]$usernameByte) % 65536)
-    }
-    $launcherGuardPort = {{CodexPlusPlusLauncherGuardPortBase}} + ($launcherGuardHash % 1000)
-    $shutdownDeadline = (Get-Date).AddMilliseconds({{(int)CodexPlusPlusShutdownDrainTimeout.TotalMilliseconds}})
-    $remainingTargets = @()
-    $remainingTargetCount = 0
-    $guardAvailable = $false
-    do {
-        Assert-LaunchRequestCurrent $requestId $expiresAtUtc
-        $remainingTargets = @()
-        if ($switchRequired) {
-            foreach ($target in $shutdownTargets) {
-                $targetProcess = Get-SnapshotProcess $target
-                if ($null -ne $targetProcess) {
-                    $remainingTargets += $targetProcess
-                }
-            }
-            if ($remainingTargets.Count -gt 0) {
-                $remainingTargets | Stop-Process -Force -ErrorAction SilentlyContinue
-                $remainingTargets | ForEach-Object { $_.Dispose() }
-                Start-Sleep -Milliseconds 100
-            }
-        }
-        $remainingTargets = @()
-        if ($switchRequired) {
-            foreach ($target in $shutdownTargets) {
-                $targetProcess = Get-SnapshotProcess $target
-                if ($null -ne $targetProcess) {
-                    $remainingTargets += $targetProcess
-                }
-            }
-        }
-        $guardAvailable = Test-LoopbackPortAvailable $launcherGuardPort
-        $remainingTargetCount = $remainingTargets.Count
-        $remainingTargets | ForEach-Object { $_.Dispose() }
-        $remainingTargets = @()
-        if ($remainingTargetCount -eq 0 -and $guardAvailable) {
-            break
-        }
-        Start-Sleep -Milliseconds 100
-    } while ((Get-Date) -lt $shutdownDeadline)
-    if ($remainingTargetCount -ne 0 -or -not $guardAvailable) {
-        throw "Previous snapshotted Codex/Codex++ processes or launcher guard port $launcherGuardPort did not release before restart."
-    }
-    Assert-LaunchRequestCurrent $requestId $expiresAtUtc
-    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $startInfo.FileName = $exe
-    $startInfo.WorkingDirectory = $projectPath
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    $startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    $codexAppDir = [string]$request.codexAppDir
-    if (-not [string]::IsNullOrWhiteSpace($codexAppDir)) {
-        $startInfo.Arguments = '--app-path "' + $codexAppDir.Replace('"', '\"') + '"'
-    }
-    $proxyUri = [string]$request.proxyUri
-    if (-not [string]::IsNullOrWhiteSpace($proxyUri)) {
-        $startInfo.Environment['HTTP_PROXY'] = $proxyUri
-        $startInfo.Environment['HTTPS_PROXY'] = $proxyUri
-        $startInfo.Environment['ALL_PROXY'] = $proxyUri
-        $startInfo.Environment['http_proxy'] = $proxyUri
-        $startInfo.Environment['https_proxy'] = $proxyUri
-        $startInfo.Environment['all_proxy'] = $proxyUri
-        foreach ($bypassName in @('NO_PROXY','no_proxy')) {
-            $bypassEntries = @(([string]$startInfo.Environment[$bypassName]).Split(',', [System.StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { $_.Trim() })
-            foreach ($loopback in '{{CodexLoopbackProxyBypass}}'.Split(',')) {
-                if ($bypassEntries -notcontains $loopback) {
-                    $bypassEntries += $loopback
-                }
-            }
-            $startInfo.Environment[$bypassName] = $bypassEntries -join ','
-        }
-    }
-    $startInfo.Environment['CODEX_HOME'] = $codexHome
-    $startInfo.Environment['CODEX_SQLITE_HOME'] = $codexSqliteHome
-    $startInfo.Environment['CODEX_PROJECT_PATH'] = $projectPath
-    $launchStartedAt = Get-Date
-    $launchStartedAtMs = ([DateTimeOffset]$launchStartedAt).ToUnixTimeMilliseconds()
-    $process = [System.Diagnostics.Process]::Start($startInfo)
-    $standardOutputTask = $process.StandardOutput.ReadToEndAsync()
-    $standardErrorTask = $process.StandardError.ReadToEndAsync()
-    $launcherExited = $process.WaitForExit({{(int)CodexPlusPlusLauncherExitProbeTimeout.TotalMilliseconds}})
-    if ($launcherExited) {
-        $launcherExitCode = [int]$process.ExitCode
-        [void]$standardOutputTask.Result
-        $launcherStandardError = [string]$standardErrorTask.Result
-        if ($launcherExitCode -ne 0) {
-            $detail = $launcherStandardError.Trim()
-            if ([string]::IsNullOrWhiteSpace($detail)) {
-                throw "Codex++ launcher exited with code $launcherExitCode."
-            }
-            throw "Codex++ launcher exited with code $launcherExitCode`: $detail"
-        }
-    }
-    @{ succeeded = $true; operation = $operation; requestId = $requestId; launchAccepted = $true; threadOpened = $false; processId = 0; launcherProcessId = $process.Id; launcherExited = $launcherExited; launcherExitCode = $launcherExitCode; launcherStandardError = $launcherStandardError; enhancementsReady = $false; newThreadOpened = $false; error = ''; completedAtUtc = [DateTime]::UtcNow.ToString('o') } |
-        ConvertTo-Json | Set-Content -LiteralPath $resultPath -Encoding UTF8
-    # The result is already visible to Account Manager.  Keep this hidden helper alive briefly
-    # only to suppress Codex++'s manager window while the launcher continues in the background;
-    # this loop does not gate the account-switch button or the Codex window.
-    $hideDeadline = (Get-Date).AddSeconds(14)
-    while ((Get-Date) -lt $hideDeadline) {
-        Hide-CodexPlusPlusManagerWindows
-        Start-Sleep -Milliseconds 100
-    }
-    exit 0
-}
-catch {
-    @{ succeeded = $false; operation = $operation; requestId = $requestId; threadOpened = $false; processId = 0; launcherProcessId = 0; launcherExited = $launcherExited; launcherExitCode = $launcherExitCode; launcherStandardError = $launcherStandardError; enhancementsReady = $false; newThreadOpened = $false; error = $_.Exception.Message; completedAtUtc = [DateTime]::UtcNow.ToString('o') } |
-        ConvertTo-Json | Set-Content -LiteralPath $resultPath -Encoding UTF8
-    exit 1
-}
-""";
-    }
-
-    internal static void ValidateCodexPlusPlusTaskLauncherScript()
-    {
-        var script = BuildCodexPlusPlusTaskLauncherScript();
-        var installerScript = BuildCodexPlusPlusTaskInstallerScript();
-        if (RequiresWindowsClientShutdown(sharedProfileAlreadySelected: true) ||
-            !RequiresWindowsClientShutdown(sharedProfileAlreadySelected: false))
-        {
-            throw new InvalidOperationException(
-                "Reusing the selected account must not stop Codex; only a real profile switch may stop it.");
-        }
-        if (CodexPlusPlusLaunchReadyTimeout < TimeSpan.FromSeconds(90) ||
-            CodexPlusPlusLauncherExitProbeTimeout < TimeSpan.FromSeconds(1) ||
-            CodexPlusPlusLauncherExitProbeTimeout > TimeSpan.FromSeconds(12) ||
-            CodexPlusPlusShutdownDrainTimeout > TimeSpan.FromSeconds(12) ||
-            CodexPlusPlusTaskRequestLifetime < TimeSpan.FromSeconds(30) ||
-            CodexPlusPlusTaskRequestLifetime > TimeSpan.FromMinutes(2) ||
-            CalculateCodexPlusPlusLauncherGuardPort("安") != 57860)
-        {
-            throw new InvalidOperationException(
-                "Codex++ launch timing must allow slow packaged-app discovery while keeping the launcher exit probe bounded.");
-        }
-        if (script.Contains("ArgumentList.Add", StringComparison.Ordinal) ||
-            !script.Contains("$startInfo.Arguments", StringComparison.Ordinal) ||
-            !script.Contains("$process = [System.Diagnostics.Process]::Start($startInfo)", StringComparison.Ordinal) ||
-            !script.Contains("launchAccepted = $true", StringComparison.Ordinal) ||
-            !script.Contains("launcherProcessId = $process.Id", StringComparison.Ordinal) ||
-            !script.Contains("$startInfo.RedirectStandardError = $true", StringComparison.Ordinal) ||
-            !script.Contains("$launcherExited = $process.WaitForExit(1500)", StringComparison.Ordinal) ||
-            !script.Contains("launcherExitCode = $launcherExitCode", StringComparison.Ordinal) ||
-            !script.Contains("[System.Text.Encoding]::UTF8.GetBytes([string]$env:USERNAME)", StringComparison.Ordinal) ||
-            !script.Contains("Test-LoopbackPortAvailable $launcherGuardPort", StringComparison.Ordinal) ||
-            !script.Contains("$remainingTargetCount -eq 0 -and $guardAvailable", StringComparison.Ordinal) ||
-            !script.Contains("Assert-LaunchRequestCurrent $requestId $expiresAtUtc", StringComparison.Ordinal) ||
-            !script.Contains("launch request expired before execution", StringComparison.Ordinal) ||
-            !script.Contains("launch request was superseded by a newer generation", StringComparison.Ordinal) ||
-            !script.Contains("[System.Diagnostics.Process]::GetProcessById([int]$Target.processId)", StringComparison.Ordinal) ||
-            !script.Contains("$candidate.StartTime.ToUniversalTime().Ticks -ne [long]$Target.startTimeUtcTicks", StringComparison.Ordinal) ||
-            !script.Contains("$protectedNames -icontains $candidateName", StringComparison.Ordinal) ||
-            !script.Contains("[int]$candidate.Id -eq [int]$request.managerProcessId", StringComparison.Ordinal) ||
-            !script.Contains("[System.IO.Path]::GetFullPath($expectedPath)", StringComparison.Ordinal) ||
-            !script.Contains("$switchRequired = [bool]$request.switchRequired", StringComparison.Ordinal) ||
-            !script.Contains("$shutdownTargets = @($request.shutdownTargets)", StringComparison.Ordinal) ||
-            script.Contains("Start-Sleep -Milliseconds 180", StringComparison.Ordinal) ||
-            !script.Contains("$startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden", StringComparison.Ordinal) ||
-            !script.Contains("Hide-CodexPlusPlusManagerWindows", StringComparison.Ordinal) ||
-            !script.Contains("ShowWindow($_.MainWindowHandle, 0)", StringComparison.Ordinal) ||
-            !script.Contains("this loop does not gate the account-switch button", StringComparison.Ordinal) ||
-            script.Contains("$enhancementDeadline", StringComparison.Ordinal) ||
-            script.Contains("Codex++ page enhancements did not become ready", StringComparison.Ordinal) ||
-            script.Contains("$uriStartInfo", StringComparison.Ordinal) ||
-            !script.Contains("Stop-Process -Force", StringComparison.Ordinal) ||
-            !script.Contains("$launchStartedAt = $null", StringComparison.Ordinal) ||
-            !script.Contains("succeeded = $false", StringComparison.Ordinal) ||
-            script.Contains("Environment.Remove", StringComparison.Ordinal) ||
-            ProxyEnvironmentVariableNames.Any(name =>
-                !script.Contains("$startInfo.Environment['" + name + "'] = $proxyUri", StringComparison.Ordinal)))
-        {
-            throw new InvalidOperationException(
-                "Codex++ scheduled-task launcher is not compatible with Windows PowerShell 5.1, cannot report failures, or does not preserve all proxy aliases.");
-        }
-
-        const string openThreadStartMarker = "# OPEN_THREAD_OPERATION_BEGIN";
-        const string openThreadEndMarker = "# OPEN_THREAD_OPERATION_END";
-        var openThreadStart = script.IndexOf(openThreadStartMarker, StringComparison.Ordinal);
-        var openThreadEnd = script.IndexOf(openThreadEndMarker, StringComparison.Ordinal);
-        if (openThreadStart < 0 || openThreadEnd <= openThreadStart)
-        {
-            throw new InvalidOperationException(
-                "Codex++ scheduled-task launcher is missing the isolated open-thread operation.");
-        }
-
-        var openThreadBlock = script[openThreadStart..(openThreadEnd + openThreadEndMarker.Length)];
-        var forbiddenOpenThreadOperations = new[]
-        {
-            "Stop-Process",
-            "CODEX_HOME",
-            "CODEX_SQLITE_HOME",
-            "codexPlusPlusPath",
-            "codexHome",
-            "projectPath",
-            "$exe",
-            "auth.json",
-            "config.toml"
-        };
-        if (!openThreadBlock.Contains("$operation -eq 'openThread'", StringComparison.Ordinal) ||
-            !openThreadBlock.Contains("[Guid]::TryParseExact", StringComparison.Ordinal) ||
-            !openThreadBlock.Contains("$threadStartInfo.UseShellExecute = $true", StringComparison.Ordinal) ||
-            !openThreadBlock.Contains("threadOpened = $true", StringComparison.Ordinal) ||
-            !openThreadBlock.Contains("requestId = $requestId", StringComparison.Ordinal) ||
-            forbiddenOpenThreadOperations.Any(forbidden =>
-                openThreadBlock.Contains(forbidden, StringComparison.Ordinal)))
-        {
-            throw new InvalidOperationException(
-                "Codex++ open-thread operation must only validate a GUID deep link, use ShellExecute, and report its result without switching accounts or stopping processes.");
-        }
-
-        if (!installerScript.Contains("New-ScheduledTaskAction", StringComparison.Ordinal) ||
-            !installerScript.Contains(CodexPlusPlusTaskHiddenWindowArgument, StringComparison.Ordinal) ||
-            !installerScript.Contains("-NonInteractive", StringComparison.Ordinal) ||
-            !installerScript.Contains("-RunLevel Highest", StringComparison.Ordinal))
-        {
-            throw new InvalidOperationException(
-                "Codex++ scheduled task must launch Windows PowerShell at highest privilege, non-interactively, and with a hidden window.");
-        }
-
-        ValidatePowerShellScriptSyntax(script);
-        ValidatePowerShellScriptSyntax(installerScript);
-    }
-
-    internal static int CalculateCodexPlusPlusLauncherGuardPort(string userName)
-    {
-        ushort hash = 0;
-        foreach (var value in Encoding.UTF8.GetBytes(userName ?? ""))
-        {
-            hash = unchecked((ushort)(hash + value));
-        }
-
-        return CodexPlusPlusLauncherGuardPortBase + hash % 1000;
-    }
-
-    private static void ValidatePowerShellScriptSyntax(string script)
-    {
-        var tempPath = Path.Combine(
-            Path.GetTempPath(),
-            "codex-account-manager-script-" + Guid.NewGuid().ToString("N") + ".ps1");
-        try
-        {
-            File.WriteAllText(tempPath, script, new UTF8Encoding(false));
-            var parserCommand =
-                "$ErrorActionPreference = 'Stop'\n" +
-                "$scriptText = [IO.File]::ReadAllText(" + ToSingleQuoted(tempPath) + ")\n" +
-                "[void][ScriptBlock]::Create($scriptText)\n";
-            var encodedParserCommand = Convert.ToBase64String(Encoding.Unicode.GetBytes(parserCommand));
-            var result = RunProcess(
-                "powershell.exe",
-                "-NoProfile -ExecutionPolicy Bypass -EncodedCommand " + encodedParserCommand,
-                TimeSpan.FromSeconds(15));
-            if (result.ExitCode != 0)
-            {
-                throw new InvalidOperationException(
-                    "Codex++ scheduled-task launcher is not valid Windows PowerShell 5.1 syntax.\n" +
-                    result.StdErr);
-            }
-        }
-        finally
-        {
-            if (File.Exists(tempPath))
-            {
-                File.Delete(tempPath);
-            }
-        }
-    }
-
     internal static void ValidateProxyEnvironmentProjection()
     {
         const string proxyUri = "http://127.0.0.1:10808";
@@ -8793,39 +7462,19 @@ catch {
         }
     }
 
-    private static string CodexPlusPlusTaskDirectory()
+    private static string WindowsClientDiagnosticsDirectory()
     {
         return Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "CodexAccountManager");
     }
 
-    private static string CodexPlusPlusTaskLauncherScriptPath()
+    private static string WindowsClientLaunchDiagnosticPath()
     {
-        return Path.Combine(CodexPlusPlusTaskDirectory(), "Start-CodexPlusPlusLauncher.ps1");
+        return Path.Combine(WindowsClientDiagnosticsDirectory(), "windows-client-launch-diagnostics.log");
     }
 
-    private static string CodexPlusPlusTaskInstallerPath()
-    {
-        return Path.Combine(CodexPlusPlusTaskDirectory(), "Install-CodexPlusPlusLauncherTask.ps1");
-    }
-
-    private static string CodexPlusPlusTaskRequestPath()
-    {
-        return Path.Combine(CodexPlusPlusTaskDirectory(), "codex-plus-plus-launch.json");
-    }
-
-    private static string CodexPlusPlusTaskResultPath()
-    {
-        return Path.Combine(CodexPlusPlusTaskDirectory(), "codex-plus-plus-launch-result.json");
-    }
-
-    private static string CodexPlusPlusLaunchDiagnosticPath()
-    {
-        return Path.Combine(CodexPlusPlusTaskDirectory(), "codex-plus-plus-launch-diagnostics.log");
-    }
-
-    private static void WriteCodexPlusPlusLaunchDiagnostic(string eventName, string detail)
+    private static void WriteWindowsClientLaunchDiagnostic(string eventName, string detail)
     {
         try
         {
@@ -8840,11 +7489,11 @@ catch {
                 safeDetail = safeDetail[..4000] + "…";
             }
 
-            lock (CodexPlusPlusLaunchDiagnosticLock)
+            lock (WindowsClientLaunchDiagnosticLock)
             {
-                Directory.CreateDirectory(CodexPlusPlusTaskDirectory());
+                Directory.CreateDirectory(WindowsClientDiagnosticsDirectory());
                 File.AppendAllText(
-                    CodexPlusPlusLaunchDiagnosticPath(),
+                    WindowsClientLaunchDiagnosticPath(),
                     $"{DateTime.UtcNow:O}\t{safeEventName}\t{safeDetail}{Environment.NewLine}",
                     new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
             }
@@ -9056,94 +7705,6 @@ catch {
             throw new InvalidOperationException(
                 "The installed Codex package AppUserModelId could not be resolved.");
         }
-    }
-
-    public static string? ResolveCodexPlusPlusLauncherPath()
-    {
-        var overridePath = Environment.GetEnvironmentVariable("CODEX_PLUS_PLUS_LAUNCHER_PATH");
-        if (!string.IsNullOrWhiteSpace(overridePath) && File.Exists(overridePath))
-        {
-            return overridePath;
-        }
-
-        var candidates = new[]
-        {
-            Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "Programs",
-                "Codex++",
-                CodexPlusPlusLauncherFileName)
-        };
-
-        return candidates.FirstOrDefault(File.Exists);
-    }
-
-    private static bool EnsureCodexPlusPlusSafeSettings(string? resolvedCodexAppDirectory)
-    {
-        var settingsPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".codex-session-delete",
-            "settings.json");
-        Directory.CreateDirectory(Path.GetDirectoryName(settingsPath)!);
-        var root = File.Exists(settingsPath)
-            ? JsonNode.Parse(File.ReadAllText(settingsPath)) as JsonObject ?? new JsonObject()
-            : new JsonObject();
-        var changed = false;
-        var serviceTierControlsChanged = root["codexAppServiceTierControls"]?.GetValue<bool>() != true;
-        void SetBoolean(string key, bool value)
-        {
-            if (root[key]?.GetValue<bool>() == value)
-            {
-                return;
-            }
-
-            root[key] = value;
-            changed = true;
-        }
-        void SetString(string key, string value)
-        {
-            if (string.Equals(
-                    root[key]?.GetValue<string>(),
-                    value,
-                    StringComparison.OrdinalIgnoreCase))
-            {
-                return;
-            }
-
-            root[key] = value;
-            changed = true;
-        }
-
-        // The manager already rewrites the shared SQLite provider safely. Enabling Codex++
-        // provider sync here would rescan every rollout on every launch (hundreds of MB).
-        SetBoolean("providerSyncEnabled", false);
-        SetBoolean("enhancementsEnabled", true);
-        SetBoolean("codexAppSessionDelete", true);
-        SetBoolean("codexAppMarkdownExport", true);
-        SetBoolean("codexAppProjectMove", true);
-        SetBoolean("codexAppFastStartup", true);
-        SetBoolean("codexAppModelWhitelistUnlock", false);
-        SetBoolean("codexAppPluginMarketplaceUnlock", false);
-        SetBoolean("codexAppPluginAutoExpand", false);
-        // Codex++ already implements its own Standard/Fast UI and priority request rewrite.
-        // Keep that native page control enabled; the CDP response bridge is reserved for the
-        // unmodified official client and is not launched on the Codex++ path.
-        SetBoolean("codexAppServiceTierControls", true);
-        SetBoolean("codexAppStepwiseEnabled", false);
-        if (!string.IsNullOrWhiteSpace(resolvedCodexAppDirectory) &&
-            Directory.Exists(resolvedCodexAppDirectory))
-        {
-            SetString("codexAppPath", Path.GetFullPath(resolvedCodexAppDirectory));
-        }
-        if (!changed)
-        {
-            return serviceTierControlsChanged;
-        }
-
-        WriteTextAtomically(
-            settingsPath,
-            root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
-        return serviceTierControlsChanged;
     }
 
     private static void SanitizeCuratedPluginManifests(string codexHome)
@@ -12214,7 +10775,7 @@ catch {
             }
 
             // Exercise the real first direct-App migration: the shared config is clean, a
-            // legacy selection remains, and Codex++ left its cockpit credential behind.
+            // legacy selection remains alongside a retired client credential.
             File.WriteAllText(sharedConfigPath, "");
             File.WriteAllText(cockpitAuthPath, "stale-cockpit-credential");
             var directTokenProjection = ProjectAccessTokenAccount(
@@ -14255,8 +12816,7 @@ catch {
                     var processName = process.ProcessName;
                     if (protectedProcessIds.Contains(process.Id) ||
                         IsProtectedWindowsClientShutdownProcessName(processName) ||
-                        (!IsCodexWindowsClientProcess(process, packageRoot) &&
-                         !IsCodexPlusPlusLauncherProcess(process)) ||
+                        !IsCodexWindowsClientProcess(process, packageRoot) ||
                         process.HasExited ||
                         !TryGetProcessExecutablePath(process, out var executablePath))
                     {
@@ -14449,7 +13009,7 @@ catch {
             if (TryOpenWindowsClientSnapshot(target, packageRoot, out var process))
             {
                 processes.Add(process!);
-                WriteCodexPlusPlusLaunchDiagnostic(
+                WriteWindowsClientLaunchDiagnostic(
                     "windows-client-exact-shutdown-target-verified",
                     $"pid={target.ProcessId}; name={target.ProcessName}; " +
                     $"start_ticks={target.StartTimeUtcTicks}; priority={target.ShutdownPriority}");
@@ -14460,7 +13020,7 @@ catch {
             }
         }
 
-        WriteCodexPlusPlusLaunchDiagnostic(
+        WriteWindowsClientLaunchDiagnostic(
             "windows-client-exact-shutdown-plan",
             $"requested_count={shutdownTargets.Count}; verified_count={processes.Count}; " +
             $"rejected_count={rejectedTargetCount}; manager_pid_excluded={processes.All(process => process.Id != Environment.ProcessId)}; " +
@@ -14551,8 +13111,7 @@ catch {
                 candidate.StartTime.ToUniversalTime().Ticks != snapshot.StartTimeUtcTicks ||
                 !TryGetProcessExecutablePath(candidate, out var executablePath) ||
                 !PathsEqual(executablePath, snapshot.ExecutablePath) ||
-                (!IsCodexWindowsClientProcess(candidate, packageRoot) &&
-                 !IsCodexPlusPlusLauncherProcess(candidate)))
+                !IsCodexWindowsClientProcess(candidate, packageRoot))
             {
                 candidate.Dispose();
                 return false;
@@ -14630,11 +13189,6 @@ catch {
 
     private static int GetShutdownPriority(Process process, string? packageRoot)
     {
-        if (IsCodexPlusPlusLauncherProcess(process))
-        {
-            return 3;
-        }
-
         try
         {
             if (IsCodexWindowsClientProcess(process, packageRoot) &&
@@ -14665,19 +13219,6 @@ catch {
         catch
         {
             return DateTime.MaxValue;
-        }
-    }
-
-    private static bool IsCodexPlusPlusLauncherProcess(Process process)
-    {
-        try
-        {
-            return process.ProcessName.Equals("codex-plus-plus", StringComparison.OrdinalIgnoreCase) ||
-                   process.ProcessName.Equals("codex-plus-plus-manager", StringComparison.OrdinalIgnoreCase);
-        }
-        catch
-        {
-            return false;
         }
     }
 
@@ -14930,111 +13471,6 @@ catch {
         }
 
         return null;
-    }
-
-    public bool IsCodexPlusPlusReady()
-    {
-        return IsCodexPlusPlusReadySince(DateTime.MinValue, out _);
-    }
-
-    private bool IsCodexPlusPlusReadySince(DateTime earliestStartUtc, out string statusDetail)
-    {
-        try
-        {
-            var statusPath = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                ".codex-session-delete",
-                "latest-status.json");
-            if (!File.Exists(statusPath))
-            {
-                statusDetail = "尚未生成 latest-status.json";
-                return false;
-            }
-
-            var status = JsonNode.Parse(File.ReadAllText(statusPath)) as JsonObject;
-            var state = status?["status"]?.GetValue<string>() ?? "unknown";
-            var message = status?["message"]?.GetValue<string>() ?? "";
-            var startedAtMs = status?["started_at_ms"]?.GetValue<long>() ?? 0;
-            var earliestStartMs = earliestStartUtc == DateTime.MinValue
-                ? long.MinValue
-                : new DateTimeOffset(earliestStartUtc).ToUnixTimeMilliseconds();
-            if (startedAtMs < earliestStartMs)
-            {
-                statusDetail = "检测到的桥接状态属于上一次启动";
-                return false;
-            }
-            if (!state.Equals("running", StringComparison.Ordinal))
-            {
-                statusDetail = string.IsNullOrWhiteSpace(message)
-                    ? $"桥接状态为 {state}"
-                    : $"桥接状态为 {state}：{message}";
-                return false;
-            }
-
-            var helperPort = status?["helper_port"]?.GetValue<int>() ?? 0;
-            if (helperPort is <= 0 or > 65535)
-            {
-                statusDetail = "桥接没有提供有效的本地端口";
-                return false;
-            }
-
-            using var client = new HttpClient { Timeout = TimeSpan.FromMilliseconds(750) };
-            using var body = new StringContent("{}", Encoding.UTF8, "application/json");
-            using var response = client.PostAsync(
-                    $"http://127.0.0.1:{helperPort}/backend/status",
-                    body)
-                .GetAwaiter()
-                .GetResult();
-            if (!response.IsSuccessStatusCode)
-            {
-                statusDetail = $"桥接端口 {helperPort} 返回 HTTP {(int)response.StatusCode}";
-                return false;
-            }
-
-            var responseBody = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-            var responseStatus = JsonNode.Parse(responseBody) as JsonObject;
-            var ready = string.Equals(
-                responseStatus?["status"]?.GetValue<string>(),
-                "ok",
-                StringComparison.OrdinalIgnoreCase);
-            statusDetail = ready
-                ? $"桥接端口 {helperPort} 已响应"
-                : $"桥接端口 {helperPort} 未返回 ok";
-            return ready;
-        }
-        catch (Exception ex)
-        {
-            statusDetail = MaskSensitive(ex.Message);
-            return false;
-        }
-    }
-
-    public bool IsCodexPlusPlusRunning()
-    {
-        foreach (var process in Process.GetProcesses())
-        {
-            using (process)
-            {
-                if (!IsCodexPlusPlusLauncherProcess(process))
-                {
-                    continue;
-                }
-
-                try
-                {
-                    if (!process.HasExited)
-                    {
-                        return true;
-                    }
-                }
-                catch
-                {
-                    // Elevated launchers can become inaccessible while they start or exit.
-                }
-            }
-        }
-
-        return false;
     }
 
     private static async Task<CommandResult> RunOfficialBrowserAuthorizationAsync(
@@ -17846,7 +16282,6 @@ catch {
         DeviceAuthBrowserKind Kind);
 
     private sealed record CommandResult(int ExitCode, string StdOut, string StdErr);
-    private sealed record ProcessRunResult(int ExitCode, string StdOut, string StdErr);
     private enum OfficialCodexLaunchAttemptOutcome
     {
         Ready,
@@ -17961,13 +16396,12 @@ public sealed class WindowsClientAccountProjection
     public bool SharedCredentialsReused { get; init; }
     public bool ProfileChanged { get; set; }
     public bool DesktopLoginRequired { get; init; }
-    public WindowsClientMode ClientMode { get; set; } = WindowsClientMode.CodexPlusPlus;
+    public WindowsClientMode ClientMode { get; set; } = WindowsClientMode.OfficialCodex;
     public bool ClientLaunchStarted { get; set; }
     public string? ClientLaunchError { get; set; }
     public bool FailedLaunchProfileRestored { get; set; }
     public bool PreviousClientRelaunchStarted { get; set; }
     public string? FailedLaunchRecoveryError { get; set; }
-    public bool CodexPlusPlusLaunchStarted { get; set; }
     public bool CodexDreamSkinFailed { get; set; }
     public bool CodexOfficialAppearanceRestored { get; set; }
     public string? GlobalStatePath { get; set; }

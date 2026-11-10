@@ -341,6 +341,8 @@ public partial class Form1 : Form
         new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTimeOffset> _officialQuotaRefreshAttemptedAt =
         new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _officialQuotaRefreshErrors =
+        new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _officialQuotaRefreshInProgress =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, SemaphoreSlim> _officialQuotaRequestLocks =
@@ -919,7 +921,7 @@ public partial class Form1 : Form
         _headerTitle.Name = "HeaderTitle";
         header.Controls.Add(_headerTitle);
 
-        _headerSubtitle.Text = "选择账号并用 Codex++、Codex 或 CLI 启动。";
+        _headerSubtitle.Text = "选择账号并用官方 Codex 或 CLI 启动。";
         _headerSubtitle.Left = 32;
         _headerSubtitle.Top = 66;
         _headerSubtitle.Width = 1040;
@@ -3471,7 +3473,7 @@ public partial class Form1 : Form
         _headerTitle.Text = GetWorkspaceTitle(_activeView);
         _headerSubtitle.Text = _activeView switch
         {
-            WorkspaceView.AccountSwitch => "选择账号并用 Codex++、Codex 或 CLI 启动。",
+            WorkspaceView.AccountSwitch => "选择账号并用官方 Codex 或 CLI 启动。",
             WorkspaceView.UnifiedHistory => "查看、全文搜索和管理本地聊天。",
             WorkspaceView.StatusCheck => "检查登录状态并管理账号凭据。",
             WorkspaceView.QuotaUsage => GetQuotaWorkspaceSubtitle(),
@@ -3485,7 +3487,7 @@ public partial class Form1 : Form
         {
             WorkspaceView.AccountSwitch => "账号配置和登录状态相互隔离；聊天记录集中保存在默认 .codex。",
             WorkspaceView.UnifiedHistory =>
-                "阅读本地聊天；分类经 Codex 官方目录接口并自动备份，不启动或登录 Codex++。",
+                "阅读本地聊天；分类经 Codex 官方目录接口并自动备份，不启动或登录客户端。",
             WorkspaceView.StatusCheck => "状态检查按账号单独执行；ChatGPT 登录、Access Token 与 API Key 均按账号目录隔离。",
             WorkspaceView.QuotaUsage =>
                 "按账号凭据显示官方 5h、周或月额度窗口；不会在后台轮流登录账号。",
@@ -4113,7 +4115,7 @@ public partial class Form1 : Form
     private static string GetWindowsClientDisplayName(WindowsClientMode mode) => mode switch
     {
         WindowsClientMode.OfficialCodex => "官方 Codex",
-        _ => "Codex++"
+        _ => "官方 Codex"
     };
 
     private void LoadAccounts(bool persistCurrentAccountSelection = true)
@@ -6021,7 +6023,7 @@ public partial class Form1 : Form
         _toolTip.SetToolTip(
             path,
             $"聊天目录：{sharedHome}；筛选结果 {visible} 条，当前显示 {rendered} 条。" +
-            "全文索引只读取本地对话，不启动或登录 Codex++。");
+            "全文索引只读取本地对话，不启动或登录客户端。");
         panel.Controls.Add(path);
 
         var create = MakeHistoryActionButton(
@@ -6382,7 +6384,7 @@ public partial class Form1 : Form
             using var dialog = new ThreadPreviewDialog(thread, transcript, _palette);
             _statusBox.Text = $"正在阅读完整本地聊天：{thread.Title}";
             dialog.ShowDialog(this);
-            _statusBox.Text = $"已关闭完整本地聊天：{thread.Title}；未启动或登录 Codex++。";
+            _statusBox.Text = $"已关闭完整本地聊天：{thread.Title}；未启动或登录客户端。";
         }
         catch (Exception ex)
         {
@@ -7060,7 +7062,7 @@ public partial class Form1 : Form
             var quotaActions = new Rectangle(width - 316, 186, 290, 34);
 
             // PAT/API rows add the optional Voice/Mobile launch between Codex and CLI.
-            const int compactActionTotalWidth = 210 + 180 + 160 + 74 + 86 + (10 * 4);
+            const int compactActionTotalWidth = 180 + 160 + 74 + 86 + (10 * 3);
             var compactActionLeft = Math.Max(18, (width - compactActionTotalWidth) / 2);
             var switchName = new Rectangle(18, 4, width - 120 - 20 - 36, 30);
             var switchState = new Rectangle(width - 120 - 20, 10, 120, 36);
@@ -8693,29 +8695,27 @@ public partial class Form1 : Form
         var horizontal = UsesHorizontalAccountSwitchLayout(width);
         var roomyHorizontal = width >= 1280;
         var hasChatGptFeatureLaunch = !account.IsOfficialOAuth;
-        var measuredCodexPlusPlusWidth = MeasureActionButtonWidth("Codex++ 启动", 210);
         var measuredCodexWidth = MeasureActionButtonWidth("Codex 启动", 180);
         var measuredFeatureWidth = hasChatGptFeatureLaunch
             ? MeasureActionButtonWidth("语音 / 手机", 160)
             : 0;
         var splitActionWidth = Math.Max(160, (width - 46) / 2);
-        var primaryActionCount = hasChatGptFeatureLaunch ? 3 : 2;
+        var primaryActionCount = hasChatGptFeatureLaunch ? 2 : 1;
         var stackedPrimaryWidth = Math.Max(
             108,
             (width - 36 - (actionGap * (primaryActionCount - 1))) / primaryActionCount);
-        var singleRowGapCount = hasChatGptFeatureLaunch ? 4 : 3;
+        var singleRowGapCount = hasChatGptFeatureLaunch ? 3 : 2;
         var featureActionSpace = hasChatGptFeatureLaunch
             ? measuredFeatureWidth
             : 0;
         var singleRowActionsFit = width - 36 >=
-                                  measuredCodexPlusPlusWidth + measuredCodexWidth +
+                                  measuredCodexWidth +
                                   featureActionSpace + cliButtonWidth + detailButtonWidth +
                                   (actionGap * singleRowGapCount);
         var twoActionRows = !singleRowActionsFit;
-        var codexPlusPlusButtonWidth = twoActionRows ? stackedPrimaryWidth : measuredCodexPlusPlusWidth;
         var codexButtonWidth = twoActionRows ? stackedPrimaryWidth : measuredCodexWidth;
         var featureButtonWidth = twoActionRows ? stackedPrimaryWidth : measuredFeatureWidth;
-        var actionTotalWidth = measuredCodexPlusPlusWidth + measuredCodexWidth +
+        var actionTotalWidth = measuredCodexWidth +
                                featureActionSpace + cliButtonWidth + detailButtonWidth +
                                (actionGap * singleRowGapCount);
         var row = new RoundedPanel
@@ -8806,16 +8806,7 @@ public partial class Form1 : Form
         row.Controls.Add(stateBadge);
 
         var actionTop = roomyHorizontal ? 35 : horizontal ? 62 : 66;
-        var codexPlusPlus = MakeLaunchActionButton(
-            "Codex++ 启动",
-            actionLeft,
-            actionTop,
-            codexPlusPlusButtonWidth);
-        codexPlusPlus.Click += async (_, _) => await LaunchAccountAsync(account, WindowsClientMode.CodexPlusPlus);
-        _toolTip.SetToolTip(codexPlusPlus, "使用 Codex++ 启动此账号");
-        row.Controls.Add(codexPlusPlus);
-
-        var codexLeft = actionLeft + codexPlusPlusButtonWidth + actionGap;
+        var codexLeft = actionLeft;
         var codex = MakeLaunchActionButton(
             "Codex 启动",
             codexLeft,
@@ -9250,22 +9241,13 @@ public partial class Form1 : Form
 
         var actionGap = 6;
         var hasChatGptFeatureLaunch = !account.IsOfficialOAuth;
-        var launchActionCount = hasChatGptFeatureLaunch ? 3 : 2;
+        var launchActionCount = hasChatGptFeatureLaunch ? 2 : 1;
         var launchActionWidth =
             (innerWidth - (actionGap * (launchActionCount - 1))) / launchActionCount;
         var actionTop = 532;
-        var codexPlusPlus = MakeLaunchActionButton(
-            "Codex++ 启动",
-            innerLeft,
-            actionTop,
-            launchActionWidth);
-        codexPlusPlus.Click += async (_, _) => await LaunchAccountAsync(account, WindowsClientMode.CodexPlusPlus);
-        _toolTip.SetToolTip(codexPlusPlus, "使用 Codex++ 启动此账号");
-        card.Controls.Add(codexPlusPlus);
-
         var codex = MakeLaunchActionButton(
             "Codex 启动",
-            innerLeft + launchActionWidth + actionGap,
+            innerLeft,
             actionTop,
             launchActionWidth);
         codex.Click += async (_, _) => await LaunchAccountAsync(account, WindowsClientMode.OfficialCodex);
@@ -9280,7 +9262,7 @@ public partial class Form1 : Form
         {
             var feature = MakeLaunchActionButton(
                 "语音 / 手机",
-                innerLeft + ((launchActionWidth + actionGap) * 2),
+                innerLeft + launchActionWidth + actionGap,
                 actionTop,
                 launchActionWidth);
             feature.Click += async (_, _) => await LaunchChatGptFeatureAccountAsync(account);
@@ -10553,6 +10535,7 @@ public partial class Form1 : Form
         _passiveQuotaMonitoringInputSignatures.Remove(accountKey);
         _officialQuotaRefreshedAt.Remove(accountKey);
         _officialQuotaRefreshAttemptedAt.Remove(accountKey);
+        _officialQuotaRefreshErrors.Remove(accountKey);
         _officialQuotaRefreshInProgress.Remove(accountKey);
         if (string.Equals(_launchedOfficialQuotaAccountKey, accountKey, StringComparison.Ordinal))
         {
@@ -18416,7 +18399,7 @@ public partial class Form1 : Form
         }
         catch (OperationCanceledException)
         {
-            // Start-of-use refresh is best effort and never delays Codex++ or retries.
+            // Start-of-use refresh is best effort and never delays Codex or retries.
         }
         catch
         {
@@ -18451,6 +18434,7 @@ public partial class Form1 : Form
         // launch refresh can surface the response that was captured before this test; the
         // per-account request lock inside ReadUsageLimitResetInfoAsync serializes this read
         // behind any older one without sending a second model request.
+        _officialQuotaRefreshErrors.Remove(accountKey);
         _officialQuotaRefreshAttemptedAt[accountKey] = DateTimeOffset.UtcNow;
         return RefreshOfficialQuotaAfterMinimalTestAsync(currentAccount, accountKey, generation);
     }
@@ -18507,12 +18491,17 @@ public partial class Form1 : Form
         }
         catch (OperationCanceledException)
         {
-            // The model test is already complete; keep the last quota snapshot silently.
+            if (IsQuotaRuntimeStateCurrent(accountKey, generation))
+                _officialQuotaRefreshErrors[accountKey] = "额度查询超时，未再次发送模型请求。";
             return false;
         }
-        catch
+        catch (Exception error)
         {
-            // Background quota refresh is best effort. Manual querying remains available.
+            if (IsQuotaRuntimeStateCurrent(accountKey, generation))
+            {
+                var message = CodexCliService.MaskSensitiveText(error.Message);
+                _officialQuotaRefreshErrors[accountKey] = message.Length <= 450 ? message : message[..450] + "…";
+            }
             return false;
         }
     }
@@ -18994,6 +18983,8 @@ public partial class Form1 : Form
                 : IsQuotaRuntimeStateCurrent(accountKey, testGeneration)
                     ? "官方额度回读暂未完成，已保留上一份快照，可以稍后点击“查询重置次数”只读刷新。"
                     : "测试期间账号状态发生了变化，因此没有继续回读官方额度。";
+            if (!quotaRefreshSucceeded && _officialQuotaRefreshErrors.TryGetValue(accountKey, out var readError))
+                refreshText += "\n查询原因：" + readError;
             var resultText =
                 $"账号：{account.Name}\n测试模型：{CodexCliService.MinimalQuotaTestModelId}\n" +
                 $"{tokenText}\n\n模型测试已经完成；{refreshText}";

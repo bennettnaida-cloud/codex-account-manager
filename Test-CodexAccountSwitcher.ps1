@@ -378,8 +378,8 @@ if (-not $accountRotationPoolButtonLabels.Success -or
     $accountRotationFormSource -notmatch 'BuildAccountRotationAccountDetail\(account,\s*quotaUsage\)' -or
     $accountRotationFormSource -notmatch 'ApplyLiveRateLimitSnapshots\(report\)' -or
     $accountRotationFormSource -notmatch 'GetQuotaWindow\(AccountQuotaWindowKind\.FiveHour\)' -or
-    $accountRotationFormSource -notmatch '5h 剩余' -or
-    $accountRotationFormSource -notmatch '5h 重置' -or
+    $accountRotationFormSource -notmatch '\{quotaLabel\}剩余' -or
+    $accountRotationFormSource -notmatch '\{quotaLabel\}重置' -or
     $accountRotationFormSource -notmatch '(?s)poolTransitionValid.*?AccountRotationPool\.Primary => primaryOccurrences == 1 && backupOccurrences == 0' -or
     $accountRotationFormSource -notmatch '_accountRotationPrimaryReturnCheckedAtUtc\s*=\s*null' -or
     $accountRotationFormSource -notmatch '(?s)private static int MeasureAccountRotationWrappedTextHeight\(.*?TextFormatFlags\.WordBreak') {
@@ -390,7 +390,7 @@ $accountSwitchRowLayout = [regex]::Match(
     '(?s)private Control CreateAccountSwitchRow\(AccountRecord account,\s*int width\).*?(?=\r?\n\s*private Control CreateAccountSummary)')
 if (-not $accountSwitchRowLayout.Success -or
     $accountSwitchRowLayout.Value -match 'account\.CodexHome|configReady|directoryReady|credentialState|API Key 已保存|Token 已记录|配置 \{|目录 \{' -or
-    $accountSwitchRowLayout.Value -notmatch '"Codex\+\+ 启动"' -or
+    $accountSwitchRowLayout.Value -match '"Codex\+\+ 启动"' -or
     $accountSwitchRowLayout.Value -notmatch '"Codex 启动"' -or
     $accountSwitchRowLayout.Value -notmatch 'MakeAccountStateBadge' -or
     $accountSwitchRowLayout.Value -notmatch 'Height\s*=\s*twoActionRows \? 168 : horizontal \? 112 : 118' -or
@@ -1327,7 +1327,7 @@ $switchWindowsClientMatch = [regex]::Match(
     '(?s)private async Task<WindowsClientAccountProjection> SwitchWindowsClientAccountCoreAsync\(.*?(?=\r?\n\s*private static bool RequiresWindowsClientShutdown\()')
 $launchWindowsClientMatch = [regex]::Match(
     $cliServiceSource,
-    '(?s)public bool LaunchWindowsClient\(.*?(?=\r?\n\s*public void RepairCodexPlusPlusScheduledTask)')
+    '(?s)public bool LaunchWindowsClient\(.*?(?=\r?\n\s*internal static string BuildThreadDeepLink)')
 $launchOfficialCodexMatch = [regex]::Match(
     $cliServiceSource,
     '(?s)private static bool LaunchOfficialCodex\(.*?(?=\r?\n\s*internal static ProcessStartInfo BuildOfficialCodexActivationStartInfo)')
@@ -1354,10 +1354,7 @@ $programSelfTestMatch = [regex]::Match(
     '(?s)private static int RunSelfTest\(\).*?(?=\r?\n\s*private static bool IsWindowsClientSelfTestSkipped)')
 $openWindowsClientThreadMatch = [regex]::Match(
     $cliServiceSource,
-    '(?s)public Task OpenWindowsClientThreadAsync\(.*?(?=\r?\n\s*public void OpenWindowsClientThread)')
-$taskLauncherScriptMatch = [regex]::Match(
-    $cliServiceSource,
-    '(?s)private static string BuildCodexPlusPlusTaskLauncherScript\(\).*?(?=\r?\n\s*internal static void ValidateCodexPlusPlusTaskLauncherScript)')
+    '(?s)public Task OpenOfficialCodexThreadAsync\(.*?(?=\r?\n\s*private static bool IsWindowsClientRuntimeHealthySince)')
 $launchAccountMatch = [regex]::Match(
     $formSource,
     '(?s)private async Task<bool> LaunchAccountAsync\(.*?(?=\r?\n\s*private async Task LaunchCliAccountAsync)')
@@ -1393,7 +1390,6 @@ if (-not $prepareWindowsClientMatch.Success -or
     -not $updateNativeFastRefreshMatch.Success -or
     -not $programSelfTestMatch.Success -or
     -not $openWindowsClientThreadMatch.Success -or
-    -not $taskLauncherScriptMatch.Success -or
     -not $launchAccountMatch.Success -or
     -not $accountBindingKeyMatch.Success -or
     -not $queueAccountDisplayMatch.Success -or
@@ -1417,7 +1413,6 @@ $recoverOfficialCodexLaunchMethod = $recoverOfficialCodexLaunchMatch.Value
 $updateNativeFastRefreshMethod = $updateNativeFastRefreshMatch.Value
 $programSelfTestMethod = $programSelfTestMatch.Value
 $openWindowsClientThreadMethod = $openWindowsClientThreadMatch.Value
-$taskLauncherScriptMethod = $taskLauncherScriptMatch.Value
 $launchAccountMethod = $launchAccountMatch.Value
 $accountBindingKeyMethod = $accountBindingKeyMatch.Value
 $queueAccountDisplayMethod = $queueAccountDisplayMatch.Value
@@ -1477,36 +1472,27 @@ if ($captureWindowsClientSnapshotsMethod -notmatch 'SelectProtectedWindowsClient
 }
 
 if ($cliServiceSource -notmatch 'LaunchWindowsClient' -or
-    $cliServiceSource -notmatch 'ResolveCodexPlusPlusLauncherPath' -or
-    $cliServiceSource -notmatch 'CODEX_PLUS_PLUS_LAUNCHER_PATH' -or
-    $cliServiceSource -notmatch 'codex-plus-plus\.exe' -or
-    $cliServiceSource -notmatch 'CodexAccountManagerCodexPlusPlus' -or
-    $cliServiceSource -notmatch 'TryLaunchCodexPlusPlusViaScheduledTask' -or
-    $cliServiceSource -notmatch 'WaitForCodexPlusPlusTaskResult' -or
-    $cliServiceSource -notmatch 'codex-plus-plus-launch-result\.json' -or
-    $cliServiceSource -notmatch 'InstallCodexPlusPlusScheduledTaskElevated' -or
-    $cliServiceSource -notmatch 'ScheduledTaskUsesHiddenPowerShell' -or
-    $cliServiceSource -notmatch 'RepairCodexPlusPlusScheduledTask' -or
-    $cliServiceSource -notmatch 'CodexPlusPlusTaskHiddenWindowArgument' -or
-    $cliServiceSource -notmatch '-WindowStyle Hidden' -or
-    $cliServiceSource -notmatch '-NonInteractive' -or
-    $cliServiceSource -notmatch 'schtasks\.exe' -or
-    $cliServiceSource -notmatch '--app-path' -or
-    $cliServiceSource -notmatch 'Path\.Combine\(dir, "app", "ChatGPT\.exe"\)' -or
+    $cliServiceSource -notmatch 'ResolveCodexWindowsClientPath' -or
     $cliServiceSource -notmatch 'PackageRootFolder' -or
     $cliServiceSource -notmatch 'ValidateWindowsClientResolution' -or
     $formSource -notmatch 'LaunchCliAccount' -or
     $formSource -notmatch 'MakeLaunchTonalButton\("CLI"') {
-    throw 'Codex++ discovery, explicit legacy task repair, official Codex resolution, and the CLI fallback must remain available.'
+    throw 'Official Codex resolution and the CLI fallback must remain available.'
+}
+if ($cliServiceSource -match 'CodexPlusPlus|codex-plus-plus|codex-session-delete|CODEX_PLUS_PLUS' -or
+    $programSource -match 'CodexPlusPlus|codex-plus-plus' -or
+    $formSource -match 'CodexPlusPlus|Codex\+\+' -or
+    $settingsSource -match 'CodexPlusPlus' -or
+    $settingsSource -notmatch 'ValidateOfficialClientMigration') {
+    throw 'The retired desktop launcher, task generator and UI must be removed; legacy settings must migrate to official Codex.'
 }
 if ($cliServiceSource -notmatch 'AccessTokenSwitchValidationCacheLifetime' -or
     $cliServiceSource -notmatch 'AccessTokenSwitchValidationCacheEntry' -or
     $cliServiceSource -notmatch 'CompatibleApiPreflightCacheFileName' -or
     $cliServiceSource -notmatch 'HasFreshCompatibleApiPreflight' -or
     $cliServiceSource -notmatch 'BuildAccountValidationFingerprint' -or
-    $cliServiceSource -notmatch 'return await Task\.Run' -or
-    $programSource -notmatch '--repair-codex-plus-plus-task') {
-    throw 'Explicit status checks must retain validation caches, switching must stay off the UI thread, and legacy task repair must remain explicit only.'
+    $cliServiceSource -notmatch 'return await Task\.Run') {
+    throw 'Explicit status checks must retain validation caches, switching must stay off the UI thread, and no retired launcher repair must run.'
 }
 if (([regex]::Matches(
         $directWindowsClientSwitchMethod,
@@ -1574,22 +1560,11 @@ if (-not $updateTokenFlow.Success -or
     $switchWindowsClientMethod -notmatch 'projection\.ClientLaunchStarted\s*=\s*LaunchWindowsClient\(\s*account,\s*projectPath,\s*projection\.DefaultCodexHome,\s*mode,') {
     throw 'Access Token and compatible-API quick credential actions and their official Codex LaunchWindowsClient path must remain available.'
 }
-if ($launchWindowsClientMethod -notmatch 'TryLaunchCodexPlusPlusViaScheduledTask' -or
-    $launchWindowsClientMethod -notmatch 'LaunchOfficialCodex' -or
+if ($launchWindowsClientMethod -notmatch 'LaunchOfficialCodex' -or
     $launchWindowsClientMethod -notmatch 'WindowsClientMode\.OfficialCodex' -or
-     $launchWindowsClientMethod -notmatch 'OpenNewTaskAfterOfficialCodexLaunchInBackground' -or
-    $launchWindowsClientMethod -notmatch 'OpenNewTaskAfterCodexPlusPlusLaunchInBackground' -or
-    $launchWindowsClientMethod -notmatch 'RedirectStandardError\s*=\s*true' -or
-    $launchWindowsClientMethod -notmatch 'WindowStyle\s*=\s*ProcessWindowStyle\.Hidden' -or
-    $cliServiceSource -notmatch 'CodexPlusPlusLaunchReadyTimeout\s*=\s*TimeSpan\.FromSeconds\(120\)' -or
-    $cliServiceSource -notmatch 'CodexPlusPlusLauncherExitProbeTimeout\s*=\s*TimeSpan\.FromMilliseconds\(1500\)' -or
-    $cliServiceSource -notmatch 'SetBoolean\("codexAppFastStartup", true\)' -or
-    $cliServiceSource -notmatch 'IsCodexPlusPlusReadySince\(earliestStartUtc' -or
-    $launchWindowsClientMethod -match 'TimeSpan\.FromSeconds\(20\)' -or
-    $launchWindowsClientMethod -notmatch 'catch\s*\(Win32Exception ex\)\s*when\s*\(ex\.NativeErrorCode\s*==\s*740\)' -or
-    $launchWindowsClientMethod -notmatch '不会隐式打开管理员 PowerShell' -or
-    $launchWindowsClientMethod -match 'StartCodexPlusPlusElevated|Verb\s*=\s*"runas"|new\s+ProcessStartInfo\("powershell\.exe"\)') {
-    throw 'The normal Start path must accept Codex++ quickly, finish fresh-window/bridge readiness in the background, enable fast startup, capture launcher errors, and avoid an implicit elevated PowerShell fallback.'
+    $launchWindowsClientMethod -notmatch 'OpenNewTaskAfterOfficialCodexLaunchInBackground' -or
+    $launchWindowsClientMethod -match 'Verb\s*=\s*"runas"') {
+    throw 'Desktop launches must use official Codex without an elevated third-party launcher.'
 }
 if ($launchWindowsClientMethod -notmatch 'official-same-profile-window-preserved' -or
     $launchWindowsClientMethod -match 'sameAccountShutdownTargets|WaitForWindowsClientProcessAndPortRelease\(\s*sameAccountShutdownTargets') {
@@ -2291,7 +2266,7 @@ if ($displayIdentityBeforeIndex -lt 0 -or
     $applyOfficialAccountDisplayMethod -notmatch 'CanReuseOfficialOAuthSharedProfile\(' -or
     $applyOfficialAccountDisplayMethod -notmatch 'catch \(OperationCanceledException\)' -or
     $applyOfficialAccountDisplayMethod -notmatch 'switchMutex\.ReleaseMutex\(\)' -or
-    $applyOfficialAccountDisplayMethod -match '(?s)WriteCodexPlusPlusLaunchDiagnostic\([^;]*(identity\.Email|modelAccount\.Name|chatGptAccount\.Name|ex\.Message)') {
+    $applyOfficialAccountDisplayMethod -match '(?s)WriteWindowsClientLaunchDiagnostic\([^;]*(identity\.Email|modelAccount\.Name|chatGptAccount\.Name|ex\.Message)') {
     throw 'Account display must revalidate the OAuth hash and shared projection under a non-blocking switch mutex, require one owner, use a short timeout, and keep PII out of diagnostics.'
 }
 $accountDisplayRuntimeEvaluateCount = [regex]::Matches(
@@ -2783,31 +2758,6 @@ if ([string]$customActiveTheme.id -cne 'custom' -or
         (Get-FileHash -LiteralPath $customPhotoSource -Algorithm SHA256).Hash) {
     throw 'Generated custom Dream Skin theme did not publish the selected local photo.'
 }
-if ($taskLauncherScriptMethod -notmatch 'launchAccepted = \$true' -or
-    $taskLauncherScriptMethod -notmatch 'RedirectStandardError = \$true' -or
-    $taskLauncherScriptMethod -notmatch '\$process\.WaitForExit\(\{\{\(int\)CodexPlusPlusLauncherExitProbeTimeout\.TotalMilliseconds\}\}\)' -or
-    $taskLauncherScriptMethod -notmatch 'launcherExitCode = \$launcherExitCode' -or
-    $taskLauncherScriptMethod -notmatch '\[System\.Text\.Encoding\]::UTF8\.GetBytes\(\[string\]\$env:USERNAME\)' -or
-    $taskLauncherScriptMethod -notmatch 'Test-LoopbackPortAvailable \$launcherGuardPort' -or
-    $taskLauncherScriptMethod -notmatch '\$remainingTargetCount -eq 0 -and \$guardAvailable' -or
-    $taskLauncherScriptMethod -notmatch 'Assert-LaunchRequestCurrent \$requestId \$expiresAtUtc' -or
-    $taskLauncherScriptMethod -notmatch 'launch request was superseded by a newer generation' -or
-    $taskLauncherScriptMethod -notmatch '\[System\.Diagnostics\.Process\]::GetProcessById\(\[int\]\$Target\.processId\)' -or
-    $taskLauncherScriptMethod -notmatch 'StartTime\.ToUniversalTime\(\)\.Ticks -ne \[long\]\$Target\.startTimeUtcTicks' -or
-    $taskLauncherScriptMethod -notmatch '\$switchRequired = \[bool\]\$request\.switchRequired' -or
-    $taskLauncherScriptMethod -notmatch 'Hide-CodexPlusPlusManagerWindows' -or
-    $taskLauncherScriptMethod -notmatch 'ShowWindow\(\$_\.MainWindowHandle, 0\)' -or
-    $taskLauncherScriptMethod -notmatch 'WindowStyle = \[System\.Diagnostics\.ProcessWindowStyle\]::Hidden' -or
-    $cliServiceSource -notmatch 'CalculateCodexPlusPlusLauncherGuardPort\("安"\) != 57860' -or
-    $cliServiceSource -match 'CodexPlusPlusLauncherGuardPort\s*=\s*57383' -or
-    $taskLauncherScriptMethod -notmatch 'this loop does not gate the account-switch button' -or
-    $cliServiceSource -notmatch 'process\.ProcessName\.Equals\("codex-plus-plus-manager"' -or
-    $cliServiceSource -notmatch 'codex-plus-plus-launch-diagnostics\.log' -or
-    $cliServiceSource -notmatch '账号凭据已保留，无需重新登录' -or
-    $cliServiceSource -match '20 秒内未同时检测到新的 Codex 窗口和可用的增强桥接' -or
-    $taskLauncherScriptMethod -match '\$enhancementDeadline|Codex\+\+ page enhancements did not become ready|\$uriStartInfo') {
-    throw 'The elevated Codex++ helper must capture immediate launcher failures, hide its manager window, leave real readiness to the background caller, log detailed diagnostics, and never kill a valid launch after a bridge timeout.'
-}
 if ($cliServiceSource -notmatch 'SwitchWindowsClientAccountAsync' -or
     $cliServiceSource -notmatch 'ProjectSharedAccountProfile' -or
     $cliServiceSource -notmatch 'ValidateSharedProfileProjection' -or
@@ -2832,32 +2782,22 @@ if ($settingsSource -notmatch 'WindowsClientMode WindowsClientMode' -or
       $cliServiceSource -notmatch '(?s)private static bool IsProjectedDesktopCredentialSelected\(.*?AuthJsonFilesSemanticallyEqual')) -or
     $cliServiceSource -match '(?s)public bool IsSharedCredentialAlreadySelected\(AccountRecord account\)\s*\{\s*return IsSharedProfileAlreadySelected' -or
     $formSource -match '_windowsClientModePicker' -or
-    $formSource -notmatch '"Codex\+\+ 启动"' -or
     $formSource -notmatch '"Codex 启动"' -or
-    $formSource -notmatch 'LaunchAccountAsync\(account, WindowsClientMode\.CodexPlusPlus\)' -or
     $formSource -notmatch 'LaunchAccountAsync\(account, WindowsClientMode\.OfficialCodex\)' -or
     $formSource -notmatch 'AutoShrinkText = false' -or
     $formSource -notmatch 'private Button MakeLaunchActionButton\(\s*string text,\s*int left' -or
     $formSource -notmatch 'IconText\s*=\s*string\.Empty' -or
     $formSource -notmatch 'ShowIconTile\s*=\s*false' -or
     $formSource -notmatch '(?s)private void ApplyStatusCheckButtonStyle\(Button button\).*?ApplyLaunchActionButtonStyle\(button\)' -or
-    $formSource -notmatch 'MeasureActionButtonWidth\("Codex\+\+ 启动", 210\)' -or
     $formSource -notmatch 'MeasureActionButtonWidth\("Codex 启动", 180\)' -or
     $formSource -notmatch 'var horizontal = UsesHorizontalAccountSwitchLayout\(width\)' -or
     $formSource -notmatch 'Height = twoActionRows \? 168 : horizontal \? 112 : 118' -or
     $formSource -notmatch 'secondaryActionTop = twoActionRows \? actionTop \+ 50 : actionTop' -or
-    $formSource -notmatch 'SwitchWindowsClientAccountAsync\(\s*account,\s*projectPath,\s*mode(?:,|\))' -or
-    $cliServiceSource -notmatch 'WaitForCodexPlusPlusTaskResult\(requestId' -or
-    $cliServiceSource -notmatch 'result\?\["requestId"\]' -or
-    $cliServiceSource -match 'TryEndCodexPlusPlusScheduledTask\(\)') {
-    throw 'Every account must expose complete icon-free premium Codex++ and Codex launch actions, with the status action in the same visual family.'
+    $formSource -notmatch 'SwitchWindowsClientAccountAsync\(\s*account,\s*projectPath,\s*mode(?:,|\))') {
+    throw 'Every account must expose complete official Codex launch actions, with the status action in the same visual family.'
 }
 if ($cliServiceSource -notmatch 'startInfo\.Environment\["CODEX_HOME"\]\s*=\s*codexHome' -or
     $cliServiceSource -notmatch 'startInfo\.Environment\["CODEX_SQLITE_HOME"\]\s*=\s*codexHome' -or
-    $cliServiceSource -notmatch '\["codexHome"\]\s*=\s*codexHome' -or
-    $cliServiceSource -notmatch '\["codexSqliteHome"\]\s*=\s*codexHome' -or
-    $cliServiceSource -notmatch '\$startInfo\.Environment\[''CODEX_HOME''\]\s*=\s*\$codexHome' -or
-    $cliServiceSource -notmatch '\$startInfo\.Environment\[''CODEX_SQLITE_HOME''\]\s*=\s*\$codexSqliteHome' -or
     $cliServiceSource -notmatch 'codexHome = Path\.GetFullPath\(codexHome\)' -or
     $cliServiceSource -notmatch 'remote_compaction_v2' -or
     $cliServiceSource -notmatch 'remote_plugin' -or
@@ -2869,11 +2809,9 @@ if ($cliServiceSource -notmatch 'startInfo\.Environment\["CODEX_HOME"\]\s*=\s*co
 }
 $proxyAliases = @('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy')
 foreach ($proxyAlias in $proxyAliases) {
-    $scheduledAssignment = '$startInfo.Environment[''' + $proxyAlias + '''] = $proxyUri'
     $shellAssignment = '$env:' + $proxyAlias + ' = '
     $cmdAssignment = 'set "' + $proxyAlias + '='
     if (-not $cliServiceSource.Contains('"' + $proxyAlias + '"') -or
-        -not $cliServiceSource.Contains($scheduledAssignment) -or
         -not $cliServiceSource.Contains($shellAssignment) -or
         -not $appScriptSource.Contains("'$proxyAlias'") -or
         -not $desktopLauncherSource.Contains($cmdAssignment)) {
@@ -2883,10 +2821,9 @@ foreach ($proxyAlias in $proxyAliases) {
 if ($cliServiceSource -match '(?m)^\s*\[void\]\$startInfo\.Environment\.Remove\(' -or
     $cliServiceSource -notmatch 'ValidateProxyEnvironmentProjection' -or
     $cliServiceSource -notmatch 'CodexLoopbackProxyBypass\s*=\s*"127\.0\.0\.1,localhost,::1"' -or
-    $taskLauncherScriptMethod -notmatch "@\('NO_PROXY','no_proxy'\)" -or
     $appScriptSource -notmatch 'Invoke-LocalPatConfigMigration' -or
     $appScriptSource -notmatch "'NO_PROXY', 'no_proxy'") {
-    throw 'Codex++ scheduled-task launch must preserve lowercase proxy aliases, bypass the proxy for its loopback CDP/helper bridge, and validate that projection.'
+    throw 'Official client and CLI launches must preserve lowercase proxy aliases, bypass the proxy for its loopback CDP/helper bridge, and validate that projection.'
 }
 if ($cliServiceSource -notmatch 'await EnsureAccountModelAvailableAsync' -or
     $cliServiceSource -notmatch 'debug models' -or
@@ -3344,27 +3281,16 @@ if ($cliServiceModelsSource -notmatch 'AccessTokenModel\s*=>\s*ModelCatalogServi
     $cliServiceModelsSource -notmatch 'CompatibleApiDefaultModel\s*=\s*"gpt-5\.5"' -or
     $cliServiceModelsSource -notmatch 'CompatibleApiReasoningEffort\s*=\s*"xhigh"' -or
     $cliServiceSource -notmatch 'sites@openai-bundled' -or
-    $cliServiceSource -notmatch 'SetBoolean\("enhancementsEnabled", true\)' -or
-    $cliServiceSource -notmatch 'SetBoolean\("providerSyncEnabled", false\)' -or
-    $cliServiceSource -match 'SetBoolean\("providerSyncEnabled", true\)' -or
-    $cliServiceSource -notmatch 'SetBoolean\("codexAppSessionDelete", true\)' -or
-    $cliServiceSource -notmatch 'SetBoolean\("codexAppMarkdownExport", true\)' -or
-    $cliServiceSource -notmatch 'SetBoolean\("codexAppProjectMove", true\)' -or
-    $cliServiceSource -notmatch 'SetBoolean\("codexAppServiceTierControls", true\)' -or
-    $cliServiceSource -notmatch 'serviceTierControlsChanged && IsCodexPlusPlusReady\(\)' -or
-    $cliServiceSource -notmatch 'SetBoolean\("codexAppModelWhitelistUnlock", false\)' -or
-    $cliServiceSource -notmatch 'SetString\("codexAppPath", Path\.GetFullPath\(resolvedCodexAppDirectory\)\)' -or
-    $cliServiceSource -notmatch 'EnsureCodexPlusPlusSafeSettings\(clientAppDir\)' -or
-    $cliServiceSource -notmatch 'codexAppPluginMarketplaceUnlock' -or
-    $cliServiceSource -notmatch 'codexAppPluginAutoExpand') {
-    throw 'Account switching must project the requested defaults and enable only safe Codex++ chat-management enhancements.'
+    $cliServiceSource -notmatch 'SanitizeCuratedPluginManifests') {
+    throw 'Account switching must project the requested model defaults and sanitize curated plugins.'
 }
+
 if ($cliServiceSource -notmatch 'ProcessName\.Equals\("ChatGPT"' -or
     $cliServiceSource -notmatch 'MainWindowHandle\s*!=\s*IntPtr\.Zero' -or
     $cliServiceSource -notmatch 'GetShutdownPriority' -or
     $cliServiceSource -notmatch 'SanitizeCuratedPluginManifests' -or
     $cliServiceSource -notmatch 'MaxPluginDefaultPromptLength\s*=\s*128' -or
-    $cliServiceSource -notmatch 'OpenNewTaskAfterWindowsClientLaunchInBackground' -or
+    $cliServiceSource -notmatch 'OpenNewTaskAfterOfficialCodexLaunchInBackground' -or
     $cliServiceSource -notmatch 'WindowsClientGracefulShutdownTimeout\s*=\s*TimeSpan\.FromSeconds\(8\)' -or
     $cliServiceSource -notmatch 'WaitForProcessesToExit\(gracefulTargets, WindowsClientGracefulShutdownTimeout\)' -or
     $cliServiceSource -match 'process\.WaitForExit\(60000\)') {
@@ -3650,8 +3576,8 @@ if (-not $openUnifiedThreadLayout.Success -or
     $formSource -notmatch 'row\.Click\s*\+=\s*openThread' -or
     $formSource -notmatch 'title\.Click\s*\+=\s*openThread' -or
     $formSource -notmatch 'AccessibleName\s*=\s*\$"阅读本地聊天：\{thread\.Title\}"' -or
-    $openUnifiedThreadLayout.Value -notmatch '未启动或登录 Codex\+\+') {
-    throw 'Opening a unified chat must show the local read-only preview directly and must not require, launch, switch, or log in to Codex++.'
+    $openUnifiedThreadLayout.Value -notmatch '未启动或登录客户端') {
+    throw 'Opening a unified chat must show the local read-only preview directly without launching or logging in to a client.'
 }
 if ($threadTranscriptSource -notmatch 'public sealed class SharedThreadTranscriptService' -or
     $threadTranscriptSource -notmatch 'public UnifiedThreadTranscript Load\(' -or
@@ -3990,10 +3916,9 @@ if ($formSource -notmatch 'ActiveStarfieldAnimationIntervalMilliseconds = 67' -o
 }
 if ($cliServiceSource -notmatch 'BuildNewThreadDeepLink' -or
     $cliServiceSource -notmatch 'codex://threads/new\?path=' -or
-    $cliServiceSource -notmatch 'OpenNewTaskAfterWindowsClientLaunchInBackground' -or
-    $cliServiceSource -notmatch '/backend/status' -or
+    $cliServiceSource -notmatch 'OpenNewTaskAfterOfficialCodexLaunchInBackground' -or
     $cliServiceSource -notmatch 'MainWindowHandle\s*!=\s*IntPtr\.Zero') {
-    throw 'A successful direct Codex++ launch must still open a blank task only after the page bridge is ready.'
+    throw 'Official Codex launches must retain new-task deep links and window readiness checks.'
 }
 if ($openWindowsClientThreadMethod -notmatch 'var threadUrl\s*=\s*BuildThreadDeepLink\(threadId\)' -or
     $openWindowsClientThreadMethod -notmatch 'Process\.Start\(new ProcessStartInfo\(threadUrl\)' -or

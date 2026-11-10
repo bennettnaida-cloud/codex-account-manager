@@ -40,14 +40,14 @@ public sealed partial class CodexCliService
     {
         var trace = new LaunchDiagnostics(CurrentLaunch.Value);
         CurrentLaunch.Value = trace;
-        WriteCodexPlusPlusLaunchDiagnostic("launch-click", $"entry={entry}");
+        WriteWindowsClientLaunchDiagnostic("launch-click", $"entry={entry}");
         return trace;
     }
 
     private static void LaunchPhase(string phase, string progress, string detail = "")
     {
         if (CurrentLaunch.Value is { } trace) trace.ProgressText = progress;
-        WriteCodexPlusPlusLaunchDiagnostic(phase, detail);
+        WriteWindowsClientLaunchDiagnostic(phase, detail);
     }
 
     internal static void ReportLaunchProgress(string phase, string progress) => LaunchPhase(phase, progress);
@@ -300,7 +300,7 @@ public sealed partial class CodexCliService
             try { port = SelectOfficialNativeFastCdpPort(); }
             catch (Exception ex)
             {
-                WriteCodexPlusPlusLaunchDiagnostic("official-optional-debug-unavailable",
+                WriteWindowsClientLaunchDiagnostic("official-optional-debug-unavailable",
                     $"error_type={ex.GetType().Name}; base_launch_continues=true");
             }
         }
@@ -404,7 +404,7 @@ public sealed partial class CodexCliService
             }
             catch (Exception ex)
             {
-                WriteCodexPlusPlusLaunchDiagnostic("official-observation-unavailable",
+                WriteWindowsClientLaunchDiagnostic("official-observation-unavailable",
                     $"pid={identity.ProcessId}; error_type={ex.GetType().Name}; restart=false; navigation=false");
             }
             finally
@@ -432,12 +432,12 @@ public sealed partial class CodexCliService
                 using var helper = CodexNativeFastBridge.StartDetached(port, browserId,
                     identity.ProcessId, identity.StartTimeUtcTicks ?? 0,
                     GetCodexWindowsClientAppDirectory()!, allowRendererReload: false);
-                WriteCodexPlusPlusLaunchDiagnostic("official-optional-fast-passive",
+                WriteWindowsClientLaunchDiagnostic("official-optional-fast-passive",
                     $"pid={identity.ProcessId}; reload_permitted=false; startup_wait=false");
             }
             catch (Exception ex)
             {
-                WriteCodexPlusPlusLaunchDiagnostic("official-optional-fast-skipped",
+                WriteWindowsClientLaunchDiagnostic("official-optional-fast-skipped",
                     $"error_type={ex.GetType().Name}; reload=false; startup_affected=false");
             }
         });
@@ -527,7 +527,7 @@ public sealed partial class CodexCliService
             last = observed;
             if (observed != null && consecutive >= 3)
             {
-                WriteCodexPlusPlusLaunchDiagnostic(
+                WriteWindowsClientLaunchDiagnostic(
                     observed == original ? "official-activation-verified" : "official-activation-handoff-verified",
                     $"activation_pid={original.ProcessId}; window_pid={observed.ProcessId}; " +
                     $"elapsed_ms={clock.ElapsedMilliseconds}; reactivated=false");
@@ -536,7 +536,7 @@ public sealed partial class CodexCliService
             Thread.Sleep(100);
         }
 
-        WriteCodexPlusPlusLaunchDiagnostic("official-activation-verification-timeout",
+        WriteWindowsClientLaunchDiagnostic("official-activation-verification-timeout",
             $"activation_pid={original.ProcessId}; elapsed_ms={clock.ElapsedMilliseconds}; " +
             "reactivated=false; terminated=false; process-exit-not-assumed=true");
         if (ObserveStartupIdentity(original) != StartupProcessState.Exited)

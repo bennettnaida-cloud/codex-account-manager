@@ -17,7 +17,7 @@ Codex Account Manager 是一个在本机运行的 Codex 多账号管理器。它
 
 也可以打开 [Latest Release](https://github.com/bennettnaida-cloud/codex-account-manager/releases/tag/latest) 查看版本、发布时间和全部文件。
 
-当前发布版本为 2.3.42，内置 Codex CLI 0.163.0。Windows 新增“新增账号 → 网页版 Session”：在已登录 ChatGPT 的浏览器打开 `https://chatgpt.com/api/auth/session`，将完整 JSON 粘贴到导入窗口，也可通过文件导入 JSON/ZIP。自动读取邮箱、工作区和有效期；到期后使用“更新 Session”重新导入，不自动续期。Session 经本地网关使用，启动前在线获取模型，并保留额度查询、账号代理和轮换。每次启动 OAuth、PAT、Session 或兼容 API 账号前都会在线同步该账号模型，查询失败保留旧目录与现有客户端。文件导入继续支持 sub2api、CPA Codex、原生 auth.json；5h ≤10%、仅周额度 ≤3% 的轮换规则保持不变。详见 [2.3.42 更新说明](docs/release-2.3.42.md)。Windows 无需另装 .NET；macOS 同步版本号并保持原有功能，Windows 启动同步与文件/Session 导入尚未移植。
+当前发布版本为 2.3.44，内置 Codex CLI 0.163.0。Windows 已移除 Codex++ 启动按钮、启动器、增强桥接等待和隐藏任务生成逻辑；新配置及旧版启动设置统一使用官方 Codex。合并 2.3.43 的导入 OAuth 额度读取修复，兼容缺少 `last_refresh` 的有效凭据，不改写原始 Token 或伪造刷新时间。保留网页版 Session、sub2api/CPA 文件导入、启动前在线模型同步、逐账号代理和 5h ≤10% / 仅周额度 ≤3% 轮换。详见 [2.3.44 更新说明](docs/release-2.3.44.md)。Windows 无需另装 .NET；macOS 同步版本号并保持原有功能，Windows 启动同步与文件/Session 导入尚未移植。
 
 保留旧会话续聊用量统计、轮换、逐账号代理与模型目录，以及升级时同步桌面和任务栏快捷方式。当前本机桌面版本为 Windows OpenAI.Codex 26.1002.7124.0（ChatGPT.exe）；专项回归并不等于已在所有电脑上完成交互实测，未来版本及第三方上游仍需按实际协议验证。
 
@@ -36,7 +36,7 @@ Codex Account Manager 是一个在本机运行的 Codex 多账号管理器。它
 ## 主要功能
 
 - 管理多个 Access Token 或兼容 OpenAI API 的 API Key 账号。
-- 在账号之间切换，并启动官方 Codex 桌面应用、Codex++ 或 CLI。
+- 在账号之间切换，并启动官方 Codex 桌面应用或 CLI。
 - 通过管理器启动 PAT/API 账号时，在官方 Codex 内显示其原生 Standard/Fast 选择器并保留所选服务层级。
 - 聊天页先显示本地缓存，再通过当前 Codex app-server 在后台同步共享目录与短标题；支持打开、归档、取消归档和永久删除，Codex 暂不可用时仍可使用缓存。
 - 按账号读取官方额度窗口、重置时间、Credits 和可重置次数。
@@ -61,7 +61,7 @@ flowchart LR
     A --> P["投放当前登录与模型配置"]
     B --> P
     P --> H["共享 CODEX_HOME"]
-    H --> C["Codex App / CLI / Codex++"]
+    H --> C["Codex App / CLI"]
     C --> L["共享聊天记录与本地用量日志"]
     L --> S["额度与成本统计"]
     M --> G["本机 PAT 网关"]
@@ -110,7 +110,7 @@ PAT 或 API Key 账号由管理器启动官方 Codex 时，程序会在经过进
 4. 安装完成后，从桌面或开始菜单打开 Codex Account Manager。
 5. 首次使用先进入“系统配置”，设置项目目录、启动目录和需要的代理。
 6. 点击“新增账号”，填写账号名称和独立凭据目录，再录入 Access Token 或 API Key。
-7. 在账号卡片检查状态，然后选择“Codex 启动”“Codex++ 启动”或 CLI。
+7. 在账号卡片检查状态，然后选择“Codex 启动”或 CLI。
 
 默认安装目录是 `%LOCALAPPDATA%\Programs\CodexAccountManager`，不需要管理员权限。程序没有商业代码签名证书；SmartScreen 提示时，请先确认下载地址和 SHA-256，再选择“更多信息 → 仍要运行”。
 

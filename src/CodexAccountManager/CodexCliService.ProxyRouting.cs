@@ -82,7 +82,7 @@ public sealed partial class CodexCliService
                     CanIdentifySharedChatGptFeatureProfileWithoutNetwork(api, oauth))
                     throw new InvalidOperationException("Bound voice/mobile launch reused a direct/global-proxy profile.");
 
-                // Codex and Codex++ share ApiCompatible projection; voice/mobile uses
+                // Ordinary Codex launches use ApiCompatible projection; voice/mobile uses
                 // ChatGptDesktop. Call the real launch projection with rotation OFF.
                 foreach (var mode in new[] { AccessTokenSharedProfileMode.ApiCompatible, AccessTokenSharedProfileMode.ChatGptDesktop })
                 {
