@@ -15867,7 +15867,7 @@ public partial class Form1 : Form
                     var imported = _store.ImportAccounts([sessionEntry]);
                     LoadAccounts();
                     _statusBox.Text = imported.Added == 0 ? "此 Session 已导入，已跳过重复凭据。"
-                        : "网页版 Session 已导入；启动前会在线获取模型，Session 到期后需重新导入。";
+                        : WebSessionCredential.ImportedMessage;
                     return;
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException or System.Text.Json.JsonException)

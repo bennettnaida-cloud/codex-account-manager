@@ -21,7 +21,7 @@ public partial class Form1
                 {
                     var result = _store.ImportAccounts([dialog.Entry!]);
                     _statusBox.Text = result.Added == 0 ? "此 Session 已导入，已跳过重复凭据。"
-                        : "网页版 Session 已导入；启动前会在线获取模型，Session 到期后需重新导入。";
+                        : WebSessionCredential.ImportedMessage;
                 }
                 LoadAccounts();
                 return;

@@ -8,6 +8,13 @@ namespace CodexAccountManager;
 internal sealed record WebSessionCredential(string AccessToken, string AccountId, DateTimeOffset ExpiresAt)
 {
     internal const string ExpiredMessage = "网页版 Session 已过期或即将过期，请重新打开 api/auth/session 并导入最新 JSON。";
+    internal const string ImportedMessage = "网页版 Session 已导入；导入不代表模型调用已获授权。若测试返回 401/403，请使用“通过 ChatGPT 登录（官方）”。";
+
+    internal static string AccessRejectedMessage(int statusCode, string operation) =>
+        $"网页版 Session 被官方{operation}拒绝（HTTP {statusCode}）。" +
+        "导入成功、Token 未到期或额度查询成功，都不代表模型请求已获授权。" +
+        "请在“新增账号 → 登录方式”选择“通过 ChatGPT 登录（官方）”，用同一账号完成 Codex 授权。" +
+        "也可更新 Session 后重试；如果官方登录仍被拒绝，请检查工作区的 Codex 访问权限。";
 
     internal static AccountImportEntry ParseImport(JsonElement session, string fallbackName)
     {

@@ -27,6 +27,9 @@
 
 API Key 与 Access Token 账号都采用一键凭据投放：点击启动时，管理器会把所选账号的密钥写成官方 Codex App 可识别的 `auth_mode=apikey` 登录文件；无需在 App 内重复输入。Access Token 的模型请求仍经本机 PAT 网关使用月额度，已有 ChatGPT OAuth 会先备份但不是启动前置条件。
 
+Windows 2.3.47：Session 地址可选中并按 Ctrl+C 复制，不再自动打开浏览器。
+Session 导入只保存凭据，不保证模型调用授权；若返回 401/403，请使用“通过 ChatGPT 登录（官方）”。
+
 Windows 2.3.46：在“新增账号 → 登录方式”选择“网页版 Session（JSON 导入）”，
 粘贴网页完整 JSON 后点击底部“导入 Session”。账号名称可留空使用邮箱；目录自动独立创建。
 

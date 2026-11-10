@@ -895,7 +895,7 @@ public sealed partial class CodexCliService
             {
                 var session = WebSessionCredential.ReadStored(Path.Combine(account.CodexHome, AuthFileName));
                 EnsureLocalPatAccountConfig(account);
-                return new LoginStatus { ExitCode = 0, Text = $"网页版 Session 已保存，有效期至 {session.ExpiresAt.ToLocalTime():yyyy-MM-dd HH:mm}；启动时在线验证。" };
+                return new LoginStatus { ExitCode = 0, Text = $"网页版 Session 已保存，有效期至 {session.ExpiresAt.ToLocalTime():yyyy-MM-dd HH:mm}；模型调用权限仍由官方服务端确认。" };
             }
             catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException or JsonException)
             { return new LoginStatus { ExitCode = 1, Text = "网页版 Session 无效或已过期，请重新导入。" }; }
@@ -1898,7 +1898,8 @@ public sealed partial class CodexCliService
                 : Encoding.UTF8.GetString(bytes);
             throw new InvalidOperationException(BuildMinimalQuotaTestFailureMessage(
                 account,
-                detail));
+                detail,
+                response.StatusCode));
         }
 
         await using var stream = await response.Content.ReadAsStreamAsync(timeout.Token);
@@ -1968,7 +1969,8 @@ public sealed partial class CodexCliService
         status.Equals("incomplete", StringComparison.OrdinalIgnoreCase) ||
         status.Equals("cancelled", StringComparison.OrdinalIgnoreCase);
 
-    private static string BuildMinimalQuotaTestFailureMessage(AccountRecord account, string detail)
+    private static string BuildMinimalQuotaTestFailureMessage(AccountRecord account, string detail,
+        HttpStatusCode? statusCode = null)
     {
         var diagnostic = ExtractMinimalQuotaTestJsonError(detail) ?? detail.Trim();
         if (diagnostic.Contains(
@@ -1989,6 +1991,16 @@ public sealed partial class CodexCliService
         {
             return $"账号 {account.Name} 的测试进程没有加载到可识别的 PAT/OAuth 凭据。" +
                    "请在“状态与凭据”中重新登录或更新 Token 后重试。";
+        }
+
+        if (account.IsWebSession &&
+            (statusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden ||
+             statusCode == null && (diagnostic.Equals("Unauthorized", StringComparison.OrdinalIgnoreCase) ||
+                                    diagnostic.Equals("Forbidden", StringComparison.OrdinalIgnoreCase))))
+        {
+            var code = statusCode.HasValue ? (int)statusCode.Value :
+                diagnostic.Equals("Forbidden", StringComparison.OrdinalIgnoreCase) ? 403 : 401;
+            return $"账号 {account.Name}：" + WebSessionCredential.AccessRejectedMessage(code, "模型接口");
         }
 
         if (IsPersonalAccessTokenMetadataRequestFailure(detail))
@@ -2016,7 +2028,8 @@ public sealed partial class CodexCliService
             {
                 if (JsonNode.Parse(trimmedOutput) is JsonObject wholeMessage)
                 {
-                    var wholeExtracted = ReadNestedErrorText(wholeMessage["error"]) ??
+                    var wholeExtracted = ReadNestedErrorText(wholeMessage["detail"]) ??
+                                         ReadNestedErrorText(wholeMessage["error"]) ??
                                          ReadNestedErrorText(wholeMessage["response"]?["error"]) ??
                                          ReadNestedErrorText(wholeMessage["message"]);
                     if (!string.IsNullOrWhiteSpace(wholeExtracted))
@@ -2221,6 +2234,20 @@ public sealed partial class CodexCliService
         {
             throw new InvalidOperationException("Minimal quota-test pretty JSON error self-test failed.");
         }
+        var sessionAccount = new AccountRecord { Name = "session-fixture", AuthKind = AccountAuthKind.WebSession };
+        foreach (var code in new[] { HttpStatusCode.Unauthorized, HttpStatusCode.Forbidden })
+        {
+            var explanation = BuildMinimalQuotaTestFailureMessage(sessionAccount,
+                "{\"detail\":\"fixture-sensitive-upstream-text\"}", code);
+            if (!explanation.Contains($"HTTP {(int)code}") || !explanation.Contains("通过 ChatGPT 登录（官方）") ||
+                explanation.Contains("fixture-sensitive-upstream-text"))
+                throw new InvalidOperationException("Session denial must explain upstream authorization without exposing response bodies.");
+        }
+        var bareDenied = BuildMinimalQuotaTestFailureMessage(sessionAccount, "{\"detail\":\"Unauthorized\"}");
+        if (!bareDenied.Contains("HTTP 401") ||
+            BuildMinimalQuotaTestFailureMessage(sessionAccount, "rate limited", HttpStatusCode.TooManyRequests)
+                .Contains("通过 ChatGPT 登录（官方）"))
+            throw new InvalidOperationException("Session authorization diagnostics must distinguish denial from rate limiting.");
     }
 
     internal void EnsureLocalPatAccountConfig(AccountRecord account)

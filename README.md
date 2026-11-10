@@ -17,7 +17,7 @@ Codex Account Manager 是一个在本机运行的 Codex 多账号管理器。它
 
 也可以打开 [Latest Release](https://github.com/bennettnaida-cloud/codex-account-manager/releases/tag/latest) 查看版本、发布时间和全部文件。
 
-当前发布版本为 2.3.46，内置 Codex CLI 0.163.0。Windows 将网页版 Session 导入整合进“新增账号 → 登录方式”，选中后直接粘贴 JSON，底部确认按钮按文字自动调整宽度；修复独立 Session 编辑弹窗按钮被挤出窗口、API Key 提示文字遮挡 Provider/Wire API 的问题。保留 2.3.45 的本地中转兼容修复。详见 [2.3.46 更新说明](docs/release-2.3.46.md)。Windows 无需另装 .NET；macOS 仅同步版本号。
+当前发布版本为 2.3.47，内置 Codex CLI 0.163.0。Windows 的 Session 网页入口改为可选中复制的完整地址；完善 Session 模型请求 401/403 的中文说明，区分凭据导入、只读查询和模型调用授权。网页 Session 导入成功不保证可用于 Codex 模型请求，被拒绝时建议通过官方 ChatGPT 登录完成 Codex 授权。详见 [2.3.47 更新说明](docs/release-2.3.47.md)。保留此前布局、中转兼容、导入和轮换修复。macOS 仅同步版本号。
 
 保留旧会话续聊用量统计、轮换、逐账号代理与模型目录，以及升级时同步桌面和任务栏快捷方式。当前本机桌面版本为 Windows OpenAI.Codex 26.1002.7124.0（ChatGPT.exe）；专项回归并不等于已在所有电脑上完成交互实测，未来版本及第三方上游仍需按实际协议验证。
 
