@@ -4574,6 +4574,11 @@ public partial class Form1 : Form
         {
             RenderAccountRotationWorkspace(query, workspaceWidth);
             _cardsPanel.ResumeLayout();
+            // Rebuilding a scrolled FlowLayoutPanel can leave a copied strip from the
+            // previous child window in the native scroll buffer.  Flush the visible
+            // descendants after the rotation list is rebuilt so a launch/switch cannot
+            // show a ghosted second row until the next scroll event.
+            _cardsPanel.InvalidateVisibleViewport(flush: true);
             return;
         }
 
@@ -15111,12 +15116,17 @@ public partial class Form1 : Form
         var cacheNote = cached > 0
             ? $"其中缓存输入约 {FormatTokens(cached)}，按缓存输入价折算。"
             : "当前没有可识别的缓存输入折扣。";
+        var exactCostNote = usage.EquivalentCostOverrideUsd > 0D
+            ? $"本窗口另有 {FormatUsd(usage.EquivalentCostOverrideUsd)} 的已导入精确账单，未按 Token 二次计费。"
+            : string.Empty;
         return $"Token 是日志里的实际 Token 数；API 等值按 {priceProfile.DisplayName} 的输入、缓存输入和输出单价估算。" +
                Environment.NewLine +
                $"本窗口：{FormatTokens(total)} token，{FormatEstimatedCost(usage, priceProfile)}。" +
                Environment.NewLine +
                cacheNote +
                Environment.NewLine +
+               exactCostNote +
+               (string.IsNullOrEmpty(exactCostNote) ? string.Empty : Environment.NewLine) +
                "所以 Token 更多时，若缓存比例更高、输出更少或模型单价不同，API 等值仍可能更低；它不是官方余额。";
     }
 
