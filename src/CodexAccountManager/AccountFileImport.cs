@@ -149,7 +149,7 @@ internal static class AccountFileImport
                 ["auth_mode"] = "chatgpt", ["OPENAI_API_KEY"] = null,
                 ["tokens"] = new JsonObject { ["access_token"] = access, ["refresh_token"] = refresh,
                     ["id_token"] = idToken, ["account_id"] = accountId },
-                ["last_refresh"] = Text(item, "last_refresh") is { Length: > 0 } last ? last : null
+                ["last_refresh"] = ReadOAuthRefreshTime(item, DateTimeOffset.UtcNow)
             }, "", "", refresh + "\n" + accountId);
         }
         ValidateSecret(apiKey, "缺少可导入的凭据，或文件仅包含账号列表而非完整导出。");
@@ -174,6 +174,41 @@ internal static class AccountFileImport
 
     internal static string Fingerprint(string kind, string identity) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(kind + "\n" + identity)));
+
+    internal static string? ReadOAuthRefreshTime(JsonElement item, DateTimeOffset now)
+    {
+        var credentials = item.TryGetProperty("credentials", out var c) && c.ValueKind == JsonValueKind.Object ? c : item;
+        var tokens = credentials.TryGetProperty("tokens", out var t) && t.ValueKind == JsonValueKind.Object ? t : credentials;
+        foreach (var source in new[] { item, credentials, tokens })
+        {
+            if (source.TryGetProperty("last_refresh", out var value) && value.ValueKind == JsonValueKind.String &&
+                value.TryGetDateTimeOffset(out var timestamp) && timestamp > DateTimeOffset.UnixEpoch &&
+                timestamp <= now.AddMinutes(5))
+                return value.GetString();
+        }
+
+        // Older Sub2API exports omit last_refresh. Native Codex then refreshes even
+        // an unexpired access token, which fails if another client rotated the RT.
+        // Recover the acquisition time from the token; never invent a refresh now.
+        var access = Text(tokens, "access_token");
+        try
+        {
+            var parts = access.Split('.');
+            if (parts.Length != 3) return null;
+            var payload = parts[1].Replace('-', '+').Replace('_', '/');
+            using var doc = JsonDocument.Parse(Convert.FromBase64String(payload.PadRight((payload.Length + 3) / 4 * 4, '=')));
+            var root = doc.RootElement;
+            if (!root.TryGetProperty("iat", out var issued) || issued.ValueKind != JsonValueKind.Number ||
+                !issued.TryGetInt64(out var seconds) || seconds <= 0) return null;
+            var timestamp = DateTimeOffset.FromUnixTimeSeconds(seconds);
+            if (timestamp > now.AddMinutes(5)) return null;
+            if (root.TryGetProperty("exp", out var expiry) &&
+                (expiry.ValueKind != JsonValueKind.Number || !expiry.TryGetInt64(out var expires) || expires <= seconds)) return null;
+            return timestamp.ToString("O");
+        }
+        catch (Exception ex) when (ex is FormatException or JsonException or ArgumentOutOfRangeException or InvalidOperationException)
+        { return null; }
+    }
     private static void ValidateSecret(string value, string error)
     {
         if (value.Length < 8 || value.Length > 32768 || value.Any(char.IsWhiteSpace) || value.Contains('*') ||

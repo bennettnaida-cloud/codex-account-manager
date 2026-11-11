@@ -11,6 +11,7 @@ internal static partial class AccountFileImportTests
         Directory.CreateDirectory(root);
         try
         {
+            ValidateOAuthRefreshTimes();
             ValidateRetiredWebSession(root);
             LocalPatGatewayHost.ValidateRetiredWebSessionRouting();
             var native = """{"auth_mode":"chatgpt","tokens":{"id_token":"fixture-id-token","access_token":"fixture-access-token","refresh_token":"fixture-refresh-token","account_id":"fixture-account"}}""";

@@ -2501,6 +2501,7 @@ public sealed partial class CodexCliService
     {
         if (account.IsWebSession) throw new InvalidDataException(AccountAuthKind.WebSessionRemovedMessage);
         using var launchLease = new DesktopLaunchLease();
+        forceClientRestart |= WindowsLocalPreferenceRepair.IsPending(new AccountStore().RootPath);
         using var diagnosticScope = CurrentLaunch.Value == null
             ? BeginLaunchDiagnostics(chatGptFeatureAccount == null ? "ordinary" : "voice-mobile") : null;
         LaunchPhase("launch-configuration-start", "正在检查配置、账号与网络…");
@@ -2654,6 +2655,7 @@ public sealed partial class CodexCliService
                 // while Codex was still open.
                 LaunchPhase("launch-old-processes-exited", "旧 Codex 已退出，正在检查本地历史索引…",
                     $"count={shutdownTargets.Count}");
+                WindowsLocalPreferenceRepair.ApplyAfterClientExit(new AccountStore().RootPath, GetDefaultCodexHome());
                 LaunchPhase("launch-history-maintenance-start", "正在检查本地历史索引…");
                 var historyRepair = CodexRolloutHistoryRepairService.TryRepairLaggingPaginatedRollouts(
                     GetDefaultCodexHome(),
@@ -10008,6 +10010,7 @@ public sealed partial class CodexCliService
             .Select(line => line.Trim())
             .ToList();
         if (dualLoginTopLevelLines.Count(IsCliAuthCredentialsStoreLine) != 1 ||
+            dualLoginTopLevelLines.Any(line => TomlKeyEquals(line, "chatgpt_base_url")) ||
             !dualLoginTopLevelLines.Contains(
                 "cli_auth_credentials_store = \"file\"",
                 StringComparer.Ordinal) ||
@@ -11825,6 +11828,9 @@ public sealed partial class CodexCliService
             var routedProjectedConfig = ProjectOfficialOAuthConfigText(
                 projectedConfig,
                 routeThroughGateway: true);
+            var legacyRoutedConfig = "chatgpt_base_url = \"http://127.0.0.1:8317/backend-api\"\n" + routedProjectedConfig;
+            if (ProjectOfficialOAuthConfigText(legacyRoutedConfig, routeThroughGateway: true) != routedProjectedConfig)
+                throw new InvalidOperationException("OAuth workspace routing must repair legacy HTTP settings without changing the model route.");
             var officialProviderHeader =
                 "[model_providers." + AccountStore.OfficialOAuthProviderId + "]";
             var forbidden = new[]
@@ -11888,9 +11894,7 @@ public sealed partial class CodexCliService
             if (!routedProjectedConfig.Contains(
                     "openai_base_url = " + TomlString(LocalPatGateway.ProviderBaseUrl),
                     StringComparison.Ordinal) ||
-                !routedProjectedConfig.Contains(
-                    "chatgpt_base_url = " + TomlString(LocalPatGateway.ChatGptBaseUrl),
-                    StringComparison.Ordinal) ||
+                routedProjectedConfig.Contains("chatgpt_base_url", StringComparison.Ordinal) ||
                 !routedProjectedConfig.Contains(
                     "base_url = " + TomlString(LocalPatGateway.ProviderBaseUrl),
                     StringComparison.Ordinal) ||
@@ -12041,11 +12045,11 @@ public sealed partial class CodexCliService
         };
         if (modelCatalogPath != null && !HasTopLevelModelCatalog(currentConfig))
             output.Insert(0, "model_catalog_json = " + TomlString(modelCatalogPath) + ManagedModelCatalogMarker);
-        // Existing desktop tasks can retain the built-in OpenAI provider. Both
-        // OAuth entry points must reach the gateway when rotation is enabled.
+        // Route model traffic only. Recent Codex resolves workspace services from
+        // chatgpt_base_url and rejects HTTP loopback before sending any request.
+        // Workspace identity stays on the native HTTPS backend during rotation.
         if (routeThroughGateway)
         {
-            output.Insert(1, "chatgpt_base_url = " + TomlString(LocalPatGateway.ChatGptBaseUrl));
             output.Insert(1, "openai_base_url = " + TomlString(LocalPatGateway.ProviderBaseUrl));
         }
         string? currentSection = null;
@@ -12272,9 +12276,11 @@ public sealed partial class CodexCliService
             "model_provider = " + TomlString(AccountStore.AccessTokenProviderId),
             "model = " + TomlString(string.IsNullOrWhiteSpace(modelOverride) ? AccessTokenModel : modelOverride.Trim()),
             "review_model = " + TomlString(string.IsNullOrWhiteSpace(modelOverride) ? AccessTokenModel : modelOverride.Trim()),
-            "model_reasoning_effort = " + TomlString(AccessTokenReasoningEffort),
-            "chatgpt_base_url = " + TomlString(LocalPatGateway.ChatGptBaseUrl)
+            "model_reasoning_effort = " + TomlString(AccessTokenReasoningEffort)
         };
+        // Dual login keeps workspace APIs on native HTTPS; its model bearer is separate.
+        if (string.IsNullOrWhiteSpace(providerBearerToken))
+            output.Add("chatgpt_base_url = " + TomlString(LocalPatGateway.ChatGptBaseUrl));
         if (!hasCustomModelCatalog &&
             !string.IsNullOrWhiteSpace(modelCatalogPath) &&
             File.Exists(modelCatalogPath))

@@ -27,6 +27,9 @@
 
 API Key 与 Access Token 账号都采用一键凭据投放：点击启动时，管理器会把所选账号的密钥写成官方 Codex App 可识别的 `auth_mode=apikey` 登录文件；无需在 App 内重复输入。Access Token 的模型请求仍经本机 PAT 网关使用月额度，已有 ChatGPT OAuth 会先备份但不是启动前置条件。
 
+Windows 2.3.49：修复 OAuth 轮换及双登录下无法加载工作空间设置的问题。
+请退出旧管理器并启动新版，再从管理器启动目标账号以应用修复。
+
 Windows 2.3.47：已移除网页版 Session 导入、编辑和更新功能，文件导入也不再接受网页 Session。
 旧 Session 账号数据仍保留并显示“已停用”；请在“新增账号”中选择“通过 ChatGPT 登录（官方）”重新添加。
 保留 PAT、兼容 API、sub2api/CPA/官方 OAuth 文件导入、模型同步和表单布局修复。

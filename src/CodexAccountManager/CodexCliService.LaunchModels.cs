@@ -62,8 +62,20 @@ public sealed partial class CodexCliService
             var root = JsonNode.Parse(File.ReadAllText(path))!.AsObject();
             var tokens = root["tokens"] as JsonObject ?? throw new InvalidDataException("缺少 OAuth 凭据，请重新登录。");
             var access = tokens["access_token"]?.GetValue<string>() ?? "";
+            using var document = JsonDocument.Parse(root.ToJsonString());
+            var refreshTime = AccountFileImport.ReadOAuthRefreshTime(document.RootElement, DateTimeOffset.UtcNow);
             if (!string.IsNullOrWhiteSpace(tokens["id_token"]?.GetValue<string>()) &&
-                !IsJwtExpiredOrExpiring(access, TimeSpan.FromMinutes(2))) return;
+                !IsJwtExpiredOrExpiring(access, TimeSpan.FromMinutes(2)) && refreshTime != null)
+            {
+                if (root["last_refresh"]?.ToJsonString() != JsonValue.Create(refreshTime)!.ToJsonString())
+                {
+                    if (!identity.SequenceEqual(BuildCanonicalJsonSha256(path)))
+                        throw new InvalidOperationException("账号凭据已变化，未覆盖新的登录状态。");
+                    root["last_refresh"] = refreshTime;
+                    AtomicFilePersistence.WriteAllText(path, root.ToJsonString());
+                }
+                return;
+            }
             var refresh = tokens["refresh_token"]?.GetValue<string>();
             if (string.IsNullOrWhiteSpace(refresh)) throw new InvalidDataException("OAuth 凭据无法刷新，请重新登录。");
             using var resolver = new AccountProxyResolver(new AccountStore().RootPath);

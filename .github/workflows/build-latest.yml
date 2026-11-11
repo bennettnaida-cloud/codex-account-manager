@@ -226,13 +226,11 @@ jobs:
           body: |
             自动构建版本 `${{ env.CAM_VERSION }}`。
 
-            Windows 2.3.47：移除网页版 Session 的导入、编辑和更新入口，文件导入也不再接受网页 Session JSON。
+            Windows 2.3.49：修复 OAuth 轮换及双登录误将工作空间接口指向本地 HTTP 网关，导致新版 Codex 无法加载工作空间设置并反复请求失败。模型请求继续支持本地网关轮换，工作空间保持原生 HTTPS。
 
-            已有 Session 账号数据继续保留，显示为已停用，不再参与启动、额度查询或网关轮换。请在新增账号中选择“通过 ChatGPT 登录（官方）”重新添加账号。
+            包含本地 2.3.48 的 Sub2API OAuth 刷新时间修复；保留 Session 功能移除、模型同步、文件导入、中转兼容、逐账号代理和 10%/3% 轮换。
 
-            保留 PAT、官方 ChatGPT OAuth、兼容 API、sub2api/CPA/官方 OAuth 文件导入、启动前在线模型同步、逐账号代理和 10%/3% 轮换，以及表单布局和本地中转兼容修复。
-
-            Windows 发布执行完整自检、旧 Session 停用及数据保留、模型、启动、轮换和中转兼容回归，以及安装包隐私扫描和隔离安装。内置 Codex CLI 0.163.0；macOS 仅同步版本号。
+            发布执行完整自检、启动、导入、模型及网关回归、安装包隐私扫描和隔离安装。内置 Codex CLI 0.163.0；macOS 仅同步版本号。升级不自动关闭正在运行的 Codex。
           prerelease: true
           make_latest: false
           files: |
