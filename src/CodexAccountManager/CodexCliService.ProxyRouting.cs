@@ -45,6 +45,13 @@ public sealed partial class CodexCliService
     // Chromium login/feature requests also need an explicit proxy on cold activation.
     internal static bool RequiresDesktopGateway(AccountRecord account, bool requested = false)
     {
+        // Official ChatGPT OAuth must keep the workspace backend on ChatGPT's HTTPS
+        // origin. Routing it by replacing the provider base URL with the local HTTP
+        // gateway makes recent Codex clients reject the whole workspace before any
+        // model request is sent. Account rotation still changes the OAuth profile;
+        // fixed desktop proxy bindings remain available through the normal proxy path.
+        if (account.IsOfficialOAuth) return false;
+
         // All API launches must pass through the local Responses compatibility layer,
         // even with rotation disabled and no fixed proxy. Keep the upstream on the
         // account record; the gateway selects its endpoint and credential at runtime.
@@ -66,7 +73,8 @@ public sealed partial class CodexCliService
             Environment.SetEnvironmentVariable("CODEX_ACCOUNT_MANAGER_HOME", fixture);
             var store = new ProxyNodeStore(fixture);
             var service = new CodexCliService();
-            if (!RequiresDesktopGateway(api) || !RequiresDesktopGateway(api, requested: true) || RequiresDesktopGateway(oauth))
+            if (!RequiresDesktopGateway(api) || !RequiresDesktopGateway(api, requested: true) ||
+                RequiresDesktopGateway(oauth) || RequiresDesktopGateway(oauth, requested: true))
                 throw new InvalidOperationException("API compatibility routing must be independent of rotation while unbound OAuth stays native.");
 
             foreach (var bindingMode in new[] { ProxyBindingMode.InheritGlobal, ProxyBindingMode.FixedNode, ProxyBindingMode.Disabled })

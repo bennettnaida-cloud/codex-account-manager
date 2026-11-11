@@ -9,6 +9,8 @@ public partial class Form1
 
     private void RenderAccountRotationWorkspace(string query, int workspaceWidth)
     {
+        _accountRotationDetailLabels.Clear();
+        _accountRotationRows.Clear();
         // The quota workspace and this page must render the same effective report.  The
         // old rotation page read the persisted snapshot directly, while the quota page
         // merged that snapshot with the current local usage report.  During a refresh
@@ -482,7 +484,9 @@ public partial class Form1
             Width = width,
             Height = horizontal ? 94 : 188,
             Radius = 14,
-            BorderColor = UiDesign.Blend(_palette.BorderColor, accent, 0.14F),
+            BorderColor = IsCurrentAccount(account)
+                ? _palette.SuccessColor
+                : UiDesign.Blend(_palette.BorderColor, accent, 0.14F),
             BackColor = _palette.CardColor,
             UseGradient = true,
             GradientColor = UiDesign.Blend(_palette.CardColor, accent, 0.018F),
@@ -548,15 +552,18 @@ public partial class Form1
             Left = 78,
             Top = 44,
             Width = horizontal ? summaryWidth : Math.Max(160, width - 102),
-            Height = horizontal ? 31 : 38,
+            Height = horizontal ? 42 : 48,
             Font = new Font(Font.FontFamily, 8.4F),
             TextAlign = ContentAlignment.MiddleLeft,
-            AutoEllipsis = true,
+            AutoEllipsis = false,
             UseMnemonic = false
         };
         ThemeStyler.ApplyLabel(detail, _palette, true);
         _toolTip.SetToolTip(detail, detail.Text);
         row.Controls.Add(detail);
+        var accountKey = QuotaAccountIdentity.CreateKey(account);
+        _accountRotationDetailLabels[accountKey] = detail;
+        _accountRotationRows[accountKey] = row;
 
         var controlsLeft = horizontal
             ? width - 22 - controlsWidth
@@ -679,35 +686,91 @@ public partial class Form1
         AccountRecord account,
         AccountUsageSummary? quotaUsage)
     {
-        var parts = new List<string> { account.AuthKindLabel };
-        if (IsCurrentAccount(account))
+        var summary = new List<string> { account.AuthKindLabel };
+        var resets = new List<string>();
+        var fiveHour = quotaUsage?.GetQuotaWindow(AccountQuotaWindowKind.FiveHour);
+        var weekly = quotaUsage?.GetQuotaWindow(AccountQuotaWindowKind.Weekly);
+        var monthly = quotaUsage?.GetQuotaWindow(AccountQuotaWindowKind.Monthly);
+
+        AppendRotationQuotaWindow(summary, resets, fiveHour, "5h", PatAutoRotationPolicy.FiveHourRemainingReserve);
+        AppendRotationQuotaWindow(summary, resets, weekly, "周", PatAutoRotationPolicy.WeeklyOnlyRemainingReserve);
+        AppendRotationQuotaWindow(summary, resets, monthly, "月", reserve: null);
+        if (summary.Count == 1)
         {
-            parts.Add("当前使用");
+            summary.Add("额度待查询");
+        }
+        if (resets.Count == 0)
+        {
+            resets.Add("重置时间待查询");
         }
 
-        var quotaWindow = quotaUsage?.GetQuotaWindow(AccountQuotaWindowKind.FiveHour)
-                          ?? quotaUsage?.GetQuotaWindow(AccountQuotaWindowKind.Weekly);
-        var quotaLabel = quotaWindow?.Kind == AccountQuotaWindowKind.Weekly ? "周额度" : "5h";
-        if (quotaWindow?.UsedPercent is { } usedPercent && double.IsFinite(usedPercent))
-        {
-            var remainingPercent = Math.Clamp(100D - usedPercent, 0D, 100D);
-            parts.Add($"{quotaLabel}剩余 {remainingPercent:0.#}%");
-            var reserve = quotaWindow.Kind == AccountQuotaWindowKind.Weekly
-                ? PatAutoRotationPolicy.WeeklyOnlyRemainingReserve
-                : PatAutoRotationPolicy.FiveHourRemainingReserve;
-            if (remainingPercent <= reserve &&
-                (quotaWindow.ResetAtUtc == null || quotaWindow.ResetAtUtc > DateTimeOffset.UtcNow))
-                parts.Add("已达保留线，暂停轮换使用");
-        }
-        else
-        {
-            parts.Add($"{quotaLabel}剩余 —");
-        }
-        parts.Add(quotaWindow?.ResetAtUtc is { } resetAtUtc
-            ? $"{quotaLabel}重置 {resetAtUtc.ToLocalTime():MM-dd HH:mm}"
-            : $"{quotaLabel}重置 —");
+        return string.Join("  ·  ", summary) + Environment.NewLine +
+               string.Join("  ·  ", resets);
+    }
 
-        return string.Join("  ·  ", parts);
+    private static void AppendRotationQuotaWindow(
+        ICollection<string> summary,
+        ICollection<string> resets,
+        AccountQuotaWindowSnapshot? window,
+        string label,
+        double? reserve)
+    {
+        if (window == null)
+        {
+            return;
+        }
+
+        var remaining = window.RemainingPercent;
+        summary.Add(remaining is { } value && double.IsFinite(value)
+            ? $"{label}剩余 {Math.Clamp(value, 0D, 100D):0.#}%"
+            : $"{label}剩余 —");
+        if (reserve is { } threshold &&
+            remaining is { } remainingValue &&
+            remainingValue <= threshold &&
+            (window.ResetAtUtc == null || window.ResetAtUtc > DateTimeOffset.UtcNow))
+        {
+            summary.Add("已达保留线");
+        }
+
+        resets.Add(window.ResetAtUtc is { } resetAtUtc
+            ? $"{label}重置 {resetAtUtc.ToLocalTime():MM-dd HH:mm}"
+            : $"{label}重置 —");
+    }
+
+    private bool TryUpdateAccountRotationRowsInPlace()
+    {
+        if (_activeView != WorkspaceView.AccountRotation ||
+            _accountRotationDetailLabels.Count == 0)
+        {
+            return false;
+        }
+
+        var usageByKey = GetAccountRotationQuotaUsage();
+        foreach (var account in _accounts)
+        {
+            var accountKey = QuotaAccountIdentity.CreateKey(account);
+            if (!_accountRotationDetailLabels.TryGetValue(accountKey, out var detail) ||
+                detail.IsDisposed)
+            {
+                continue;
+            }
+
+            usageByKey.TryGetValue(accountKey, out var usage);
+            detail.Text = BuildAccountRotationAccountDetail(account, usage);
+            _toolTip.SetToolTip(detail, detail.Text);
+            if (_accountRotationRows.TryGetValue(accountKey, out var row) && !row.IsDisposed)
+            {
+                var pool = AccountRotationConfiguration.GetPool(_appSettings, account);
+                var accent = GetAccountRotationPoolColor(pool);
+                row.BorderColor = IsCurrentAccount(account)
+                    ? _palette.SuccessColor
+                    : UiDesign.Blend(_palette.BorderColor, accent, 0.14F);
+                row.Invalidate();
+            }
+            detail.Invalidate();
+        }
+
+        return true;
     }
 
     private IReadOnlyDictionary<string, AccountUsageSummary> GetAccountRotationQuotaUsage()

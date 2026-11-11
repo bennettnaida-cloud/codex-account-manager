@@ -341,6 +341,13 @@ public partial class Form1 : Form
         new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTimeOffset> _officialQuotaRefreshAttemptedAt =
         new(StringComparer.OrdinalIgnoreCase);
+    // Rotation rows are rebuilt only when their structure changes. Quota/log refreshes
+    // update these labels in place so the page does not flash or feel unresponsive while
+    // the shared usage report is being refreshed in the background.
+    private readonly Dictionary<string, Label> _accountRotationDetailLabels =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, RoundedPanel> _accountRotationRows =
+        new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _officialQuotaRefreshErrors =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _officialQuotaRefreshInProgress =
@@ -2428,9 +2435,13 @@ public partial class Form1 : Form
                 else if (_activeView == WorkspaceView.AccountRotation)
                 {
                     // The rotation rows now read the same effective UsageReport as the
-                    // quota workspace.  Repaint them when a background report arrives so
-                    // their 5h percentage/reset never lags behind the quota cards.
-                    RenderCards();
+                    // quota workspace. Update their labels in place when the row
+                    // structure is already present; rebuilding every card on each log
+                    // refresh made the rotation page flash and feel unresponsive.
+                    if (!TryUpdateAccountRotationRowsInPlace())
+                    {
+                        RenderCards();
+                    }
                 }
             }
         }
@@ -2662,6 +2673,9 @@ public partial class Form1 : Form
                 SetLabelText(
                     binding.Metrics[index].Tokens,
                     $"{FormatTokens(metrics[index].Bucket.TotalTokens)} token");
+            var metricExplanation = GetUsageMetricExplanation(metrics[index].Bucket, priceProfile);
+            _toolTip.SetToolTip(binding.Metrics[index].Cost, metricExplanation);
+            _toolTip.SetToolTip(binding.Metrics[index].Tokens, metricExplanation);
             }
 
             SetLabelText(binding.Subtitle, subtitleText);
@@ -2801,6 +2815,9 @@ public partial class Form1 : Form
         {
             binding.Metrics[index].Cost.Text = FormatEstimatedCost(metrics[index].Bucket, priceProfile);
             binding.Metrics[index].Tokens.Text = $"{FormatTokens(metrics[index].Bucket.TotalTokens)} token";
+            var metricExplanation = GetUsageMetricExplanation(metrics[index].Bucket, priceProfile);
+            _toolTip.SetToolTip(binding.Metrics[index].Cost, metricExplanation);
+            _toolTip.SetToolTip(binding.Metrics[index].Tokens, metricExplanation);
         }
 
         binding.Kind.Text = GetQuotaListSubtitle(account, quotaLimitType);
@@ -10636,7 +10653,10 @@ public partial class Form1 : Form
                     // Official reads can complete while the user is on the rotation page.
                     // Repaint that page immediately so it observes the same snapshot as
                     // the quota cards instead of waiting for the next usage-log refresh.
-                    RenderCards();
+                    if (!TryUpdateAccountRotationRowsInPlace())
+                    {
+                        RenderCards();
+                    }
                 }
             }
         }
@@ -15080,6 +15100,24 @@ public partial class Form1 : Form
     private static string FormatEstimatedCost(UsageBucket usage, UsagePriceProfile priceProfile)
     {
         return FormatUsd(EstimateTotalCost(usage, priceProfile));
+    }
+
+    private static string GetUsageMetricExplanation(
+        UsageBucket usage,
+        UsagePriceProfile priceProfile)
+    {
+        var cached = usage.CachedInputTokens;
+        var total = usage.TotalTokens;
+        var cacheNote = cached > 0
+            ? $"其中缓存输入约 {FormatTokens(cached)}，按缓存输入价折算。"
+            : "当前没有可识别的缓存输入折扣。";
+        return $"Token 是日志里的实际 Token 数；API 等值按 {priceProfile.DisplayName} 的输入、缓存输入和输出单价估算。" +
+               Environment.NewLine +
+               $"本窗口：{FormatTokens(total)} token，{FormatEstimatedCost(usage, priceProfile)}。" +
+               Environment.NewLine +
+               cacheNote +
+               Environment.NewLine +
+               "所以 Token 更多时，若缓存比例更高、输出更少或模型单价不同，API 等值仍可能更低；它不是官方余额。";
     }
 
     private static UsageBucket[] GetQuotaUsageBuckets(AccountUsageSummary usage) =>
