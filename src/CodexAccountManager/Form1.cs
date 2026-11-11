@@ -1,4 +1,4 @@
-using System.ComponentModel;
+﻿using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing.Drawing2D;
 using System.Globalization;
@@ -4530,6 +4530,11 @@ public partial class Form1 : Form
         finally
         {
             _renderingCards = false;
+            if (_buttonDisableDepth > 0)
+                SetButtonsEnabledRecursive(_cardsPanel, enabled: false);
+            // RenderCardsCore has now restored WM_SETREDRAW on the parent. Before
+            // that point its descendants appear hidden and viewport repaint skips them.
+            _cardsPanel.InvalidateVisibleViewport(flush: true);
             QueueCardsAnimationVisibilityRefresh();
         }
     }
@@ -4574,11 +4579,6 @@ public partial class Form1 : Form
         {
             RenderAccountRotationWorkspace(query, workspaceWidth);
             _cardsPanel.ResumeLayout();
-            // Rebuilding a scrolled FlowLayoutPanel can leave a copied strip from the
-            // previous child window in the native scroll buffer.  Flush the visible
-            // descendants after the rotation list is rebuilt so a launch/switch cannot
-            // show a ghosted second row until the next scroll event.
-            _cardsPanel.InvalidateVisibleViewport(flush: true);
             return;
         }
 
@@ -15117,13 +15117,21 @@ public partial class Form1 : Form
             ? $"其中缓存输入约 {FormatTokens(cached)}，按缓存输入价折算。"
             : "当前没有可识别的缓存输入折扣。";
         var exactCostNote = usage.EquivalentCostOverrideUsd > 0D
-            ? $"本窗口另有 {FormatUsd(usage.EquivalentCostOverrideUsd)} 的已导入精确账单，未按 Token 二次计费。"
+            ? $"本窗口另有 {FormatUsd(usage.EquivalentCostOverrideUsd)} 的固定费用或导入账单，相关 Token 未重复计费。"
             : string.Empty;
+        var rates = string.Join(Environment.NewLine, usage.ModelUsage.Select(model =>
+        {
+            var price = GetUsagePriceProfile(model.Model, priceProfile);
+            return $"{model.Model ?? price.DisplayName}{(model.IsLongContext ? "（长上下文）" : "")}：每百万 Token 输入 ${price.GetInputRate(model.IsLongContext):0.###}、缓存 ${price.GetCachedInputRate(model.IsLongContext):0.###}、输出 ${price.GetOutputRate(model.IsLongContext):0.###}。";
+        }).Distinct());
         return $"Token 是日志里的实际 Token 数；API 等值按 {priceProfile.DisplayName} 的输入、缓存输入和输出单价估算。" +
                Environment.NewLine +
                $"本窗口：{FormatTokens(total)} token，{FormatEstimatedCost(usage, priceProfile)}。" +
                Environment.NewLine +
                cacheNote +
+               Environment.NewLine +
+               rates + Environment.NewLine +
+               $"普通输入 {FormatUsd(EstimateRegularInputCost(usage, priceProfile))} + 缓存输入 {FormatUsd(EstimateCachedInputCost(usage, priceProfile))} + 缓存写入 {FormatUsd(EstimateCacheWriteCost(usage, priceProfile))} + 输出 {FormatUsd(EstimateOutputCost(usage, priceProfile))}。" +
                Environment.NewLine +
                exactCostNote +
                (string.IsNullOrEmpty(exactCostNote) ? string.Empty : Environment.NewLine) +
@@ -19477,12 +19485,26 @@ public partial class Form1 : Form
         }
     }
 
+    private int _buttonDisableDepth;
+    private readonly Dictionary<Button, bool> _buttonStatesBeforeBusy = new();
+
     private void SetButtonsEnabled(bool enabled)
     {
-        foreach (Control control in Controls)
+        if (!enabled)
         {
-            SetButtonsEnabledRecursive(control, enabled);
+            if (_buttonDisableDepth++ > 0) return;
         }
+        else if (_buttonDisableDepth == 0 || --_buttonDisableDepth > 0)
+        {
+            return;
+        }
+        using (NativeWindowTheme.SuspendRedraw(_accountLayout))
+        {
+            foreach (Control control in Controls)
+                SetButtonsEnabledRecursive(control, enabled);
+        }
+        if (enabled) _buttonStatesBeforeBusy.Clear();
+        _cardsPanel.InvalidateVisibleViewport(flush: true);
     }
 
     private void SetButtonsEnabledRecursive(Control control, bool enabled)
@@ -19491,6 +19513,7 @@ public partial class Form1 : Form
         {
             if (!enabled)
             {
+                _buttonStatesBeforeBusy.TryAdd(button, button.Enabled);
                 button.Enabled = false;
             }
             else if (button.Name.Equals("UsageResetAction", StringComparison.Ordinal))
@@ -19516,7 +19539,8 @@ public partial class Form1 : Form
             }
             else
             {
-                button.Enabled = true;
+                if (_buttonStatesBeforeBusy.TryGetValue(button, out var wasEnabled))
+                    button.Enabled = wasEnabled;
             }
         }
 

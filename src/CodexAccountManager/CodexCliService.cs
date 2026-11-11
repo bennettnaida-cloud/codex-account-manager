@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.ComponentModel;
 using System.Globalization;
 using System.Net;
@@ -11892,7 +11892,7 @@ public sealed partial class CodexCliService
             if (!routedProjectedConfig.Contains(
                     "openai_base_url = " + TomlString(LocalPatGateway.ProviderBaseUrl),
                     StringComparison.Ordinal) ||
-                routedProjectedConfig.Contains("chatgpt_base_url", StringComparison.Ordinal) ||
+                !routedProjectedConfig.Contains("chatgpt_base_url = " + TomlString("https://chatgpt.com/backend-api"), StringComparison.Ordinal) ||
                 !routedProjectedConfig.Contains(
                     "base_url = " + TomlString(LocalPatGateway.ProviderBaseUrl),
                     StringComparison.Ordinal) ||
@@ -12048,7 +12048,8 @@ public sealed partial class CodexCliService
         // Workspace identity stays on the native HTTPS backend during rotation.
         if (routeThroughGateway)
         {
-            output.Insert(1, "openai_base_url = " + TomlString(LocalPatGateway.ProviderBaseUrl));
+            output.Insert(1, "chatgpt_base_url = \"https://chatgpt.com/backend-api\"");
+            output.Insert(2, "openai_base_url = " + TomlString(LocalPatGateway.ProviderBaseUrl));
         }
         string? currentSection = null;
         var skipSection = false;

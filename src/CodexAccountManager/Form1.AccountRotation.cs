@@ -1,4 +1,4 @@
-namespace CodexAccountManager;
+﻿namespace CodexAccountManager;
 
 public partial class Form1
 {
@@ -480,31 +480,10 @@ public partial class Form1
         var horizontal = width >= AccountRotationHorizontalMinWidth;
         var accent = GetAccountRotationPoolColor(pool);
 
-        var detailText = BuildAccountRotationAccountDetail(account, quotaUsage);
-        var detailWidth = horizontal
-            ? Math.Max(180, width - 94 -
-                       (124 +
-                        (horizontal
-                            ? Math.Max(176, MeasureAccountRotationPoolActionWidth())
-                            : 0) +
-                        92 +
-                        (42 * 2) +
-                        (8 * 4)) - 26)
-            : Math.Max(160, width - 102);
-        var detailFont = new Font(Font.FontFamily, 8.4F);
-        var detailMeasure = TextRenderer.MeasureText(
-            detailText,
-            detailFont,
-            new Size(detailWidth, int.MaxValue),
-            TextFormatFlags.WordBreak | TextFormatFlags.NoPadding);
-        var detailHeight = Math.Max(42, detailMeasure.Height + 8);
-        var rowHeight = horizontal
-            ? Math.Max(94, 44 + detailHeight + 8)
-            : Math.Max(188, 44 + detailHeight + 100);
         var row = new RoundedPanel
         {
             Width = width,
-            Height = rowHeight,
+            Height = horizontal ? 94 : 188,
             Radius = 14,
             BorderColor = IsCurrentAccount(account)
                 ? _palette.SuccessColor
@@ -553,20 +532,6 @@ public partial class Form1
         var summaryWidth = horizontal
             ? Math.Max(180, width - 94 - actionWidth - 26)
             : Math.Max(160, width - 98);
-        // Measure against the actual text column width.  At high DPI the two-line
-        // quota/reset summary is taller than the old fixed 42px slot, so the row
-        // must grow with the rendered font instead of clipping its second line.
-        detailWidth = horizontal ? summaryWidth : Math.Max(160, width - 102);
-        detailMeasure = TextRenderer.MeasureText(
-            detailText,
-            detailFont,
-            new Size(detailWidth, int.MaxValue),
-            TextFormatFlags.WordBreak | TextFormatFlags.NoPadding);
-        detailHeight = Math.Max(42, detailMeasure.Height + 8);
-        rowHeight = horizontal
-            ? Math.Max(94, 44 + detailHeight + 8)
-            : Math.Max(188, 44 + detailHeight + 100);
-        row.Height = rowHeight;
         var name = new Label
         {
             Text = account.Name,
@@ -584,12 +549,12 @@ public partial class Form1
 
         var detail = new Label
         {
-            Text = detailText,
+            Text = BuildAccountRotationAccountDetail(account, quotaUsage),
             Left = 78,
             Top = 44,
-            Width = horizontal ? summaryWidth : detailWidth,
-            Height = detailHeight,
-            Font = detailFont,
+            Width = summaryWidth,
+            Height = 42,
+            Font = new Font(Font.FontFamily, 8.4F),
             TextAlign = ContentAlignment.MiddleLeft,
             AutoEllipsis = false,
             UseMnemonic = false
@@ -605,7 +570,7 @@ public partial class Form1
             ? width - 22 - controlsWidth
             : Math.Max(22, (width - controlsWidth) / 2);
         var controlsTop = horizontal
-            ? Math.Max(26, (rowHeight - 42) / 2)
+            ? Math.Max(26, (row.Height - 42) / 2)
             : 132;
 
         var activeButton = MakeActionButton(
@@ -700,6 +665,35 @@ public partial class Form1
         down.Click += (_, _) => MoveAccountRotationAccount(account, 1);
         row.Controls.Add(down);
 
+        // Measure the actual Label after theme/DPI font changes. Quota refreshes
+        // can add a reset line or wrap the summary and must resize the existing row.
+        var fitting = false;
+        void FitRow()
+        {
+            if (fitting || row.IsDisposed || detail.IsDisposed) return;
+            fitting = true;
+            row.SuspendLayout();
+            try
+            {
+                name.Height = Math.Max(34, name.GetPreferredSize(new Size(name.Width, 0)).Height);
+                detail.Top = name.Bottom;
+                detail.Height = Math.Max(42, detail.GetPreferredSize(new Size(detail.Width, 0)).Height + 8);
+                row.Height = horizontal ? Math.Max(94, detail.Bottom + 12) : Math.Max(188, detail.Bottom + 62);
+                var top = horizontal ? (row.Height - 42) / 2 : detail.Bottom + 10;
+                foreach (var button in row.Controls.OfType<Button>()) button.Top = top;
+            }
+            finally
+            {
+                row.ResumeLayout();
+                fitting = false;
+            }
+        }
+        detail.TextChanged += (_, _) => FitRow();
+        detail.FontChanged += (_, _) => FitRow();
+        detail.SizeChanged += (_, _) => FitRow();
+        name.FontChanged += (_, _) => FitRow();
+        FitRow();
+
         return row;
     }
 
@@ -731,7 +725,7 @@ public partial class Form1
         var monthly = quotaUsage?.GetQuotaWindow(AccountQuotaWindowKind.Monthly);
 
         AppendRotationQuotaWindow(summary, resets, fiveHour, "5h", PatAutoRotationPolicy.FiveHourRemainingReserve);
-        AppendRotationQuotaWindow(summary, resets, weekly, "周", PatAutoRotationPolicy.WeeklyOnlyRemainingReserve);
+        AppendRotationQuotaWindow(summary, resets, weekly, "周", fiveHour == null ? PatAutoRotationPolicy.WeeklyOnlyRemainingReserve : null);
         AppendRotationQuotaWindow(summary, resets, monthly, "月", reserve: null);
         if (summary.Count == 1)
         {
@@ -800,12 +794,15 @@ public partial class Form1
             {
                 var pool = AccountRotationConfiguration.GetPool(_appSettings, account);
                 var accent = GetAccountRotationPoolColor(pool);
-                row.BorderColor = IsCurrentAccount(account)
+                var border = IsCurrentAccount(account)
                     ? _palette.SuccessColor
                     : UiDesign.Blend(_palette.BorderColor, accent, 0.14F);
-                row.Invalidate();
+                if (row.BorderColor != border)
+                {
+                    row.BorderColor = border;
+                    row.Invalidate();
+                }
             }
-            detail.Invalidate();
         }
 
         return true;

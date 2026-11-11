@@ -259,6 +259,13 @@ static class Program
             Console.WriteLine("Gateway rotation and compatible quota classification self-test passed.");
             return 0;
         }
+        if (args.Contains("--rotation-ui-self-test", StringComparer.OrdinalIgnoreCase))
+        {
+            ApplicationConfiguration.Initialize();
+            Form1.ValidateAccountRotationRowLayout();
+            Console.WriteLine("Rotation rows: quota/reset text and refresh layout passed at 100/150/200% fonts.");
+            return 0;
+        }
         if (args.Contains("--companion-compatibility-self-test", StringComparer.OrdinalIgnoreCase))
         {
             CodexEmptyCompanionSnapshotsTests.Validate();

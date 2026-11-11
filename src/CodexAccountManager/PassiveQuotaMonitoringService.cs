@@ -51,6 +51,8 @@ public sealed class PassiveQuotaMonitoringService
         new(StringComparer.OrdinalIgnoreCase);
     private readonly string _path;
     private readonly object _gate;
+    private MonitoringFile? _cachedFile;
+    private (long Length, DateTime LastWrite) _cachedFileStamp;
 
     public PassiveQuotaMonitoringService(string rootPath)
     {
@@ -679,11 +681,17 @@ public sealed class PassiveQuotaMonitoringService
     {
         if (!File.Exists(_path))
         {
+            _cachedFile = null;
             return new MonitoringFile();
         }
 
         try
         {
+            // A quota refresh reads several properties for every account. Reuse the
+            // parsed document until an actual file change, including external writes.
+            var info = new FileInfo(_path);
+            var stamp = (info.Length, info.LastWriteTimeUtc);
+            if (_cachedFile != null && _cachedFileStamp == stamp) return _cachedFile;
             var file = JsonSerializer.Deserialize<MonitoringFile>(File.ReadAllText(_path), JsonOptions) ??
                        new MonitoringFile();
             file.Accounts ??= [];
@@ -701,10 +709,13 @@ public sealed class PassiveQuotaMonitoringService
                 .Select(group => group.Last())
                 .ToList();
             file.SchemaVersion = CurrentSchemaVersion;
+            _cachedFile = file;
+            _cachedFileStamp = stamp;
             return file;
         }
         catch
         {
+            _cachedFile = null;
             // A damaged optional monitoring cache must not prevent account switching.
             return new MonitoringFile();
         }
@@ -712,6 +723,8 @@ public sealed class PassiveQuotaMonitoringService
 
     private void SaveUnsafe(MonitoringFile file)
     {
+        // A failed save must never leave an unpersisted mutable document cached.
+        _cachedFile = null;
         file.SchemaVersion = CurrentSchemaVersion;
         file.Accounts = file.Accounts
             .OrderBy(item => item.AccountName, StringComparer.OrdinalIgnoreCase)
@@ -726,6 +739,9 @@ public sealed class PassiveQuotaMonitoringService
                 JsonSerializer.Serialize(file, JsonOptions),
                 new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
             File.Move(temporaryPath, _path, overwrite: true);
+            var info = new FileInfo(_path);
+            _cachedFileStamp = (info.Length, info.LastWriteTimeUtc);
+            _cachedFile = file;
         }
         finally
         {
@@ -926,6 +942,16 @@ public sealed class PassiveQuotaMonitoringService
             }
 
             var usage = MakeValidationUsage(epochStart);
+            var cacheRoot = System.IO.Path.Combine(root, "cache-invalidation");
+            var firstReader = new PassiveQuotaMonitoringService(cacheRoot);
+            var secondWriter = new PassiveQuotaMonitoringService(cacheRoot);
+            firstReader.Enable(account, epochStart);
+            var warm = firstReader.LoadUnsafe();
+            if (!ReferenceEquals(warm, firstReader.LoadUnsafe()))
+                throw new InvalidOperationException("Unchanged monitoring data was parsed again.");
+            secondWriter.Disable(account, epochStart.AddMinutes(1));
+            if (firstReader.GetState(account).IsEnabled)
+                throw new InvalidOperationException("Monitoring cache ignored another writer's change.");
             static double SyntheticCost(UsageEvent item) => item.InputTokens / 1_000_000D;
             var activeResult = service.Analyze(account, usage, SyntheticCost, epochStart.AddMinutes(20));
             if (!activeResult.IsEnabled ||

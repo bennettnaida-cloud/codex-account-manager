@@ -39,10 +39,17 @@ internal sealed class ConstrainedToolTip : ToolTip
     {
         ArgumentNullException.ThrowIfNull(control);
 
+        var width = CalculateMaximumWidth(control);
+        var font = control.Font;
+        if (_originalCaptions.TryGetValue(control, out var previous) &&
+            previous.Value == caption && previous.Width == width &&
+            previous.FontName == font.Name && previous.FontSize == font.Size &&
+            previous.FontStyle == font.Style && previous.Dpi == control.DeviceDpi)
+            return;
         _originalCaptions.Remove(control);
         if (caption != null)
         {
-            _originalCaptions.Add(control, new OriginalCaption(caption));
+            _originalCaptions.Add(control, new OriginalCaption(caption, width, font.Name, font.Size, font.Style, control.DeviceDpi));
         }
 
         base.SetToolTip(control, caption == null ? null : WrapForDisplay(control, caption));
@@ -198,8 +205,13 @@ internal sealed class ConstrainedToolTip : ToolTip
         return Math.Min(MaximumWidth, Math.Max(1, width - WindowHorizontalMargin));
     }
 
-    private sealed class OriginalCaption(string value)
+    private sealed class OriginalCaption(string value, int width, string fontName, float fontSize, FontStyle fontStyle, int dpi)
     {
         internal string Value { get; } = value;
+        internal int Width { get; } = width;
+        internal string FontName { get; } = fontName;
+        internal float FontSize { get; } = fontSize;
+        internal FontStyle FontStyle { get; } = fontStyle;
+        internal int Dpi { get; } = dpi;
     }
 }
