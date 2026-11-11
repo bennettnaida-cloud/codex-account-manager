@@ -2501,7 +2501,6 @@ public sealed partial class CodexCliService
     {
         if (account.IsWebSession) throw new InvalidDataException(AccountAuthKind.WebSessionRemovedMessage);
         using var launchLease = new DesktopLaunchLease();
-        forceClientRestart |= WindowsLocalPreferenceRepair.IsPending(new AccountStore().RootPath);
         using var diagnosticScope = CurrentLaunch.Value == null
             ? BeginLaunchDiagnostics(chatGptFeatureAccount == null ? "ordinary" : "voice-mobile") : null;
         LaunchPhase("launch-configuration-start", "正在检查配置、账号与网络…");
@@ -2655,7 +2654,6 @@ public sealed partial class CodexCliService
                 // while Codex was still open.
                 LaunchPhase("launch-old-processes-exited", "旧 Codex 已退出，正在检查本地历史索引…",
                     $"count={shutdownTargets.Count}");
-                WindowsLocalPreferenceRepair.ApplyAfterClientExit(new AccountStore().RootPath, GetDefaultCodexHome());
                 LaunchPhase("launch-history-maintenance-start", "正在检查本地历史索引…");
                 var historyRepair = CodexRolloutHistoryRepairService.TryRepairLaggingPaginatedRollouts(
                     GetDefaultCodexHome(),

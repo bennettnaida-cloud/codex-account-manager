@@ -250,7 +250,6 @@ static class Program
         }
         if (args.Contains("--gateway-rotation-self-test", StringComparer.OrdinalIgnoreCase))
         {
-            WindowsLocalPreferenceRepair.Validate();
             CodexCliService.ValidateOfficialOAuthProfileProjection();
             PatAutoRotationPolicy.Validate();
             LocalPatGatewayHost.ValidateRoutingAndCredentialClassification();
