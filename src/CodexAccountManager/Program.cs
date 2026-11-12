@@ -259,6 +259,17 @@ static class Program
             Console.WriteLine("Gateway rotation and compatible quota classification self-test passed.");
             return 0;
         }
+        if (args.Contains("--workspace-lifetime-self-test", StringComparer.OrdinalIgnoreCase))
+        {
+            try
+            {
+                ApplicationConfiguration.Initialize();
+                Form1.ValidateWorkspaceControlLifetime();
+                Console.WriteLine("Workspace control lifetime self-test passed.");
+                return 0;
+            }
+            catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }
+        }
         if (args.Contains("--rotation-ui-self-test", StringComparer.OrdinalIgnoreCase))
         {
             ApplicationConfiguration.Initialize();
@@ -417,6 +428,14 @@ static class Program
         ManagerLifecycleDiagnostics.WriteException(
             "ui-thread-exception-contained",
             eventArgs.Exception);
+        // A late WinForms callback can arrive after a cached page has been replaced
+        // and its controls disposed. It is safe to contain this race; showing a modal
+        // dialog here blocks the manager and makes the page appear to duplicate or
+        // freeze. Other UI exceptions keep the existing visible diagnostic.
+        if (eventArgs.Exception is ObjectDisposedException)
+        {
+            return;
+        }
         try
         {
             MessageBox.Show(

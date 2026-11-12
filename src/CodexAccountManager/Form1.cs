@@ -1766,7 +1766,7 @@ public partial class Form1 : Form
         {
             foreach (var control in previous.Controls)
             {
-                if (!ReferenceEquals(control, _proxySidebar)) control.Dispose();
+                DisposeWorkspaceControl(control);
             }
         }
 
@@ -1802,7 +1802,7 @@ public partial class Form1 : Form
         {
             foreach (var control in entry.Controls)
             {
-                if (!ReferenceEquals(control, _proxySidebar)) control.Dispose();
+                DisposeWorkspaceControl(control);
             }
             return false;
         }
@@ -1818,7 +1818,7 @@ public partial class Form1 : Form
             DetachPersistentControl(_proxySidebar);
             foreach (var current in _cardsPanel.Controls.Cast<Control>().ToArray())
             {
-                if (!ReferenceEquals(current, _proxySidebar)) current.Dispose();
+                DisposeWorkspaceControl(current);
             }
             _cardsPanel.Controls.Clear();
             _cardsPanel.Controls.AddRange(entry.Controls);
@@ -1839,10 +1839,27 @@ public partial class Form1 : Form
         {
             foreach (var control in entry.Controls)
             {
-                if (!ReferenceEquals(control, _proxySidebar)) control.Dispose();
+                DisposeWorkspaceControl(control);
             }
         }
         _workspaceViewCache.Clear();
+    }
+
+    private void DisposeWorkspaceControl(Control control)
+    {
+        // Cached pages own their temporary rows, but not form-owned controls nested
+        // inside them. Account changes, cache replacement and width invalidation all
+        // dispose cached headers; preserve the bulk action on every disposal path.
+        // Only detach descendants of this tree, so clearing an unrelated cache cannot
+        // remove the bulk action from the currently visible quota page.
+        if (ReferenceEquals(control, _bulkQuotaTestButton) ||
+            ReferenceEquals(control, _proxySidebar))
+            return;
+        if (control.Contains(_bulkQuotaTestButton))
+            DetachPersistentControl(_bulkQuotaTestButton);
+        if (_proxySidebar != null && control.Contains(_proxySidebar))
+            DetachPersistentControl(_proxySidebar);
+        control.Dispose();
     }
 
     private void ResetCardsScrollPosition()
@@ -4530,12 +4547,18 @@ public partial class Form1 : Form
         finally
         {
             _renderingCards = false;
-            if (_buttonDisableDepth > 0)
+            if (_buttonDisableDepth > 0 && !_cardsPanel.IsDisposed)
                 SetButtonsEnabledRecursive(_cardsPanel, enabled: false);
             // RenderCardsCore has now restored WM_SETREDRAW on the parent. Before
             // that point its descendants appear hidden and viewport repaint skips them.
-            _cardsPanel.InvalidateVisibleViewport(flush: true);
-            QueueCardsAnimationVisibilityRefresh();
+            // A nested close/cache operation can dispose the panel while RenderCardsCore
+            // is unwinding. Do not turn that benign lifetime race into the generic
+            // "operation failed" dialog on the UI thread.
+            if (!_formClosed && !_cardsPanel.IsDisposed)
+            {
+                _cardsPanel.InvalidateVisibleViewport(flush: true);
+                QueueCardsAnimationVisibilityRefresh();
+            }
         }
     }
 
@@ -4553,7 +4576,7 @@ public partial class Form1 : Form
         _bulkQuotaTestButton.Visible = false;
         foreach (var oldControl in _cardsPanel.Controls.Cast<Control>().ToArray())
         {
-            oldControl.Dispose();
+            DisposeWorkspaceControl(oldControl);
         }
         _cardsPanel.Controls.Clear();
         UpdateWorkspaceChrome();
@@ -19504,11 +19527,14 @@ public partial class Form1 : Form
                 SetButtonsEnabledRecursive(control, enabled);
         }
         if (enabled) _buttonStatesBeforeBusy.Clear();
-        _cardsPanel.InvalidateVisibleViewport(flush: true);
+        if (!_formClosed && !_cardsPanel.IsDisposed)
+            _cardsPanel.InvalidateVisibleViewport(flush: true);
     }
 
     private void SetButtonsEnabledRecursive(Control control, bool enabled)
     {
+        if (control.IsDisposed)
+            return;
         if (control is Button button)
         {
             if (!enabled)

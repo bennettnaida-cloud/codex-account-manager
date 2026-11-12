@@ -41,13 +41,23 @@ internal static class ManagerLifecycleDiagnostics
                 ? "none"
                 : exception.TargetSite.DeclaringType?.FullName + "." +
                   exception.TargetSite.Name;
+            var message = exception == null
+                ? ""
+                : Sanitize(exception.Message, 500);
+            var innerType = exception?.InnerException?.GetType().FullName ?? "none";
+            var innerMessage = exception?.InnerException == null
+                ? ""
+                : Sanitize(exception.InnerException.Message, 400);
             var line = new StringBuilder()
                 .Append(DateTimeOffset.UtcNow.ToString("O"))
                 .Append("\tpid=").Append(Environment.ProcessId)
                 .Append("\tevent=").Append(safeEvent)
                 .Append("\texception=").Append(Sanitize(exceptionType, 240))
                 .Append("\thresult=").Append(exception?.HResult.ToString("X8") ?? "none")
-                .Append("\ttarget=").Append(Sanitize(target, 300));
+                .Append("\ttarget=").Append(Sanitize(target, 300))
+                .Append("\tmessage=").Append(message)
+                .Append("\tinner=").Append(Sanitize(innerType, 240))
+                .Append("\tinner_message=").Append(innerMessage);
             if (!string.IsNullOrWhiteSpace(safeDetails))
             {
                 line.Append("\tdetails=").Append(safeDetails);
