@@ -245,6 +245,7 @@ static class Program
         if (args.Contains("--account-import-self-test", StringComparer.OrdinalIgnoreCase))
         {
             AccountFileImportTests.Validate();
+            AccountStore.ValidateRegistrationIsolation();
             Console.WriteLine("Account file import self-test passed.");
             return 0;
         }
@@ -713,6 +714,7 @@ static class Program
             AccountAuthKind.ValidateAuthenticationKinds();
             AccountStore.ValidateOfficialOAuthAccountStorage();
             AccountStore.ValidatePermanentAccountDeletion();
+            AccountStore.ValidateRegistrationIsolation();
             UsageLimitResetSession.ValidateProtocolParsing();
             CodexCliService.ValidateUsageLimitResetGatewaySafety();
             QuotaSessionAccessToken.ValidateImportedOAuth();

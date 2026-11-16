@@ -3354,6 +3354,8 @@ public sealed partial class CodexCliService
         return new AccountRecord
         {
             Name = account.Name,
+            RegistrationId = account.RegistrationId,
+            RegisteredAtUtc = account.RegisteredAtUtc,
             CodexHome = account.CodexHome,
             AuthKind = account.AuthKind,
             ApiProviderName = account.ApiProviderName,

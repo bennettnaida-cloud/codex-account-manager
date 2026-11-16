@@ -7,7 +7,7 @@ using Microsoft.Data.Sqlite;
 
 namespace CodexAccountManager;
 
-public sealed class UsageTracker
+public sealed partial class UsageTracker
 {
     private const int PersistentUsageCacheSchemaVersion = 5;
     private const int PersistentCacheWriteIndexSchemaVersion = 2;
@@ -1326,7 +1326,8 @@ public sealed class UsageTracker
             account => new AccountUsageSummary
             {
                 AccountName = account.Name,
-                AccountKey = QuotaAccountIdentity.CreateKey(account)
+                AccountKey = QuotaAccountIdentity.CreateKey(account),
+                RegisteredAtUtc = account.RegisteredAtUtc
             },
             StringComparer.OrdinalIgnoreCase);
 
@@ -2059,8 +2060,11 @@ public sealed class UsageTracker
             target = summaries.Values.FirstOrDefault(summary =>
                 string.Equals(summary.AccountKey, usage.AccountKey, StringComparison.Ordinal));
         }
-        if (target == null && !string.IsNullOrWhiteSpace(usage.AccountName) &&
-            summaries.TryGetValue(usage.AccountName, out var summaryByName))
+        if (string.IsNullOrWhiteSpace(usage.AccountKey) && !string.IsNullOrWhiteSpace(usage.AccountName) &&
+            summaries.TryGetValue(usage.AccountName, out var summaryByName) &&
+            (!summaryByName.RegisteredAtUtc.HasValue ||
+             usage.TimestampUtc >= summaryByName.RegisteredAtUtc.Value &&
+             usage.ActivationEpochUtc >= summaryByName.RegisteredAtUtc.Value))
         {
             target = summaryByName;
         }
@@ -4548,6 +4552,7 @@ public sealed class UsageReport
 public sealed class AccountUsageSummary
 {
     public string AccountName { get; set; } = "";
+    public DateTimeOffset? RegisteredAtUtc { get; set; }
     /// <summary>
     /// Stable identity for the credential directory that owns this summary.  It is kept
     /// separate from AccountName because users can rename accounts while a background quota

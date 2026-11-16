@@ -156,6 +156,7 @@ internal sealed partial class LocalPatGatewayHost
             AccountRecord MakeAccount(string name)
             {
                 var record = new AccountRecord { Name = name, CodexHome = Path.Combine(root, name),
+                    RegistrationId = Guid.NewGuid().ToString("N"), RegisteredAtUtc = DateTimeOffset.UtcNow,
                     AuthKind = AccountAuthKind.CompatibleApi, ApiBaseUrl = upstream.Prefixes.Single().TrimEnd('/'), ApiModel = "gpt-6-astra" };
                 Directory.CreateDirectory(record.CodexHome);
                 File.WriteAllText(Path.Combine(record.CodexHome, "auth.json"),

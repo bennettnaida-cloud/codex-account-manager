@@ -6,7 +6,7 @@ namespace CodexAccountManager;
 
 /// <summary>
 /// Persists the latest official quota response without storing credentials.  The
-/// account identity (auth kind + credential directory) is the only ownership key;
+/// account identity (registration + auth kind + credential directory) is the ownership key;
 /// account display names are deliberately not used so renames remain safe.
 /// </summary>
 internal sealed class QuotaSnapshotStore

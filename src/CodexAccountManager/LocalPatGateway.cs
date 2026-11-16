@@ -78,7 +78,9 @@ internal static class LocalPatGateway
     // v16 retires browser Session credentials without modifying stored accounts.
     internal const string LegacyV16RotationProtocolValue = "request-boundary-v16";
     // v17 adds CPA fill-first / round-robin admission and transient cooldown.
-    internal const string RotationProtocolValue = "request-boundary-v17";
+    internal const string LegacyV17RotationProtocolValue = "request-boundary-v17";
+    // v18 keys newly registered accounts separately from deleted entries.
+    internal const string RotationProtocolValue = "request-boundary-v18";
     private static readonly SemaphoreSlim StartupLock = new(1, 1);
     private static readonly TimeSpan StartupLockTimeout = TimeSpan.FromSeconds(8);
     private static readonly TimeSpan DesktopStartupTimeout = TimeSpan.FromSeconds(12);
@@ -166,7 +168,7 @@ internal static class LocalPatGateway
         }
         // Only injected gates/preparation callbacks are used: no real listener, account,
         // proxy or credential is read/changed by these tests.
-        foreach (var legacyProtocol in new[] { LegacyV15RotationProtocolValue, LegacyV16RotationProtocolValue })
+        foreach (var legacyProtocol in new[] { LegacyV15RotationProtocolValue, LegacyV16RotationProtocolValue, LegacyV17RotationProtocolValue })
         {
             using var legacy = new HttpResponseMessage();
             legacy.Headers.Add(RotationProtocolHeader, legacyProtocol);
@@ -1020,6 +1022,7 @@ internal static class LocalPatGateway
 
     internal static bool IsCompatibleRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV17RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV16RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV15RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV14RotationProtocolValue, StringComparison.Ordinal) ||
@@ -1040,6 +1043,7 @@ internal static class LocalPatGateway
     // new executable waits for a request-boundary listener hand-off.
     internal static bool IsCurrentRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV17RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV16RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV15RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV14RotationProtocolValue, StringComparison.Ordinal) ||
@@ -1050,6 +1054,7 @@ internal static class LocalPatGateway
 
     internal static bool IsTransparentRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV17RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV16RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV15RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV14RotationProtocolValue, StringComparison.Ordinal) ||
@@ -1065,6 +1070,7 @@ internal static class LocalPatGateway
 
     internal static bool IsConfirmedQuotaRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV17RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV16RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV15RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV14RotationProtocolValue, StringComparison.Ordinal) ||
@@ -1105,6 +1111,7 @@ internal static class LocalPatGateway
                         string.Equals(value, SafeContentEncodingRotationProtocolValue, StringComparison.Ordinal) ||
                         string.Equals(value, "request-boundary-v9", StringComparison.Ordinal) ||
                         string.Equals(value, LegacyV11RotationProtocolValue, StringComparison.Ordinal) ||
+                        string.Equals(value, LegacyV17RotationProtocolValue, StringComparison.Ordinal) ||
                         string.Equals(value, LegacyV16RotationProtocolValue, StringComparison.Ordinal) ||
                         string.Equals(value, LegacyV15RotationProtocolValue, StringComparison.Ordinal) ||
                         string.Equals(value, LegacyV14RotationProtocolValue, StringComparison.Ordinal) ||

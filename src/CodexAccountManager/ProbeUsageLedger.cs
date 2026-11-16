@@ -39,7 +39,10 @@ internal static class QuotaAccountIdentity
         var normalizedHome = Path.GetFullPath(account.CodexHome)
             .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
             .ToUpperInvariant();
-        var bytes = Encoding.UTF8.GetBytes(account.AuthKind + "\n" + normalizedHome);
+        var identity = account.AuthKind + "\n" + normalizedHome;
+        if (!string.IsNullOrWhiteSpace(account.RegistrationId))
+            identity += "\nregistration:" + account.RegistrationId;
+        var bytes = Encoding.UTF8.GetBytes(identity);
         return Convert.ToHexString(SHA256.HashData(bytes));
     }
 

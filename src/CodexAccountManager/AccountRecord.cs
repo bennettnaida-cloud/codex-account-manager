@@ -4,6 +4,14 @@ namespace CodexAccountManager;
 
 public sealed class AccountRecord
 {
+    // A fresh registration must not inherit cached state when a name/home is reused.
+    // Missing IDs retain the legacy key so upgrading existing accounts is non-destructive.
+    [JsonPropertyName("registrationId")]
+    public string? RegistrationId { get; set; }
+
+    [JsonPropertyName("registeredAtUtc")]
+    public DateTimeOffset? RegisteredAtUtc { get; set; }
+
     [JsonPropertyName("name")]
     public string Name { get; set; } = "";
 

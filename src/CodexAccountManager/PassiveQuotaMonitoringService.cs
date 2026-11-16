@@ -68,6 +68,17 @@ public sealed class PassiveQuotaMonitoringService
 
     public string Path => _path;
 
+    internal void Remove(AccountRecord account)
+    {
+        var key = QuotaAccountIdentity.CreateKey(account);
+        lock (_gate)
+        {
+            var file = LoadUnsafe();
+            if (file.Accounts.RemoveAll(item => item.AccountKey == key) > 0)
+                SaveUnsafe(file);
+        }
+    }
+
     public PassiveQuotaMonitoringState GetState(AccountRecord account)
     {
         ArgumentNullException.ThrowIfNull(account);

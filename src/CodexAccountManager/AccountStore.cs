@@ -168,6 +168,18 @@ public sealed partial class AccountStore
                 $"账号 {duplicateHome.Name} 已使用这个 CODEX_HOME。每个账号必须使用独立凭据目录；聊天记录仍会统一写入默认 .codex。");
         }
 
+        var existingRegistration = accounts.FirstOrDefault(existing =>
+            existing.Name.Equals(target, StringComparison.OrdinalIgnoreCase));
+        if (existingRegistration == null)
+            InitializeNewRegistration(account);
+        else
+        {
+            // Editing/renaming an existing entry preserves its registration, including
+            // a legacy null ID. Only a genuinely new entry starts a new lifecycle.
+            account.RegistrationId = existingRegistration.RegistrationId;
+            account.RegisteredAtUtc = existingRegistration.RegisteredAtUtc;
+        }
+
         byte[]? previousOAuthCredential = null;
         string? committedOAuthPath = null;
         var previousOAuthCredentialExisted = false;
@@ -303,8 +315,10 @@ public sealed partial class AccountStore
     public void RemoveAccount(string name)
     {
         var accounts = LoadAccounts();
+        var removed = accounts.Where(a => a.Name.Equals(name, StringComparison.OrdinalIgnoreCase)).ToList();
         accounts.RemoveAll(a => a.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
         SaveAccounts(accounts);
+        foreach (var account in removed) RemoveDeletedAccountState(account);
     }
 
     public void DeleteAccount(AccountRecord account)
@@ -314,9 +328,10 @@ public sealed partial class AccountStore
         var accounts = LoadAccounts();
         var storedAccount = accounts.FirstOrDefault(candidate =>
             candidate.Name.Equals(account.Name, StringComparison.OrdinalIgnoreCase));
-        if (storedAccount == null)
+        if (storedAccount == null ||
+            QuotaAccountIdentity.CreateKey(storedAccount) != QuotaAccountIdentity.CreateKey(account))
         {
-            throw new InvalidOperationException($"账号 {account.Name} 不存在，未删除任何文件。");
+            throw new InvalidOperationException($"账号 {account.Name} 不存在或已重新添加，请刷新列表后重试；未删除任何文件。");
         }
 
         var otherHomes = accounts
@@ -328,6 +343,8 @@ public sealed partial class AccountStore
         accounts.RemoveAll(candidate =>
             candidate.Name.Equals(storedAccount.Name, StringComparison.OrdinalIgnoreCase));
         SaveAccounts(accounts);
+
+        RemoveDeletedAccountState(storedAccount);
 
         var metadata = LoadTokenMetadata();
         if (metadata.Remove(storedAccount.Name))

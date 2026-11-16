@@ -2366,7 +2366,9 @@ public partial class Form1 : Form
             {
                 Name = account.Name,
                 CodexHome = account.CodexHome,
-                AuthKind = account.AuthKind
+                AuthKind = account.AuthKind,
+                RegistrationId = account.RegistrationId,
+                RegisteredAtUtc = account.RegisteredAtUtc
             })
             .ToList();
 
@@ -19264,6 +19266,7 @@ public partial class Form1 : Form
         await RunBusyAsync(async () =>
         {
             var status = await _codex.GetLoginStatusAsync(account);
+            if (!IsCurrentAccountRegistration(account)) return;
             _statusCache[account.Name] = status;
             var conciseStatus = status.ExitCode == 0 ? "已登录" : "检查失败";
             _statusBox.Text = $"{account.Name} · {conciseStatus}";
@@ -19407,6 +19410,7 @@ public partial class Form1 : Form
                     progress,
                     cancellation.Token);
                 CloseLinkDialog();
+                if (!IsCurrentAccountRegistration(account)) return;
                 _statusCache[account.Name] = status;
                 _statusBox.Text =
                     $"{account.Name}：已通过 ChatGPT 官方网页登录。" +
@@ -19450,6 +19454,7 @@ public partial class Form1 : Form
             }
             var expiry = CodexCliService.GetAccessTokenExpiryUtc(token);
             var status = await _codex.LoginWithAccessTokenAsync(account, token);
+            if (!IsCurrentAccountRegistration(account)) return;
             _store.WriteTokenMetadata(account.Name, expiry);
             _statusCache[account.Name] = status;
             _statusBox.Text =
@@ -19462,6 +19467,10 @@ public partial class Form1 : Form
         });
     }
 
+    private bool IsCurrentAccountRegistration(AccountRecord account) =>
+        _accounts.Any(candidate => candidate.Name.Equals(account.Name, StringComparison.OrdinalIgnoreCase) &&
+            QuotaAccountIdentity.CreateKey(candidate) == QuotaAccountIdentity.CreateKey(account));
+
     private static AccountRecord CreateAccountFromDialog(
         AccountDialog dialog,
         AccountRecord? existingAccount = null)
@@ -19469,6 +19478,8 @@ public partial class Form1 : Form
         return new AccountRecord
         {
             Name = dialog.AccountNameValue,
+            RegistrationId = existingAccount?.RegistrationId,
+            RegisteredAtUtc = existingAccount?.RegisteredAtUtc,
             CodexHome = dialog.CodexHomeValue,
             AuthKind = dialog.AuthKindValue,
             ApiProviderName = dialog.ApiProviderNameValue,

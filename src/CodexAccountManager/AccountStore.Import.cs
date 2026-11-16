@@ -51,6 +51,7 @@ public sealed partial class AccountStore
                 var account = new AccountRecord { Name = name, CodexHome = home, AuthKind = entry.AuthKind,
                     ApiBaseUrl = entry.BaseUrl, ApiModel = string.IsNullOrWhiteSpace(entry.Model) ? "gpt-5.5" : entry.Model,
                     DiscoverDefaultModelOnLaunch = entry.AuthKind == AccountAuthKind.CompatibleApi && string.IsNullOrWhiteSpace(entry.Model) };
+                InitializeNewRegistration(account);
                 created.Add(home);
                 using var credential = JsonDocument.Parse(entry.AuthJson);
                 EnsureCodexHome(account, account.IsCompatibleApi ? AccountFileImport.Text(credential.RootElement, "OPENAI_API_KEY") : null);
