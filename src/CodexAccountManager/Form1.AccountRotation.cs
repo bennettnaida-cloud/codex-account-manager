@@ -1,4 +1,4 @@
-﻿namespace CodexAccountManager;
+namespace CodexAccountManager;
 
 public partial class Form1
 {
@@ -235,6 +235,27 @@ public partial class Form1
             await SetAccountRotationEnabledFromUiAsync(toggle.Checked);
         panel.Controls.Add(toggle);
 
+        if (AccountRotationConfiguration.UsesCpaRouting(_appSettings))
+        {
+            var mode = new Label
+            {
+                Text = AccountRotationConfiguration.UsesCpaRoundRobin(_appSettings) ? "CPA 轮询" : "CPA 优先",
+                Left = rightLabelLeft,
+                Top = affinityTop,
+                Width = rightColumnWidth,
+                Height = 34,
+                Font = new Font(Font.FontFamily, 8.7F, FontStyle.Bold),
+                TextAlign = ContentAlignment.MiddleRight,
+                UseMnemonic = false
+            };
+            ThemeStyler.ApplyLabel(mode, _palette);
+            _toolTip.SetToolTip(mode, (AccountRotationConfiguration.UsesCpaRoundRobin(_appSettings)
+                ? "普通模型请求逐次轮询主池；" : "持续使用主池顺序中第一个可用账号；手动选择的账号在同池内优先。") +
+                "主池不可用才用备用池。" +
+                "临时失败账号冷却至少 60 秒。previous_response_id 续聊始终使用原账号。");
+            panel.Controls.Add(mode);
+            return panel;
+        }
         var affinityEnabled = _appSettings.AccountRotationSessionAffinityEnabled;
         var affinityState = new Label
         {
@@ -310,7 +331,10 @@ public partial class Form1
             _appSettings.AccountRotationBackupCursorAccountKey);
         // Keep each pool on its own line.  A single combined line silently clipped the
         // backup cursor when either account name was long or Windows text scaling was high.
-        return $"暂停并换号：5h 剩余 ≤10% / 仅周额度剩余 ≤3%\r\n使用轮换池：{primary}\r\n备用轮换池：{backup}";
+        var modeText = AccountRotationConfiguration.UsesCpaRouting(_appSettings)
+            ? (AccountRotationConfiguration.UsesCpaRoundRobin(_appSettings) ? "CPA：逐请求轮询" : "CPA：优先同一可用账号") +
+              " · 主池优先 · 故障冷却\r\n" : "";
+        return modeText + $"暂停并换号：5h 剩余 ≤10% / 仅周额度剩余 ≤3%\r\n使用轮换池：{primary}\r\n备用轮换池：{backup}";
     }
 
     private string ResolveAccountRotationCursorName(string? accountKey)

@@ -256,6 +256,8 @@ static class Program
             LocalPatGatewayHost.ValidateCompatibleQuotaErrors();
             AccountRotationConfiguration.Validate();
             LocalPatGatewayHost.ValidateCompatibleQuotaFailoverAsync().GetAwaiter().GetResult();
+            LocalPatGatewayHost.ValidateCpaRoutingAsync().GetAwaiter().GetResult();
+            LocalPatGatewayHost.ValidateCpaRoutingAsync(roundRobin: true).GetAwaiter().GetResult();
             Console.WriteLine("Gateway rotation and compatible quota classification self-test passed.");
             return 0;
         }

@@ -17,7 +17,7 @@ Codex Account Manager 是一个在本机运行的 Codex 多账号管理器。它
 
 也可以打开 [Latest Release](https://github.com/bennettnaida-cloud/codex-account-manager/releases/tag/latest) 查看版本、发布时间和全部文件。
 
-当前发布版本为 2.3.49，内置 Codex CLI 0.163.0。修复 OAuth 轮换误将工作空间接口指向本地 HTTP 网关而导致新版 Codex 无法加载工作空间设置的问题；工作空间保持官方 HTTPS，模型请求仍可经本地网关轮换。包含 2.3.48 的 Sub2API OAuth 导入刷新时间修复。详见 [2.3.49 更新说明](docs/release-2.3.49.md)。macOS 仅同步版本号。
+当前本地 Windows 开发版本为 2.3.57，基于本机 2.3.56，默认使用 CPA 风格的 fill-first 调度：优先使用同一可用账号，保留 10%／3% 保留线，失败冷却后按主池、备用池顺序接管。详见 [2.3.57 更新说明](docs/release-2.3.57.md)。此构建尚未上传 GitHub，线上版本以 Latest Release 为准。
 
 保留旧会话续聊用量统计、轮换、逐账号代理与模型目录，以及升级时同步桌面和任务栏快捷方式。当前本机桌面版本为 Windows OpenAI.Codex 26.1002.7124.0（ChatGPT.exe）；专项回归并不等于已在所有电脑上完成交互实测，未来版本及第三方上游仍需按实际协议验证。
 
@@ -40,8 +40,8 @@ Codex Account Manager 是一个在本机运行的 Codex 多账号管理器。它
 - 通过管理器启动 PAT/API 账号时，在官方 Codex 内显示其原生 Standard/Fast 选择器并保留所选服务层级。
 - 聊天页先显示本地缓存，再通过当前 Codex app-server 在后台同步共享目录与短标题；支持打开、归档、取消归档和永久删除，Codex 暂不可用时仍可使用缓存。
 - 按账号读取官方额度窗口、重置时间、Credits 和可重置次数。
-- 提供使用池与备用池两级账号轮换；PAT、官方 ChatGPT OAuth 和兼容 API 可自定义参与状态与顺序。开启会话粘性后，每个请求只按优先级选择一个普通粘性标识（显式 session/conversation、`prompt_cache_key`、turn metadata 或稳定内容摘要），并以默认 60 分钟的滑动有效期绑定到完整成功的账号。可安全重放的普通请求遇到 HTTP 429 时可按池顺序换号并在成功后改绑；`previous_response_id` 使用独立的已确认绑定，未知绑定、原账号不可用或 429 均不会跨账号重放。关闭普通会话粘性后，已确认的 `previous_response_id` 绑定仍保留严格账号约束。
-- 轮换位置与 5h 重置时间会持久化；使用池恢复后等待一分钟，再从下一次请求返回使用池。安全余量会根据最近请求消耗动态计算。
+- 提供使用池与备用池两级账号轮换；PAT、官方 ChatGPT OAuth 和兼容 API 可自定义参与状态与顺序。默认 CPA fill-first 优先使用池内第一个可用账号，失败账号进入短暂冷却，主池不可用时才使用备用池。普通会话标识不覆盖调度顺序；`previous_response_id` 使用独立的已确认绑定，不能跨账号重放。
+- 5h 剩余 ≤10%、仅周额度剩余 ≤3% 时暂停账号，显示对应重置时间。确认的额度耗尽和临时服务故障分开记录；恢复的账号按池内优先顺序重新参与调度。
 - 对经本地网关转发的账号，可逐账号选择 `gateway_default / off / device / session / full`：`gateway_default` 沿用旧版客户端元数据过滤，`off` 转发网关允许的指纹字段但不收敛，`device` 只收敛 installation，`session` 还固定账号 session 并按客户端 session 派生 thread，`full` 将 thread/window 收敛到账号 session。可安全重写时，`device / session / full` 对请求头和 JSON 请求体使用同一计划；官方 OAuth 原生直连不受此设置影响。授权、Cookie 以及 ChatGPT/组织/项目/工作区身份头始终不会跨账号透传。
 - 会话与 response 粘性缓存只持久化 HMAC 摘要和账号哈希，不保存原始 session、conversation、prompt-cache 或 response ID。
 - 从本地 JSONL 与 SQLite 日志统计 Token、缓存写入和逐模型 API 等值成本。

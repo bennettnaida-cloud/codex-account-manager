@@ -76,7 +76,9 @@ internal static class LocalPatGateway
     internal const string LegacyV14RotationProtocolValue = "request-boundary-v14";
     internal const string LegacyV15RotationProtocolValue = "request-boundary-v15";
     // v16 retires browser Session credentials without modifying stored accounts.
-    internal const string RotationProtocolValue = "request-boundary-v16";
+    internal const string LegacyV16RotationProtocolValue = "request-boundary-v16";
+    // v17 adds CPA fill-first / round-robin admission and transient cooldown.
+    internal const string RotationProtocolValue = "request-boundary-v17";
     private static readonly SemaphoreSlim StartupLock = new(1, 1);
     private static readonly TimeSpan StartupLockTimeout = TimeSpan.FromSeconds(8);
     private static readonly TimeSpan DesktopStartupTimeout = TimeSpan.FromSeconds(12);
@@ -164,12 +166,13 @@ internal static class LocalPatGateway
         }
         // Only injected gates/preparation callbacks are used: no real listener, account,
         // proxy or credential is read/changed by these tests.
-        using (var legacy = new HttpResponseMessage())
+        foreach (var legacyProtocol in new[] { LegacyV15RotationProtocolValue, LegacyV16RotationProtocolValue })
         {
-            legacy.Headers.Add(RotationProtocolHeader, LegacyV15RotationProtocolValue);
+            using var legacy = new HttpResponseMessage();
+            legacy.Headers.Add(RotationProtocolHeader, legacyProtocol);
             Require(HasCompatibleRotationProtocol(legacy) && !HasExpectedRotationProtocol(legacy) &&
-                IsCurrentRotationProtocolValue(LegacyV15RotationProtocolValue),
-                "v15 status must remain readable but require an upgrade before launch");
+                IsCurrentRotationProtocolValue(legacyProtocol),
+                "legacy status must remain readable but require an upgrade before launch");
         }
         using (var current = new HttpResponseMessage())
         {
@@ -1017,6 +1020,7 @@ internal static class LocalPatGateway
 
     internal static bool IsCompatibleRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV16RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV15RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV14RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV13RotationProtocolValue, StringComparison.Ordinal) ||
@@ -1036,6 +1040,7 @@ internal static class LocalPatGateway
     // new executable waits for a request-boundary listener hand-off.
     internal static bool IsCurrentRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV16RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV15RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV14RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV13RotationProtocolValue, StringComparison.Ordinal) ||
@@ -1045,6 +1050,7 @@ internal static class LocalPatGateway
 
     internal static bool IsTransparentRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV16RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV15RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV14RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV13RotationProtocolValue, StringComparison.Ordinal) ||
@@ -1059,6 +1065,7 @@ internal static class LocalPatGateway
 
     internal static bool IsConfirmedQuotaRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV16RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV15RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV14RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV13RotationProtocolValue, StringComparison.Ordinal) ||
@@ -1098,6 +1105,7 @@ internal static class LocalPatGateway
                         string.Equals(value, SafeContentEncodingRotationProtocolValue, StringComparison.Ordinal) ||
                         string.Equals(value, "request-boundary-v9", StringComparison.Ordinal) ||
                         string.Equals(value, LegacyV11RotationProtocolValue, StringComparison.Ordinal) ||
+                        string.Equals(value, LegacyV16RotationProtocolValue, StringComparison.Ordinal) ||
                         string.Equals(value, LegacyV15RotationProtocolValue, StringComparison.Ordinal) ||
                         string.Equals(value, LegacyV14RotationProtocolValue, StringComparison.Ordinal) ||
                         string.Equals(value, LegacyV13RotationProtocolValue, StringComparison.Ordinal) ||
@@ -1212,7 +1220,8 @@ internal sealed partial class LocalPatGatewayHost
     // A dead per-account node must not hold a whoami or response-header connection
     // for the default HttpClient lifetime. This is only the pre-header attempt bound;
     // once SSE headers arrive, the stream keeps using the caller's request deadline.
-    private static readonly TimeSpan UpstreamAttemptHeadersTimeout = TimeSpan.FromSeconds(60);
+    // Do not impose a fixed first-header timeout on model or compaction requests;
+    // the caller's cancellation and the upstream connection lifecycle are the limits.
     private const int MaxUpstreamErrorBodyBytes = 16 * 1024;
     private const int Transient429SameAccountRetryLimit = 2;
     // A request may walk the latest configured ring after a transient 429, but a
@@ -2396,17 +2405,8 @@ internal sealed partial class LocalPatGatewayHost
                 return;
             }
             var rotationBoundaryApplied = false;
-            if (ShouldApplyRotationAtRequestBoundary(
-                    isModelRequest,
-                    isIndependentAccountProbe))
-            {
-                var routeBeforeBoundary = _rotationStore.Load();
-                rotationBoundaryApplied = routeBeforeBoundary.Status != PatGatewayRotationStatus.None &&
-                    IncomingMatchesRotationTransport(credential, routeBeforeBoundary);
-                credential = await ApplyRotationAtRequestBoundaryAsync(
-                    credential,
-                    requestCancellationToken);
-            }
+            var cpaRouting = isModelRequest && !isIndependentAccountProbe &&
+                IsCpaRoutingTransport(credential);
             var chatGptUpstreamUri = upstreamUri;
             ReplayableModelRequestBody? replayableBody = null;
             if (isModelRequest && context.Request.HasEntityBody)
@@ -2464,6 +2464,23 @@ internal sealed partial class LocalPatGatewayHost
                     replayableBody?.Bytes,
                     contentEncoding: null);
             }
+            // Inspect continuation state before any global/manual redirect. A response ID
+            // is owned by its original account even if a new route was armed meanwhile.
+            if (ShouldApplyRotationAtRequestBoundary(isModelRequest, isIndependentAccountProbe) &&
+                affinityRequest is not { PreviousResponseId: not null } &&
+                affinityRequest is not { UnsafeContinuation: true } &&
+                affinityRequest is not { OpaqueBody: true })
+            {
+                var routeBeforeBoundary = _rotationStore.Load();
+                if (!cpaRouting || routeBeforeBoundary.Status == PatGatewayRotationStatus.Armed)
+                {
+                    rotationBoundaryApplied = routeBeforeBoundary.Status != PatGatewayRotationStatus.None &&
+                        IncomingMatchesRotationTransport(credential, routeBeforeBoundary);
+                    credential = await ApplyRotationAtRequestBoundaryAsync(credential, requestCancellationToken);
+                    globalRouteCredential = credential;
+                    globalRouteSourceAccountKey = credential.AccountKey;
+                }
+            }
             if (isModelRequest &&
                 !isIndependentAccountProbe &&
                 !rotationBoundaryApplied &&
@@ -2512,7 +2529,7 @@ internal sealed partial class LocalPatGatewayHost
                     strictResponseAffinity = affinityRequest?.PreviousResponseId != null;
                     IReadOnlyList<PatGatewaySessionAffinityKey> routingKeys = affinityRequest == null
                         ? []
-                        : affinitySettings.AccountRotationSessionAffinityEnabled
+                        : !cpaRouting && affinitySettings.AccountRotationSessionAffinityEnabled
                             ? affinityRequest.Keys
                             : affinityRequest.Keys
                                 .Where(key => key.Kind == PatGatewaySessionAffinityKeyKind.Response)
@@ -2594,6 +2611,37 @@ internal sealed partial class LocalPatGatewayHost
                     }
                 }
             }
+            if (cpaRouting && !strictResponseAffinity &&
+                (affinityRequest?.AllowCrossAccountReplay ?? true))
+            {
+                if (!rotationBoundaryApplied)
+                {
+                    if (!TrySelectNextTransparentRotationCredential(credential,
+                            new HashSet<string>(StringComparer.Ordinal),
+                            CanRewriteCompatibleApiRequestBody(context.Request, replayableBody),
+                            out var nextRequestCredential, out _, out _, cpaAdmission: true))
+                    {
+                        response.Headers["Retry-After"] = "60";
+                        await WriteErrorAsync(response, HttpStatusCode.ServiceUnavailable,
+                            "CPA 调度池暂无可用账号：账号可能已达到 10%/3% 保留线、正在冷却或凭据不可用。请稍后重试。");
+                        return;
+                    }
+                    credential = nextRequestCredential!;
+                }
+                else
+                {
+                    RememberCpaSelection(credential);
+                }
+                globalRouteCredential = credential;
+                globalRouteSourceAccountKey = credential.AccountKey;
+            }
+            if (cpaRouting && IsCpaAccountCooling(credential.AccountKey, DateTimeOffset.UtcNow))
+            {
+                response.Headers["Retry-After"] = "60";
+                await WriteErrorAsync(response, HttpStatusCode.ServiceUnavailable,
+                    "原账号正在故障冷却；带有 previous_response_id 的续聊不能跨账号重放，请稍后重试或开始新会话。");
+                return;
+            }
             using var modelRequestActivity = isModelRequest && !isIndependentAccountProbe
                 ? BeginModelRequest(credential.AccountKey)
                 : null;
@@ -2619,6 +2667,19 @@ internal sealed partial class LocalPatGatewayHost
             var preserveAffinityBindingOnSuccess = false;
             string? successfulProxyNodeId = null;
             var successfulRequestUsedGlobalProxy = false;
+
+            bool TryCpaBeforeModelFailure(out GatewayCredential? next)
+            {
+                next = null;
+                if (!cpaRouting) return false;
+                CoolCpaAccount(credential.AccountKey);
+                if (!string.IsNullOrWhiteSpace(credential.AccountKey))
+                    attemptedAccountKeys.Add(credential.AccountKey);
+                return !strictResponseAffinity && (affinityRequest?.AllowCrossAccountReplay ?? true) &&
+                    (!context.Request.HasEntityBody || replayableBody != null) &&
+                    TrySelectNextTransparentRotationCredential(credential, attemptedAccountKeys,
+                        allowCompatibleApiRetry, out next, out _, out _);
+            }
 
             while (finalUpstreamResponse == null)
             {
@@ -2721,6 +2782,11 @@ internal sealed partial class LocalPatGatewayHost
                 var proxyUri = proxyResolution.ProxyUri;
                 if (!useDirectConnection && !proxyResolution.Success)
                 {
+                    if (TryCpaBeforeModelFailure(out var proxyFailureCandidate))
+                    {
+                        credential = proxyFailureCandidate!;
+                        continue;
+                    }
                     if (lastQuotaResponse != null)
                     {
                         finalUpstreamResponse = lastQuotaResponse;
@@ -2766,6 +2832,11 @@ internal sealed partial class LocalPatGatewayHost
                     }
                     catch (PatRejectedException ex)
                     {
+                        if (TryCpaBeforeModelFailure(out var rejectedIdentityCandidate))
+                        {
+                            credential = rejectedIdentityCandidate!;
+                            continue;
+                        }
                         if (lastQuotaResponse != null &&
                             TrySelectNextTransparentRotationCredential(
                                 credential,
@@ -2827,6 +2898,11 @@ internal sealed partial class LocalPatGatewayHost
                                 runtimeGlobalProxyFallbackAccounts,
                                 "identity-network-failure"))
                         {
+                            continue;
+                        }
+                        if (TryCpaBeforeModelFailure(out var identityFailureCandidate))
+                        {
+                            credential = identityFailureCandidate!;
                             continue;
                         }
                         if (lastQuotaResponse != null)
@@ -3088,7 +3164,6 @@ internal sealed partial class LocalPatGatewayHost
                 {
                     using var attemptDeadline = CancellationTokenSource.CreateLinkedTokenSource(
                         requestCancellationToken);
-                    attemptDeadline.CancelAfter(UpstreamAttemptHeadersTimeout);
                     attemptResponse = await client.SendAsync(
                         upstreamRequest,
                         HttpCompletionOption.ResponseHeadersRead,
@@ -3097,12 +3172,15 @@ internal sealed partial class LocalPatGatewayHost
                 catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
                 {
                     var requestWasCanceled = requestCancellationToken.IsCancellationRequested;
+                    // A transport failure has an indeterminate acceptance state. Cool
+                    // the account for subsequent requests without replaying this POST.
+                    if (cpaRouting && !requestWasCanceled) CoolCpaAccount(credential.AccountKey);
                     ManagerLifecycleDiagnostics.WriteException(
                         "pat-gateway-upstream-send-failed",
                         ex,
                         $"account={NormalizeOptionalAccountKey(credential.AccountKey) ?? "unbound"}; " +
                         $"request_canceled={requestWasCanceled}; " +
-                        $"header_timeout_ms={(int)UpstreamAttemptHeadersTimeout.TotalMilliseconds}");
+                        "header_timeout_ms=0");
                     if (!requestCancellationToken.IsCancellationRequested &&
                         TryActivateRuntimeGlobalProxyFallback(
                             credential,
@@ -3134,10 +3212,8 @@ internal sealed partial class LocalPatGatewayHost
                         requestWasCanceled
                             ? "通过本地代理请求 ChatGPT Codex 上游失败：" +
                               SanitizeNetworkError(ex.Message)
-                            : "通过本地代理请求 ChatGPT Codex 上游失败：上游在 " +
-                              $"{UpstreamAttemptHeadersTimeout.TotalSeconds:0} 秒内未返回响应头，" +
-                              "可能是代理节点响应过慢；请稍后重试或更换代理节点。" +
-                              "（" + SanitizeNetworkError(ex.Message) + "）");
+                            : "通过本地代理请求 ChatGPT Codex 上游失败：" +
+                              SanitizeNetworkError(ex.Message));
                     return;
                 }
 
@@ -3183,6 +3259,30 @@ internal sealed partial class LocalPatGatewayHost
                             "当前上游的 compact 能力不可用。这不是账号额度耗尽，且请求没有回退到 ChatGPT OAuth。");
                         return;
                     }
+                }
+
+                // A definite HTTP failure can be retried before any downstream bytes.
+                // Do not fabricate quota exhaustion from a rate limit or service outage.
+                if (cpaRouting && quotaClassification?.IsQuotaExhausted != true &&
+                    IsCpaRetryableStatus(attemptResponse.StatusCode))
+                {
+                    CoolCpaAccount(credential.AccountKey, attemptResponse);
+                    if (!string.IsNullOrWhiteSpace(credential.AccountKey))
+                        attemptedAccountKeys.Add(credential.AccountKey);
+                    if (!strictResponseAffinity && (affinityRequest?.AllowCrossAccountReplay ?? true) &&
+                        (!context.Request.HasEntityBody || replayableBody != null) &&
+                        TrySelectNextTransparentRotationCredential(credential, attemptedAccountKeys,
+                            allowCompatibleApiRetry, out var failureCandidate, out var failureOrdinal, out _))
+                    {
+                        WriteTransparentRotationDiagnostic("cpa-failover", failureOrdinal,
+                            "http-" + (int)attemptResponse.StatusCode);
+                        attemptResponse.Dispose();
+                        credential = failureCandidate!;
+                        transparentRetryCount++;
+                        continue;
+                    }
+                    finalUpstreamResponse = attemptResponse;
+                    break;
                 }
 
                 if (quotaClassification != null)
@@ -3716,7 +3816,7 @@ internal sealed partial class LocalPatGatewayHost
                 // actually produced the remembered 429 (rather than the first sticky
                 // attempt), while still requiring it to be the current global route so a
                 // sticky-only account cannot move the global ring.
-                if (hadSuccessfulTransparentRetry &&
+                if (!cpaRouting && hadSuccessfulTransparentRetry &&
                     responseCompletedSuccessfully &&
                     globalRouteQuotaSeen &&
                     PatGatewayRotationStore.TryNormalizeAccountKey(
@@ -4380,7 +4480,26 @@ internal sealed partial class LocalPatGatewayHost
         out GatewayCredential? credential,
         out int candidateOrdinal,
         out AccountRotationPool pool,
-        bool allowBackupPool = true)
+        bool allowBackupPool = true,
+        bool cpaAdmission = false)
+    {
+        lock (_cpaRoutingGate)
+        {
+            return TrySelectNextTransparentRotationCredentialCore(current, attemptedAccountKeys,
+                allowCompatibleApi, out credential, out candidateOrdinal, out pool,
+                allowBackupPool, cpaAdmission);
+        }
+    }
+
+    private bool TrySelectNextTransparentRotationCredentialCore(
+        GatewayCredential current,
+        ISet<string> attemptedAccountKeys,
+        bool allowCompatibleApi,
+        out GatewayCredential? credential,
+        out int candidateOrdinal,
+        out AccountRotationPool pool,
+        bool allowBackupPool = true,
+        bool cpaAdmission = false)
     {
         credential = null;
         candidateOrdinal = 0;
@@ -4434,15 +4553,69 @@ internal sealed partial class LocalPatGatewayHost
         // in-memory settings snapshot so a Manager write racing this request cannot be
         // overwritten by the gateway. The Manager reconciles the committed active route
         // and durably persists the same cursor after a successful retry.
-        AccountRotationConfiguration.MarkUsed(settings, currentAccount);
+        var cpa = AccountRotationConfiguration.UsesCpaRouting(settings);
+        if (cpa)
+        {
+            // Initialize once from the durable last-used positions. Manager writes and
+            // out-of-order response completions must not rewind an admission cursor.
+            if (!_cpaCursorsInitialized)
+            {
+                _cpaPrimaryCursor = settings.AccountRotationPrimaryCursorAccountKey;
+                _cpaBackupCursor = settings.AccountRotationBackupCursorAccountKey;
+                _cpaCursorsInitialized = true;
+            }
+            settings.AccountRotationPrimaryCursorAccountKey = _cpaPrimaryCursor;
+            settings.AccountRotationBackupCursorAccountKey = _cpaBackupCursor;
+        }
+        else AccountRotationConfiguration.MarkUsed(settings, currentAccount);
         var now = DateTimeOffset.UtcNow;
         var unavailable = new HashSet<string>(attemptedAccountKeys, StringComparer.Ordinal);
         var reservePaused = GetQuotaReservePausedAccountKeys(accounts, now);
+        // A gateway quota signal can outlive the official quota response that caused it.
+        // When the account's newer official snapshot is back above the reserve line,
+        // the old signal must not keep the account locked out until its original reset
+        // timestamp.  This is especially important for weekly-only accounts: a prior
+        // 429 may carry a future weekly reset even though the account is usable again.
+        IReadOnlyDictionary<string, PersistedQuotaSnapshot> quotaSnapshots;
+        try
+        {
+            quotaSnapshots = new QuotaSnapshotStore(_accountStore.RootPath)
+                .LoadForAccounts(accounts);
+        }
+        catch
+        {
+            quotaSnapshots = new Dictionary<string, PersistedQuotaSnapshot>(StringComparer.Ordinal);
+        }
         foreach (var pair in _quotaLimitedAccounts.ToArray())
         {
             if (!IsQuotaLimitObservationActive(pair.Value, now))
             {
                 _quotaLimitedAccounts.TryRemove(pair.Key, out _);
+                continue;
+            }
+            if (quotaSnapshots.TryGetValue(pair.Key, out var snapshot) &&
+                snapshot.ObservedAtUtc > pair.Value.ObservedAtUtc &&
+                PatAutoRotationPolicy.HasLocallyAvailableRotationQuota(
+                    snapshot,
+                    latestConfirmedExhaustion: null,
+                    now))
+            {
+                _quotaLimitedAccounts.TryRemove(pair.Key, out _);
+                // Keep this request's in-memory settings consistent with the recovered
+                // snapshot. The Manager persists the same cleanup on its next refresh.
+                settings.AccountRotationResetAtUtc.Remove(pair.Key);
+                try
+                {
+                    _quotaSignalStore.RemoveForAccount(pair.Key);
+                }
+                catch (Exception ex) when (
+                    ex is IOException or UnauthorizedAccessException or InvalidDataException or
+                    InvalidOperationException or NotSupportedException or ArgumentException or
+                    System.Text.Json.JsonException)
+                {
+                    // The in-memory recovery remains authoritative for this request;
+                    // a later request can retry the best-effort durable cleanup.
+                }
                 continue;
             }
             unavailable.Add(pair.Key);
@@ -4452,6 +4625,10 @@ internal sealed partial class LocalPatGatewayHost
             }
         }
 
+        var fillFirst = cpa && !AccountRotationConfiguration.UsesCpaRoundRobin(settings);
+        var manualRoute = fillFirst ? _rotationStore.Load() : PatGatewayRotationSnapshot.Empty;
+        var preferredKey = manualRoute.Status == PatGatewayRotationStatus.Active
+            ? manualRoute.TargetAccountKey : null;
         while (true)
         {
             if (!AccountRotationConfiguration.TrySelectNextCandidate(
@@ -4464,8 +4641,13 @@ internal sealed partial class LocalPatGatewayHost
                     out var candidate,
                     out pool,
                     canSelectAccount: account => (allowCompatibleApi || !account.IsCompatibleApi) &&
-                        !reservePaused.Contains(QuotaAccountIdentity.CreateKey(account)),
-                    hardUnavailableAccountKeys: attemptedAccountKeys))
+                        !reservePaused.Contains(QuotaAccountIdentity.CreateKey(account)) &&
+                        (!cpa || !IsCpaAccountCooling(QuotaAccountIdentity.CreateKey(account), now)),
+                    hardUnavailableAccountKeys: attemptedAccountKeys,
+                    usePoolCursor: cpa,
+                    includeCurrent: cpaAdmission,
+                    fillFirst: fillFirst,
+                    preferredAccountKey: preferredKey))
             {
                 return false;
             }
@@ -4486,6 +4668,7 @@ internal sealed partial class LocalPatGatewayHost
             try
             {
                 credential = ResolveRotationCredential(candidateKey);
+                if (cpa) RememberCpaSelection(credential, pool);
                 return true;
             }
             catch (Exception ex) when (

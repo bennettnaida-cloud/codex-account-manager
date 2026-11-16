@@ -171,6 +171,28 @@ internal sealed class PatGatewayQuotaSignalStore
         }
     }
 
+    internal bool RemoveForAccount(string accountKey)
+    {
+        if (!PatGatewayRotationStore.TryNormalizeAccountKey(accountKey, out var normalizedKey))
+        {
+            return false;
+        }
+
+        lock (_gate)
+        {
+            var file = LoadUnsafe();
+            var removed = file.Signals.RemoveAll(signal =>
+                signal.AccountKey.Equals(normalizedKey, StringComparison.Ordinal));
+            if (removed == 0)
+            {
+                return false;
+            }
+
+            SaveUnsafe(file);
+            return true;
+        }
+    }
+
     private static IEnumerable<PatGatewayQuotaSignal> SelectCurrentSignals(
         SignalFile file,
         DateTimeOffset nowUtc)

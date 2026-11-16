@@ -71,7 +71,7 @@ internal sealed partial class LocalPatGatewayHost
                 }
                 var accounts = reserveUsed.HasValue ? new[] { source, pausedCandidate, target } : new[] { source, target };
                 File.WriteAllText(Path.Combine(root, "accounts.json"), JsonSerializer.Serialize(accounts));
-                var settings = new AppSettings { AccountRotationEnabled = true, PatGatewayProxyAutoDetect = false };
+                var settings = new AppSettings { AccountRotationEnabled = true, AccountRotationStrategy = "failover", PatGatewayProxyAutoDetect = false };
                 AccountRotationConfiguration.SetPool(settings, accounts, source, AccountRotationPool.Primary);
                 if (reserveUsed.HasValue)
                     AccountRotationConfiguration.SetPool(settings, accounts, pausedCandidate, AccountRotationPool.Primary);

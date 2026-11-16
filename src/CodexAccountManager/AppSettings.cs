@@ -30,6 +30,9 @@ public sealed class AppSettings
     public double PatAutoRotationUsedPercentThreshold { get; set; } =
         PatAutoRotationPolicy.DefaultUsedPercentThreshold;
     public bool? AccountRotationEnabled { get; set; }
+    // New installations and upgraded settings use CPA-style fill-first scheduling.
+    // "failover" retains the former scheduler for compatibility/regression testing.
+    public string AccountRotationStrategy { get; set; } = "fill-first";
     public Dictionary<string, string> AccountRotationPools { get; set; } =
         new(StringComparer.Ordinal);
     public List<string> AccountRotationPrimaryOrder { get; set; } = [];

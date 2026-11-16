@@ -28,6 +28,12 @@ internal static class AccountRotationConfiguration
     internal static bool IsEnabled(AppSettings settings) =>
         settings.AccountRotationEnabled ?? settings.PatAutoRotationEnabled;
 
+    internal static bool UsesCpaRouting(AppSettings settings) =>
+        !string.Equals(settings.AccountRotationStrategy, "failover", StringComparison.OrdinalIgnoreCase);
+
+    internal static bool UsesCpaRoundRobin(AppSettings settings) =>
+        string.Equals(settings.AccountRotationStrategy, "round-robin", StringComparison.OrdinalIgnoreCase);
+
     internal static void SetEnabled(AppSettings settings, bool enabled)
     {
         settings.AccountRotationEnabled = enabled;
@@ -478,7 +484,11 @@ internal static class AccountRotationConfiguration
         out AccountRecord? candidate,
         out AccountRotationPool pool,
         Func<AccountRecord, bool>? canSelectAccount = null,
-        ISet<string>? hardUnavailableAccountKeys = null)
+        ISet<string>? hardUnavailableAccountKeys = null,
+        bool usePoolCursor = false,
+        bool includeCurrent = false,
+        bool fillFirst = false,
+        string? preferredAccountKey = null)
     {
         ArgumentNullException.ThrowIfNull(settings);
         ArgumentNullException.ThrowIfNull(accounts);
@@ -498,7 +508,7 @@ internal static class AccountRotationConfiguration
             nowUtc,
             hasUsableCredential,
             canSelectAccount,
-            hardUnavailableAccountKeys);
+            hardUnavailableAccountKeys, usePoolCursor, includeCurrent, fillFirst, preferredAccountKey);
         if (candidate != null)
         {
             pool = AccountRotationPool.Primary;
@@ -514,7 +524,7 @@ internal static class AccountRotationConfiguration
             nowUtc,
             hasUsableCredential,
             canSelectAccount,
-            hardUnavailableAccountKeys);
+            hardUnavailableAccountKeys, usePoolCursor, includeCurrent, fillFirst, preferredAccountKey);
         if (candidate != null)
         {
             pool = AccountRotationPool.Backup;
@@ -1032,7 +1042,11 @@ internal static class AccountRotationConfiguration
         DateTimeOffset nowUtc,
         Func<AccountRecord, bool> hasUsableCredential,
         Func<AccountRecord, bool> canSelectAccount,
-        ISet<string> hardUnavailableAccountKeys)
+        ISet<string> hardUnavailableAccountKeys,
+        bool usePoolCursor,
+        bool includeCurrent,
+        bool fillFirst,
+        string? preferredAccountKey)
     {
         var ordered = GetOrderedAccounts(settings, accounts, pool);
         if (ordered.Count == 0)
@@ -1040,20 +1054,28 @@ internal static class AccountRotationConfiguration
             return null;
         }
 
+        if (fillFirst && preferredAccountKey != null)
+        {
+            // An explicit manual selection is a local priority override, not an
+            // ordinary session-cache binding. Never promote a backup above primary.
+            ordered = ordered.OrderByDescending(account =>
+                QuotaAccountIdentity.CreateKey(account) == preferredAccountKey).ToList();
+        }
         var cursor = pool == AccountRotationPool.Primary
             ? settings.AccountRotationPrimaryCursorAccountKey
             : settings.AccountRotationBackupCursorAccountKey;
+        var anchorKey = fillFirst ? null : usePoolCursor ? cursor : currentKey;
         var anchor = -1;
         for (var index = 0; index < ordered.Count; index++)
         {
             if (QuotaAccountIdentity.CreateKey(ordered[index])
-                .Equals(currentKey, StringComparison.Ordinal))
+                .Equals(anchorKey, StringComparison.Ordinal))
             {
                 anchor = index;
                 break;
             }
         }
-        if (anchor < 0 && !string.IsNullOrWhiteSpace(cursor))
+        if (!fillFirst && anchor < 0 && !string.IsNullOrWhiteSpace(cursor))
         {
             for (var index = 0; index < ordered.Count; index++)
             {
@@ -1070,7 +1092,7 @@ internal static class AccountRotationConfiguration
         {
             var account = ordered[(anchor + offset + ordered.Count) % ordered.Count];
             var key = QuotaAccountIdentity.CreateKey(account);
-            if (key.Equals(currentKey, StringComparison.Ordinal) ||
+            if ((!includeCurrent && key.Equals(currentKey, StringComparison.Ordinal)) ||
                 hardUnavailableAccountKeys.Contains(key) ||
                 IsStillUnavailable(settings, key, unavailableAccountKeys, nowUtc) ||
                 !IsResetGraceElapsed(settings, key, nowUtc) ||

@@ -1954,6 +1954,11 @@ public partial class Form1 : Form
 
     private void RefreshAccountRotationPrimaryReturnIfNeeded()
     {
+        // CPA checks primary eligibility on every admission, including cooldown
+        // recovery. A separate manager worker must not arm an obsolete global route.
+        if (AccountRotationConfiguration.UsesCpaRouting(_appSettings) &&
+            _patGatewayObservedRotationProtocol == LocalPatGateway.RotationProtocolValue)
+            return;
         if (_formClosed || IsDisposed ||
             !AccountRotationConfiguration.IsEnabled(_appSettings) ||
             !_appSettings.PatGatewayEnabled ||
@@ -2015,6 +2020,7 @@ public partial class Form1 : Form
         var route = new PatGatewayRotationStore(_store.RootPath).Load();
         string? logicalKey = route.Status switch
         {
+            PatGatewayRotationStatus.Active when AccountRotationConfiguration.UsesCpaRouting(_appSettings) => null,
             PatGatewayRotationStatus.Active => route.TargetAccountKey,
             PatGatewayRotationStatus.Armed when allowArmedSource => route.SourceAccountKey,
             PatGatewayRotationStatus.Armed => null,
@@ -20008,7 +20014,11 @@ public partial class Form1 : Form
         var logical = rotation?.Status switch
         {
             PatGatewayRotationStatus.Armed => FindRotationAccount(rotation.SourceAccountKey),
+            PatGatewayRotationStatus.Active when AccountRotationConfiguration.UsesCpaRouting(_appSettings) =>
+                observed ?? FindRotationAccount(rotation.TargetAccountKey),
             PatGatewayRotationStatus.Active => FindRotationAccount(rotation.TargetAccountKey),
+            _ when AccountRotationConfiguration.UsesCpaRouting(_appSettings) =>
+                projectedRecoveryTransport ?? observed ?? sharedActiveAccount ?? selected,
             _ => projectedRecoveryTransport ?? sharedActiveAccount ?? observed ?? selected
         };
         if (transport == null ||
