@@ -7,7 +7,7 @@ public sealed partial class CodexCliService
     // even though they offer gpt-5.6-sol.
     private static string AccessTokenModel => ModelCatalogService.CanonicalDefaultModel;
     private static string AccessTokenReasoningEffort => ModelCatalogService.DefaultReasoningEffort;
-    private const string CompatibleApiDefaultModel = "gpt-5.5";
+    private const string CompatibleApiDefaultModel = AccountRecord.DefaultApiModel;
     private const string CompatibleApiReasoningEffort = "xhigh";
     private const string DesktopServiceTier = "default";
     private const int LegacyDisabledAutoCompactTokenLimit = 1_000_000_000;

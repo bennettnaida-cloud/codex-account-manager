@@ -577,7 +577,7 @@ public sealed partial class AccountStore
         }
         if (string.IsNullOrWhiteSpace(account.ApiModel))
         {
-            account.ApiModel = "gpt-5.5";
+            account.ApiModel = AccountRecord.DefaultApiModel;
         }
         if (string.IsNullOrWhiteSpace(account.ApiWireApi))
         {

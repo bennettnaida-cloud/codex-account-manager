@@ -49,7 +49,7 @@ public sealed partial class AccountStore
                 // Names and paths from the imported document never choose a filesystem location.
                 var home = Path.Combine(RootPath, "accounts", "imported-" + Guid.NewGuid().ToString("N"));
                 var account = new AccountRecord { Name = name, CodexHome = home, AuthKind = entry.AuthKind,
-                    ApiBaseUrl = entry.BaseUrl, ApiModel = string.IsNullOrWhiteSpace(entry.Model) ? "gpt-5.5" : entry.Model,
+                    ApiBaseUrl = entry.BaseUrl, ApiModel = string.IsNullOrWhiteSpace(entry.Model) ? AccountRecord.DefaultApiModel : entry.Model,
                     DiscoverDefaultModelOnLaunch = entry.AuthKind == AccountAuthKind.CompatibleApi && string.IsNullOrWhiteSpace(entry.Model) };
                 InitializeNewRegistration(account);
                 created.Add(home);

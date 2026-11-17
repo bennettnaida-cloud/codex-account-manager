@@ -4,6 +4,8 @@ namespace CodexAccountManager;
 
 public sealed class AccountRecord
 {
+    internal const string DefaultApiModel = "gpt-6.1-sol";
+
     // A fresh registration must not inherit cached state when a name/home is reused.
     // Missing IDs retain the legacy key so upgrading existing accounts is non-destructive.
     [JsonPropertyName("registrationId")]
@@ -28,7 +30,7 @@ public sealed class AccountRecord
     public string ApiBaseUrl { get; set; } = "";
 
     [JsonPropertyName("apiModel")]
-    public string ApiModel { get; set; } = "gpt-5.5";
+    public string ApiModel { get; set; } = DefaultApiModel;
 
     // PAT accounts keep an account-specific model instead of inheriting the
     // global catalog default.

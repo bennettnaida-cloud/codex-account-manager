@@ -361,7 +361,7 @@ public sealed class AccountDialog : Form
 
         var modelLabel = MakeLabel("Model", 22, 475, 124);
         _formCard.Controls.Add(modelLabel);
-        _modelBox.Text = string.IsNullOrWhiteSpace(account?.ApiModel) ? "gpt-5.5" : account.ApiModel;
+        _modelBox.Text = string.IsNullOrWhiteSpace(account?.ApiModel) ? AccountRecord.DefaultApiModel : account.ApiModel;
         _modelShell = MakeInputShell(_modelBox, 164, 468, 744);
         _modelShell.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         _formCard.Controls.Add(_modelShell);
