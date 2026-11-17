@@ -36,6 +36,17 @@ static class Program
             try { CodexCliService.ValidateAccessTokenRemoteDiscoveryAsync().GetAwaiter().GetResult(); return 0; }
             catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }
         }
+        if (args.Contains("--chat-section-self-test", StringComparer.OrdinalIgnoreCase))
+        {
+            try
+            {
+                SharedHistoryService.ValidateReader();
+                ChatSectionSynchronizationService.Validate();
+                Console.WriteLine("Chat section synchronization self-test passed.");
+                return 0;
+            }
+            catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }
+        }
         if (args.Contains("--startup-self-test", StringComparer.OrdinalIgnoreCase))
         {
             try

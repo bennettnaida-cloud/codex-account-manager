@@ -29,6 +29,7 @@ internal static class ChatSectionSynchronizationService
 {
     private const string GlobalStateFileName = ".codex-global-state.json";
     private const string PersistedStateName = "electron-persisted-atom-state";
+    private const string OwnerStatePrefix = "electron-owner-atoms:";
     private const string ProfilesStateName = "sidebar-custom-sections-v3";
     // Codex uses this literal profile key while auth_mode=apikey. PAT and compatible
     // API launches therefore never select their whoami GUID bucket in the renderer.
@@ -131,7 +132,8 @@ internal static class ChatSectionSynchronizationService
             var root = JsonNode.Parse(string.IsNullOrWhiteSpace(originalText) ? "{}" : originalText)
                        as JsonObject
                        ?? throw new InvalidOperationException("Codex 全局状态 JSON 格式无效。");
-            if (!TryGetCompatibleProfiles(root, out var profiles))
+            var containers = GetCompatibleProfileContainers(root);
+            if (containers.Count == 0)
             {
                 ManagerLifecycleDiagnostics.Write("chat-section-sync-unsupported-schema",
                     "Official sidebar schema is absent or changed; no state was overwritten.");
@@ -140,16 +142,25 @@ internal static class ChatSectionSynchronizationService
             var originalRoot = root.DeepClone();
             var activeId = TryReadIdentity(new AccountRecord { CodexHome = codexHome }, out var activeIdentity)
                 ? activeIdentity.AccountId : LocalProfileAccountId;
-            var originalActiveProfile = profiles[activeId]?.DeepClone();
-            // Normalize before choosing the template: duplicated memberships otherwise
-            // inflate its score and change the chosen template again on the next pass.
-            var normalizedProfiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var originalActiveProfiles = containers.Select(container =>
+                container.Profiles[activeId]?.DeepClone()).ToList();
+            // Owner hashes cannot be derived from account IDs. Only legacy state may
+            // materialize missing buckets; owner containers retain their exact key set.
+            var normalizedProfiles = new HashSet<JsonObject>();
+            foreach (var container in containers)
             foreach (var target in profileAccounts)
             {
-                if (profiles[target.AccountId] is JsonObject existing && MergeDuplicateLocalSections(existing))
-                    normalizedProfiles.Add(target.AccountId);
+                if (container.Profiles[target.AccountId] is JsonObject existing &&
+                    MergeDuplicateLocalSections(existing))
+                    normalizedProfiles.Add(existing);
             }
-            var profileByAccountId = ReadProfiles(profiles);
+            var profileByAccountId = containers
+                .SelectMany(container => ReadProfiles(container.Profiles).Values)
+                .GroupBy(profile => profile.AccountId, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(group => group.Key, group => group
+                    .OrderByDescending(profile => profile.Sections.Sum(section => section.ItemKeys.Count))
+                    .ThenByDescending(profile => profile.Sections.Count).First(),
+                    StringComparer.OrdinalIgnoreCase);
             var deletedThreadIds = SharedHistoryService.LoadDeletedThreadIds(codexHome);
             var officialSnapshot = LoadOfficialSectionSnapshot(codexHome);
             var availableThreadKeys = TryLoadLocalThreadKeys(codexHome, out var localThreadKeys)
@@ -165,10 +176,13 @@ internal static class ChatSectionSynchronizationService
             var updatedProfiles = 0;
             var addedSections = 0;
             var addedItems = 0;
+            foreach (var container in containers)
             foreach (var target in profileAccounts)
             {
-                var targetProfile = GetOrCreateProfile(profiles, target.AccountId);
-                var changed = normalizedProfiles.Contains(target.AccountId);
+                if (container.OwnerScoped && container.Profiles[target.AccountId] is not JsonObject)
+                    continue;
+                var targetProfile = GetOrCreateProfile(container.Profiles, target.AccountId);
+                var changed = normalizedProfiles.Contains(targetProfile);
                 if (template != null && template.Sections.Count > 0)
                 {
                     changed |= MergeProfile(
@@ -222,7 +236,8 @@ internal static class ChatSectionSynchronizationService
                 template?.AccountId,
                 backupPath)
             {
-                ActiveProfileChanged = !JsonNode.DeepEquals(originalActiveProfile, profiles[activeId])
+                ActiveProfileChanged = containers.Where((container, index) =>
+                    !JsonNode.DeepEquals(originalActiveProfiles[index], container.Profiles[activeId])).Any()
             };
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException)
@@ -251,11 +266,27 @@ internal static class ChatSectionSynchronizationService
         }
     }
 
-    private static bool TryGetCompatibleProfiles(JsonObject root, out JsonObject profiles)
+    private sealed record ProfileContainer(JsonObject Profiles, bool OwnerScoped);
+
+    private static List<ProfileContainer> GetCompatibleProfileContainers(JsonObject root)
+    {
+        var result = new List<ProfileContainer>();
+        foreach (var pair in root)
+        {
+            var ownerScoped = pair.Key.StartsWith(OwnerStatePrefix, StringComparison.Ordinal) &&
+                              pair.Key.Length > OwnerStatePrefix.Length;
+            if ((pair.Key == PersistedStateName || ownerScoped) &&
+                pair.Value is JsonObject container &&
+                TryGetCompatibleProfiles(container, out var profiles))
+                result.Add(new ProfileContainer(profiles, ownerScoped));
+        }
+        return result;
+    }
+
+    private static bool TryGetCompatibleProfiles(JsonObject persisted, out JsonObject profiles)
     {
         profiles = null!;
-        if (root[PersistedStateName] is not JsonObject persisted ||
-            persisted.Any(pair => pair.Key.StartsWith("sidebar-custom-sections-v", StringComparison.Ordinal) &&
+        if (persisted.Any(pair => pair.Key.StartsWith("sidebar-custom-sections-v", StringComparison.Ordinal) &&
                                   pair.Key != ProfilesStateName) ||
             persisted[ProfilesStateName] is not JsonObject candidates) return false;
         foreach (var pair in candidates)
@@ -374,7 +405,9 @@ internal static class ChatSectionSynchronizationService
         try
         {
             var history = new SharedHistoryService();
-            var sections = history.LoadThreadSections(codexHome)
+            var sectionSnapshot = history.LoadThreadSections(codexHome, out var available);
+            if (!available) return OfficialSectionSnapshot.Unavailable;
+            var sections = sectionSnapshot
                 .Where(section => !section.IsPinned)
                 .ToList();
             var threads = history.Load(codexHome, 10000)
@@ -1133,6 +1166,7 @@ internal static class ChatSectionSynchronizationService
         keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         try
         {
+            if (!File.Exists(Path.Combine(codexHome, "state_5.sqlite"))) return false;
             var history = new SharedHistoryService();
             foreach (var thread in history.Load(codexHome, 10000))
             {
@@ -1260,6 +1294,7 @@ internal static class ChatSectionSynchronizationService
             if (Synchronize(accounts, root, "template", root).Changed || File.ReadAllText(globalPath) != invalidText)
                 throw new InvalidOperationException("Changed official section shape was overwritten.");
 
+            ValidateOwnerContainers(root, accounts, templateId.ToString("D"), targetId.ToString("D"));
             ValidateOfficialMembershipProjection();
             ValidateDuplicateLocalSections();
         }
@@ -1273,6 +1308,98 @@ internal static class ChatSectionSynchronizationService
             {
                 // Best-effort cleanup for the temporary self-test directory.
             }
+        }
+    }
+
+    private static void ValidateOwnerContainers(
+        string home, IReadOnlyList<AccountRecord> accounts, string templateId, string targetId)
+    {
+        var sectionId = Guid.NewGuid().ToString("D");
+        var itemKey = ToLocalThreadKey(Guid.NewGuid().ToString("D"));
+        var source = new JsonObject
+        {
+            [SectionsStateName] = new JsonArray(new JsonObject
+            {
+                ["id"] = sectionId, ["name"] = "Restored",
+                [HostSectionIdsStateName] = new JsonObject { [LocalHostName] = Guid.NewGuid().ToString("D") },
+                [ItemKeysStateName] = new JsonArray(itemKey)
+            }),
+            [SectionOrderStateName] = new JsonArray("custom:" + sectionId),
+            [CollapsedSectionIdsStateName] = new JsonArray(sectionId),
+            ["identity"] = "source-only"
+        };
+        var state = new JsonObject
+        {
+            [OwnerStatePrefix + "aaa"] = new JsonObject
+            {
+                ["identity"] = "owner-a", ["settings"] = "dark",
+                [ProfilesStateName] = new JsonObject { [templateId] = source }
+            },
+            [OwnerStatePrefix + "bbb"] = new JsonObject
+            {
+                ["identity"] = "owner-b", ["settings"] = "light",
+                [ProfilesStateName] = new JsonObject
+                {
+                    [targetId] = new JsonObject { ["identity"] = "target-only" },
+                    [LocalProfileAccountId] = new JsonObject()
+                }
+            },
+            [OwnerStatePrefix + "empty"] = new JsonObject { ["identity"] = "no-sidebar" },
+            [OwnerStatePrefix + "future"] = new JsonObject
+            {
+                [ProfilesStateName] = new JsonObject { [targetId] = new JsonObject() },
+                ["sidebar-custom-sections-v4"] = new JsonObject()
+            },
+            [OwnerStatePrefix + "invalid"] = new JsonObject
+            {
+                [ProfilesStateName] = new JsonObject { [targetId] = new JsonObject { [SectionsStateName] = 42 } }
+            }
+        };
+        var path = Path.Combine(home, GlobalStateFileName);
+        foreach (var mixed in new[] { false, true })
+        {
+            var input = (JsonObject)state.DeepClone();
+            if (mixed)
+                input[PersistedStateName] = new JsonObject { [ProfilesStateName] = new JsonObject() };
+            File.WriteAllText(path, input.ToJsonString());
+            var result = Synchronize(accounts, home, "template", home);
+            var output = JsonNode.Parse(File.ReadAllText(path))!.AsObject();
+            if (!result.Changed || !result.ActiveProfileChanged || !File.Exists(result.BackupPath) ||
+                result.TemplateAccountId != templateId)
+                throw new InvalidOperationException("Owner sidebar synchronization did not report its changes.");
+            foreach (var pair in input.Where(pair => pair.Key.StartsWith(OwnerStatePrefix, StringComparison.Ordinal)))
+            {
+                var before = pair.Value!.AsObject();
+                var after = output[pair.Key]!.AsObject();
+                if (pair.Key.EndsWith("aaa") || pair.Key.EndsWith("bbb"))
+                {
+                    var beforeProfiles = before[ProfilesStateName]!.AsObject();
+                    var afterProfiles = after[ProfilesStateName]!.AsObject();
+                    if (!beforeProfiles.Select(p => p.Key).SequenceEqual(afterProfiles.Select(p => p.Key)))
+                        throw new InvalidOperationException("A wrong-owner profile bucket was created.");
+                    foreach (var profileId in beforeProfiles.Select(p => p.Key))
+                    {
+                        var profile = afterProfiles[profileId]!.AsObject();
+                        var section = profile[SectionsStateName]!.AsArray().Single()!;
+                        if (section["name"]!.GetValue<string>() != "Restored" ||
+                            section[ItemKeysStateName]!.AsArray().Single()!.GetValue<string>() != itemKey ||
+                            !JsonNode.DeepEquals(beforeProfiles[profileId]!["identity"], profile["identity"]))
+                            throw new InvalidOperationException("Restored category/membership lost or profile identity copied.");
+                    }
+                    var settings = (JsonObject)after.DeepClone();
+                    settings[ProfilesStateName] = beforeProfiles.DeepClone();
+                    if (!JsonNode.DeepEquals(before, settings))
+                        throw new InvalidOperationException("Unrelated owner settings were modified.");
+                }
+                else if (!JsonNode.DeepEquals(before, after))
+                    throw new InvalidOperationException("Unsupported owner container was modified.");
+            }
+            if (mixed && output[PersistedStateName]![ProfilesStateName]![targetId] is not JsonObject ||
+                !mixed && output.ContainsKey(PersistedStateName))
+                throw new InvalidOperationException("Legacy coexistence behavior changed.");
+            var text = File.ReadAllText(path);
+            if (Synchronize(accounts, home, "template", home).Changed || File.ReadAllText(path) != text)
+                throw new InvalidOperationException("Owner sidebar synchronization is not idempotent.");
         }
     }
 
@@ -1383,6 +1510,14 @@ internal static class ChatSectionSynchronizationService
         {
             throw new InvalidOperationException("官方目录归属同步不是幂等的。");
         }
+        // Confirmed empty snapshots propagate real deletions; unavailable ones do not.
+        var emptySnapshot = new OfficialSectionSnapshot(true, [],
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase));
+        if (!ReconcileOfficialProfile(profile, emptySnapshot,
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase), ref addedSections, ref addedItems) ||
+            profile[SectionsStateName]!.AsArray().Count != 0 ||
+            profile[SectionOrderStateName]!.AsArray().Count != 0)
+            throw new InvalidOperationException("Confirmed empty snapshot did not remove deleted categories.");
     }
 
     private sealed record OAuthIdentity(string AccountId, string Name);

@@ -147,6 +147,12 @@ public sealed class SharedHistoryService
 
     internal IReadOnlyList<CodexThreadSection> LoadThreadSections(string codexHome)
     {
+        return LoadThreadSections(codexHome, out _);
+    }
+
+    internal IReadOnlyList<CodexThreadSection> LoadThreadSections(string codexHome, out bool available)
+    {
+        available = false;
         var databasePath = Path.Combine(Path.GetFullPath(codexHome), "state_5.sqlite");
         if (!File.Exists(databasePath))
         {
@@ -187,6 +193,7 @@ public sealed class SharedHistoryService
             }
             result.Add(new CodexThreadSection(id, name, ReadText(reader, 2)));
         }
+        available = true;
         return result;
     }
 
@@ -600,6 +607,43 @@ public sealed class SharedHistoryService
         {
             CodexCliService.EnsureSqliteProvider();
             var databasePath = Path.Combine(root, "state_5.sqlite");
+            var service = new SharedHistoryService();
+            if (service.LoadThreadSections(root, out var available).Count != 0 || available ||
+                File.Exists(databasePath))
+            {
+                throw new InvalidOperationException("Missing section database must be unavailable and must not be created.");
+            }
+            using (var connection = OpenDatabase(databasePath, SqliteOpenMode.ReadWriteCreate))
+            {
+                if (service.LoadThreadSections(root, out available).Count != 0 || available)
+                {
+                    throw new InvalidOperationException("Missing section table must be unavailable.");
+                }
+
+                using var schema = connection.CreateCommand();
+                foreach (var column in new[] { "name", "id" })
+                {
+                    schema.CommandText = $"CREATE TABLE thread_sections ({column} TEXT);";
+                    schema.ExecuteNonQuery();
+                    if (service.LoadThreadSections(root, out available).Count != 0 || available)
+                    {
+                        throw new InvalidOperationException("Section table missing required columns must be unavailable: " + column);
+                    }
+                    schema.CommandText = "DROP TABLE thread_sections;";
+                    schema.ExecuteNonQuery();
+                }
+
+                // Appearance is optional; an empty table with both required columns is authoritative.
+                schema.CommandText = "CREATE TABLE thread_sections (id TEXT PRIMARY KEY, name TEXT NOT NULL);";
+                schema.ExecuteNonQuery();
+                if (service.LoadThreadSections(root, out available).Count != 0 || !available ||
+                    service.LoadThreadSections(root).Count != 0)
+                {
+                    throw new InvalidOperationException("Valid empty section table must be available.");
+                }
+                schema.CommandText = "DROP TABLE thread_sections;";
+                schema.ExecuteNonQuery();
+            }
             using (var connection = new SqliteConnection(
                        new SqliteConnectionStringBuilder
                        {
@@ -682,9 +726,10 @@ public sealed class SharedHistoryService
                 throw new InvalidOperationException("Unified shared history reader validation failed.");
             }
 
-            var service = new SharedHistoryService();
-            var sections = service.LoadThreadSections(root);
-            if (sections is not [{ Id: "01a02005-6112-7c52-a91e-3a8d5e3b8339", Name: "Test section" }])
+            var sections = service.LoadThreadSections(root, out available);
+            if (!available ||
+                sections is not [{ Id: "01a02005-6112-7c52-a91e-3a8d5e3b8339", Name: "Test section" }] ||
+                !service.LoadThreadSections(root).SequenceEqual(sections))
             {
                 throw new InvalidOperationException("Unified shared history section reader validation failed.");
             }

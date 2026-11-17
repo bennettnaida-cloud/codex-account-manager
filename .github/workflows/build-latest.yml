@@ -71,6 +71,9 @@ jobs:
           $startupTest = Start-Process -FilePath $startupExe -ArgumentList '--startup-self-test' -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput 'startup-self-test.out' -RedirectStandardError 'startup-self-test.err'
           Get-Content 'startup-self-test.out','startup-self-test.err'
           if ($startupTest.ExitCode -ne 0) { throw 'Windows startup regression test failed.' }
+          $chatSectionTest = Start-Process -FilePath $startupExe -ArgumentList '--chat-section-self-test' -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput 'chat-section-self-test.out' -RedirectStandardError 'chat-section-self-test.err'
+          Get-Content 'chat-section-self-test.out','chat-section-self-test.err'
+          if ($chatSectionTest.ExitCode -ne 0) { throw 'Chat section synchronization regression test failed.' }
           $atTest = Start-Process -FilePath $startupExe -ArgumentList '--access-token-model-self-test' -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput 'at-model-self-test.out' -RedirectStandardError 'at-model-self-test.err'
           Get-Content 'at-model-self-test.out','at-model-self-test.err'
           if ($atTest.ExitCode -ne 0) { throw 'AT remote model discovery regression test failed.' }
@@ -226,11 +229,11 @@ jobs:
           body: |
             自动构建版本 `${{ env.CAM_VERSION }}`。
 
-            Windows 2.3.58：修复删除后重新添加同一邮箱继承旧额度和 Token 用量的问题。新增及文件导入使用独立注册标识；清理已删除账号的额度与监测缓存，阻止旧历史按同名邮箱回填，保留其他账号和共享聊天记录。
+            Windows 2.4.1：纳入本地 2.3.58.1 的聊天分组同步修复，兼容新版 Codex 按所有者保存的侧栏状态；同步分组时保留账号身份与独立设置，不向其他所有者创建错误的账号条目。区分分组数据暂不可用与确认为空，避免数据库缺失或结构不兼容时误清空分组。
 
-            包含 CPA fill-first 调度：优先使用同一可用账号，主池不可用时启用备用池，明确失败时换号并冷却；保留 5h ≤10%／仅周额度 ≤3% 保留线、续聊原账号绑定及长请求等待行为。包含此前的模型同步、文件导入、中转兼容和逐账号代理修复。
+            包含 CPA fill-first 调度、5h ≤10%／仅周额度 ≤3% 保留线、失败冷却、续聊原账号绑定及长请求等待行为。保留删除重加账号的额度和 Token 用量隔离，以及此前的模型同步、文件导入、中转兼容和逐账号代理修复。
 
-            发布执行完整自检、启动、导入、模型及网关回归、安装包隐私扫描和隔离安装。内置 Codex CLI 0.163.0。macOS 本次仅同步发布版本号，不包含上述 Windows 调度及账号生命周期改动。升级不自动关闭正在运行的 Codex。
+            发布执行完整自检、聊天分组同步、启动、导入、模型及网关回归、安装包隐私扫描和隔离安装。内置 Codex CLI 0.163.0。macOS 本次仅同步发布版本号，不包含上述 Windows 专属改动。升级不自动关闭正在运行的 Codex。
           prerelease: true
           make_latest: false
           files: |
