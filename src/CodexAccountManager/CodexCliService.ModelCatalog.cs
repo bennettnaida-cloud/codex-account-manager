@@ -473,10 +473,16 @@ public sealed partial class CodexCliService
         return File.Exists(path) ? path : null;
     }
 
+    private sealed record CompatibleCatalogReceipt(
+        string CatalogIdentity,
+        string CatalogHash,
+        DateTimeOffset FetchedAtUtc);
+
     private static bool RefreshManagedCompatibleModelCatalog(
         AccountRecord account,
         IEnumerable<string> upstreamModelIds,
-        Func<bool>? isCurrent = null)
+        Func<bool>? isCurrent = null,
+        string? verifiedCatalogIdentity = null)
     {
         ArgumentNullException.ThrowIfNull(account);
         ArgumentNullException.ThrowIfNull(upstreamModelIds);
@@ -533,6 +539,10 @@ public sealed partial class CodexCliService
                         output,
                         StringComparison.Ordinal))
                 {
+                    if (!string.IsNullOrWhiteSpace(verifiedCatalogIdentity))
+                    {
+                        WriteCompatibleModelCatalogReceipt(path, verifiedCatalogIdentity);
+                    }
                     return false;
                 }
             }
@@ -542,8 +552,87 @@ public sealed partial class CodexCliService
             }
 
             AtomicFilePersistence.WriteAllText(path, output);
+            if (!string.IsNullOrWhiteSpace(verifiedCatalogIdentity))
+            {
+                WriteCompatibleModelCatalogReceipt(path, verifiedCatalogIdentity);
+            }
             ManagerLifecycleDiagnostics.Write("compatible-model-catalog-updated", $"models={models.Count}");
             return true;
+        }
+    }
+
+    private static void WriteCompatibleModelCatalogReceipt(string catalogPath, string catalogIdentity)
+    {
+        try
+        {
+            var receipt = new CompatibleCatalogReceipt(
+                catalogIdentity,
+                CatalogFileHash(catalogPath),
+                DateTimeOffset.UtcNow);
+            AtomicFilePersistence.WriteAllText(
+                catalogPath + ".refresh.json",
+                JsonSerializer.Serialize(receipt));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        {
+            // Cache receipt is an optional launch-speed optimization; never fail catalog writes.
+        }
+    }
+
+    private static bool HasFreshVerifiedCompatibleModelCatalog(
+        AccountRecord account,
+        string catalogIdentity,
+        TimeSpan maxAge)
+    {
+        if (account.DiscoverDefaultModelOnLaunch || string.IsNullOrWhiteSpace(account.CodexHome))
+        {
+            return false;
+        }
+
+        var path = ManagedCompatibleModelCatalogPath(account.CodexHome);
+        var receiptPath = path + ".refresh.json";
+        try
+        {
+            if (!File.Exists(path) || !File.Exists(receiptPath))
+            {
+                return false;
+            }
+
+            var receipt = JsonSerializer.Deserialize<CompatibleCatalogReceipt>(
+                AtomicFilePersistence.ReadAllTextWithRetry(receiptPath));
+            if (receipt == null ||
+                !string.Equals(receipt.CatalogIdentity, catalogIdentity, StringComparison.Ordinal) ||
+                DateTimeOffset.UtcNow - receipt.FetchedAtUtc >= maxAge ||
+                receipt.FetchedAtUtc > DateTimeOffset.UtcNow.AddMinutes(5))
+            {
+                return false;
+            }
+
+            if (!string.Equals(receipt.CatalogHash, CatalogFileHash(path), StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            if (!TryReadManagedCompatibleModelIds(path, out var models) || models.Count == 0)
+            {
+                return false;
+            }
+
+            if (account.UseBundledCompatibleApiModelCatalog &&
+                !IsCompleteBundledCompatibleModelCatalog(models))
+            {
+                return false;
+            }
+
+            var configuredModel = account.ApiModel?.Trim() ?? string.Empty;
+            return !string.IsNullOrWhiteSpace(configuredModel) &&
+                   models.Contains(configuredModel, StringComparer.Ordinal);
+        }
+        catch (Exception ex) when (
+            ex is IOException or UnauthorizedAccessException or JsonException or
+            InvalidOperationException or FormatException)
+        {
+            return false;
         }
     }
 

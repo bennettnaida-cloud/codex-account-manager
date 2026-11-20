@@ -121,23 +121,32 @@ public sealed partial class CodexCliService
             root["last_refresh"] = DateTimeOffset.UtcNow.ToString("O");
     }
 
-    internal async Task PrepareLaunchModelCatalogAsync(AccountRecord account, CancellationToken cancellationToken)
+    internal async Task PrepareLaunchModelCatalogAsync(
+        AccountRecord account,
+        CancellationToken cancellationToken,
+        bool allowFreshCache = false)
     {
         if (account.IsWebSession) throw new InvalidDataException(AccountAuthKind.WebSessionRemovedMessage);
-        LaunchPhase("launch-model-discovery-start", "正在获取所选账号的最新模型，完成后启动…");
+        LaunchPhase("launch-model-discovery-start", "正在检查所选账号的模型目录…");
         if (account.IsCompatibleApi)
         {
-            await RefreshOfficialCompatibleModelTemplatesAsync(cancellationToken);
-            await EnsureCompatibleApiLaunchPreflightAsync(account, cancellationToken, requireRemoteCatalog: true);
+            await RefreshOfficialCompatibleModelTemplatesAsync(
+                cancellationToken,
+                allowCachedFallback: allowFreshCache);
+            await EnsureCompatibleApiLaunchPreflightAsync(
+                account,
+                cancellationToken,
+                requireRemoteCatalog: true,
+                allowFreshCache: allowFreshCache);
             ProjectCompatibleApiConfig(Path.Combine(account.CodexHome, ConfigFileName), account);
         }
         else
         {
             await RefreshAccessTokenModelCatalogAsync(account, cancellationToken,
-                requireConfiguredModel: false, forceRemoteRefresh: true);
+                requireConfiguredModel: false, forceRemoteRefresh: !allowFreshCache);
             if (account.IsOfficialOAuth) EnsureOfficialOAuthAccountConfig(account);
             else ProjectAccessTokenSourceConfig(Path.Combine(account.CodexHome, ConfigFileName), account);
         }
-        LaunchPhase("launch-model-discovery-complete", "最新模型已获取，正在启动 Codex…");
+        LaunchPhase("launch-model-discovery-complete", "模型目录已就绪，正在启动 Codex…");
     }
 }

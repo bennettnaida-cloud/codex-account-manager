@@ -280,6 +280,11 @@ internal sealed class OfficialCodexLogProbe
         "hasConnection=true hostId=local initialized=true initializeInFlight=false " +
         "next=connected(?: [A-Za-z][A-Za-z0-9]*=[^ \\r\\n]+)* transport=stdio" +
         "(?: [A-Za-z][A-Za-z0-9]*=[^ \\r\\n]+)*$");
+    private static readonly Regex RemoteConnectionPrefixPattern = CreatePattern(
+        "^" + LogTimestampCapture + " info \\[electron-message-handler\\] " +
+        "remote_connections\\.(?<event>connection_state_changed|manager_state_set) ");
+    private static readonly Regex RendererWebContentsIdPattern = CreatePattern(
+        " rendererWebContentsId=(?<webContentsId>[1-9][0-9]*)(?: |$)");
     private static readonly Regex RoutesMountedPattern = CreatePattern(
         "^" + LogTimestampCapture + " info " +
         "\\[electron-message-handler\\] \\[startup\\]\\[renderer\\] app routes mounted after [0-9]+ms " +
@@ -547,21 +552,22 @@ internal sealed class OfficialCodexLogProbe
 
                         if (_stage == OfficialCodexLogReadinessStage.InitialLaunch)
                         {
-                            var appServerConnected = AppServerConnectedPattern.Match(line);
-                            if (appServerConnected.Success)
+                            var appServerMatch = TryMatchAppServerConnected(
+                                line,
+                                out var connectedAt,
+                                out var connectionId,
+                                out var freshAndValid);
+                            if (appServerMatch)
                             {
-                                if (IsFreshTimestamp(appServerConnected, out var connectedAt) &&
-                                    int.TryParse(
-                                        appServerConnected.Groups["connectionId"].Value,
-                                        NumberStyles.None,
-                                        CultureInfo.InvariantCulture,
-                                        out var connectionId))
+                                if (freshAndValid)
                                 {
                                     // The desktop logger can emit the same state-change record
-                                    // twice. Do not let a duplicate for the same immutable
-                                    // connection generation erase routes that mounted between
-                                    // the two writes. A genuinely new connection still resets
-                                    // the renderer evidence and must complete the full chain.
+                                    // twice (or emit connection_state_changed followed by
+                                    // manager_state_set for the same primary webContentsId). Do not
+                                    // let a duplicate for the same immutable connection generation
+                                    // erase routes that mounted between the two writes. A genuinely
+                                    // new connection still resets the renderer evidence and must
+                                    // complete the full chain.
                                     if (readiness.AppServerConnectionId != connectionId)
                                     {
                                         readiness.ObservedReady = false;
@@ -663,6 +669,75 @@ internal sealed class OfficialCodexLogProbe
             readiness.Invalidate();
             return OfficialCodexLogReadinessState.Pending;
         }
+    }
+
+    private bool TryMatchAppServerConnected(
+        string line,
+        out DateTimeOffset connectedAt,
+        out int connectionId,
+        out bool freshAndValid)
+    {
+        connectedAt = default;
+        connectionId = 0;
+        freshAndValid = false;
+
+        var legacy = AppServerConnectedPattern.Match(line);
+        if (legacy.Success)
+        {
+            freshAndValid = IsFreshTimestamp(legacy, out connectedAt) &&
+                            int.TryParse(
+                                legacy.Groups["connectionId"].Value,
+                                NumberStyles.None,
+                                CultureInfo.InvariantCulture,
+                                out connectionId);
+            return true;
+        }
+
+        // Codex Desktop 26.1117+ hosts the local app-server in a utility process and reports
+        // local connection readiness via [electron-message-handler] remote_connections events
+        // rather than legacy [AppServerConnection] transport=stdio lines. Non-fatal stderr
+        // warnings from skill icons can appear inside error={...} even while state=connected.
+        var remotePrefix = RemoteConnectionPrefixPattern.Match(line);
+        if (!remotePrefix.Success)
+        {
+            return false;
+        }
+
+        if (!line.Contains(" hostId=local ", StringComparison.Ordinal) ||
+            !line.Contains(" rendererWindowAppearance=primary ", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var eventName = remotePrefix.Groups["event"].Value;
+        var isConnected = eventName.Equals("connection_state_changed", StringComparison.Ordinal)
+            ? line.EndsWith(" state=connected", StringComparison.Ordinal) ||
+              line.Contains(" state=connected ", StringComparison.Ordinal)
+            : line.Contains(" nextState=connected ", StringComparison.Ordinal) &&
+              (line.EndsWith(" source=host_connection_state_changed", StringComparison.Ordinal) ||
+               line.Contains(" source=host_connection_state_changed ", StringComparison.Ordinal));
+        if (!isConnected)
+        {
+            return false;
+        }
+
+        var webContentsMatch = RendererWebContentsIdPattern.Match(line);
+        if (webContentsMatch.Success &&
+            int.TryParse(
+                webContentsMatch.Groups["webContentsId"].Value,
+                NumberStyles.None,
+                CultureInfo.InvariantCulture,
+                out var webContentsId) &&
+            IsFreshTimestamp(remotePrefix, out connectedAt))
+        {
+            // Keep remote_connections generations in a negative namespace distinct from legacy
+            // positive currentConnectionId so paired connection_state_changed + manager_state_set
+            // lines for the same primary webContentsId share one immutable generation.
+            connectionId = -webContentsId;
+            freshAndValid = true;
+        }
+
+        return true;
     }
 
     private bool IsFreshTimestamp(Match match, out DateTimeOffset timestamp)
@@ -839,6 +914,8 @@ internal static class OfficialCodexLogReadiness
                 CreateTestDirectory(root, "baseline-boundary"));
             ValidateReadBounds(
                 CreateTestDirectory(root, "read-bounds"));
+            ValidateRemoteConnectionLocalAppServer(
+                CreateTestDirectory(root, "remote-local-app-server"));
         }
         finally
         {
@@ -1657,6 +1734,70 @@ internal static class OfficialCodexLogReadiness
                "pendingClientRequests=0 pendingInternalRequests=0 previous=connecting " +
                "reconnectAttempt=0 reconnectTimerScheduled=false restartInFlight=false " +
                $"targetConnectionId={connectionId} targetReadyState=1 transport={transport}";
+    }
+
+    private static void ValidateRemoteConnectionLocalAppServer(string directory)
+    {
+        var baseline = CaptureUsable(directory);
+        var clock = EvidenceClock.After(baseline);
+
+        const int modernPid = 49001;
+        File.WriteAllText(
+            NewT0Path(directory, modernPid),
+            Timestamp(clock.AppServer) +
+            " info [electron-message-handler] remote_connections.connection_state_changed " +
+            "appServerVersion=0.171.0-alpha.13 error={\"code\":\"connection-failed\",\"message\":\"WARN\"} " +
+            "hostId=local progress=null rendererWebContentsId=1 rendererWindowAppearance=primary " +
+            "rendererWindowFocused=false rendererWindowId=1 rendererWindowVisible=true state=connected\n" +
+            Timestamp(clock.AppServer.AddMilliseconds(5)) +
+            " info [electron-message-handler] remote_connections.manager_state_set " +
+            "hostId=local nextError=null nextState=connected previousError=null previousState=disconnected " +
+            "rendererWebContentsId=1 rendererWindowAppearance=primary rendererWindowFocused=false " +
+            "rendererWindowId=1 rendererWindowVisible=true source=host_connection_state_changed\n" +
+            PrimaryRoute(clock.Routes) + "\n" +
+            Ready(clock.Ready) + "\n" +
+            Timestamp(clock.Ready.AddMilliseconds(50)) +
+            " info [electron-message-handler] remote_connections.connection_state_changed " +
+            "appServerVersion=0.171.0-alpha.13 error=null hostId=local progress=null " +
+            "rendererWebContentsId=2 rendererWindowAppearance=avatarOverlay rendererWindowFocused=false " +
+            "rendererWindowId=2 rendererWindowVisible=false state=connected\n",
+            Utf8WithoutBom);
+        ExpectState(
+            CreateProbe(baseline, modernPid, clock.Activation, OfficialCodexLogReadinessStage.InitialLaunch),
+            OfficialCodexLogReadinessState.Ready,
+            "Codex 26.1117+ remote_connections local connected + primary routes + ready was rejected");
+
+        const int durableOnlyPid = 49002;
+        File.WriteAllText(
+            NewT0Path(directory, durableOnlyPid),
+            Timestamp(clock.AppServer) +
+            " info [electron-message-handler] remote_connections.connection_state_changed " +
+            "appServerVersion=0.1.0 error=null hostId=durable progress=null rendererWebContentsId=1 " +
+            "rendererWindowAppearance=primary rendererWindowFocused=false rendererWindowId=1 " +
+            "rendererWindowVisible=true state=connected\n" +
+            PrimaryRoute(clock.Routes) + "\n" +
+            Ready(clock.Ready) + "\n",
+            Utf8WithoutBom);
+        ExpectState(
+            CreateProbe(baseline, durableOnlyPid, clock.Activation, OfficialCodexLogReadinessStage.InitialLaunch),
+            OfficialCodexLogReadinessState.Pending,
+            "a non-local durable connection alone satisfied local app-server readiness");
+
+        const int disconnectedPid = 49003;
+        File.WriteAllText(
+            NewT0Path(directory, disconnectedPid),
+            Timestamp(clock.AppServer) +
+            " info [electron-message-handler] remote_connections.connection_state_changed " +
+            "appServerVersion=0.171.0-alpha.13 error=null hostId=local progress=null rendererWebContentsId=1 " +
+            "rendererWindowAppearance=primary rendererWindowFocused=false rendererWindowId=1 " +
+            "rendererWindowVisible=true state=disconnected\n" +
+            PrimaryRoute(clock.Routes) + "\n" +
+            Ready(clock.Ready) + "\n",
+            Utf8WithoutBom);
+        ExpectState(
+            CreateProbe(baseline, disconnectedPid, clock.Activation, OfficialCodexLogReadinessStage.InitialLaunch),
+            OfficialCodexLogReadinessState.Pending,
+            "a disconnected local connection satisfied app-server readiness");
     }
 
     private static string PrimaryRoute(DateTimeOffset at)

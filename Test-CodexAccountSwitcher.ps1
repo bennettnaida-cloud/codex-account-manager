@@ -3275,7 +3275,7 @@ if ($cliServiceSource -notmatch 'ProcessName\.Equals\("ChatGPT"' -or
     $cliServiceSource -notmatch 'SanitizeCuratedPluginManifests' -or
     $cliServiceSource -notmatch 'MaxPluginDefaultPromptLength\s*=\s*128' -or
     $cliServiceSource -notmatch 'OpenNewTaskAfterOfficialCodexLaunchInBackground' -or
-    $cliServiceSource -notmatch 'WindowsClientGracefulShutdownTimeout\s*=\s*TimeSpan\.FromSeconds\(8\)' -or
+    $cliServiceSource -notmatch 'WindowsClientGracefulShutdownTimeout\s*=\s*TimeSpan\.FromSeconds\(1\.5\)' -or
     $cliServiceSource -notmatch 'WaitForProcessesToExit\(gracefulTargets, WindowsClientGracefulShutdownTimeout\)' -or
     $cliServiceSource -match 'process\.WaitForExit\(60000\)') {
     throw 'Windows client restart must close Codex with shared deadlines, sanitize the launch environment, and keep successful-launch readiness checks in the background.'

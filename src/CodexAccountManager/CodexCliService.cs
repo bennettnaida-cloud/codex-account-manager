@@ -177,7 +177,7 @@ public sealed partial class CodexCliService
     private static long _windowsClientLaunchGeneration;
     private static long _officialAccountDisplayGeneration;
     private static readonly SemaphoreSlim OfficialAccountDisplayGate = new(1, 1);
-    private static readonly TimeSpan WindowsClientGracefulShutdownTimeout = TimeSpan.FromSeconds(8);
+    private static readonly TimeSpan WindowsClientGracefulShutdownTimeout = TimeSpan.FromSeconds(1.5);
     private static readonly TimeSpan WindowsClientForceShutdownTimeout = TimeSpan.FromSeconds(4);
     private static readonly TimeSpan WindowsClientRuntimeStableDuration = TimeSpan.FromSeconds(3);
     private static bool _sqliteProviderInitialized;
@@ -2317,7 +2317,7 @@ public sealed partial class CodexCliService
             await LocalPatGateway.EnsureReadyForDesktopLaunchAsync();
         using var modelDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(50));
         await EnsureOfficialOAuthLaunchCredentialAsync(account, modelDeadline.Token);
-        await PrepareLaunchModelCatalogAsync(account, modelDeadline.Token);
+        await PrepareLaunchModelCatalogAsync(account, modelDeadline.Token, allowFreshCache: true);
         return await Task.Run(() =>
         {
             using var switchMutex = new Mutex(false, WindowsClientSwitchMutexName);
@@ -2547,7 +2547,7 @@ public sealed partial class CodexCliService
         });
         LaunchPhase("launch-local-validation-complete", "本地凭据已核对，正在准备所选节点…",
             "online_login_probe=false; online_pat_model_probe=false");
-        try { await PrepareLaunchModelCatalogAsync(account, modelDeadline.Token); }
+        try { await PrepareLaunchModelCatalogAsync(account, modelDeadline.Token, allowFreshCache: true); }
         catch (OperationCanceledException) when (modelDeadline.IsCancellationRequested)
         { throw new TimeoutException("启动前模型同步超时；当前 Codex 与共享凭据未切换，请检查所选账号的节点后重试。"); }
         // Resolve/start the selected node BEFORE closing the old client. A functioning
@@ -5307,7 +5307,7 @@ public sealed partial class CodexCliService
                 stableQuiescentSamples = 0;
             }
 
-            Thread.Sleep(200);
+            Thread.Sleep(100);
         }
 
         return false;
@@ -7710,6 +7710,11 @@ public sealed partial class CodexCliService
         }
     }
 
+    private static readonly object CuratedPluginSanitizeCacheLock = new();
+    private static string? _lastSanitizedPluginsRoot;
+    private static int _lastSanitizedPluginCount = -1;
+    private static long _lastSanitizedPluginMaxTicks = -1;
+
     private static void SanitizeCuratedPluginManifests(string codexHome)
     {
         var pluginsRoot = Path.Combine(codexHome, ".tmp", "plugins", "plugins");
@@ -7718,10 +7723,27 @@ public sealed partial class CodexCliService
             return;
         }
 
-        foreach (var manifestPath in Directory.EnumerateFiles(
-                     pluginsRoot,
-                     "plugin.json",
-                     SearchOption.AllDirectories))
+        var manifestPaths = Directory.EnumerateFiles(
+            pluginsRoot,
+            "plugin.json",
+            SearchOption.AllDirectories).ToList();
+        long maxWriteTicks = 0;
+        foreach (var path in manifestPaths)
+        {
+            var ticks = File.GetLastWriteTimeUtc(path).Ticks;
+            if (ticks > maxWriteTicks) maxWriteTicks = ticks;
+        }
+        lock (CuratedPluginSanitizeCacheLock)
+        {
+            if (string.Equals(_lastSanitizedPluginsRoot, pluginsRoot, StringComparison.OrdinalIgnoreCase) &&
+                _lastSanitizedPluginCount == manifestPaths.Count &&
+                _lastSanitizedPluginMaxTicks == maxWriteTicks)
+            {
+                return;
+            }
+        }
+
+        foreach (var manifestPath in manifestPaths)
         {
             try
             {
@@ -7764,12 +7786,21 @@ public sealed partial class CodexCliService
                     WriteTextAtomically(
                         manifestPath,
                         root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+                    var updatedTicks = File.GetLastWriteTimeUtc(manifestPath).Ticks;
+                    if (updatedTicks > maxWriteTicks) maxWriteTicks = updatedTicks;
                 }
             }
             catch
             {
                 // Invalid marketplace entries are ignored by Codex as well.
             }
+        }
+
+        lock (CuratedPluginSanitizeCacheLock)
+        {
+            _lastSanitizedPluginsRoot = pluginsRoot;
+            _lastSanitizedPluginCount = manifestPaths.Count;
+            _lastSanitizedPluginMaxTicks = maxWriteTicks;
         }
     }
 
@@ -8888,7 +8919,8 @@ public sealed partial class CodexCliService
         AccountRecord account,
         CancellationToken cancellationToken = default,
         bool validateConfiguredModel = true,
-        bool requireRemoteCatalog = false)
+        bool requireRemoteCatalog = false,
+        bool allowFreshCache = false)
     {
         var modelError = GetCompatibleApiModelIdValidationError(account.ApiModel);
         if (modelError != null)
@@ -8943,12 +8975,19 @@ public sealed partial class CodexCliService
             }
         }
 
+        var credential = ReadAccessTokenCredential(Path.Combine(account.CodexHome, AuthFileName));
+        var catalogIdentity = CompatibleModelCatalogIdentity(account, credential);
+        if (allowFreshCache &&
+            HasFreshVerifiedCompatibleModelCatalog(account, catalogIdentity, TimeSpan.FromMinutes(15)))
+        {
+            WriteWindowsClientLaunchDiagnostic("launch-model-discovery-cache-hit", "kind=compatible-api");
+            return;
+        }
+
         var modelsUri = BuildCompatibleApiModelsUri(baseUri);
         using var client = configuredProxy != null
             ? ProxyHttpClientFactory.Create(proxyResolution, proxyResolver.GetNode(proxyResolution.NodeId))
             : new HttpClient(new HttpClientHandler { UseProxy = false }) { Timeout = Timeout.InfiniteTimeSpan };
-        var credential = ReadAccessTokenCredential(Path.Combine(account.CodexHome, AuthFileName));
-        var catalogIdentity = CompatibleModelCatalogIdentity(account, credential);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         // Metadata GET only: tolerate brief boot/tunnel recovery without retrying
         // generation, changing credentials, or accepting a cached catalog as live.
@@ -9044,7 +9083,8 @@ public sealed partial class CodexCliService
                 throw new InvalidOperationException("账号地址或凭据已变化，已丢弃过期的模型结果。");
 
             RefreshManagedCompatibleModelCatalog(account, modelIds,
-                () => IsCompatibleModelCatalogIdentityCurrent(account, catalogIdentity));
+                () => IsCompatibleModelCatalogIdentityCurrent(account, catalogIdentity),
+                verifiedCatalogIdentity: catalogIdentity);
 
             if (!validateConfiguredModel) return;
 
@@ -13124,7 +13164,7 @@ public sealed partial class CodexCliService
         }
 
         // Give the MSIX package a short hand-off window before activating the replacement.
-        Thread.Sleep(300);
+        Thread.Sleep(100);
     }
 
     private static bool TryOpenWindowsClientSnapshot(

@@ -1,6 +1,6 @@
 {
   "name": "codex-account-manager-macos",
-  "version": "2.4.8",
+  "version": "2.4.9",
   "private": true,
   "description": "Codex Account Manager for macOS",
   "main": "src/main.js",

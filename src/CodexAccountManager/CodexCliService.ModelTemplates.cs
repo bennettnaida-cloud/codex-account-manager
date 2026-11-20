@@ -17,8 +17,23 @@ public sealed partial class CodexCliService
     private static string OfficialCompatibleModelTemplatesPath =>
         Path.Combine(new AccountStore().RootPath, OfficialCompatibleModelTemplatesFile);
 
-    private static async Task RefreshOfficialCompatibleModelTemplatesAsync(CancellationToken cancellationToken)
+    private static async Task RefreshOfficialCompatibleModelTemplatesAsync(
+        CancellationToken cancellationToken,
+        bool allowCachedFallback = false)
     {
+        if (allowCachedFallback && ReadOfficialCompatibleModelTemplates().Count > 0)
+        {
+            var nowCheck = DateTimeOffset.UtcNow;
+            var pathCheck = OfficialCompatibleModelTemplatesPath;
+            var modifiedCheck = File.GetLastWriteTimeUtc(pathCheck);
+            if (nowCheck >= _nextOfficialModelTemplateAttemptUtc &&
+                (modifiedCheck > nowCheck.UtcDateTime || modifiedCheck <= nowCheck.UtcDateTime.AddMinutes(-15)))
+            {
+                _ = Task.Run(() => RefreshOfficialCompatibleModelTemplatesAsync(CancellationToken.None));
+            }
+            return;
+        }
+
         await OfficialCompatibleModelTemplatesGate.WaitAsync(cancellationToken);
         try
         {
