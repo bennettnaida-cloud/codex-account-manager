@@ -621,7 +621,7 @@ public sealed partial class AccountStore
             return;
         }
 
-        File.WriteAllText(configPath, BuildAccessTokenConfig());
+        AtomicFilePersistence.WriteAllText(configPath, BuildAccessTokenConfig());
     }
 
     private static void EnsureOfficialOAuthHome(string codexHome)
@@ -633,7 +633,7 @@ public sealed partial class AccountStore
         var configPath = Path.Combine(codexHome, "config.toml");
         var existingConfig = File.Exists(configPath) ? File.ReadAllText(configPath) : "";
         var serviceTier = CodexCliService.ReadDesktopServiceTier(existingConfig);
-        File.WriteAllText(configPath, BuildOfficialOAuthConfig(serviceTier));
+        AtomicFilePersistence.WriteAllText(configPath, BuildOfficialOAuthConfig(serviceTier));
     }
 
     internal static string BuildOfficialOAuthConfig(string? serviceTier = null)
@@ -709,7 +709,7 @@ sandbox = "unelevated"
         var configPath = Path.Combine(account.CodexHome, "config.toml");
         var existingConfig = File.Exists(configPath) ? File.ReadAllText(configPath) : "";
         var serviceTier = CodexCliService.ReadDesktopServiceTier(existingConfig);
-        File.WriteAllText(configPath, BuildCompatibleApiConfig(account, serviceTier));
+        AtomicFilePersistence.WriteAllText(configPath, BuildCompatibleApiConfig(account, serviceTier));
 
         var authPath = Path.Combine(account.CodexHome, "auth.json");
         if (!string.IsNullOrWhiteSpace(apiKey))
@@ -718,7 +718,7 @@ sandbox = "unelevated"
             {
                 ["OPENAI_API_KEY"] = apiKey.Trim()
             };
-            File.WriteAllText(authPath, JsonSerializer.Serialize(auth, new JsonSerializerOptions { WriteIndented = true }));
+            AtomicFilePersistence.WriteAllText(authPath, JsonSerializer.Serialize(auth, new JsonSerializerOptions { WriteIndented = true }));
         }
         else if (!File.Exists(authPath))
         {

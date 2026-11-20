@@ -112,42 +112,62 @@ internal sealed class ConstrainedToolTip : ToolTip
             return;
         }
 
-        var current = new StringBuilder(line.Length);
-        foreach (var textElement in EnumerateTextElements(line))
+        // Fast path: most tooltips fit within a single line and need only one GDI measurement.
+        if (MeasureWidth(line, font) <= maxWidth)
         {
-            current.Append(textElement);
-            if (MeasureWidth(current, font) <= maxWidth || current.Length == textElement.Length)
-            {
-                continue;
-            }
-
-            // Move the element that overflowed to the next line.  This keeps all
-            // content (including long email/path segments) while guaranteeing the
-            // native tooltip receives a finite line width.
-            current.Length -= textElement.Length;
-            if (current.Length > 0)
-            {
-                destination.Append(current);
-                destination.Append(Environment.NewLine);
-            }
-
-            current.Clear();
-            current.Append(textElement);
+            destination.Append(line);
+            return;
         }
 
-        destination.Append(current);
-    }
-
-    private static IEnumerable<string> EnumerateTextElements(string value)
-    {
-        var enumerator = StringInfo.GetTextElementEnumerator(value);
-        while (enumerator.MoveNext())
+        var elementStarts = StringInfo.ParseCombiningCharacters(line);
+        var elementCount = elementStarts.Length;
+        if (elementCount <= 1)
         {
-            yield return enumerator.GetTextElement();
+            destination.Append(line);
+            return;
+        }
+
+        var startElement = 0;
+        while (startElement < elementCount)
+        {
+            var charStart = elementStarts[startElement];
+            if (startElement == elementCount - 1)
+            {
+                destination.Append(line.AsSpan(charStart));
+                break;
+            }
+
+            if (startElement > 0 && MeasureWidth(line.Substring(charStart), font) <= maxWidth)
+            {
+                destination.Append(line.AsSpan(charStart));
+                break;
+            }
+
+            var low = startElement + 1;
+            var high = elementCount - 1;
+            var best = startElement + 1;
+            while (low <= high)
+            {
+                var mid = low + ((high - low) / 2);
+                var charEnd = elementStarts[mid];
+                if (MeasureWidth(line.Substring(charStart, charEnd - charStart), font) <= maxWidth)
+                {
+                    best = mid;
+                    low = mid + 1;
+                }
+                else
+                {
+                    high = mid - 1;
+                }
+            }
+
+            destination.Append(line.AsSpan(charStart, elementStarts[best] - charStart));
+            destination.Append(Environment.NewLine);
+            startElement = best;
         }
     }
 
-    private static int MeasureWidth(StringBuilder value, Font font)
+    private static int MeasureWidth(string value, Font font)
     {
         if (value.Length == 0)
         {
@@ -157,7 +177,7 @@ internal sealed class ConstrainedToolTip : ToolTip
         try
         {
             return TextRenderer.MeasureText(
-                    value.ToString(),
+                    value,
                     font,
                     new Size(int.MaxValue, int.MaxValue),
                     TextFormatFlags.SingleLine |

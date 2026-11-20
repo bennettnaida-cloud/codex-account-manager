@@ -212,13 +212,13 @@ public partial class Form1 : Form
         public required bool ShowsCacheWriteColumn { get; init; }
     }
 
-    private const int AccountListWidth = 430;
-    private const int AccountSummaryMinWidth = 360;
-    private const int AccountSummaryHeight = 126;
     private const int AccountRowMinWidth = 560;
     private const int AccountSwitchHorizontalMinWidth = 920;
     private const int QuotaUsageHorizontalMinWidth = 900;
     private const int WorkspaceHeroHeight = 160;
+    private const int CompactWorkspaceHeroHeight = 108;
+    private const int QuotaRefreshActiveIntervalMs = 250;
+    private const int QuotaRefreshMinimizedIntervalMs = 2000;
     private const int WorkspaceScrollbarEdgeInset = 2;
     private const int CardGap = 22;
     private const int UnifiedHistoryPageSize = 8;
@@ -270,7 +270,6 @@ public partial class Form1 : Form
     private readonly Dictionary<string, LoginStatus> _statusCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly BufferedTableLayoutPanel _accountLayout = new();
     private readonly BufferedFlowLayoutPanel _cardsPanel = new();
-    private readonly Panel _detailPanel = new();
     private readonly TextBox _searchBox = new();
     private readonly TextBox _projectPathBox = new();
     private readonly TextBox _patGatewayProxyAddressBox = new();
@@ -280,7 +279,7 @@ public partial class Form1 : Form
     private readonly ModernButton _patGatewayToggleButton = new();
     private readonly Label _patAutoRotationStatusLabel = new();
     private readonly ModernButton _patAutoRotationToggleButton = new();
-    private readonly ModernButton _patAutoRotationThresholdButton = new();
+    private readonly PillLabel _patAutoRotationThresholdBadge = new();
     private readonly Label _statusBox = new();
     private readonly ThemePicker _themeModePicker = new();
     private readonly ModernButton _updateAvailableButton = new();
@@ -311,14 +310,15 @@ public partial class Form1 : Form
     private FileSystemWatcher? _chatSectionStateWatcher;
     private FileSystemWatcher? _chatSectionIdentityWatcher;
     private int _usageLogDirty = 1;
-    private bool _usageLogWatcherReady;
+    private volatile bool _usageLogWatcherReady;
+    private int _usageLogWatcherNeedsReset;
+    private DateTimeOffset _usageLogWatcherNextRetryUtc = DateTimeOffset.MinValue;
+    private int _usageLogWatcherFailureCount;
     private readonly ThemeService _themeService;
     private readonly UsageTracker _usageTracker;
     private readonly PassiveQuotaMonitoringService _passiveQuotaMonitoring;
     private readonly QuotaSnapshotStore _quotaSnapshotStore;
     private readonly AppSettings _appSettings;
-    private readonly CodexTaskBoundaryMonitor _codexTaskBoundaryMonitor =
-        new(CodexCliService.GetDefaultCodexHome());
     private readonly QuotaSafetyMarginTracker _quotaSafetyMarginTracker = new();
     private readonly bool _preserveExistingPatGatewayOnStartup;
     private readonly bool _refreshNativeFastBridgeOnStartup;
@@ -498,7 +498,7 @@ public partial class Form1 : Form
         _currentAccountName = _appSettings.CurrentAccountName;
 
         BuildUi();
-        ApplyTheme();
+        ApplyTheme(renderCards: false);
         LoadAccounts();
         ConfigureQuotaAutoRefresh();
         ConfigureAutomaticModelCatalogRefresh();
@@ -615,6 +615,11 @@ public partial class Form1 : Form
 
     private void SaveWindowBounds()
     {
+        if (_appSettings.LoadFailed || _themeService.SettingsLoadFailed)
+        {
+            return;
+        }
+
         var bounds = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
         if (bounds.Width <= 0 || bounds.Height <= 0)
         {
@@ -852,10 +857,11 @@ public partial class Form1 : Form
         _updateAvailableButton.SetBounds(0, 0, 228, 40);
         _updateAvailableButton.Text = "有可用更新";
         _updateAvailableButton.Tag = "primary";
-        _updateAvailableButton.Font = new Font(Font.FontFamily, 8.9F, FontStyle.Bold);
+        _updateAvailableButton.Font = UiFontCache.Get(Font.FontFamily, 8.9F, FontStyle.Bold);
         _updateAvailableButton.Padding = new Padding(10, 0, 10, 0);
         _updateAvailableButton.Radius = 12;
-        _updateAvailableButton.IconText = "↻";
+        _updateAvailableButton.IconText = string.Empty;
+        _updateAvailableButton.IconGlyph = ModernButtonGlyph.Refresh;
         _updateAvailableButton.IconWidth = 22;
         _updateAvailableButton.ShowIconTile = true;
         _updateAvailableButton.AccessibleName = "安装可用更新";
@@ -1136,6 +1142,18 @@ public partial class Form1 : Form
             _accountRotationPrimaryReturnCancellation?.Cancel();
             _accountRotationPrimaryReturnCancellation = null;
             _unifiedHistoryContentIndexCancellation?.Cancel();
+            _unifiedHistoryContentIndexCancellation?.Dispose();
+            _unifiedHistoryContentIndexCancellation = null;
+            _proxySidebar?.Dispose();
+            _proxySidebar = null;
+            lock (_officialQuotaRequestLocks)
+            {
+                foreach (var requestLock in _officialQuotaRequestLocks.Values)
+                {
+                    requestLock.Dispose();
+                }
+                _officialQuotaRequestLocks.Clear();
+            }
             _quotaRefreshTimer.Dispose();
             _layoutRefreshTimer.Dispose();
             _usageLogWatcher?.Dispose();
@@ -1230,17 +1248,54 @@ public partial class Form1 : Form
 
         SizeChanged += (_, _) => RestoreWorkspaceAfterMinimize();
 
-        DpiChanged += (_, _) => BeginInvoke(() =>
+        DpiChanged += (_, _) =>
         {
-            UpdateStatusBarLayout();
-            RenderCards();
-        });
+            if (_formClosed || IsDisposed || !IsHandleCreated)
+            {
+                return;
+            }
+
+            try
+            {
+                BeginInvoke(() =>
+                {
+                    if (_formClosed || IsDisposed)
+                    {
+                        return;
+                    }
+                    ClearWorkspaceViewCache();
+                    UpdateWorkspaceChrome();
+                    UpdateStatusBarLayout();
+                    RenderCards();
+                });
+            }
+            catch (InvalidOperationException)
+            {
+            }
+        };
 
         UpdateWorkspaceChrome();
     }
 
+    private void UpdateQuotaRefreshTimerInterval()
+    {
+        if (_formClosed || IsDisposed)
+        {
+            return;
+        }
+
+        var targetInterval = WindowState == FormWindowState.Minimized
+            ? QuotaRefreshMinimizedIntervalMs
+            : QuotaRefreshActiveIntervalMs;
+        if (_quotaRefreshTimer.Interval != targetInterval)
+        {
+            _quotaRefreshTimer.Interval = targetInterval;
+        }
+    }
+
     private void RestoreWorkspaceAfterMinimize()
     {
+        UpdateQuotaRefreshTimerInterval();
         if (WindowState == FormWindowState.Minimized)
         {
             _windowWasMinimized = true;
@@ -1432,7 +1487,7 @@ public partial class Form1 : Form
         footer.BringToFront();
     }
 
-    private void ApplyTheme()
+    private void ApplyTheme(bool renderCards = true)
     {
         _palette = _themeService.GetPalette(_appSettings.ThemeMode);
         BackColor = _palette.FormBackColor;
@@ -1453,11 +1508,15 @@ public partial class Form1 : Form
         }
         _themeModePicker.ApplyPalette(_palette);
         ThemeStyler.ApplyPrimaryButton(_updateAvailableButton, _palette);
+        ApplyPatAutoRotationThresholdBadgeStyle();
         _statusBox.BackColor = _palette.StatusBackColor;
         _statusBox.ForeColor = _palette.MutedTextColor;
         UpdateWorkspaceChrome();
         ApplySidebarNavButtons();
-        RenderCards();
+        if (renderCards)
+        {
+            RenderCards();
+        }
         Invalidate(true);
     }
 
@@ -1556,6 +1615,10 @@ public partial class Form1 : Form
                 {
                     ApplyHistoryActionButtonStyle(button, danger: true);
                 }
+                else if (Equals(button.Tag, "danger-action"))
+                {
+                    ApplyDangerActionButtonStyle(button);
+                }
                 else if (Equals(button.Tag, "status-check"))
                 {
                     ApplyStatusCheckButtonStyle(button);
@@ -1625,17 +1688,18 @@ public partial class Form1 : Form
         button.Name = $"SidebarNav{view}";
         if (button is ModernButton modern)
         {
-            modern.IconText = view switch
+            modern.IconText = string.Empty;
+            modern.IconGlyph = view switch
             {
-                WorkspaceView.AccountSwitch => "⇄",
-                WorkspaceView.UnifiedHistory => "◷",
-                WorkspaceView.StatusCheck => "✓",
-                WorkspaceView.QuotaUsage => "▥",
-                WorkspaceView.AccountRotation => "↻",
-                WorkspaceView.ThemeSettings => "◐",
-                WorkspaceView.SystemConfig => "⚙",
-                WorkspaceView.ProxyManagement => "⌁",
-                _ => "•"
+                WorkspaceView.AccountSwitch => ModernButtonGlyph.AccountSwitch,
+                WorkspaceView.UnifiedHistory => ModernButtonGlyph.UnifiedHistory,
+                WorkspaceView.StatusCheck => ModernButtonGlyph.StatusCheck,
+                WorkspaceView.QuotaUsage => ModernButtonGlyph.QuotaUsage,
+                WorkspaceView.AccountRotation => ModernButtonGlyph.AccountRotation,
+                WorkspaceView.ThemeSettings => ModernButtonGlyph.ThemeSettings,
+                WorkspaceView.SystemConfig => ModernButtonGlyph.SystemConfig,
+                WorkspaceView.ProxyManagement => ModernButtonGlyph.ProxyManagement,
+                _ => ModernButtonGlyph.None
             };
             modern.IconWidth = 24;
             modern.Radius = 12;
@@ -1660,7 +1724,8 @@ public partial class Form1 : Form
         button.Cursor = Cursors.Hand;
         if (button is ModernButton modern)
         {
-            modern.IconText = "+";
+            modern.IconText = string.Empty;
+            modern.IconGlyph = ModernButtonGlyph.Plus;
             modern.IconWidth = 24;
             modern.Radius = 12;
             modern.ShowIconTile = true;
@@ -1915,9 +1980,11 @@ public partial class Form1 : Form
     private void ConfigureQuotaAutoRefresh()
     {
         TryConfigureUsageLogWatcher();
-        _quotaRefreshTimer.Interval = 250;
+        _quotaRefreshTimer.Interval = QuotaRefreshActiveIntervalMs;
         _quotaRefreshTimer.Tick += (_, _) =>
         {
+            UpdateQuotaRefreshTimerInterval();
+            TryRecoverUsageLogWatcherIfNeeded();
             RefreshQuotaUsageIfNeeded();
             RefreshOfficialQuotaIfNeeded();
             RefreshPersistedPatGatewayQuotaSignalIfNeeded();
@@ -1962,14 +2029,7 @@ public partial class Form1 : Form
         if (_formClosed || IsDisposed ||
             !AccountRotationConfiguration.IsEnabled(_appSettings) ||
             !_appSettings.PatGatewayEnabled ||
-            _patAutoRotationBoundaryCancellation != null ||
-            !TryResolvePersistedPatGatewayLogicalAccount(
-                allowArmedSource: false,
-                out var current,
-                out _) ||
-            current == null ||
-            AccountRotationConfiguration.GetPool(_appSettings, current) !=
-                AccountRotationPool.Backup)
+            _patAutoRotationBoundaryCancellation != null)
         {
             return;
         }
@@ -1981,6 +2041,17 @@ public partial class Form1 : Form
             return;
         }
         _accountRotationPrimaryReturnCheckedAtUtc = now;
+
+        if (!TryResolvePersistedPatGatewayLogicalAccount(
+                allowArmedSource: false,
+                out var current,
+                out _) ||
+            current == null ||
+            AccountRotationConfiguration.GetPool(_appSettings, current) !=
+                AccountRotationPool.Backup)
+        {
+            return;
+        }
 
         PruneResetPatAutoRotationAccounts();
 
@@ -2255,19 +2326,57 @@ public partial class Form1 : Form
         _ = RefreshQuotaUsageAsync(force: _usageLogWatcherReady && logDirty, _workspaceLoadGeneration);
     }
 
+    private void TryRecoverUsageLogWatcherIfNeeded()
+    {
+        if (_formClosed || IsDisposed)
+        {
+            return;
+        }
+
+        var resetRequested = Interlocked.Exchange(ref _usageLogWatcherNeedsReset, 0) != 0;
+        if (_usageLogWatcherReady && !resetRequested)
+        {
+            return;
+        }
+
+        if (resetRequested)
+        {
+            _usageLogWatcherReady = false;
+            _usageLogWatcher?.Dispose();
+            _usageLogWatcher = null;
+            _usageLogWatcherFailureCount = Math.Min(5, _usageLogWatcherFailureCount + 1);
+            var backoffSeconds = Math.Min(30, 1 << _usageLogWatcherFailureCount);
+            _usageLogWatcherNextRetryUtc = DateTimeOffset.UtcNow.AddSeconds(backoffSeconds);
+            return;
+        }
+
+        if (DateTimeOffset.UtcNow < _usageLogWatcherNextRetryUtc)
+        {
+            return;
+        }
+
+        TryConfigureUsageLogWatcher();
+    }
+
     private void TryConfigureUsageLogWatcher()
     {
+        _usageLogWatcher?.Dispose();
+        _usageLogWatcher = null;
+        _usageLogWatcherReady = false;
+
         var sessionsRoot = Path.Combine(CodexCliService.GetDefaultCodexHome(), "sessions");
         if (!Directory.Exists(sessionsRoot))
         {
+            _usageLogWatcherNextRetryUtc = DateTimeOffset.UtcNow.AddSeconds(10);
             return;
         }
 
         try
         {
-            _usageLogWatcher = new FileSystemWatcher(sessionsRoot, "*.jsonl")
+            var watcher = new FileSystemWatcher(sessionsRoot, "*.jsonl")
             {
                 IncludeSubdirectories = true,
+                InternalBufferSize = 64 * 1024,
                 NotifyFilter = NotifyFilters.FileName |
                                NotifyFilters.LastWrite |
                                NotifyFilters.CreationTime |
@@ -2276,22 +2385,29 @@ public partial class Form1 : Form
             };
             FileSystemEventHandler markDirty = (_, _) => Interlocked.Exchange(ref _usageLogDirty, 1);
             RenamedEventHandler markRenamed = (_, _) => Interlocked.Exchange(ref _usageLogDirty, 1);
-            _usageLogWatcher.Changed += markDirty;
-            _usageLogWatcher.Created += markDirty;
-            _usageLogWatcher.Deleted += markDirty;
-            _usageLogWatcher.Renamed += markRenamed;
-            _usageLogWatcher.Error += (_, _) =>
+            watcher.Changed += markDirty;
+            watcher.Created += markDirty;
+            watcher.Deleted += markDirty;
+            watcher.Renamed += markRenamed;
+            watcher.Error += (_, _) =>
             {
                 _usageLogWatcherReady = false;
                 Interlocked.Exchange(ref _usageLogDirty, 1);
+                Interlocked.Exchange(ref _usageLogWatcherNeedsReset, 1);
             };
+            _usageLogWatcher = watcher;
             _usageLogWatcherReady = true;
+            _usageLogWatcherFailureCount = 0;
+            _usageLogWatcherNextRetryUtc = DateTimeOffset.MinValue;
         }
         catch
         {
             _usageLogWatcher?.Dispose();
             _usageLogWatcher = null;
             _usageLogWatcherReady = false;
+            _usageLogWatcherFailureCount = Math.Min(5, _usageLogWatcherFailureCount + 1);
+            var backoffSeconds = Math.Min(30, 1 << _usageLogWatcherFailureCount);
+            _usageLogWatcherNextRetryUtc = DateTimeOffset.UtcNow.AddSeconds(backoffSeconds);
         }
     }
     private DateTime GetLatestUsageLogWriteTimeUtc()
@@ -3540,11 +3656,7 @@ public partial class Form1 : Form
             _ => _headerSubtitle.Text
         };
         _toolTip.SetToolTip(_headerSubtitle, subtitleDetail);
-        if (_controlsRow != null)
-        {
-            _controlsRow.Visible = _activeView is not
-                (WorkspaceView.ThemeSettings or WorkspaceView.SystemConfig or WorkspaceView.ProxyManagement);
-        }
+        ApplyDetailViewportMode();
         if (!_bulkQuotaTestButton.IsDisposed)
         {
             // The control is hosted by the first quota account-group header. It must never
@@ -3638,7 +3750,7 @@ public partial class Form1 : Form
         button.BackColor = selected ? _palette.SidebarSelectedColor : _palette.SidebarColor;
         button.ForeColor = selected ? _palette.SidebarTextColor : _palette.SidebarMutedTextColor;
         button.Cursor = Cursors.Hand;
-        button.Font = new Font(Font.FontFamily, 9.5F, selected ? FontStyle.Bold : FontStyle.Regular);
+        button.Font = UiFontCache.Get(Font.FontFamily, 9.5F, selected ? FontStyle.Bold : FontStyle.Regular);
         if (button is ModernButton modern)
         {
             modern.BaseBackColor = selected ? _palette.SidebarSelectedColor : _palette.SidebarColor;
@@ -4741,7 +4853,6 @@ public partial class Form1 : Form
                 groupRows,
                 showBulkQuotaAction));
             bulkQuotaActionAttached |= showBulkQuotaAction;
-            PumpHeaderAnimationFrame();
 
             foreach (var account in group.Accounts)
             {
@@ -4762,7 +4873,6 @@ public partial class Form1 : Form
                 row.Visible = !collapsed;
                 groupRows.Add(row);
                 _cardsPanel.Controls.Add(row);
-                PumpHeaderAnimationFrame();
             }
         }
 
@@ -4779,7 +4889,7 @@ public partial class Form1 : Form
         DetachPersistentControl(_patGatewayToggleButton);
         DetachPersistentControl(_patAutoRotationStatusLabel);
         DetachPersistentControl(_patAutoRotationToggleButton);
-        DetachPersistentControl(_patAutoRotationThresholdButton);
+        DetachPersistentControl(_patAutoRotationThresholdBadge);
     }
 
     private static void DetachPersistentControl(Control? control)
@@ -4823,13 +4933,26 @@ public partial class Form1 : Form
         var compact = (_showAccountDetail &&
                        _activeView is WorkspaceView.AccountSwitch or WorkspaceView.QuotaUsage) ||
                       (_showCodexAppearanceDetail && _activeView == WorkspaceView.ThemeSettings) ||
-                      _activeView is WorkspaceView.SystemConfig or WorkspaceView.ProxyManagement;
-        // Every workspace uses one stable hero footprint. Hiding the search row on a
-        // detail page must not resize the starfield banner or shift the page below it.
-        _contentLayout.RowStyles[0].Height = WorkspaceHeroHeight;
+                      _activeView is WorkspaceView.ThemeSettings or WorkspaceView.SystemConfig or WorkspaceView.ProxyManagement;
+        var dpiScale = Math.Max(1F, DeviceDpi / 96F);
+        var compactHeight = Math.Max(
+            (int)Math.Ceiling(CompactWorkspaceHeroHeight * dpiScale),
+            _headerSubtitle.Bottom + (int)Math.Ceiling(12F * dpiScale));
+        var fullHeight = Math.Max(
+            (int)Math.Ceiling(WorkspaceHeroHeight * dpiScale),
+            compactHeight + Math.Max(48, _controlsRow.Height));
+        var targetHeroHeight = compact ? compactHeight : fullHeight;
+        if (Math.Abs(_contentLayout.RowStyles[0].Height - targetHeroHeight) > 0.5F)
+        {
+            _contentLayout.RowStyles[0].Height = targetHeroHeight;
+        }
+        if (_headerPanel != null && _headerPanel.Height != targetHeroHeight)
+        {
+            _headerPanel.Height = targetHeroHeight;
+        }
         _controlsRow.Visible = !compact;
         _accountLayout.Padding = compact
-            ? new Padding(2, 4, 0, 0)
+            ? new Padding(2, 6, 0, 0)
             : new Padding(2, 12, 0, 4);
     }
 
@@ -5812,12 +5935,6 @@ public partial class Form1 : Form
             throw new InvalidOperationException("Unified history groups must be ordered by latest update first.");
         }
     }
-
-    private static bool IsUnifiedHistoryGroupCollapsed(
-        string groupKey,
-        bool searching,
-        ISet<string> expandedGroups) =>
-        !searching && !expandedGroups.Contains(groupKey);
 
     private int GetUnifiedHistoryGroupVisibleLimit(string groupKey)
     {
@@ -7586,18 +7703,6 @@ public partial class Form1 : Form
         }
     }
 
-    private int GetAccountSummaryWidth()
-    {
-        var viewportWidth = _cardsPanel.ClientSize.Width - _cardsPanel.Padding.Horizontal - SystemInformation.VerticalScrollBarWidth - 4;
-        return Math.Max(AccountSummaryMinWidth, viewportWidth);
-    }
-
-    private int GetAccountDetailWidth()
-    {
-        var viewportWidth = _detailPanel.ClientSize.Width - _detailPanel.Padding.Horizontal - SystemInformation.VerticalScrollBarWidth - 4;
-        return Math.Max(650, viewportWidth);
-    }
-
     private Control CreateEmptyState(int width)
     {
         var panel = new RoundedPanel
@@ -8422,18 +8527,6 @@ public partial class Form1 : Form
         ResetCardsScrollPosition();
     }
 
-    private static Image? LoadImageWithoutFileLock(string path)
-    {
-        if (!File.Exists(path))
-        {
-            return null;
-        }
-
-        using var stream = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-        using var source = Image.FromStream(stream);
-        return new Bitmap(source);
-    }
-
     private Control CreateSystemConfigPanel(int width)
     {
         var panel = new RoundedPanel
@@ -8684,19 +8777,18 @@ public partial class Form1 : Form
 
         var rotationActionGap = 8;
         var rotationActionWidth = (configActionWidth - rotationActionGap) / 2;
-        _patAutoRotationThresholdButton.Parent?.Controls.Remove(_patAutoRotationThresholdButton);
-        _patAutoRotationThresholdButton.SetBounds(
+        _patAutoRotationThresholdBadge.Parent?.Controls.Remove(_patAutoRotationThresholdBadge);
+        _patAutoRotationThresholdBadge.SetBounds(
             configActionLeft,
-            411,
+            414,
             rotationActionWidth,
-            42);
-        _patAutoRotationThresholdButton.Tag = "soft";
-        _patAutoRotationThresholdButton.Radius = 12;
-        _patAutoRotationThresholdButton.Font = new Font(Font.FontFamily, 8.6F);
-        _patAutoRotationThresholdButton.MinimumFontSize = 7.8F;
-        _patAutoRotationThresholdButton.AccessibleName = "轮换保留线：5h 剩余 10%，仅周额度剩余 3%";
-        ThemeStyler.ApplySoftButton(_patAutoRotationThresholdButton, _palette);
-        panel.Controls.Add(_patAutoRotationThresholdButton);
+            36);
+        _patAutoRotationThresholdBadge.Font = UiFontCache.Get(Font.FontFamily, 8.4F, FontStyle.Bold);
+        _patAutoRotationThresholdBadge.TextAlign = ContentAlignment.MiddleCenter;
+        _patAutoRotationThresholdBadge.ShowDot = true;
+        _patAutoRotationThresholdBadge.AccessibleName = "轮换保留线：5h 剩余 10%，仅周额度剩余 3%";
+        ApplyPatAutoRotationThresholdBadgeStyle();
+        panel.Controls.Add(_patAutoRotationThresholdBadge);
 
         _patAutoRotationToggleButton.Parent?.Controls.Remove(_patAutoRotationToggleButton);
         _patAutoRotationToggleButton.SetBounds(
@@ -8706,7 +8798,7 @@ public partial class Form1 : Form
             42);
         _patAutoRotationToggleButton.Tag = "soft";
         _patAutoRotationToggleButton.Radius = 12;
-        _patAutoRotationToggleButton.Font = new Font(Font.FontFamily, 8.6F);
+        _patAutoRotationToggleButton.Font = UiFontCache.Get(Font.FontFamily, 8.6F);
         _patAutoRotationToggleButton.MinimumFontSize = 7.8F;
         _patAutoRotationToggleButton.AccessibleName = "打开或关闭账号轮换";
         ThemeStyler.ApplySoftButton(_patAutoRotationToggleButton, _palette);
@@ -8820,7 +8912,7 @@ public partial class Form1 : Form
             Top = roomyHorizontal ? 14 : horizontal ? 4 : 6,
             Width = nameWidth,
             Height = roomyHorizontal ? 38 : 30,
-            Font = new Font(Font.FontFamily, 10F, FontStyle.Bold),
+            Font = UiFontCache.Get(Font.FontFamily, 10F, FontStyle.Bold),
             AutoEllipsis = true,
             TextAlign = ContentAlignment.MiddleLeft,
             UseCompatibleTextRendering = true,
@@ -8838,7 +8930,7 @@ public partial class Form1 : Form
             Top = roomyHorizontal ? 58 : horizontal ? 34 : 36,
             Width = nameWidth,
             Height = roomyHorizontal ? 32 : 24,
-            Font = new Font(Font.FontFamily, 8.7F, FontStyle.Bold),
+            Font = UiFontCache.Get(Font.FontFamily, 8.7F, FontStyle.Bold),
             AutoEllipsis = true,
             TextAlign = ContentAlignment.MiddleLeft,
             UseCompatibleTextRendering = true,
@@ -8908,105 +9000,42 @@ public partial class Form1 : Form
         row.Controls.Add(detail);
 
         AttachAccountSelection(row, account.Name);
+        AttachRowHoverHighlight(row, GetAccountStateColor(account));
         return row;
     }
 
-    private Control CreateAccountSummary(AccountRecord account, int width, bool selected)
+    private void AttachRowHoverHighlight(RoundedPanel row, Color accent)
     {
-        var status = _statusCache.GetValueOrDefault(account.Name);
-        var configReady = Directory.Exists(account.CodexHome) && File.Exists(Path.Combine(account.CodexHome, "config.toml"));
-        var directoryReady = Directory.Exists(account.CodexHome);
-        var authReady = HasUsableAccountCredential(account);
-        var secretState = GetCredentialStateText(account, authReady);
-        var isCurrent = IsCurrentAccount(account);
+        var dark = ThemeStyler.IsDark(_palette);
+        row.EnableHoverHighlight = true;
+        row.HoverBackColor = UiDesign.Blend(row.BackColor, accent, dark ? 0.11F : 0.048F);
+        row.HoverBorderColor = UiDesign.Blend(row.BorderColor, accent, dark ? 0.44F : 0.34F);
 
-        var card = new RoundedPanel
+        void BindHover(Control target, bool enterHighlights)
         {
-            Width = width,
-            Height = AccountSummaryHeight,
-            Radius = 14,
-            BorderColor = selected || isCurrent ? _palette.PrimaryColor : _palette.BorderColor,
-            BackColor = selected ? _palette.SurfaceAltColor : _palette.CardColor,
-            AccentColor = selected || isCurrent ? _palette.AccentColor : Color.Transparent,
-            AccentWidth = selected || isCurrent ? 3 : 0,
-            ShadowColor = Color.FromArgb(22, _palette.ShadowColor),
-            Margin = new Padding(0, 0, 0, 12),
-            Cursor = Cursors.Hand
-        };
-
-        var name = new Label
-        {
-            Text = account.Name,
-            Left = 16,
-            Top = 12,
-            Width = Math.Max(120, width - (isCurrent ? 210 : 150)),
-            Height = 30,
-            Font = new Font(Font.FontFamily, 10F, FontStyle.Bold),
-            AutoEllipsis = true,
-            Cursor = Cursors.Hand
-        };
-        ThemeStyler.ApplyLabel(name, _palette);
-        card.Controls.Add(name);
-
-        if (isCurrent)
-        {
-            var currentBadge = MakeBadge("当前", width - 186, 14, Color.FromArgb(44, _palette.PrimaryColor), _palette.PrimaryColor);
-            currentBadge.Width = 56;
-            currentBadge.Height = 28;
-            currentBadge.Cursor = Cursors.Hand;
-            card.Controls.Add(currentBadge);
+            if (enterHighlights)
+            {
+                target.MouseEnter += (_, _) => row.SetHovered(true);
+            }
+            target.MouseLeave += (_, _) =>
+            {
+                if (row.IsDisposed || !row.IsHandleCreated)
+                {
+                    return;
+                }
+                if (!row.ClientRectangle.Contains(row.PointToClient(Control.MousePosition)))
+                {
+                    row.SetHovered(false);
+                }
+            };
+            foreach (Control child in target.Controls)
+            {
+                var interactiveChild = child is Button or ComboBox;
+                BindHover(child, !interactiveChild);
+            }
         }
 
-        var badge = MakeBadge(GetStatusBadgeText(status), width - 124, 14, GetStatusBackColor(status), GetStatusForeColor(status));
-        badge.Width = 100;
-        badge.Height = 28;
-        badge.Cursor = Cursors.Hand;
-        card.Controls.Add(badge);
-
-        var kind = new Label
-        {
-            Text = account.AuthKindLabel,
-            Left = 16,
-            Top = 48,
-            Width = 210,
-            Height = 24,
-            Font = new Font(Font.FontFamily, 8.5F, FontStyle.Bold),
-            AutoEllipsis = true,
-            Cursor = Cursors.Hand
-        };
-        ThemeStyler.ApplyLabel(kind, _palette, true);
-        card.Controls.Add(kind);
-
-        var home = new Label
-        {
-            Text = account.CodexHome,
-            Left = 232,
-            Top = 48,
-            Width = Math.Max(140, width - 256),
-            Height = 24,
-            Font = new Font(Font.FontFamily, 8.5F),
-            AutoEllipsis = true,
-            Cursor = Cursors.Hand
-        };
-        ThemeStyler.ApplyLabel(home, _palette, true);
-        card.Controls.Add(home);
-
-        var metrics = new Label
-        {
-            Text = $"配置 {(configReady ? "就绪" : "缺失")}    目录 {(directoryReady ? "存在" : "缺失")}    {secretState}",
-            Left = 16,
-            Top = 86,
-            Width = Math.Max(160, width - 32),
-            Height = 24,
-            Font = new Font(Font.FontFamily, 8.5F),
-            AutoEllipsis = true,
-            Cursor = Cursors.Hand
-        };
-        ThemeStyler.ApplyLabel(metrics, _palette);
-        card.Controls.Add(metrics);
-
-        AttachAccountSelection(card, account.Name);
-        return card;
+        BindHover(row, enterHighlights: true);
     }
 
     private bool HasUsableAccountCredential(AccountRecord account)
@@ -9381,6 +9410,8 @@ public partial class Form1 : Form
         card.Controls.Add(edit);
 
         var delete = MakeActionButton("删除", innerLeft + ((secondaryActionWidth + actionGap) * 2), secondActionTop, secondaryActionWidth, false);
+        delete.Tag = "danger-action";
+        ApplyDangerActionButtonStyle(delete);
         delete.Click += (_, _) => DeleteAccount(account);
         card.Controls.Add(delete);
 
@@ -9410,211 +9441,6 @@ public partial class Form1 : Form
         button.BorderColor = _palette.BorderColor;
         button.GlyphColor = _palette.PrimaryColor;
         button.Invalidate();
-    }
-
-    private static void MakeButtonCircular(Button button)
-    {
-        void ApplyRegion()
-        {
-            button.Region?.Dispose();
-            using var path = new GraphicsPath();
-            path.AddEllipse(0, 0, button.Width - 1, button.Height - 1);
-            button.Region = new Region(path);
-        }
-
-        button.Width = Math.Max(button.Width, button.Height);
-        button.Height = button.Width;
-        button.FlatAppearance.BorderSize = 1;
-        ApplyRegion();
-        button.SizeChanged += (_, _) => ApplyRegion();
-    }
-
-    private Control CreateStatusDashboard(IReadOnlyList<AccountRecord> accounts, int cardWidth)
-    {
-        var rowWidth = Math.Max(620, cardWidth - SystemInformation.VerticalScrollBarWidth - 8);
-        var panel = new FlowLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            AutoScroll = true,
-            WrapContents = false,
-            FlowDirection = FlowDirection.TopDown,
-            Padding = new Padding(0, 0, 8, 0),
-            BackColor = _palette.FormBackColor
-        };
-
-        panel.Controls.Add(CreateDashboardHeader(
-            "状态总览",
-            "逐个检查账号状态。",
-            rowWidth));
-
-        foreach (var account in accounts)
-        {
-            panel.Controls.Add(CreateStatusRow(account, rowWidth));
-        }
-
-        return panel;
-    }
-
-    private Control CreateTokenDashboard(IReadOnlyList<AccountRecord> accounts, int cardWidth)
-    {
-        var rowWidth = Math.Max(620, cardWidth - SystemInformation.VerticalScrollBarWidth - 8);
-        var panel = new FlowLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            AutoScroll = true,
-            WrapContents = false,
-            FlowDirection = FlowDirection.TopDown,
-            Padding = new Padding(0, 0, 8, 0),
-            BackColor = _palette.FormBackColor
-        };
-
-        panel.Controls.Add(CreateDashboardHeader(
-            "凭据总览",
-            "各账号凭据独立保存。",
-            rowWidth));
-
-        foreach (var account in accounts)
-        {
-            panel.Controls.Add(CreateTokenRow(account, rowWidth));
-        }
-
-        return panel;
-    }
-
-    private Control CreateDashboardHeader(string titleText, string subtitleText, int width, string? actionText = null, Func<Task>? action = null)
-    {
-        var panel = new RoundedPanel
-        {
-            Width = width,
-            Height = 104,
-            Radius = 16,
-            BorderColor = _palette.BorderColor,
-            BackColor = _palette.SurfaceColor,
-            Margin = new Padding(0, 0, 0, 14),
-            Padding = new Padding(22)
-        };
-
-        var title = new Label
-        {
-            Text = titleText,
-            Left = 22,
-            Top = 18,
-            Width = action == null ? width - 44 : width - 210,
-            Height = 32,
-            Font = new Font(Font.FontFamily, 11F, FontStyle.Bold),
-            AutoEllipsis = true
-        };
-        ThemeStyler.ApplyLabel(title, _palette);
-        panel.Controls.Add(title);
-
-        var subtitle = new Label
-        {
-            Text = subtitleText,
-            Left = 22,
-            Top = 56,
-            Width = action == null ? width - 44 : width - 210,
-            Height = 28,
-            Font = new Font(Font.FontFamily, 8.8F),
-            AutoEllipsis = true
-        };
-        ThemeStyler.ApplyLabel(subtitle, _palette, true);
-        panel.Controls.Add(subtitle);
-
-        if (action != null && actionText != null)
-        {
-            var button = MakeActionButton(actionText, width - 166, 32, 132, true);
-            button.Click += async (_, _) => await action();
-            panel.Controls.Add(button);
-        }
-
-        return panel;
-    }
-
-    private Control CreateStatusRow(AccountRecord account, int width)
-    {
-        var status = _statusCache.GetValueOrDefault(account.Name);
-
-        var row = new RoundedPanel
-        {
-            Width = width,
-            Height = 104,
-            Radius = 16,
-            BorderColor = UiDesign.Blend(_palette.BorderColor, _palette.PrimaryColor, 0.10F),
-            BackColor = _palette.CardColor,
-            UseGradient = true,
-            GradientColor = UiDesign.Blend(_palette.CardColor, _palette.PrimaryColor, 0.022F),
-            AccentColor = GetAccountStateColor(account),
-            AccentWidth = IsCurrentAccount(account) ? 4 : 2,
-            ShadowColor = Color.FromArgb(20, _palette.ShadowColor),
-            Margin = new Padding(0, 0, 0, 12),
-            Cursor = Cursors.Hand
-        };
-        row.Click += (_, _) => SelectAccount(account.Name);
-
-        const int actionWidth = 122;
-        const int badgeWidth = 124;
-        const int actionGap = 12;
-        const int rightMargin = 20;
-        var checkLeft = width - rightMargin - actionWidth;
-        var badgeLeft = checkLeft - actionGap - badgeWidth;
-        var identityWidth = Math.Max(180, badgeLeft - 36);
-
-        var name = new Label
-        {
-            Text = account.Name,
-            Left = 18,
-            Top = 14,
-            Width = identityWidth,
-            Height = 34,
-            Font = new Font(Font.FontFamily, 10F, FontStyle.Bold),
-            AutoEllipsis = true,
-            TextAlign = ContentAlignment.MiddleLeft,
-            UseCompatibleTextRendering = true,
-            UseMnemonic = false,
-            Cursor = Cursors.Hand
-        };
-        ThemeStyler.ApplyLabel(name, _palette);
-        _toolTip.SetToolTip(name, account.Name);
-        name.Click += (_, _) => SelectAccount(account.Name);
-        row.Controls.Add(name);
-
-        var kind = new Label
-        {
-            Text = account.AuthKindLabel,
-            Left = 18,
-            Top = 54,
-            Width = identityWidth,
-            Height = 28,
-            Font = new Font(Font.FontFamily, 8.7F, FontStyle.Bold),
-            AutoEllipsis = true,
-            TextAlign = ContentAlignment.MiddleLeft,
-            UseCompatibleTextRendering = true,
-            UseMnemonic = false,
-            Cursor = Cursors.Hand
-        };
-        ThemeStyler.ApplyLabel(kind, _palette, true);
-        kind.Click += (_, _) => SelectAccount(account.Name);
-        row.Controls.Add(kind);
-
-        var badge = MakeBadge(
-            $"{(status == null ? "○" : "●")}  {GetStatusBadgeText(status)}",
-            badgeLeft,
-            36,
-            GetStatusBackColor(status),
-            GetStatusForeColor(status));
-        badge.Width = badgeWidth;
-        badge.Height = 32;
-        badge.UseMnemonic = false;
-        _toolTip.SetToolTip(
-            badge,
-            status == null ? "尚未检查登录状态" : status.Text);
-        row.Controls.Add(badge);
-
-        var check = MakeStatusCheckButton(checkLeft, 30, actionWidth);
-        check.Click += async (_, _) => await CheckStatusAsync(account);
-        row.Controls.Add(check);
-
-        return row;
     }
 
     private Control CreateStatusTokenRow(AccountRecord account, int width)
@@ -9659,7 +9485,7 @@ public partial class Form1 : Form
             Text = accountDisplayName,
             Name = "AccountDisplayName",
             Bounds = geometry.Primary,
-            Font = new Font(Font.FontFamily, 10F, FontStyle.Bold),
+            Font = UiFontCache.Get(Font.FontFamily, 10F, FontStyle.Bold),
             AutoEllipsis = true,
             AutoSize = false,
             Visible = true,
@@ -9682,7 +9508,7 @@ public partial class Form1 : Form
             Text = $"{account.AuthKindLabel}  ·  {stateText}  ·  {detailText}",
             Name = "AccountCredentialSummary",
             Bounds = geometry.Secondary,
-            Font = new Font(Font.FontFamily, 8.5F),
+            Font = UiFontCache.Get(Font.FontFamily, 8.5F),
             AutoEllipsis = true,
             AutoSize = false,
             Visible = true,
@@ -9751,6 +9577,7 @@ public partial class Form1 : Form
         primary.BringToFront();
         secondary.BringToFront();
         accountStateBadge.BringToFront();
+        AttachRowHoverHighlight(row, GetAccountStateColor(account));
 
         return row;
     }
@@ -9921,107 +9748,6 @@ public partial class Form1 : Form
             new Rectangle(actionLeft + actionWidth + gap, 60, actionWidth, 38));
     }
 
-    private Control CreateTokenRow(AccountRecord account, int width)
-    {
-        var authReady = HasUsableAccountCredential(account);
-        var stateText = GetCredentialStateText(account, authReady);
-        var detailText = GetCredentialModelText(account);
-        var detailTip = account.IsOfficialOAuth
-            ? $"账号目录：{account.CodexHome}；由官方 Codex 自动续期 ChatGPT 登录"
-            : account.IsCompatibleApi
-            ? $"API 地址：{account.ApiBaseUrl}；模型：{account.ApiModel} / xhigh"
-            : $"账号目录：{account.CodexHome}；模型：{ModelCatalogService.DefaultModel} / {ModelCatalogService.DefaultReasoningEffort}";
-
-        var geometry = CalculateTokenRowGeometry(width);
-        var row = new RoundedPanel
-        {
-            Width = width,
-            Height = geometry.Height,
-            Radius = 14,
-            BorderColor = _palette.BorderColor,
-            BackColor = _palette.CardColor,
-            AccentColor = GetAccountStateColor(account),
-            AccentWidth = IsCurrentAccount(account) ? 4 : 2,
-            ShadowColor = Color.FromArgb(24, _palette.ShadowColor),
-            Margin = new Padding(0, 0, 0, 12),
-            Cursor = Cursors.Hand
-        };
-        row.Click += (_, _) => SelectAccount(account.Name);
-
-        var name = new Label
-        {
-            Text = account.Name,
-            Bounds = geometry.Name,
-            Font = new Font(Font.FontFamily, 10F, FontStyle.Bold),
-            AutoEllipsis = true,
-            Cursor = Cursors.Hand
-        };
-        ThemeStyler.ApplyLabel(name, _palette);
-        _toolTip.SetToolTip(name, account.Name);
-        name.Click += (_, _) => SelectAccount(account.Name);
-        row.Controls.Add(name);
-
-        var authKind = new Label
-        {
-            Text = account.AuthKindLabel,
-            Bounds = geometry.AuthKind,
-            Font = new Font(Font.FontFamily, 8.7F, FontStyle.Bold),
-            AutoEllipsis = true,
-            TextAlign = ContentAlignment.MiddleLeft,
-            UseCompatibleTextRendering = true,
-            UseMnemonic = false,
-            Cursor = Cursors.Hand
-        };
-        ThemeStyler.ApplyLabel(authKind, _palette, true);
-        authKind.Click += (_, _) => SelectAccount(account.Name);
-        row.Controls.Add(authKind);
-
-        var state = new Label
-        {
-            Text = stateText,
-            Bounds = geometry.State,
-            Font = new Font(Font.FontFamily, 9.2F, FontStyle.Bold),
-            AutoEllipsis = true,
-            Cursor = Cursors.Hand
-        };
-        ThemeStyler.ApplyLabel(state, _palette);
-        state.Click += (_, _) => SelectAccount(account.Name);
-        row.Controls.Add(state);
-
-        var detail = new Label
-        {
-            Text = detailText,
-            Bounds = geometry.Detail,
-            Font = new Font(Font.FontFamily, 8.5F),
-            AutoEllipsis = true,
-            TextAlign = ContentAlignment.MiddleLeft,
-            UseCompatibleTextRendering = true,
-            UseMnemonic = false,
-            Cursor = Cursors.Hand
-        };
-        ThemeStyler.ApplyLabel(detail, _palette, true);
-        _toolTip.SetToolTip(detail, detailTip);
-        detail.Click += (_, _) => SelectAccount(account.Name);
-        row.Controls.Add(detail);
-
-        var kind = MakeBadge(GetCredentialBadgeText(account), geometry.Badge.Left, geometry.Badge.Top,
-            authReady || account.IsAccessToken ? Color.FromArgb(48, _palette.SuccessColor) : Color.FromArgb(40, _palette.WarningColor),
-            authReady || account.IsAccessToken ? _palette.SuccessColor : _palette.WarningColor);
-        kind.Size = geometry.Badge.Size;
-        row.Controls.Add(kind);
-
-        var update = MakeTokenUpdateButton(
-            GetCredentialActionText(account),
-            geometry.Update.Left,
-            geometry.Update.Top,
-            geometry.Update.Width);
-        update.Height = geometry.Update.Height;
-        update.Click += async (_, _) => await UpdateTokenAsync(account);
-        row.Controls.Add(update);
-
-        return row;
-    }
-
     private static TokenRowGeometry CalculateTokenRowGeometry(int width)
     {
         const int side = 18;
@@ -10058,48 +9784,6 @@ public partial class Form1 : Form
             new Rectangle(middleLeft, 58, middleWidth, 40),
             new Rectangle(badgeLeftWide, 41, badgeWidth, 30),
             new Rectangle(actionLeft, 35, updateWidth, 42));
-    }
-
-    private Control CreateUsageUnassignedNotice(int width, UsageReport report)
-    {
-        var panel = new RoundedPanel
-        {
-            Width = width,
-            Height = 72,
-            Radius = 14,
-            BorderColor = _palette.WarningColor,
-            BackColor = _palette.SurfaceColor,
-            Margin = new Padding(0, 0, 0, 12)
-        };
-
-        var title = new Label
-        {
-            Text = "未归属用量",
-            Left = 18,
-            Top = 12,
-            Width = width - 36,
-            Height = 28,
-            Font = new Font(Font.FontFamily, 9.2F, FontStyle.Bold),
-            AutoEllipsis = true
-        };
-        ThemeStyler.ApplyLabel(title, _palette);
-        panel.Controls.Add(title);
-
-        var text = new Label
-        {
-            Text = $"今日 {FormatTokens(report.UnassignedToday.TotalTokens)} · 7天 {FormatTokens(report.UnassignedWeek.TotalTokens)} · 30天 {FormatTokens(report.UnassignedMonth.TotalTokens)}",
-            Left = 18,
-            Top = 40,
-            Width = width - 36,
-            Height = 24,
-            Font = new Font(Font.FontFamily, 8.5F),
-            AutoEllipsis = true
-        };
-        ThemeStyler.ApplyLabel(text, _palette, true);
-        _toolTip.SetToolTip(text, "之后产生的本地用量会按当前账号自动归属。");
-        panel.Controls.Add(text);
-
-        return panel;
     }
 
     private void ApplyLiveRateLimitSnapshots(UsageReport report)
@@ -11031,9 +10715,6 @@ public partial class Form1 : Form
             GetPassiveQuotaPresentationToolTip(monitoring, latestOfficialRemainingPercent));
     }
 
-    private static string FormatRemainingValue(double? remainingPercent) =>
-        remainingPercent.HasValue ? $"{remainingPercent.Value:0.#}%" : "待查询";
-
     private static string FormatQuotaRemaining(
         AccountQuotaWindowSnapshot? window,
         string windowLabel)
@@ -11575,6 +11256,7 @@ public partial class Form1 : Form
             TestAction = testAction
         };
 
+        AttachRowHoverHighlight(row, GetAccountStateColor(account));
         return row;
     }
 
@@ -13262,68 +12944,6 @@ public partial class Form1 : Form
         return string.Join("  ·  ", parts);
     }
 
-    private Control MakeQuotaSummaryTile(string caption, string value, string secondaryText, int left, int top, int width)
-    {
-        var panel = new RoundedPanel
-        {
-            Left = left,
-            Top = top,
-            Width = width,
-            Height = 98,
-            Radius = 10,
-            BackColor = _palette.SurfaceAltColor,
-            BorderColor = _palette.BorderColor,
-            UseGradient = true,
-            GradientColor = UiDesign.Blend(_palette.SurfaceAltColor, _palette.PrimaryColor, 0.04F)
-        };
-
-        var captionLabel = new Label
-        {
-            Text = caption,
-            Left = 14,
-            Top = 10,
-            Width = width - 28,
-            Height = 28,
-            Font = new Font(Font.FontFamily, 9F),
-            AutoEllipsis = true
-        };
-        ThemeStyler.ApplyLabel(captionLabel, _palette, true);
-        panel.Controls.Add(captionLabel);
-
-        var valueLabel = new Label
-        {
-            Text = value,
-            Left = 14,
-            Top = 40,
-            Width = width - 28,
-            Height = 34,
-            Font = new Font(Font.FontFamily, 12F, FontStyle.Bold),
-            AutoEllipsis = true
-        };
-        ThemeStyler.ApplyLabel(valueLabel, _palette);
-        panel.Controls.Add(valueLabel);
-
-        var secondary = new Label
-        {
-            Text = secondaryText,
-            Left = 14,
-            Top = 72,
-            Width = width - 28,
-            Height = 22,
-            Font = new Font(Font.FontFamily, 7.4F),
-            AutoEllipsis = true
-        };
-        ThemeStyler.ApplyLabel(secondary, _palette, true);
-        panel.Controls.Add(secondary);
-        panel.Tag = new UsageMetricBinding
-        {
-            Cost = valueLabel,
-            Tokens = secondary
-        };
-
-        return panel;
-    }
-
     private Control MakeQuotaUsageTable(int left, int top, int width, AccountUsageSummary usage, UsagePriceProfile priceProfile)
     {
         var rowHeight = 56;
@@ -13709,78 +13329,6 @@ public partial class Form1 : Form
             Cost = total,
             Tokens = token
         };
-
-        return panel;
-    }
-
-    private Control MakeQuotaDetailMetric(string caption, UsageBucket usage, int left, int top, int width)
-    {
-        var panel = new RoundedPanel
-        {
-            Left = left,
-            Top = top,
-            Width = width,
-            Height = 134,
-            Radius = 10,
-            BackColor = _palette.SurfaceAltColor,
-            BorderColor = _palette.BorderColor,
-            UseGradient = true,
-            GradientColor = UiDesign.Blend(_palette.SurfaceAltColor, _palette.AccentColor, 0.032F)
-        };
-
-        var title = new Label
-        {
-            Text = caption,
-            Left = 14,
-            Top = 12,
-            Width = width - 28,
-            Height = 26,
-            Font = new Font(Font.FontFamily, 9.2F, FontStyle.Bold),
-            AutoEllipsis = true
-        };
-        ThemeStyler.ApplyLabel(title, _palette, true);
-        panel.Controls.Add(title);
-
-        var total = new Label
-        {
-            Text = $"总 token：{FormatTokens(usage.TotalTokens)}",
-            Left = 14,
-            Top = 42,
-            Width = width - 28,
-            Height = 28,
-            Font = new Font(Font.FontFamily, 9.8F, FontStyle.Bold),
-            AutoEllipsis = true
-        };
-        ThemeStyler.ApplyLabel(total, _palette);
-        panel.Controls.Add(total);
-
-        var input = new Label
-        {
-            Text = usage.CacheWriteTokens > 0L
-                ? $"输入：{FormatTokens(usage.InputTokens)} · 写入：{FormatTokens(usage.CacheWriteTokens)}"
-                : $"输入：{FormatTokens(usage.InputTokens)}",
-            Left = 14,
-            Top = 76,
-            Width = width - 28,
-            Height = 24,
-            Font = new Font(Font.FontFamily, 8.6F),
-            AutoEllipsis = true
-        };
-        ThemeStyler.ApplyLabel(input, _palette, true);
-        panel.Controls.Add(input);
-
-        var output = new Label
-        {
-            Text = $"输出：{FormatTokens(usage.OutputTokens)}",
-            Left = 14,
-            Top = 102,
-            Width = width - 28,
-            Height = 24,
-            Font = new Font(Font.FontFamily, 8.6F),
-            AutoEllipsis = true
-        };
-        ThemeStyler.ApplyLabel(output, _palette, true);
-        panel.Controls.Add(output);
 
         return panel;
     }
@@ -15400,46 +14948,6 @@ public partial class Form1 : Form
         };
     }
 
-    private Button MakePrimaryButton(string text, int left, int top, int width)
-    {
-        var button = new ModernButton
-        {
-            Text = text,
-            Left = left,
-            Top = top,
-            Width = width,
-            Height = 46,
-            Margin = new Padding(0, 6, 12, 10),
-            Tag = "primary",
-            Radius = 12,
-            Padding = new Padding(12, 0, 12, 0),
-            Font = new Font(Font.FontFamily, 9.1F, FontStyle.Bold),
-            MinimumFontSize = 8F
-        };
-        ThemeStyler.ApplyPrimaryButton(button, _palette);
-        return button;
-    }
-
-    private Button MakeSoftButton(string text, int left, int top, int width)
-    {
-        var button = new ModernButton
-        {
-            Text = text,
-            Left = left,
-            Top = top,
-            Width = width,
-            Height = 46,
-            Margin = new Padding(0, 6, 12, 10),
-            Tag = "soft",
-            Radius = 12,
-            Padding = new Padding(12, 0, 12, 0),
-            Font = new Font(Font.FontFamily, 9F),
-            MinimumFontSize = 8F
-        };
-        ThemeStyler.ApplySoftButton(button, _palette);
-        return button;
-    }
-
     private Button MakeActionButton(string text, int left, int top, int width, bool primary)
     {
         var button = new ModernButton
@@ -15452,7 +14960,7 @@ public partial class Form1 : Form
             Tag = primary ? "primary" : "soft",
             Radius = 12,
             Padding = new Padding(12, 0, 12, 0),
-            Font = new Font(
+            Font = UiFontCache.Get(
                 Font.FontFamily,
                 primary ? 9F : 8.9F,
                 primary ? FontStyle.Bold : FontStyle.Regular),
@@ -15467,6 +14975,66 @@ public partial class Form1 : Form
             ThemeStyler.ApplySoftButton(button, _palette);
         }
         return button;
+    }
+
+    private void ApplyDangerActionButtonStyle(Button button)
+    {
+        var dark = ThemeStyler.IsDark(_palette);
+        var danger = _palette.DangerColor;
+        var baseColor = UiDesign.Blend(_palette.CardColor, danger, dark ? 0.14F : 0.045F);
+        var hoverColor = UiDesign.Blend(_palette.CardColor, danger, dark ? 0.24F : 0.11F);
+        var pressedColor = UiDesign.Blend(hoverColor, danger, dark ? 0.18F : 0.14F);
+        var borderColor = UiDesign.Blend(_palette.BorderColor, danger, dark ? 0.48F : 0.36F);
+        var textColor = dark ? UiDesign.Blend(danger, Color.White, 0.28F) : danger;
+
+        button.FlatStyle = FlatStyle.Flat;
+        button.FlatAppearance.BorderSize = 1;
+        button.FlatAppearance.BorderColor = borderColor;
+        button.FlatAppearance.MouseOverBackColor = hoverColor;
+        button.FlatAppearance.MouseDownBackColor = pressedColor;
+        button.BackColor = baseColor;
+        button.ForeColor = textColor;
+        button.Cursor = Cursors.Hand;
+        button.UseMnemonic = false;
+
+        if (button is ModernButton modern)
+        {
+            modern.BaseBackColor = baseColor;
+            modern.HoverBackColor = hoverColor;
+            modern.PressedBackColor = pressedColor;
+            modern.BorderColor = borderColor;
+            modern.GradientBackColor = Color.Transparent;
+            modern.ShadowColor = Color.Transparent;
+            modern.TextColor = textColor;
+            modern.UseSurfaceSheen = false;
+            modern.ShowAccent = false;
+            modern.DisabledBackColor = UiDesign.Blend(_palette.DisabledColor, _palette.CardColor, 0.32F);
+            modern.DisabledTextColor = UiDesign.Blend(_palette.MutedTextColor, _palette.CardColor, 0.34F);
+            modern.FocusColor = Color.FromArgb(180, danger);
+            modern.Invalidate();
+        }
+    }
+
+    private void ApplyPatAutoRotationThresholdBadgeStyle()
+    {
+        if (_patAutoRotationThresholdBadge.IsDisposed)
+        {
+            return;
+        }
+
+        var dark = ThemeStyler.IsDark(_palette);
+        var accent = _palette.AccentColor;
+        _patAutoRotationThresholdBadge.FillColor = dark
+            ? UiDesign.Blend(_palette.CardColor, accent, 0.18F)
+            : UiDesign.Blend(_palette.SurfaceAltColor, accent, 0.10F);
+        _patAutoRotationThresholdBadge.StrokeColor = Color.FromArgb(dark ? 132 : 84, accent);
+        _patAutoRotationThresholdBadge.DotColor = dark
+            ? UiDesign.Blend(accent, Color.White, 0.25F)
+            : accent;
+        _patAutoRotationThresholdBadge.ForeColor = dark
+            ? UiDesign.Blend(accent, Color.White, 0.36F)
+            : _palette.PrimaryColor;
+        _patAutoRotationThresholdBadge.Invalidate();
     }
 
     private Button MakeLaunchActionButton(
@@ -15485,7 +15053,7 @@ public partial class Form1 : Form
             Tag = "launch-primary",
             Radius = 14,
             Padding = new Padding(16, 0, 16, 0),
-            Font = new Font(Font.FontFamily, 9.1F, FontStyle.Bold),
+            Font = UiFontCache.Get(Font.FontFamily, 9.1F, FontStyle.Bold),
             MinimumFontSize = 8F,
             IconText = string.Empty,
             IconWidth = 0,
@@ -15553,7 +15121,7 @@ public partial class Form1 : Form
             Tag = "launch-tonal",
             Radius = 13,
             Padding = new Padding(10, 0, 10, 0),
-            Font = new Font(Font.FontFamily, 8.9F, FontStyle.Bold),
+            Font = UiFontCache.Get(Font.FontFamily, 8.9F, FontStyle.Bold),
             MinimumFontSize = 8F,
             AutoShrinkText = false,
             UseMnemonic = false
@@ -15610,7 +15178,7 @@ public partial class Form1 : Form
             Tag = "token-update",
             Radius = 14,
             Padding = new Padding(12, 0, 12, 0),
-            Font = new Font(Font.FontFamily, 9F, FontStyle.Bold),
+            Font = UiFontCache.Get(Font.FontFamily, 9F, FontStyle.Bold),
             MinimumFontSize = 8F,
             // Preserve the complete label if a user's fallback font is wider than the
             // measured Windows UI font. The wider layout above normally needs no shrink.
@@ -15945,7 +15513,7 @@ public partial class Form1 : Form
         while (true)
         {
             var result = dialog.ShowDialog(this);
-            if (result == DialogResult.Retry) { ImportAccountFiles(); return; }
+            if (result == DialogResult.Retry) { _ = ImportAccountFilesAsync(); return; }
             if (result != DialogResult.OK) return;
             var account = CreateAccountFromDialog(dialog);
             try
@@ -16143,7 +15711,6 @@ public partial class Form1 : Form
 
         try
         {
-            _codex.DeleteSharedCredentialIfSelected(account);
             _store.DeleteAccount(account);
         }
         catch (Exception ex)
@@ -16151,6 +15718,46 @@ public partial class Form1 : Form
             ShowError($"无法永久删除账号：{ex.Message}");
             return;
         }
+
+        try
+        {
+            _codex.DeleteSharedCredentialIfSelected(account);
+        }
+        catch (Exception ex)
+        {
+            ShowError($"账号已从列表移除，但清理共享凭据失败：{ex.Message}");
+        }
+
+        var deletedAccountKey = QuotaAccountIdentity.CreateKey(account);
+        try
+        {
+            new ProxyNodeStore(_store.RootPath).RemoveBinding(AccountProxyResolver.AccountKeyFor(account));
+        }
+        catch
+        {
+            // Deleting an optional proxy binding must not fail a completed account deletion.
+        }
+
+        var clearGatewayRoute = false;
+        try
+        {
+            var rotationStore = new PatGatewayRotationStore(_store.RootPath);
+            var route = rotationStore.Load();
+            if (route.Status != PatGatewayRotationStatus.None &&
+                (string.Equals(route.TransportAccountKey, deletedAccountKey, StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(route.SourceAccountKey, deletedAccountKey, StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(route.TargetAccountKey, deletedAccountKey, StringComparison.OrdinalIgnoreCase)))
+            {
+                rotationStore.Clear();
+                clearGatewayRoute = true;
+                CancelPendingPatAutoRotation(resetState: true);
+            }
+        }
+        catch
+        {
+            // Clearing an optional gateway rotation route is best-effort.
+        }
+        _ = CleanupDeletedAccountGatewayStateAsync(deletedAccountKey, clearGatewayRoute);
 
         TryRemoveChatGptFeatureBindings(account, out var postOperationSettingsError);
         try
@@ -16187,6 +15794,35 @@ public partial class Form1 : Form
             ShowCompletedAccountOperationSettingsWarning(
                 $"账号 {account.Name} 已永久删除",
                 postOperationSettingsError);
+        }
+    }
+
+    private static async Task CleanupDeletedAccountGatewayStateAsync(
+        string deletedAccountKey,
+        bool clearGatewayRoute)
+    {
+        try
+        {
+            if (clearGatewayRoute)
+            {
+                await LocalPatGateway.ClearRotationAsync();
+            }
+        }
+        catch
+        {
+            // Best-effort cleanup of deleted account route in live gateway.
+        }
+
+        try
+        {
+            if (PatGatewayRotationStore.TryNormalizeAccountKey(deletedAccountKey, out var normalizedKey))
+            {
+                await LocalPatGateway.InvalidateOrdinarySessionAffinityAsync(normalizedKey);
+            }
+        }
+        catch
+        {
+            // Best-effort cleanup of deleted account session affinity.
         }
     }
 
@@ -18614,9 +18250,11 @@ public partial class Form1 : Form
         CancellationToken cancellationToken = default)
     {
         var requestLock = GetOfficialQuotaRequestLock(account);
-        await requestLock.WaitAsync(cancellationToken);
+        var lockAcquired = false;
         try
         {
+            await requestLock.WaitAsync(cancellationToken);
+            lockAcquired = true;
             await using var session = await _codex.OpenUsageLimitResetSessionAsync(
                 account,
                 fastFail,
@@ -18635,9 +18273,22 @@ public partial class Form1 : Form
             var retry = await session.ReadAsync(cancellationToken);
             return MergeUsageLimitResetReads(first, retry);
         }
+        catch (ObjectDisposedException) when (_formClosed || IsDisposed)
+        {
+            throw new OperationCanceledException(cancellationToken);
+        }
         finally
         {
-            requestLock.Release();
+            if (lockAcquired)
+            {
+                try
+                {
+                    requestLock.Release();
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+            }
         }
     }
 
@@ -18903,7 +18554,10 @@ public partial class Form1 : Form
                     }
                     catch (Exception ex)
                     {
-                        var detail = ex.Message.Replace('\r', ' ').Replace('\n', ' ').Trim();
+                        var detail = CodexCliService.MaskSensitiveText(ex.Message)
+                            .Replace('\r', ' ')
+                            .Replace('\n', ' ')
+                            .Trim();
                         if (detail.Length > 180)
                         {
                             detail = detail[..180] + "…";
@@ -18931,8 +18585,11 @@ public partial class Form1 : Form
         {
             _bulkQuotaTestInProgress = false;
             _bulkQuotaTestCompleted = Math.Min(_bulkQuotaTestCompleted, _bulkQuotaTestTotal);
-            SetButtonsEnabled(true);
-            UpdateWorkspaceChrome();
+            if (!_formClosed && !IsDisposed)
+            {
+                SetButtonsEnabled(true);
+                UpdateWorkspaceChrome();
+            }
         }
 
         if (_formClosed || IsDisposed)
@@ -19501,6 +19158,11 @@ public partial class Form1 : Form
 
     private async Task RunBusyAsync(Func<Task> action, bool showErrors = true)
     {
+        if (_formClosed || IsDisposed)
+        {
+            return;
+        }
+
         try
         {
             Cursor = Cursors.WaitCursor;
@@ -19509,19 +19171,33 @@ public partial class Form1 : Form
         }
         catch (Exception ex)
         {
+            if (_formClosed || IsDisposed)
+            {
+                return;
+            }
+
+            var safeMessage = CodexCliService.MaskSensitiveText(ex.Message);
             if (showErrors)
             {
-                ShowError(ex.Message);
+                ShowError(safeMessage);
             }
-            else
+            else if (!_statusBox.IsDisposed)
             {
-                _statusBox.Text = ex.Message;
+                _statusBox.Text = safeMessage;
             }
         }
         finally
         {
-            SetButtonsEnabled(true);
-            Cursor = Cursors.Default;
+            if (!_formClosed && !IsDisposed)
+            {
+                SetButtonsEnabled(true);
+                Cursor = Cursors.Default;
+            }
+            else
+            {
+                _buttonDisableDepth = 0;
+                _buttonStatesBeforeBusy.Clear();
+            }
         }
     }
 
@@ -19530,6 +19206,13 @@ public partial class Form1 : Form
 
     private void SetButtonsEnabled(bool enabled)
     {
+        if (_formClosed || IsDisposed)
+        {
+            _buttonDisableDepth = 0;
+            _buttonStatesBeforeBusy.Clear();
+            return;
+        }
+
         if (!enabled)
         {
             if (_buttonDisableDepth++ > 0) return;
@@ -19543,7 +19226,17 @@ public partial class Form1 : Form
             foreach (Control control in Controls)
                 SetButtonsEnabledRecursive(control, enabled);
         }
-        if (enabled) _buttonStatesBeforeBusy.Clear();
+        if (enabled)
+        {
+            _buttonStatesBeforeBusy.Clear();
+        }
+        else if (_buttonStatesBeforeBusy.Count > 0)
+        {
+            foreach (var disposed in _buttonStatesBeforeBusy.Keys.Where(button => button.IsDisposed).ToArray())
+            {
+                _buttonStatesBeforeBusy.Remove(disposed);
+            }
+        }
         if (!_formClosed && !_cardsPanel.IsDisposed)
             _cardsPanel.InvalidateVisibleViewport(flush: true);
     }
@@ -19728,6 +19421,11 @@ public partial class Form1 : Form
 
     private void SaveProjectPath(string projectPath)
     {
+        if (_appSettings.LoadFailed || _themeService.SettingsLoadFailed)
+        {
+            return;
+        }
+
         if (string.Equals(_appSettings.ProjectPath, projectPath, StringComparison.OrdinalIgnoreCase))
         {
             return;
@@ -19853,7 +19551,6 @@ public partial class Form1 : Form
 
     private async Task UpgradePatGatewayAtSafeBoundaryAsync()
     {
-        var pendingSinceUtc = DateTimeOffset.UtcNow;
         var consecutiveSafeChecks = 0;
         while (!_formClosed && !IsDisposed)
         {
@@ -19866,11 +19563,6 @@ public partial class Form1 : Form
             }
 
             var activity = await LocalPatGateway.ReadOwnedActivitySnapshotAsync();
-            var taskBoundary = await Task.Run(
-                () => _codexTaskBoundaryMonitor.Inspect(pendingSinceUtc));
-            // A Codex session can keep its task_started marker while it is doing local
-            // work, waiting for user input, or holding an unrelated tool turn. That marker
-            // is not an active model request and must not pin an old listener forever.
             // The gateway activity counter plus its quiet period are the authoritative
             // boundary for a listener-only hand-off; Codex itself is never stopped.
             var safe = activity != null &&
@@ -19879,11 +19571,9 @@ public partial class Form1 : Form
             if (consecutiveSafeChecks >=
                 PatAutoRotationPolicy.RequiredConsecutiveSafeBoundaryChecks)
             {
-                // Close only the owned gateway, never ChatGPT.exe. Re-read both oracles
-                // immediately before the short listener hand-off so a new request cancels it.
+                // Close only the owned gateway, never ChatGPT.exe. Re-read the activity
+                // oracle immediately before the short listener hand-off so a new request cancels it.
                 activity = await LocalPatGateway.ReadOwnedActivitySnapshotAsync();
-                taskBoundary = await Task.Run(
-                    () => _codexTaskBoundaryMonitor.Inspect(pendingSinceUtc));
                 if (activity != null &&
                     PatAutoRotationPolicy.IsGatewayQuiet(activity, DateTimeOffset.UtcNow) &&
                     await LocalPatGateway.RequiresRotationProtocolUpgradeAsync())
@@ -20278,31 +19968,51 @@ public partial class Form1 : Form
 
     private async Task TogglePatAutoRotationAsync()
     {
-        AccountRotationConfiguration.SetEnabled(
-            _appSettings,
-            !AccountRotationConfiguration.IsEnabled(_appSettings));
-        _themeService.SaveSettings(_appSettings);
-        if (!AccountRotationConfiguration.IsEnabled(_appSettings))
+        var previousEnabled = AccountRotationConfiguration.IsEnabled(_appSettings);
+        var nextEnabled = !previousEnabled;
+        try
         {
-            CancelPendingPatAutoRotation(resetState: true);
-            await CancelArmedPatGatewayRotationAsync();
-            _statusBox.Text = "已关闭账号轮换；额度监控仍会继续显示，但不会自动切换账号。";
+            AccountRotationConfiguration.SetEnabled(_appSettings, nextEnabled);
+            _themeService.SaveSettings(_appSettings);
+            if (!nextEnabled)
+            {
+                CancelPendingPatAutoRotation(resetState: true);
+                await CancelArmedPatGatewayRotationAsync();
+                if (!_formClosed && !IsDisposed && !_statusBox.IsDisposed)
+                {
+                    _statusBox.Text = "已关闭账号轮换；额度监控仍会继续显示，但不会自动切换账号。";
+                }
+            }
+            else if (!_formClosed && !IsDisposed && !_statusBox.IsDisposed)
+            {
+                _statusBox.Text =
+                    "已开启账号轮换；5h 剩余 ≤10%、仅周额度剩余 ≤3% 时暂停并换号，" +
+                    "当前响应继续运行，下一次模型请求按轮换池顺序切换。";
+            }
         }
-        else
+        catch (Exception ex)
         {
-            _statusBox.Text =
-                "已开启账号轮换；5h 剩余 ≤10%、仅周额度剩余 ≤3% 时暂停并换号，" +
-                "当前响应继续运行，下一次模型请求按轮换池顺序切换。";
+            AccountRotationConfiguration.SetEnabled(_appSettings, previousEnabled);
+            if (!_formClosed && !IsDisposed)
+            {
+                ShowError($"切换账号轮换失败：{CodexCliService.MaskSensitiveText(ex.Message)}");
+            }
         }
-        UpdatePatAutoRotationControls();
+        finally
+        {
+            if (!_formClosed && !IsDisposed)
+            {
+                UpdatePatAutoRotationControls();
+            }
+        }
     }
 
     private void UpdatePatAutoRotationControls()
     {
-        if (!_patAutoRotationThresholdButton.IsDisposed)
+        if (!_patAutoRotationThresholdBadge.IsDisposed)
         {
-            _patAutoRotationThresholdButton.Text = "保留 10% / 3%";
-            _patAutoRotationThresholdButton.Enabled = false;
+            _patAutoRotationThresholdBadge.Text = "保留 10% / 3%";
+            ApplyPatAutoRotationThresholdBadgeStyle();
         }
         if (!_patAutoRotationToggleButton.IsDisposed)
         {
@@ -20684,16 +20394,6 @@ public partial class Form1 : Form
         return status.ExitCode == 0 ? _palette.SuccessColor : _palette.WarningColor;
     }
 
-    private static string Ellipsize(string value, int length)
-    {
-        if (value.Length <= length)
-        {
-            return value;
-        }
-
-        return value[..Math.Max(0, length - 3)] + "...";
-    }
-
     private enum ResetCreditStatus
     {
         NotQueried,
@@ -20816,19 +20516,20 @@ internal sealed class CircleIconButton : Button
         base.OnEnabledChanged(e);
     }
 
-    protected override void OnResize(EventArgs e)
+    protected override void OnPaintBackground(PaintEventArgs pevent)
     {
-        base.OnResize(e);
-        Region?.Dispose();
-        using var path = new GraphicsPath();
-        path.AddEllipse(0, 0, Width - 1, Height - 1);
-        Region = new Region(path);
+        // AllPaintingInWmPaint + UserPaint: OnPaint paints the backdrop and anti-aliased circle.
     }
 
     protected override void OnPaint(PaintEventArgs e)
     {
+        if (Width <= 3 || Height <= 3)
+        {
+            return;
+        }
+
+        UiDesign.PaintParentBackdrop(e.Graphics, this);
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        e.Graphics.Clear(Parent?.BackColor ?? SystemColors.Control);
 
         var backColor = _pressed ? PressedBackColor : _hovered ? HoverBackColor : BaseBackColor;
         var rect = new RectangleF(1.5F, 1.5F, Width - 3F, Height - 3F);
@@ -20870,6 +20571,7 @@ internal sealed class RoundedPanel : Panel
     private const int CurvedMeteorTrailSegmentCount = 7;
     private int _radius = 12;
     private bool _showStarfield;
+    private bool _isHovered;
     private Color _decorationColor = Color.Transparent;
     private System.Windows.Forms.Timer? _starfieldAnimationTimer;
     private Form? _starfieldAnimationHost;
@@ -20886,13 +20588,42 @@ internal sealed class RoundedPanel : Panel
         set
         {
             _radius = Math.Max(0, value);
-            UpdateRoundedRegion();
             Invalidate();
         }
     }
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public Color BorderColor { get; set; } = Color.FromArgb(220, 230, 240);
+
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public bool EnableHoverHighlight { get; set; }
+
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public Color HoverBackColor { get; set; } = Color.Transparent;
+
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public Color HoverBorderColor { get; set; } = Color.Transparent;
+
+    internal Color EffectiveBackColor =>
+        EnableHoverHighlight && _isHovered && HoverBackColor.A > 0
+            ? HoverBackColor
+            : BackColor;
+
+    internal Color EffectiveGradientColor =>
+        EnableHoverHighlight && _isHovered && HoverBackColor.A > 0 && GradientColor.A > 0
+            ? UiDesign.Blend(GradientColor, HoverBackColor, 0.55F)
+            : GradientColor;
+
+    internal void SetHovered(bool hovered)
+    {
+        if (!EnableHoverHighlight || _isHovered == hovered)
+        {
+            return;
+        }
+
+        _isHovered = hovered;
+        Invalidate(invalidateChildren: true);
+    }
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public Color GradientColor { get; set; } = Color.Transparent;
@@ -21007,8 +20738,26 @@ internal sealed class RoundedPanel : Panel
     protected override void OnResize(EventArgs eventargs)
     {
         base.OnResize(eventargs);
-        UpdateRoundedRegion();
         DisposeStarfieldStaticCache();
+        Invalidate();
+    }
+
+    protected override void OnScroll(ScrollEventArgs se)
+    {
+        base.OnScroll(se);
+        if (AutoScroll)
+        {
+            Invalidate();
+        }
+    }
+
+    protected override void OnMouseWheel(MouseEventArgs e)
+    {
+        base.OnMouseWheel(e);
+        if (AutoScroll)
+        {
+            Invalidate();
+        }
     }
 
     protected override void Dispose(bool disposing)
@@ -21206,18 +20955,6 @@ internal sealed class RoundedPanel : Panel
         _starfieldStaticCacheDecorationColor = Color.Empty;
     }
 
-    private void UpdateRoundedRegion()
-    {
-        Region?.Dispose();
-        if (Width <= 1 || Height <= 1)
-        {
-            return;
-        }
-
-        using var path = UiDesign.CreateRoundedPath(new RectangleF(0F, 0F, Width, Height), Radius);
-        Region = new Region(path);
-    }
-
     private RectangleF GetSurfaceBounds()
     {
         var shadowSpace = Math.Max(0, Elevation);
@@ -21230,10 +20967,20 @@ internal sealed class RoundedPanel : Panel
 
     protected override void OnPaintBackground(PaintEventArgs e)
     {
+        if (Width <= 1 || Height <= 1)
+        {
+            return;
+        }
+
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        e.Graphics.Clear(Parent?.BackColor ?? BackColor);
+        UiDesign.PaintParentBackdrop(e.Graphics, this);
 
         var surfaceBounds = GetSurfaceBounds();
+        if (surfaceBounds.Width <= 0F || surfaceBounds.Height <= 0F)
+        {
+            return;
+        }
+
         if (Elevation > 0 && ShadowColor.A > 0)
         {
             var shadowBounds = surfaceBounds;
@@ -21243,19 +20990,21 @@ internal sealed class RoundedPanel : Panel
             e.Graphics.FillPath(shadowBrush, shadowPath);
         }
 
+        var fillBack = EffectiveBackColor;
+        var fillGradient = EffectiveGradientColor;
         using var surfacePath = UiDesign.CreateRoundedPath(surfaceBounds, Radius);
-        if (UseGradient && GradientColor.A > 0)
+        if (UseGradient && fillGradient.A > 0)
         {
             using var gradient = new LinearGradientBrush(
                 surfaceBounds,
-                BackColor,
-                GradientColor,
+                fillBack,
+                fillGradient,
                 LinearGradientMode.Horizontal);
             e.Graphics.FillPath(gradient, surfacePath);
         }
         else
         {
-            using var brush = new SolidBrush(BackColor);
+            using var brush = new SolidBrush(fillBack);
             e.Graphics.FillPath(brush, surfacePath);
         }
 
@@ -21272,8 +21021,17 @@ internal sealed class RoundedPanel : Panel
     protected override void OnPaint(PaintEventArgs e)
     {
         base.OnPaint(e);
+        if (Width <= 1 || Height <= 1)
+        {
+            return;
+        }
+
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
         var surfaceBounds = GetSurfaceBounds();
+        if (surfaceBounds.Width <= 0F || surfaceBounds.Height <= 0F)
+        {
+            return;
+        }
 
         if (ShowTechDecoration && DecorationColor.A > 0)
         {
@@ -21282,21 +21040,28 @@ internal sealed class RoundedPanel : Panel
 
         if (AccentWidth > 0 && AccentColor.A > 0)
         {
-            var accentBounds = new RectangleF(
-                2F,
-                Math.Max(12F, Radius * 0.72F),
-                AccentWidth,
-                Math.Max(8F, surfaceBounds.Height - Math.Max(24F, Radius * 1.44F)));
-            using var accentBrush = new LinearGradientBrush(
-                accentBounds,
-                AccentColor,
-                UiDesign.Blend(AccentColor, Color.White, 0.26F),
-                LinearGradientMode.Vertical);
-            e.Graphics.FillRoundedRectangle(accentBrush, accentBounds, AccentWidth / 2F);
+            var accentHeight = Math.Max(8F, surfaceBounds.Height - Math.Max(24F, Radius * 1.44F));
+            if (accentHeight > 0F)
+            {
+                var accentBounds = new RectangleF(
+                    2F,
+                    Math.Max(12F, Radius * 0.72F),
+                    AccentWidth,
+                    accentHeight);
+                using var accentBrush = new LinearGradientBrush(
+                    accentBounds,
+                    AccentColor,
+                    UiDesign.Blend(AccentColor, Color.White, 0.26F),
+                    LinearGradientMode.Vertical);
+                e.Graphics.FillRoundedRectangle(accentBrush, accentBounds, AccentWidth / 2F);
+            }
         }
 
+        var borderColor = EnableHoverHighlight && _isHovered && HoverBorderColor.A > 0
+            ? HoverBorderColor
+            : BorderColor;
         using var path = UiDesign.CreateRoundedPath(surfaceBounds, Radius);
-        using var pen = new Pen(BorderColor, 1F);
+        using var pen = new Pen(borderColor, 1F);
         e.Graphics.DrawPath(pen, path);
     }
 

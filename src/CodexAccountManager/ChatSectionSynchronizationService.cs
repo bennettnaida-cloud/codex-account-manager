@@ -1147,11 +1147,40 @@ internal static class ChatSectionSynchronizationService
         }
     }
 
+    private const int MaxSidebarSyncBackups = 10;
+
     private static string CreateBackup(string path)
     {
         var backupPath = path + ".sidebar-sync-" + DateTime.UtcNow.ToString("yyyyMMddHHmmssfff") + ".bak";
         File.Copy(path, backupPath, overwrite: false);
+        PruneOldBackups(path, MaxSidebarSyncBackups);
         return backupPath;
+    }
+
+    private static void PruneOldBackups(string path, int keepNewest)
+    {
+        try
+        {
+            var directory = Path.GetDirectoryName(path);
+            if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory))
+            {
+                return;
+            }
+            var pattern = Path.GetFileName(path) + ".sidebar-sync-*.bak";
+            var oldBackups = new DirectoryInfo(directory)
+                .GetFiles(pattern)
+                .OrderByDescending(file => file.LastWriteTimeUtc)
+                .ThenByDescending(file => file.Name, StringComparer.Ordinal)
+                .Skip(Math.Max(1, keepNewest));
+            foreach (var stale in oldBackups)
+            {
+                try { stale.Delete(); } catch { }
+            }
+        }
+        catch
+        {
+            // Best-effort cleanup must never block sidebar synchronization.
+        }
     }
 
     private static void WriteTextAtomically(string path, string text)

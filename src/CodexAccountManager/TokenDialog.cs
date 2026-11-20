@@ -21,13 +21,13 @@ public sealed class TokenDialog : Form
         AutoScaleMode = AutoScaleMode.Dpi;
         ClientSize = new Size(920, 500);
         MinimumSize = new Size(940, 520);
-        Font = new Font("Microsoft YaHei UI", 9.25F);
+        Font = UiFontCache.Get("Microsoft YaHei UI", 9.25F);
         DoubleBuffered = true;
         ThemeStyler.ApplyDialog(this, palette);
 
         _accountLabel.Text = $"账号  ·  {accountName}";
         _accountLabel.SetBounds(28, 18, 630, 28);
-        _accountLabel.Font = new Font(Font.FontFamily, 8.7F, FontStyle.Bold);
+        _accountLabel.Font = UiFontCache.Get(Font.FontFamily, 8.7F, FontStyle.Bold);
         _accountLabel.AutoEllipsis = false;
         _accountLabel.TextAlign = ContentAlignment.MiddleLeft;
         _accountLabel.UseCompatibleTextRendering = true;
@@ -39,21 +39,26 @@ public sealed class TokenDialog : Form
         _title.SetBounds(28, 48, 620, 48);
         _title.AutoEllipsis = false;
         _title.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
-        _title.Font = new Font(Font.FontFamily, 13F, FontStyle.Bold);
+        _title.Font = UiFontCache.Get(Font.FontFamily, 13F, FontStyle.Bold);
         _title.TextAlign = ContentAlignment.MiddleLeft;
         _title.UseCompatibleTextRendering = true;
         _title.UseMnemonic = false;
         ThemeStyler.ApplyLabel(_title, palette);
         Controls.Add(_title);
 
+        var dark = ThemeStyler.IsDark(palette);
         _safetyBadge.Text = "仅写入当前账号目录";
         _safetyBadge.SetBounds(696, 40, 196, 38);
         _safetyBadge.Anchor = AnchorStyles.Top | AnchorStyles.Right;
-        _safetyBadge.Font = new Font(Font.FontFamily, 8.2F, FontStyle.Bold);
+        _safetyBadge.Font = UiFontCache.Get(Font.FontFamily, 8.2F, FontStyle.Bold);
         _safetyBadge.TextAlign = ContentAlignment.MiddleCenter;
-        _safetyBadge.FillColor = Color.FromArgb(34, palette.AccentColor);
-        _safetyBadge.StrokeColor = Color.FromArgb(90, palette.AccentColor);
-        _safetyBadge.ForeColor = palette.PrimaryColor;
+        _safetyBadge.FillColor = dark
+            ? UiDesign.Blend(palette.SurfaceColor, palette.AccentColor, 0.20F)
+            : Color.FromArgb(34, palette.AccentColor);
+        _safetyBadge.StrokeColor = Color.FromArgb(dark ? 136 : 90, palette.AccentColor);
+        _safetyBadge.ForeColor = dark
+            ? UiDesign.Blend(palette.AccentColor, Color.White, 0.38F)
+            : palette.PrimaryColor;
         Controls.Add(_safetyBadge);
 
         _card.SetBounds(16, 108, 888, 300);
@@ -71,7 +76,7 @@ public sealed class TokenDialog : Form
 
         _tokenLabel.Text = "新的 Access Token";
         _tokenLabel.SetBounds(20, 12, 360, 32);
-        _tokenLabel.Font = new Font(Font.FontFamily, 8.8F, FontStyle.Bold);
+        _tokenLabel.Font = UiFontCache.Get(Font.FontFamily, 8.8F, FontStyle.Bold);
         _tokenLabel.TextAlign = ContentAlignment.MiddleLeft;
         _tokenLabel.UseCompatibleTextRendering = true;
         _tokenLabel.UseMnemonic = false;
@@ -79,7 +84,7 @@ public sealed class TokenDialog : Form
         _card.Controls.Add(_tokenLabel);
 
         _tokenBox.UseSystemPasswordChar = true;
-        _tokenBox.Font = new Font(Font.FontFamily, 9.5F);
+        _tokenBox.Font = UiFontCache.Get(Font.FontFamily, 9.5F);
         _tokenBox.PlaceholderText = "粘贴新的 Codex Access Token";
         _tokenBox.AccessibleName = "新的 Codex Access Token";
         _tokenShell = new ModernInputShell(_tokenBox)
@@ -98,7 +103,7 @@ public sealed class TokenDialog : Form
         _note.Text = $"凭据目录\n{codexHome}\n\n只填写 Codex Access Token 本体；不要填写 sk- API Key、JSON、refresh_token 或 session_token。";
         _note.SetBounds(20, 112, 848, 164);
         _note.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
-        _note.Font = new Font(Font.FontFamily, 8.6F);
+        _note.Font = UiFontCache.Get(Font.FontFamily, 8.6F);
         _note.TextAlign = ContentAlignment.TopLeft;
         _note.UseCompatibleTextRendering = true;
         _note.UseMnemonic = false;

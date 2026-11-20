@@ -439,7 +439,7 @@ internal static class LocalPatGateway
         // account for a route mutation.  A 700 ms health-probe timeout is too aggressive
         // under transient local disk/AV pressure: returning null there makes the Manager
         // fall back to a stale UI account and every subsequent arm request fails with 409.
-        using var client = CreateLoopbackControlClient();
+        using var requestTimeout = CreateLoopbackTimeout(LoopbackControlTimeout, cancellationToken);
         try
         {
             var challenge = LocalPatGatewayControl.CreateChallenge();
@@ -447,7 +447,7 @@ internal static class LocalPatGateway
             request.Headers.TryAddWithoutValidation(
                 LocalPatGatewayControl.ChallengeHeader,
                 challenge);
-            using var response = await client.SendAsync(request, cancellationToken);
+            using var response = await SharedLoopbackClient.SendAsync(request, requestTimeout.Token);
             if (!HasExpectedMarker(response) ||
                 !HasExpectedControlProof(response, challenge) ||
                 (requireCompatibleProtocol && !HasCompatibleRotationProtocol(response)) ||
@@ -462,10 +462,10 @@ internal static class LocalPatGateway
                 ? rotationProtocolValues.FirstOrDefault(IsCompatibleRotationProtocolValue)
                 : null;
 
-            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            await using var stream = await response.Content.ReadAsStreamAsync(requestTimeout.Token);
             using var document = await JsonDocument.ParseAsync(
                 stream,
-                cancellationToken: cancellationToken);
+                cancellationToken: requestTimeout.Token);
             var root = document.RootElement;
             if (!root.TryGetProperty("activity", out var activity) ||
                 activity.ValueKind != JsonValueKind.Object ||
@@ -503,7 +503,7 @@ internal static class LocalPatGateway
         }
         catch (Exception ex) when (
             ex is HttpRequestException or
-            TaskCanceledException or
+            OperationCanceledException or
             IOException or
             JsonException or
             InvalidOperationException)
@@ -546,7 +546,7 @@ internal static class LocalPatGateway
             transportAccountKey = transport,
             replaceExistingArmedTarget
         });
-        using var client = CreateLoopbackControlClient();
+        using var requestTimeout = CreateLoopbackTimeout(LoopbackControlTimeout, cancellationToken);
         var challenge = LocalPatGatewayControl.CreateChallenge();
         using var request = new HttpRequestMessage(
             HttpMethod.Post,
@@ -563,7 +563,7 @@ internal static class LocalPatGateway
                 LocalPatGatewayControl.LoadOrCreateSecret(),
                 challenge,
                 BuildRotationArmPurpose(payload)));
-        using var response = await client.SendAsync(request, cancellationToken);
+        using var response = await SharedLoopbackClient.SendAsync(request, requestTimeout.Token);
         if (!HasExpectedMarker(response))
         {
             throw new InvalidOperationException("本地 PAT 网关没有返回可信的轮换协议标记。");
@@ -576,7 +576,7 @@ internal static class LocalPatGateway
         {
             var controlError = await ReadGatewayControlErrorMessageAsync(
                 response,
-                cancellationToken);
+                requestTimeout.Token);
             if (replaceExistingArmedTarget &&
                 response.StatusCode == HttpStatusCode.Conflict &&
                 controlError?.Contains(
@@ -611,10 +611,10 @@ internal static class LocalPatGateway
                     : $"：{controlError}"));
         }
 
-        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        await using var stream = await response.Content.ReadAsStreamAsync(requestTimeout.Token);
         using var document = await JsonDocument.ParseAsync(
             stream,
-            cancellationToken: cancellationToken);
+            cancellationToken: requestTimeout.Token);
         return ReadRotationSnapshot(document.RootElement) is { } snapshot &&
                snapshot.Status != PatGatewayRotationStatus.None
             ? snapshot
@@ -634,7 +634,7 @@ internal static class LocalPatGateway
             return false;
         }
 
-        using var client = CreateLoopbackControlClient();
+        using var requestTimeout = CreateLoopbackTimeout(LoopbackControlTimeout, cancellationToken);
         try
         {
             var challenge = LocalPatGatewayControl.CreateChallenge();
@@ -650,7 +650,7 @@ internal static class LocalPatGateway
                     LocalPatGatewayControl.LoadOrCreateSecret(),
                     challenge,
                     "rotation-clear"));
-            using var response = await client.SendAsync(request, cancellationToken);
+            using var response = await SharedLoopbackClient.SendAsync(request, requestTimeout.Token);
             if (!HasExpectedMarker(response))
             {
                 return false;
@@ -658,7 +658,7 @@ internal static class LocalPatGateway
             return response.IsSuccessStatusCode;
         }
         catch (Exception ex) when (
-            ex is HttpRequestException or TaskCanceledException or IOException)
+            ex is HttpRequestException or OperationCanceledException or IOException)
         {
             // No listener means the already-deleted route is fully cleared.
             return true;
@@ -677,7 +677,7 @@ internal static class LocalPatGateway
         }
 
         var payload = JsonSerializer.SerializeToUtf8Bytes(new { accountKey = normalized });
-        using var client = CreateLoopbackControlClient();
+        using var requestTimeout = CreateLoopbackTimeout(LoopbackControlTimeout, cancellationToken);
         try
         {
             var challenge = LocalPatGatewayControl.CreateChallenge();
@@ -696,7 +696,7 @@ internal static class LocalPatGateway
                     LocalPatGatewayControl.LoadOrCreateSecret(),
                     challenge,
                     BuildSessionAffinityInvalidationPurpose(payload)));
-            using var response = await client.SendAsync(request, cancellationToken);
+            using var response = await SharedLoopbackClient.SendAsync(request, requestTimeout.Token);
             if (response.IsSuccessStatusCode &&
                 HasExpectedMarker(response) &&
                 HasExpectedRotationProtocol(response))
@@ -705,7 +705,7 @@ internal static class LocalPatGateway
             }
         }
         catch (Exception ex) when (
-            ex is HttpRequestException or TaskCanceledException or IOException or
+            ex is HttpRequestException or OperationCanceledException or IOException or
                 InvalidOperationException or UnauthorizedAccessException)
         {
             // Fall through to an offline cache update. v3-v5 gateways do not hold
@@ -832,7 +832,7 @@ internal static class LocalPatGateway
         string secret,
         CancellationToken cancellationToken)
     {
-        using var client = CreateLoopbackClient();
+        using var requestTimeout = CreateLoopbackTimeout(LoopbackProbeTimeout, cancellationToken);
         try
         {
             var challenge = LocalPatGatewayControl.CreateChallenge();
@@ -843,12 +843,12 @@ internal static class LocalPatGateway
             request.Headers.TryAddWithoutValidation(
                 LocalPatGatewayControl.ProofHeader,
                 LocalPatGatewayControl.CreateShutdownProof(secret, challenge));
-            using var response = await client.SendAsync(request, cancellationToken);
+            using var response = await SharedLoopbackClient.SendAsync(request, requestTimeout.Token);
             return HasExpectedMarker(response) && response.IsSuccessStatusCode;
         }
         catch (Exception ex) when (
             ex is HttpRequestException or
-            TaskCanceledException or
+            OperationCanceledException or
             IOException or
             UnauthorizedAccessException)
         {
@@ -905,7 +905,7 @@ internal static class LocalPatGateway
 
     private static async Task<GatewayHealth> ProbeAsync(CancellationToken cancellationToken)
     {
-        using var client = CreateLoopbackClient();
+        using var requestTimeout = CreateLoopbackTimeout(LoopbackProbeTimeout, cancellationToken);
         try
         {
             var challenge = LocalPatGatewayControl.CreateChallenge();
@@ -913,7 +913,7 @@ internal static class LocalPatGateway
             request.Headers.TryAddWithoutValidation(
                 LocalPatGatewayControl.ChallengeHeader,
                 challenge);
-            using var response = await client.SendAsync(request, cancellationToken);
+            using var response = await SharedLoopbackClient.SendAsync(request, requestTimeout.Token);
             if (!HasExpectedMarker(response))
             {
                 return GatewayHealth.ForeignListener;
@@ -947,26 +947,31 @@ internal static class LocalPatGateway
                 ? GatewayHealth.Ready
                 : GatewayHealth.ProxyMismatch;
         }
-        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException)
         {
             return GatewayHealth.Unavailable;
         }
     }
 
-    private static HttpClient CreateLoopbackClient()
-    {
-        return new HttpClient(new HttpClientHandler { UseProxy = false })
+    private static readonly TimeSpan LoopbackProbeTimeout = TimeSpan.FromMilliseconds(700);
+    private static readonly TimeSpan LoopbackControlTimeout = TimeSpan.FromSeconds(5);
+    private static readonly HttpClient SharedLoopbackClient = new(
+        new SocketsHttpHandler
         {
-            Timeout = TimeSpan.FromMilliseconds(700)
-        };
-    }
+            UseProxy = false,
+            PooledConnectionLifetime = TimeSpan.FromMinutes(5)
+        })
+    {
+        Timeout = Timeout.InfiniteTimeSpan
+    };
 
-    private static HttpClient CreateLoopbackControlClient()
+    private static CancellationTokenSource CreateLoopbackTimeout(
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
     {
-        return new HttpClient(new HttpClientHandler { UseProxy = false })
-        {
-            Timeout = TimeSpan.FromSeconds(5)
-        };
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(timeout);
+        return cts;
     }
 
     private static bool HasExpectedMarker(HttpResponseMessage response)
@@ -1089,7 +1094,7 @@ internal static class LocalPatGateway
     private static async Task<bool> HasCompatibleLegacyRotationProtocolAsync(
         CancellationToken cancellationToken)
     {
-        using var client = CreateLoopbackClient();
+        using var requestTimeout = CreateLoopbackTimeout(LoopbackProbeTimeout, cancellationToken);
         try
         {
             var challenge = LocalPatGatewayControl.CreateChallenge();
@@ -1097,7 +1102,7 @@ internal static class LocalPatGateway
             request.Headers.TryAddWithoutValidation(
                 LocalPatGatewayControl.ChallengeHeader,
                 challenge);
-            using var response = await client.SendAsync(request, cancellationToken);
+            using var response = await SharedLoopbackClient.SendAsync(request, requestTimeout.Token);
             return response.IsSuccessStatusCode &&
                    HasExpectedMarker(response) &&
                    HasExpectedControlProof(response, challenge) &&
@@ -1120,7 +1125,7 @@ internal static class LocalPatGateway
                         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal));
         }
         catch (Exception ex) when (
-            ex is HttpRequestException or TaskCanceledException or IOException or
+            ex is HttpRequestException or OperationCanceledException or IOException or
             InvalidOperationException)
         {
             return false;
@@ -1224,6 +1229,11 @@ internal sealed partial class LocalPatGatewayHost
     private const string DefaultUserAgent =
         "codex_cli_rs/0.153.4 (Windows 10.0.0; x86_64) codex-account-manager";
     private static readonly TimeSpan IdentityCacheLifetime = TimeSpan.FromMinutes(30);
+    private const int MaxCachedUpstreamClients = 32;
+    private static readonly TimeSpan UpstreamClientIdleLifetime = TimeSpan.FromMinutes(30);
+    private static readonly TimeSpan CachePruneInterval = TimeSpan.FromMinutes(5);
+    private const int MaxIdentityCacheEntries = 256;
+    private static readonly TimeSpan ShutdownDrainTimeout = TimeSpan.FromSeconds(5);
     // A dead per-account node must not hold a whoami or response-header connection
     // for the default HttpClient lifetime. This is only the pre-header attempt bound;
     // once SSE headers arrive, the stream keeps using the caller's request deadline.
@@ -1354,8 +1364,11 @@ internal sealed partial class LocalPatGatewayHost
     private readonly AccountProxyResolver _proxyResolver;
     private readonly object _rotationGate = new();
     private readonly SemaphoreSlim _rotationActivationGate = new(1, 1);
-    private readonly ConcurrentDictionary<string, HttpClient> _clients = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, CachedUpstreamClient> _clients = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, IdentityCacheEntry> _identityCache = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<long, Task> _inFlightRequests = new();
+    private long _nextRequestSequence;
+    private long _lastCachePruneUtcTicks;
     private readonly ConcurrentDictionary<string, QuotaLimitObservation> _quotaLimitedAccounts =
         new(StringComparer.Ordinal);
     private readonly object _activityGate = new();
@@ -2284,7 +2297,23 @@ internal sealed partial class LocalPatGatewayHost
                     break;
                 }
 
-                _ = Task.Run(() => HandleAsync(context, listener, shutdown));
+                var requestId = Interlocked.Increment(ref _nextRequestSequence);
+                var requestTask = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await HandleAsync(context, listener, shutdown);
+                    }
+                    finally
+                    {
+                        _inFlightRequests.TryRemove(requestId, out _);
+                    }
+                });
+                _inFlightRequests[requestId] = requestTask;
+                if (requestTask.IsCompleted)
+                {
+                    _inFlightRequests.TryRemove(requestId, out _);
+                }
             }
             return 0;
         }
@@ -2294,11 +2323,41 @@ internal sealed partial class LocalPatGatewayHost
         }
         finally
         {
-            foreach (var client in _clients.Values)
-            {
-                client.Dispose();
-            }
+            await DrainInFlightRequestsAsync(ShutdownDrainTimeout);
+            DisposeUpstreamClients();
             _proxyResolver.Dispose();
+        }
+    }
+
+    private async Task DrainInFlightRequestsAsync(TimeSpan timeout)
+    {
+        var pending = _inFlightRequests.Values.Where(task => !task.IsCompleted).ToArray();
+        if (pending.Length == 0)
+        {
+            return;
+        }
+        try
+        {
+            await Task.WhenAll(pending).WaitAsync(timeout);
+        }
+        catch (TimeoutException)
+        {
+            // Bounded drain elapsed; proceed with disposing clients and proxy cores.
+        }
+        catch
+        {
+            // Individual request failures are handled inside HandleAsync.
+        }
+    }
+
+    internal void DisposeUpstreamClients()
+    {
+        foreach (var pair in _clients.ToArray())
+        {
+            if (_clients.TryRemove(pair))
+            {
+                pair.Value.DisposeIfCreated();
+            }
         }
     }
 
@@ -2309,6 +2368,7 @@ internal sealed partial class LocalPatGatewayHost
     {
         var response = context.Response;
         var affinityLeases = new List<PatGatewaySessionAffinityLease>();
+        var clientLeases = new List<CachedUpstreamClient>();
         // These buffered upstream responses may survive several in-request candidate
         // attempts. Keep the references outside the try block so the unconditional finally
         // can dispose them even when request handling exits through an early error.
@@ -2645,8 +2705,12 @@ internal sealed partial class LocalPatGatewayHost
             if (cpaRouting && IsCpaAccountCooling(credential.AccountKey, DateTimeOffset.UtcNow))
             {
                 response.Headers["Retry-After"] = "60";
-                await WriteErrorAsync(response, HttpStatusCode.ServiceUnavailable,
-                    "原账号正在故障冷却；带有 previous_response_id 的续聊不能跨账号重放，请稍后重试或开始新会话。");
+                var coolingMessage = strictResponseAffinity
+                    ? "原账号正在故障冷却；带有 previous_response_id 的续聊不能跨账号重放，请稍后重试或开始新会话。"
+                    : rotationBoundaryApplied
+                        ? "当前切换的目标账号正在故障冷却，暂不可用；请稍后重试，或切换到其他可用账号。"
+                        : "当前账号正在故障冷却，且本次请求不能跨账号重放；请稍后重试或开始新会话。";
+                await WriteErrorAsync(response, HttpStatusCode.ServiceUnavailable, coolingMessage);
                 return;
             }
             using var modelRequestActivity = isModelRequest && !isIndependentAccountProbe
@@ -2821,9 +2885,7 @@ internal sealed partial class LocalPatGatewayHost
                         proxyResolution.PoolKey.StartsWith("global:", StringComparison.Ordinal);
                 }
                 var proxyNode = _proxyResolver.GetNode(proxyResolution.NodeId);
-                var client = _clients.GetOrAdd(
-                    clientKey,
-                    _ => CreateUpstreamClient(proxyResolution, proxyNode));
+                var client = AcquireUpstreamClient(clientKey, proxyResolution, proxyNode, clientLeases);
                 PatIdentity? identity = string.IsNullOrWhiteSpace(credential.ChatGptAccountId)
                     ? null
                     : new PatIdentity(credential.ChatGptAccountId, IsFedRamp: false);
@@ -3216,11 +3278,8 @@ internal sealed partial class LocalPatGatewayHost
                     await WriteErrorAsync(
                         response,
                         HttpStatusCode.BadGateway,
-                        requestWasCanceled
-                            ? "通过本地代理请求 ChatGPT Codex 上游失败：" +
-                              SanitizeNetworkError(ex.Message)
-                            : "通过本地代理请求 ChatGPT Codex 上游失败：" +
-                              SanitizeNetworkError(ex.Message));
+                        "通过本地代理请求 ChatGPT Codex 上游失败：" +
+                        SanitizeNetworkError(ex.Message));
                     return;
                 }
 
@@ -3882,6 +3941,10 @@ internal sealed partial class LocalPatGatewayHost
             // or a successful request so a long-lived gateway cannot accumulate them.
             lastTransient429Response?.Dispose();
             lastQuotaResponse?.Dispose();
+            for (var index = clientLeases.Count - 1; index >= 0; index--)
+            {
+                clientLeases[index].Release();
+            }
             try
             {
                 response.Close();
@@ -4577,12 +4640,8 @@ internal sealed partial class LocalPatGatewayHost
         else AccountRotationConfiguration.MarkUsed(settings, currentAccount);
         var now = DateTimeOffset.UtcNow;
         var unavailable = new HashSet<string>(attemptedAccountKeys, StringComparer.Ordinal);
-        var reservePaused = GetQuotaReservePausedAccountKeys(accounts, now);
-        // A gateway quota signal can outlive the official quota response that caused it.
-        // When the account's newer official snapshot is back above the reserve line,
-        // the old signal must not keep the account locked out until its original reset
-        // timestamp.  This is especially important for weekly-only accounts: a prior
-        // 429 may carry a future weekly reset even though the account is usable again.
+        // Load persisted quota snapshots once under _cpaRoutingGate and share across
+        // both the reserve-pause filter and stale gateway-signal recovery below.
         IReadOnlyDictionary<string, PersistedQuotaSnapshot> quotaSnapshots;
         try
         {
@@ -4593,6 +4652,12 @@ internal sealed partial class LocalPatGatewayHost
         {
             quotaSnapshots = new Dictionary<string, PersistedQuotaSnapshot>(StringComparer.Ordinal);
         }
+        var reservePaused = GetQuotaReservePausedAccountKeys(accounts, quotaSnapshots, now);
+        // A gateway quota signal can outlive the official quota response that caused it.
+        // When the account's newer official snapshot is back above the reserve line,
+        // the old signal must not keep the account locked out until its original reset
+        // timestamp.  This is especially important for weekly-only accounts: a prior
+        // 429 may carry a future weekly reset even though the account is usable again.
         foreach (var pair in _quotaLimitedAccounts.ToArray())
         {
             if (!IsQuotaLimitObservationActive(pair.Value, now))
@@ -5858,9 +5923,11 @@ internal sealed partial class LocalPatGatewayHost
         var identity = new PatIdentity(
             accountId,
             ReadOptionalBoolean(root, "chatgpt_account_is_fedramp"));
+        var now = DateTimeOffset.UtcNow;
         _identityCache[key] = new IdentityCacheEntry(
             identity,
-            DateTimeOffset.UtcNow + IdentityCacheLifetime);
+            now + IdentityCacheLifetime);
+        PruneCachesIfDue(now);
         var accountKey = ResolveAccountKeyForPatToken(token);
         if (accountKey != null)
         {
@@ -7035,6 +7102,111 @@ internal sealed partial class LocalPatGatewayHost
         }
     }
 
+    private HttpClient AcquireUpstreamClient(
+        string clientKey,
+        ProxyResolution proxyResolution,
+        ProxyNodeRecord? proxyNode,
+        List<CachedUpstreamClient> leases)
+    {
+        var now = DateTimeOffset.UtcNow;
+        PruneCachesIfDue(now);
+        while (true)
+        {
+            var entry = _clients.GetOrAdd(
+                clientKey,
+                _ => new CachedUpstreamClient(
+                    () => CreateUpstreamClient(proxyResolution, proxyNode),
+                    now));
+            if (!entry.TryAcquire(now))
+            {
+                _clients.TryRemove(new KeyValuePair<string, CachedUpstreamClient>(clientKey, entry));
+                continue;
+            }
+
+            try
+            {
+                var client = entry.LazyClient.Value;
+                leases.Add(entry);
+                return client;
+            }
+            catch
+            {
+                entry.Release();
+                _clients.TryRemove(new KeyValuePair<string, CachedUpstreamClient>(clientKey, entry));
+                throw;
+            }
+        }
+    }
+
+    private void PruneCachesIfDue(DateTimeOffset now)
+    {
+        var overCapacity = _clients.Count > MaxCachedUpstreamClients ||
+                           _identityCache.Count > MaxIdentityCacheEntries;
+        var lastTicks = Interlocked.Read(ref _lastCachePruneUtcTicks);
+        if (!overCapacity &&
+            lastTicks != 0 &&
+            now.UtcTicks - lastTicks < CachePruneInterval.Ticks)
+        {
+            return;
+        }
+        if (Interlocked.CompareExchange(ref _lastCachePruneUtcTicks, now.UtcTicks, lastTicks) != lastTicks)
+        {
+            return;
+        }
+        PruneIdentityCache(now);
+        EvictIdleUpstreamClients(now);
+    }
+
+    private void PruneIdentityCache(DateTimeOffset now)
+    {
+        foreach (var pair in _identityCache.ToArray())
+        {
+            if (pair.Value.ExpiresAtUtc <= now)
+            {
+                _identityCache.TryRemove(pair);
+            }
+        }
+        if (_identityCache.Count <= MaxIdentityCacheEntries)
+        {
+            return;
+        }
+        var overflow = _identityCache.Count - MaxIdentityCacheEntries;
+        foreach (var pair in _identityCache.ToArray()
+                     .OrderBy(item => item.Value.ExpiresAtUtc)
+                     .Take(overflow))
+        {
+            _identityCache.TryRemove(pair);
+        }
+    }
+
+    private void EvictIdleUpstreamClients(DateTimeOffset now)
+    {
+        foreach (var pair in _clients.ToArray())
+        {
+            if (pair.Value.ActiveRequests == 0 &&
+                now - pair.Value.LastUsedAtUtc >= UpstreamClientIdleLifetime &&
+                _clients.TryRemove(pair))
+            {
+                pair.Value.MarkEvictedAndDisposeWhenIdle();
+            }
+        }
+        if (_clients.Count <= MaxCachedUpstreamClients)
+        {
+            return;
+        }
+        var overflow = _clients.Count - MaxCachedUpstreamClients;
+        foreach (var pair in _clients.ToArray()
+                     .Where(item => item.Value.ActiveRequests == 0)
+                     .OrderBy(item => item.Value.LastUsedAtUtc)
+                     .Take(overflow))
+        {
+            if (_clients.TryRemove(pair))
+            {
+                pair.Value.MarkEvictedAndDisposeWhenIdle();
+            }
+        }
+    }
+
     private HttpClient CreateUpstreamClient(ProxyResolution resolution, ProxyNodeRecord? node)
     {
         if (resolution.ProxyUri == null)
@@ -7552,6 +7724,63 @@ internal sealed partial class LocalPatGatewayHost
         response.ContentLength64 = bytes.Length;
         await response.OutputStream.WriteAsync(bytes);
         await response.OutputStream.FlushAsync();
+    }
+
+    private sealed class CachedUpstreamClient : IDisposable
+    {
+        private long _lastUsedUtcTicks;
+        private int _activeRequests;
+        private int _evicted;
+        private int _disposed;
+
+        internal Lazy<HttpClient> LazyClient { get; }
+        internal DateTimeOffset LastUsedAtUtc => new(Interlocked.Read(ref _lastUsedUtcTicks), TimeSpan.Zero);
+        internal int ActiveRequests => Volatile.Read(ref _activeRequests);
+
+        internal CachedUpstreamClient(Func<HttpClient> factory, DateTimeOffset nowUtc)
+        {
+            _lastUsedUtcTicks = nowUtc.UtcTicks;
+            LazyClient = new Lazy<HttpClient>(factory, LazyThreadSafetyMode.ExecutionAndPublication);
+        }
+
+        internal bool TryAcquire(DateTimeOffset nowUtc)
+        {
+            Interlocked.Increment(ref _activeRequests);
+            if (Volatile.Read(ref _evicted) != 0)
+            {
+                Release();
+                return false;
+            }
+            Interlocked.Exchange(ref _lastUsedUtcTicks, nowUtc.UtcTicks);
+            return true;
+        }
+
+        internal void Release()
+        {
+            var remaining = Interlocked.Decrement(ref _activeRequests);
+            if (remaining == 0 && Volatile.Read(ref _evicted) != 0)
+            {
+                DisposeIfCreated();
+            }
+        }
+
+        internal void MarkEvictedAndDisposeWhenIdle()
+        {
+            Interlocked.Exchange(ref _evicted, 1);
+            if (Volatile.Read(ref _activeRequests) == 0)
+            {
+                DisposeIfCreated();
+            }
+        }
+
+        internal void DisposeIfCreated()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            if (!LazyClient.IsValueCreated) return;
+            try { LazyClient.Value.Dispose(); } catch { }
+        }
+
+        public void Dispose() => DisposeIfCreated();
     }
 
     private sealed record PatIdentity(string AccountId, bool IsFedRamp);

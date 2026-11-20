@@ -117,7 +117,9 @@ public partial class Form1
         }
         defaultModel.SelectedItem = defaultModel.Items.Cast<string>().FirstOrDefault(item =>
             item.Equals(catalog.DefaultModel, StringComparison.OrdinalIgnoreCase));
-        defaultModel.SelectedIndex = defaultModel.SelectedIndex >= 0 ? defaultModel.SelectedIndex : 0;
+        defaultModel.SelectedIndex = defaultModel.SelectedIndex >= 0
+            ? defaultModel.SelectedIndex
+            : defaultModel.Items.Count > 0 ? 0 : -1;
         ThemeStyler.ApplyComboBox(defaultModel, _palette);
         panel.Controls.Add(defaultModel);
 
@@ -347,6 +349,12 @@ public partial class Form1
                 model.LongOutputMultiplier);
         }
         grid.ClearSelection();
+        var dark = ThemeStyler.IsDark(_palette);
+        grid.HandleCreated += (_, _) => NativeWindowTheme.ApplyScrollable(grid, dark);
+        if (grid.IsHandleCreated)
+        {
+            NativeWindowTheme.ApplyScrollable(grid, dark);
+        }
         return grid;
     }
 
@@ -479,9 +487,10 @@ public partial class Form1
         string? proxyUri = null;
         try
         {
+            if (!TryGetModelCatalogRefreshToken(out var cancellationToken)) return;
             proxyUri = GetModelCatalogProxyUri();
             _statusBox.Text = $"正在通过 {FormatProxyEndpoint(proxyUri)} 检查 OpenAI 官网模型与价格……";
-            var result = await ModelCatalogService.CheckAndSaveOfficialAsync(proxyUri, _modelCatalogRefreshCancellation.Token);
+            var result = await ModelCatalogService.CheckAndSaveOfficialAsync(proxyUri, cancellationToken);
             if (IsDisposed || Disposing) return;
             _nextAutomaticPriceCheckUtc = DateTimeOffset.UtcNow.AddHours(6);
             ApplyModelCatalogToAccounts();

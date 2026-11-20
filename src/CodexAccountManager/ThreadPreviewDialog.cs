@@ -11,6 +11,7 @@ public sealed class ThreadPreviewDialog : Form
     private readonly Label _findStatusLabel = new();
     private readonly Label _noticeLabel = new();
     private readonly ConstrainedToolTip _toolTip = new();
+    private readonly System.Windows.Forms.Timer _findDebounceTimer = new() { Interval = 160 };
     private readonly string _copyText;
     private readonly string _exportFileName;
 
@@ -22,6 +23,7 @@ public sealed class ThreadPreviewDialog : Form
         ArgumentNullException.ThrowIfNull(thread);
         ArgumentNullException.ThrowIfNull(transcript);
 
+        var dark = ThemeStyler.IsDark(palette);
         Text = BuildWindowTitle(transcript);
         StartPosition = FormStartPosition.CenterParent;
         FormBorderStyle = FormBorderStyle.Sizable;
@@ -30,12 +32,25 @@ public sealed class ThreadPreviewDialog : Form
         AutoScaleMode = AutoScaleMode.Dpi;
         ClientSize = new Size(980, 700);
         MinimumSize = new Size(760, 540);
-        Font = new Font("Microsoft YaHei UI", 9.25F);
+        Font = UiFontCache.Get("Microsoft YaHei UI", 9.25F);
         DoubleBuffered = true;
         KeyPreview = true;
         ShowInTaskbar = false;
         ThemeStyler.ApplyDialog(this, palette);
-        Disposed += (_, _) => _toolTip.Dispose();
+        _findDebounceTimer.Tick += (_, _) =>
+        {
+            _findDebounceTimer.Stop();
+            if (!IsDisposed && !Disposing)
+            {
+                FindMatch(forward: true, restart: true);
+            }
+        };
+        Disposed += (_, _) =>
+        {
+            _findDebounceTimer.Stop();
+            _findDebounceTimer.Dispose();
+            _toolTip.Dispose();
+        };
 
         _copyText = BuildCopyText(thread, transcript);
         _exportFileName = BuildExportFileName(thread.Title);
@@ -74,7 +89,7 @@ public sealed class ThreadPreviewDialog : Form
             Text = thread.Title,
             Dock = DockStyle.Fill,
             AutoEllipsis = true,
-            Font = new Font(Font.FontFamily, 15F, FontStyle.Bold),
+            Font = UiFontCache.Get(Font.FontFamily, 15F, FontStyle.Bold),
             TextAlign = ContentAlignment.MiddleLeft,
             UseCompatibleTextRendering = true,
             UseMnemonic = false,
@@ -83,22 +98,23 @@ public sealed class ThreadPreviewDialog : Form
         ThemeStyler.ApplyLabel(title, palette);
         header.Controls.Add(title, 0, 0);
 
+        var badgeAccent = transcript.OfficialIndexLagging ? palette.WarningColor : palette.AccentColor;
         var readOnlyBadge = new PillLabel
         {
             Text = transcript.OfficialIndexLagging ? "索引滞后" : "本地只读",
             Dock = DockStyle.Fill,
             Margin = new Padding(12, 7, 0, 7),
-            Font = new Font(Font.FontFamily, 8.5F, FontStyle.Bold),
+            Font = UiFontCache.Get(Font.FontFamily, 8.5F, FontStyle.Bold),
             TextAlign = ContentAlignment.MiddleCenter,
-            FillColor = Color.FromArgb(
-                34,
-                transcript.OfficialIndexLagging ? palette.WarningColor : palette.AccentColor),
-            StrokeColor = Color.FromArgb(
-                94,
-                transcript.OfficialIndexLagging ? palette.WarningColor : palette.AccentColor),
-            ForeColor = transcript.OfficialIndexLagging
-                ? palette.WarningColor
-                : palette.PrimaryColor
+            FillColor = dark
+                ? UiDesign.Blend(palette.FormBackColor, badgeAccent, 0.20F)
+                : Color.FromArgb(34, badgeAccent),
+            StrokeColor = Color.FromArgb(dark ? 136 : 94, badgeAccent),
+            ForeColor = dark
+                ? UiDesign.Blend(badgeAccent, Color.White, 0.38F)
+                : transcript.OfficialIndexLagging
+                    ? palette.WarningColor
+                    : palette.PrimaryColor
         };
         header.Controls.Add(readOnlyBadge, 1, 0);
 
@@ -109,7 +125,7 @@ public sealed class ThreadPreviewDialog : Form
                 : $"{transcript.Messages.Count} 条对话消息 · 已过滤系统信息与工具日志",
             Dock = DockStyle.Fill,
             AutoEllipsis = true,
-            Font = new Font(Font.FontFamily, 8.8F),
+            Font = UiFontCache.Get(Font.FontFamily, 8.8F),
             TextAlign = ContentAlignment.MiddleLeft,
             UseCompatibleTextRendering = true,
             UseMnemonic = false
@@ -135,7 +151,7 @@ public sealed class ThreadPreviewDialog : Form
 
         _findBox.PlaceholderText = "搜索当前对话（Ctrl+F）";
         _findBox.Dock = DockStyle.Fill;
-        _findBox.Font = new Font(Font.FontFamily, 9F);
+        _findBox.Font = UiFontCache.Get(Font.FontFamily, 9F);
         _findBox.Margin = Padding.Empty;
         ThemeStyler.ApplyInput(_findBox, palette);
         var findShell = new ModernInputShell(_findBox, showSearchGlyph: true)
@@ -155,7 +171,11 @@ public sealed class ThreadPreviewDialog : Form
             AccessibleName = "查找上一个匹配"
         };
         ThemeStyler.ApplySoftButton(previous, palette);
-        previous.Click += (_, _) => FindMatch(forward: false);
+        previous.Click += (_, _) =>
+        {
+            _findDebounceTimer.Stop();
+            FindMatch(forward: false);
+        };
         searchRow.Controls.Add(previous, 1, 0);
 
         var next = new ModernButton
@@ -166,29 +186,44 @@ public sealed class ThreadPreviewDialog : Form
             AccessibleName = "查找下一个匹配"
         };
         ThemeStyler.ApplySoftButton(next, palette);
-        next.Click += (_, _) => FindMatch(forward: true);
+        next.Click += (_, _) =>
+        {
+            _findDebounceTimer.Stop();
+            FindMatch(forward: true);
+        };
         searchRow.Controls.Add(next, 2, 0);
 
         _findStatusLabel.Text = "Ctrl+F";
         _findStatusLabel.Dock = DockStyle.Fill;
-        _findStatusLabel.Font = new Font(Font.FontFamily, 8.2F, FontStyle.Bold);
+        _findStatusLabel.Font = UiFontCache.Get(Font.FontFamily, 8.2F, FontStyle.Bold);
         _findStatusLabel.TextAlign = ContentAlignment.MiddleCenter;
         _findStatusLabel.UseCompatibleTextRendering = true;
         _findStatusLabel.UseMnemonic = false;
         ThemeStyler.ApplyLabel(_findStatusLabel, palette, true);
         searchRow.Controls.Add(_findStatusLabel, 3, 0);
 
-        _findBox.TextChanged += (_, _) => FindMatch(forward: true, restart: true);
+        _findBox.TextChanged += (_, _) =>
+        {
+            _findDebounceTimer.Stop();
+            if (string.IsNullOrWhiteSpace(_findBox.Text))
+            {
+                FindMatch(forward: true, restart: true);
+                return;
+            }
+            _findDebounceTimer.Start();
+        };
         _findBox.KeyDown += (_, eventArgs) =>
         {
             if (eventArgs.KeyCode == Keys.Enter)
             {
+                _findDebounceTimer.Stop();
                 FindMatch(forward: !eventArgs.Shift);
                 eventArgs.Handled = true;
                 eventArgs.SuppressKeyPress = true;
             }
             else if (eventArgs.KeyCode == Keys.Escape)
             {
+                _findDebounceTimer.Stop();
                 _findBox.Clear();
                 _transcriptBox.Focus();
                 eventArgs.Handled = true;
@@ -218,7 +253,7 @@ public sealed class ThreadPreviewDialog : Form
         _transcriptBox.BorderStyle = BorderStyle.None;
         _transcriptBox.BackColor = palette.InputBackColor;
         _transcriptBox.ForeColor = palette.TextColor;
-        _transcriptBox.Font = new Font(Font.FontFamily, 9.5F);
+        _transcriptBox.Font = UiFontCache.Get(Font.FontFamily, 9.5F);
         _transcriptBox.WordWrap = true;
         _transcriptBox.ScrollBars = RichTextBoxScrollBars.Vertical;
         _transcriptBox.ShortcutsEnabled = true;
@@ -226,7 +261,12 @@ public sealed class ThreadPreviewDialog : Form
         _transcriptBox.DetectUrls = false;
         _transcriptBox.AccessibleName = "本地聊天正文";
         _transcriptBox.AccessibleDescription = "只读内容，可选择后按 Ctrl+C 复制。";
+        _transcriptBox.HandleCreated += (_, _) => NativeWindowTheme.ApplyScrollable(_transcriptBox, dark);
         transcriptSurface.Controls.Add(_transcriptBox);
+        if (_transcriptBox.IsHandleCreated)
+        {
+            NativeWindowTheme.ApplyScrollable(_transcriptBox, dark);
+        }
         RenderTranscript(transcript, palette);
 
         var footer = new TableLayoutPanel
@@ -250,7 +290,7 @@ public sealed class ThreadPreviewDialog : Form
         _noticeLabel.Dock = DockStyle.Fill;
         _noticeLabel.Margin = new Padding(0, 0, 14, 0);
         _noticeLabel.AutoEllipsis = true;
-        _noticeLabel.Font = new Font(Font.FontFamily, 8.3F);
+        _noticeLabel.Font = UiFontCache.Get(Font.FontFamily, 8.3F);
         _noticeLabel.TextAlign = ContentAlignment.MiddleLeft;
         _noticeLabel.UseCompatibleTextRendering = true;
         _noticeLabel.UseMnemonic = false;
@@ -303,6 +343,7 @@ public sealed class ThreadPreviewDialog : Form
             }
             else if (eventArgs.KeyCode == Keys.F3)
             {
+                _findDebounceTimer.Stop();
                 FindMatch(forward: !eventArgs.Shift);
                 eventArgs.Handled = true;
                 eventArgs.SuppressKeyPress = true;
@@ -360,9 +401,10 @@ public sealed class ThreadPreviewDialog : Form
     private void RenderTranscript(UnifiedThreadTranscript transcript, ThemePalette palette)
     {
         _transcriptBox.Clear();
-        using var authorFont = new Font(Font.FontFamily, 9.6F, FontStyle.Bold);
-        using var bodyFont = new Font(Font.FontFamily, 9.5F, FontStyle.Regular);
-        using var noticeFont = new Font(Font.FontFamily, 10F, FontStyle.Bold);
+        var dark = ThemeStyler.IsDark(palette);
+        var authorFont = UiFontCache.Get(Font.FontFamily, 9.6F, FontStyle.Bold);
+        var bodyFont = UiFontCache.Get(Font.FontFamily, 9.5F, FontStyle.Regular);
+        var noticeFont = UiFontCache.Get(Font.FontFamily, 10F, FontStyle.Bold);
 
         if (transcript.Messages.Count == 0)
         {
@@ -371,13 +413,20 @@ public sealed class ThreadPreviewDialog : Form
             return;
         }
 
+        var userAuthorColor = dark
+            ? UiDesign.Blend(palette.AccentColor, Color.White, 0.34F)
+            : palette.PrimaryColor;
+        var assistantAuthorColor = dark
+            ? UiDesign.Blend(palette.SuccessColor, Color.White, 0.24F)
+            : palette.SuccessColor;
+
         for (var i = 0; i < transcript.Messages.Count; i++)
         {
             var message = transcript.Messages[i];
             var author = message.Role == UnifiedThreadMessageRole.User ? "你" : "Codex";
             var authorColor = message.Role == UnifiedThreadMessageRole.User
-                ? palette.PrimaryColor
-                : palette.SuccessColor;
+                ? userAuthorColor
+                : assistantAuthorColor;
             var time = message.Timestamp.HasValue
                 ? message.Timestamp.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.CurrentCulture)
                 : "时间未知";

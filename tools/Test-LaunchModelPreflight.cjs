@@ -12,14 +12,15 @@ const shared = path.join(root, 'shared');
 fs.mkdirSync(home); fs.mkdirSync(shared);
 fs.writeFileSync(path.join(shared, 'auth.json'), '{"unchanged":"fixture"}');
 const catalog = path.join(home, '.codex-account-manager-compatible-models.json');
-let calls = 0, status = 200, ids = ['gpt-9.1-sol'];
+let calls = 0, status = 200, transient = [], ids = ['gpt-9.1-sol'];
 const server = http.createServer((req,res) => {
   calls++;
   assert.equal(req.method, 'GET');
   assert.equal(req.url, '/v1/models');
   assert.equal(req.headers.authorization, 'Bearer fixture-api-key');
-  res.writeHead(status, {'Content-Type':'application/json'});
-  res.end(JSON.stringify(status === 200 ? {data: ids.map(id=>({id}))} : {error:'fixture-sensitive-error'}));
+  const reply = transient.length ? transient.shift() : status;
+  res.writeHead(reply, {'Content-Type':'application/json'});
+  res.end(JSON.stringify(reply === 200 ? {data: ids.map(id=>({id}))} : {error:'fixture-sensitive-error'}));
 });
 async function preflight(expected=0) {
   const result = await new Promise((resolve,reject) => {
@@ -51,7 +52,8 @@ async function preflight(expected=0) {
     assert.equal(calls,2,'every launch queries even a fresh catalog');
     assert.deepEqual(JSON.parse(fs.readFileSync(catalog)).models.map(m=>m.slug),ids);
     const lastGood=fs.readFileSync(catalog,'utf8');
-    for(const failure of [401,404,503]){status=failure;await preflight(1);assert.equal(fs.readFileSync(catalog,'utf8'),lastGood);}
+    transient=[502,503];const beforeRecovery=calls;await preflight();assert.equal(calls-beforeRecovery,3);
+    for(const failure of [401,403,404,503]){status=failure;const before=calls;await preflight(1);assert.equal(calls-before,failure===503?3:1);assert.equal(fs.readFileSync(catalog,'utf8'),lastGood);}
     status=200; ids=[]; await preflight(1);assert.equal(fs.readFileSync(catalog,'utf8'),lastGood);
     console.log('PASS: every-launch remote query, imported default discovery, future models, failures preserve catalog and shared auth');
   } finally {await new Promise(resolve=>server.close(resolve));fs.rmSync(root,{recursive:true,force:true});}

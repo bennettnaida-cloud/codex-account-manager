@@ -199,6 +199,18 @@ internal static class PatAutoRotationPolicy
             return false;
         }
 
+        if (latestConfirmedExhaustion != null &&
+            latestConfirmedExhaustion.ObservedAtUtc.ToUniversalTime() >=
+                snapshot.ObservedAtUtc.ToUniversalTime())
+        {
+            if (latestConfirmedExhaustion.ResetAtUtc is { } newerConfirmedResetAtUtc)
+            {
+                return newerConfirmedResetAtUtc.ToUniversalTime() +
+                       AccountRotationConfiguration.PrimaryResetGracePeriod <= now;
+            }
+            return false;
+        }
+
         if (latestConfirmedExhaustion?.ResetAtUtc is { } confirmedResetAtUtc &&
             confirmedResetAtUtc.ToUniversalTime() +
                 AccountRotationConfiguration.PrimaryResetGracePeriod <= now)
@@ -516,6 +528,18 @@ internal static class PatAutoRotationPolicy
             HasLocallyAvailableRotationQuota(
                 localAvailableSnapshot,
                 newerConfirmedExhaustion,
+                now) ||
+            HasLocallyAvailableRotationQuota(
+                elapsedLocalSnapshot,
+                newerConfirmedExhaustion,
+                now) ||
+            HasLocallyAvailableRotationQuota(
+                elapsedLocalSnapshot,
+                newerConfirmedExhaustion with { ResetAtUtc = null },
+                now) ||
+            !HasLocallyAvailableRotationQuota(
+                elapsedLocalSnapshot,
+                newerConfirmedExhaustion with { ResetAtUtc = now.AddMinutes(-2) },
                 now) ||
             !HasLocallyAvailableRotationQuota(elapsedLocalSnapshot, null, now) ||
             IsGatewayQuiet(

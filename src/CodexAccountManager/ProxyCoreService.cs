@@ -163,6 +163,9 @@ internal sealed class ProxyCoreService : IDisposable
     private readonly string _rootPath;
     private readonly object _gate = new();
     private readonly Dictionary<string, RunningCore> _running = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, object> _nodeGates = new(StringComparer.OrdinalIgnoreCase);
+    private CancellationTokenSource _resetCancellation = new();
+    private long _resetGeneration;
 
     public ProxyCoreService(string rootPath) => _rootPath = Path.GetFullPath(rootPath);
 
@@ -186,20 +189,53 @@ internal sealed class ProxyCoreService : IDisposable
         }
 
         var fingerprint = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(nativeUri)))[..24];
+        var requiresSingBox = hasNativeOutbound || node.EffectiveScheme.ToLowerInvariant() is "hysteria2" or "hy2";
+        var preferSingBox = requiresSingBox || RequiresInsecureTls(nativeUri);
+
+        object nodeGate;
         lock (_gate)
         {
-            var requiresSingBox = hasNativeOutbound || node.EffectiveScheme.ToLowerInvariant() is "hysteria2" or "hy2";
-            var preferSingBox = requiresSingBox || RequiresInsecureTls(nativeUri);
-            if (_running.TryGetValue(node.NodeId, out var existing) &&
-                existing.Fingerprint.Equals(fingerprint, StringComparison.Ordinal) &&
-                (!preferSingBox || existing.UsesSingBox) &&
-                !existing.Process.HasExited)
+            if (_running.TryGetValue(node.NodeId, out var existingFast) &&
+                existingFast.Fingerprint.Equals(fingerprint, StringComparison.Ordinal) &&
+                (!preferSingBox || existingFast.UsesSingBox) &&
+                !existingFast.Process.HasExited)
             {
-                localProxy = new Uri($"http://127.0.0.1:{existing.Port}");
+                localProxy = new Uri($"http://127.0.0.1:{existingFast.Port}");
                 return true;
             }
-            StopCore(existing);
-            _running.Remove(node.NodeId);
+            if (!_nodeGates.TryGetValue(node.NodeId, out nodeGate!))
+            {
+                nodeGate = new object();
+                _nodeGates[node.NodeId] = nodeGate;
+            }
+        }
+
+        // Serialize startup per node without holding _gate across core discovery or the
+        // 4-second loopback port wait, so other nodes and ResetNativeCores/Dispose never stall.
+        lock (nodeGate)
+        {
+            RunningCore? staleCore = null;
+            long startGeneration;
+            CancellationToken resetToken;
+            lock (_gate)
+            {
+                if (_running.TryGetValue(node.NodeId, out var existing) &&
+                    existing.Fingerprint.Equals(fingerprint, StringComparison.Ordinal) &&
+                    (!preferSingBox || existing.UsesSingBox) &&
+                    !existing.Process.HasExited)
+                {
+                    localProxy = new Uri($"http://127.0.0.1:{existing.Port}");
+                    return true;
+                }
+                if (existing != null)
+                {
+                    staleCore = existing;
+                    _running.Remove(node.NodeId);
+                }
+                startGeneration = _resetGeneration;
+                resetToken = _resetCancellation.Token;
+            }
+            StopCore(staleCore);
 
             if (!TryFindCorePath(preferSingBox, out var corePath, out var usesSingBox))
             {
@@ -242,6 +278,8 @@ internal sealed class ProxyCoreService : IDisposable
             var runtimeDir = Path.Combine(_rootPath, ".proxy-runtime");
             Directory.CreateDirectory(runtimeDir);
             var configPath = Path.Combine(runtimeDir, Guid.NewGuid().ToString("N") + ".json");
+            Process? process = null;
+            var registered = false;
             try
             {
                 var config = usesSingBox
@@ -275,14 +313,14 @@ internal sealed class ProxyCoreService : IDisposable
                 psi.ArgumentList.Add("run");
                 psi.ArgumentList.Add("-c");
                 psi.ArgumentList.Add(usesSingBox ? "stdin" : configPath);
-                var process = Process.Start(psi);
+                process = Process.Start(psi);
                 if (process is null)
                 {
                     error = "代理核心启动失败。";
                     return false;
                 }
-                _ = process.StandardOutput.ReadToEndAsync();
-                _ = process.StandardError.ReadToEndAsync();
+                StartBoundedDrain(process.StandardOutput);
+                StartBoundedDrain(process.StandardError);
                 if (usesSingBox)
                 {
                     process.StandardInput.Write(configJson);
@@ -291,28 +329,77 @@ internal sealed class ProxyCoreService : IDisposable
                 // A dead subscription should fail quickly in the UI. The gateway
                 // has its own resolver/core instance, so this only shortens an
                 // interactive node probe and never changes the rotation path.
-                if (!WaitForPort(port, TimeSpan.FromSeconds(4)))
+                if (!WaitForPort(port, TimeSpan.FromSeconds(4), externalToken: resetToken, process: process))
                 {
-                    try { process.Kill(entireProcessTree: true); } catch { }
                     error = "代理核心未在本地回环端口启动。";
                     return false;
                 }
                 try { File.Delete(configPath); } catch { }
-                _running[node.NodeId] = new RunningCore(process, port, fingerprint, usesSingBox);
+                RunningCore? replaced = null;
+                lock (_gate)
+                {
+                    if (_resetGeneration != startGeneration)
+                    {
+                        error = "代理核心已重置。";
+                        return false;
+                    }
+                    if (_running.TryGetValue(node.NodeId, out var prior))
+                    {
+                        replaced = prior;
+                    }
+                    _running[node.NodeId] = new RunningCore(process, port, fingerprint, usesSingBox);
+                    registered = true;
+                }
+                StopCore(replaced);
                 localProxy = new Uri($"http://127.0.0.1:{port}");
                 return true;
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
             {
                 error = "原生代理核心启动失败。";
-                try { File.Delete(configPath); } catch { }
                 return false;
             }
             finally
             {
+                if (!registered && process is not null)
+                {
+                    try { if (!process.HasExited) process.Kill(entireProcessTree: true); } catch { }
+                    try { process.Dispose(); } catch { }
+                }
                 try { File.Delete(configPath); } catch { }
             }
         }
+    }
+
+    private static void StartBoundedDrain(StreamReader reader)
+    {
+        _ = Task.Run(async () =>
+        {
+            var chunk = new char[4096];
+            var ring = new char[4096];
+            var ringPos = 0;
+            try
+            {
+                while (true)
+                {
+                    var read = await reader.ReadAsync(chunk, 0, chunk.Length).ConfigureAwait(false);
+                    if (read <= 0) break;
+                    var take = Math.Min(read, ring.Length);
+                    var srcOffset = read - take;
+                    var firstCopy = Math.Min(take, ring.Length - ringPos);
+                    Array.Copy(chunk, srcOffset, ring, ringPos, firstCopy);
+                    if (take > firstCopy)
+                    {
+                        Array.Copy(chunk, srcOffset + firstCopy, ring, 0, take - firstCopy);
+                    }
+                    ringPos = (ringPos + take) % ring.Length;
+                }
+            }
+            catch
+            {
+                // Process exited or pipe closed during shutdown.
+            }
+        });
     }
 
     private bool TryFindCorePath(bool preferSingBox, out string path, out bool usesSingBox)
@@ -422,12 +509,30 @@ internal sealed class ProxyCoreService : IDisposable
     }
 
     private static bool WaitForPort(int port, TimeSpan timeout,
-        Func<TcpClient, int, CancellationToken, ValueTask>? connect = null)
+        Func<TcpClient, int, CancellationToken, ValueTask>? connect = null,
+        CancellationToken externalToken = default,
+        Process? process = null)
     {
-        if (timeout <= TimeSpan.Zero) return false;
-        using var deadline = new CancellationTokenSource(timeout);
+        if (timeout <= TimeSpan.Zero || externalToken.IsCancellationRequested) return false;
+        CancellationTokenSource deadline;
+        try
+        {
+            deadline = externalToken.CanBeCanceled
+                ? CancellationTokenSource.CreateLinkedTokenSource(externalToken)
+                : new CancellationTokenSource();
+        }
+        catch (ObjectDisposedException)
+        {
+            return false;
+        }
+        using var ownedDeadline = deadline;
+        deadline.CancelAfter(timeout);
         while (!deadline.IsCancellationRequested)
         {
+            if (process is not null)
+            {
+                try { if (process.HasExited) return false; } catch { return false; }
+            }
             try
             {
                 using var client = new TcpClient();
@@ -789,11 +894,19 @@ internal sealed class ProxyCoreService : IDisposable
 
     public void Dispose()
     {
+        List<RunningCore> toStop;
+        CancellationTokenSource oldCts;
         lock (_gate)
         {
-            foreach (var core in _running.Values) StopCore(core);
+            _resetGeneration++;
+            oldCts = _resetCancellation;
+            _resetCancellation = new CancellationTokenSource();
+            toStop = _running.Values.ToList();
             _running.Clear();
         }
+        try { oldCts.Cancel(); } catch { }
+        try { oldCts.Dispose(); } catch { }
+        foreach (var core in toStop) StopCore(core);
     }
 
     private sealed record RunningCore(Process Process, int Port, string Fingerprint, bool UsesSingBox);

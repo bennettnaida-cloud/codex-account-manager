@@ -2,15 +2,23 @@ namespace CodexAccountManager;
 
 internal sealed partial class LocalPatGatewayHost
 {
-    private HashSet<string> GetQuotaReservePausedAccountKeys(
-        IReadOnlyCollection<AccountRecord> accounts, DateTimeOffset nowUtc)
+    private static HashSet<string> GetQuotaReservePausedAccountKeys(
+        IReadOnlyCollection<AccountRecord> accounts,
+        IReadOnlyDictionary<string, PersistedQuotaSnapshot> snapshots,
+        DateTimeOffset nowUtc)
     {
-        var snapshots = new QuotaSnapshotStore(_accountStore.RootPath).LoadForAccounts(accounts);
         return accounts.Where(account => !account.IsCompatibleApi)
             .Select(QuotaAccountIdentity.CreateKey)
             .Where(key => snapshots.TryGetValue(key, out var snapshot) &&
                           PatAutoRotationPolicy.IsReservePaused(snapshot, nowUtc))
             .ToHashSet(StringComparer.Ordinal);
+    }
+
+    private HashSet<string> GetQuotaReservePausedAccountKeys(
+        IReadOnlyCollection<AccountRecord> accounts, DateTimeOffset nowUtc)
+    {
+        var snapshots = new QuotaSnapshotStore(_accountStore.RootPath).LoadForAccounts(accounts);
+        return GetQuotaReservePausedAccountKeys(accounts, snapshots, nowUtc);
     }
 
     private bool IsQuotaReservePausedForRotation(GatewayCredential credential)

@@ -17,7 +17,7 @@ Codex Account Manager 是一个在本机运行的 Codex 多账号管理器。它
 
 也可以打开 [Latest Release](https://github.com/bennettnaida-cloud/codex-account-manager/releases/tag/latest) 查看版本、发布时间和全部文件。
 
-当前发布版本为 2.4.2。Windows 新增兼容 API 账号的默认模型统一为 `gpt-6.1-sol`，同时更新文件导入、账号字段及配置生成时的空模型兜底；保留已有账号明确设置的模型。继续包含聊天分组同步、CPA fill-first 调度、10%／3% 保留线及删除重加账号的额度与用量隔离。详见 [2.4.2 更新说明](docs/release-2.4.2.md)。macOS 本次仅同步发布版本号，不包含上述 Windows 专属改动。
+当前发布版本为 2.4.3。Windows 重点修复代理节点指纹去重、批量测速覆盖禁用节点、损坏配置静默覆写、轮换耗尽状态回跳、账号删除残留清理及代理核心锁争用与句柄泄漏，并优化本地网关连接池、界面对比度与刷新流畅度。继续包含 2.4.2 兼容 API 默认模型 `gpt-6.1-sol`、聊天分组同步、CPA fill-first 调度、10%／3% 保留线及删除重加账号的额度与用量隔离。详见 [2.4.3 更新说明](docs/release-2.4.3.md)。macOS 本次仅同步发布版本号，不包含上述 Windows 专属改动。
 
 保留旧会话续聊用量统计、轮换、逐账号代理与模型目录，以及升级时同步桌面和任务栏快捷方式。当前本机桌面版本为 Windows OpenAI.Codex 26.1002.7124.0（ChatGPT.exe）；专项回归并不等于已在所有电脑上完成交互实测，未来版本及第三方上游仍需按实际协议验证。
 

@@ -151,7 +151,7 @@ internal sealed partial class LocalPatGatewayHost
             }
             finally
             {
-                if (host != null) foreach (var client in host._clients.Values) client.Dispose();
+                host?.DisposeUpstreamClients();
                 Environment.SetEnvironmentVariable("CODEX_ACCOUNT_MANAGER_HOME", previousRoot);
                 Environment.SetEnvironmentVariable("CODEX_ACCOUNT_MANAGER_SHARED_CODEX_HOME", previousShared);
                 if (Directory.Exists(root)) Directory.Delete(root, recursive: true);

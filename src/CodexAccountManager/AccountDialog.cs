@@ -60,6 +60,8 @@ public sealed class AccountDialog : Form
     private bool _oauthLoginBusy;
     private CancellationTokenSource? _oauthCancellation;
     private Task<LoginStatus>? _oauthLoginTask;
+    private readonly System.Windows.Forms.Timer _nameDebounceTimer = new() { Interval = 180 };
+    private bool _updatingLayout;
 
     public AccountDialog(
         AccountRecord? account,
@@ -86,9 +88,17 @@ public sealed class AccountDialog : Form
         AutoScaleMode = AutoScaleMode.Dpi;
         ClientSize = new Size(960, 770);
         MinimumSize = new Size(980, 460);
-        Font = new Font("Microsoft YaHei UI", 9.25F);
+        Font = UiFontCache.Get("Microsoft YaHei UI", 9.25F);
         DoubleBuffered = true;
         ThemeStyler.ApplyDialog(this, palette);
+        _nameDebounceTimer.Tick += (_, _) =>
+        {
+            _nameDebounceTimer.Stop();
+            if (!IsDisposed && !Disposing)
+            {
+                UpdateSuggestedHomeForName();
+            }
+        };
 
         _heroCard.SetBounds(16, 14, 928, 86);
         _heroCard.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
@@ -177,6 +187,8 @@ public sealed class AccountDialog : Form
         _formCard.ShadowColor = Color.FromArgb(34, palette.ShadowColor);
         _formCard.Elevation = 2;
         _formCard.ShowTechDecoration = false;
+        _formCard.HandleCreated += (_, _) =>
+            NativeWindowTheme.ApplyScrollable(_formCard, ThemeStyler.IsDark(_palette));
         Controls.Add(_formCard);
 
         var profileBadge = MakeSectionBadge("账号资料", 20, 14, 108);
@@ -203,7 +215,12 @@ public sealed class AccountDialog : Form
         _formCard.Controls.Add(nameLabel);
 
         _nameBox.Text = account?.Name ?? "";
-        _nameBox.TextChanged += (_, _) => UpdateSuggestedHomeForName();
+        _nameBox.TextChanged += (_, _) =>
+        {
+            _nameDebounceTimer.Stop();
+            _nameDebounceTimer.Start();
+        };
+        _nameBox.Leave += (_, _) => FlushPendingSuggestedHomeUpdate();
         _nameShell = MakeInputShell(_nameBox, 164, 40, 744);
         _nameShell.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         _formCard.Controls.Add(_nameShell);
@@ -391,16 +408,17 @@ public sealed class AccountDialog : Form
 
         _saveButton.Text = "保存账号";
         _saveButton.SetBounds(672, 720, 140, 44);
-        _saveButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        _saveButton.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
         _saveButton.DialogResult = DialogResult.OK;
         _saveButton.Radius = 12;
         _saveButton.Padding = new Padding(14, 0, 14, 0);
         _saveButton.AutoShrinkText = false;
+        _saveButton.Click += (_, _) => FlushPendingSuggestedHomeUpdate();
         ThemeStyler.ApplyPrimaryButton(_saveButton, palette);
 
         _cancelButton.Text = "取消";
         _cancelButton.SetBounds(824, 720, 120, 44);
-        _cancelButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        _cancelButton.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
         _cancelButton.DialogResult = DialogResult.Cancel;
         ConfigureDialogTonalButton(_cancelButton);
         Controls.Add(_saveButton);
@@ -411,7 +429,9 @@ public sealed class AccountDialog : Form
         UpdateAuthMode();
         Shown += (_, _) => BeginInvoke(() =>
         {
+            if (IsDisposed || Disposing) return;
             UpdateAuthMode();
+            EnsureDialogInsideWorkingArea();
             // A long suggested CODEX_HOME can otherwise retain an end-of-line scroll offset
             // on high-DPI displays and hide the drive letter when the dialog first appears.
             _homeBox.Focus();
@@ -419,11 +439,17 @@ public sealed class AccountDialog : Form
             _nameBox.Focus();
             BeginInvoke(() =>
             {
+                if (IsDisposed || Disposing) return;
                 _homeShell.PerformLayout();
                 ResetHomePathViewport();
             });
         });
-        DpiChanged += (_, _) => BeginInvoke(UpdateAuthMode);
+        DpiChanged += (_, _) => BeginInvoke(() =>
+        {
+            if (IsDisposed || Disposing) return;
+            UpdateAuthMode();
+            EnsureDialogInsideWorkingArea();
+        });
     }
 
     public string AccountNameValue => _nameBox.Text.Trim();
@@ -455,7 +481,17 @@ public sealed class AccountDialog : Form
     {
         if (disposing)
         {
-            _oauthCancellation?.Cancel();
+            _nameDebounceTimer.Stop();
+            _nameDebounceTimer.Dispose();
+            try
+            {
+                _oauthCancellation?.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+            _oauthCancellation?.Dispose();
+            _oauthCancellation = null;
             ClearOAuthLoginClipboard();
             ScheduleOAuthDraftCleanup();
             _pathToolTip.Dispose();
@@ -665,8 +701,36 @@ public sealed class AccountDialog : Form
             Size.Empty,
             TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding);
         var horizontalPadding = Math.Max(10, Math.Max(button.Padding.Left, button.Padding.Right));
-        var iconSpace = string.IsNullOrEmpty(button.IconText) ? 0 : button.IconWidth + 8;
+        var hasIcon = button.IconGlyph != ModernButtonGlyph.None || !string.IsNullOrEmpty(button.IconText);
+        var iconSpace = hasIcon ? button.IconWidth + 8 : 0;
         return measured.Width <= button.ClientSize.Width - (horizontalPadding * 2) - iconSpace;
+    }
+
+    private void FlushPendingSuggestedHomeUpdate()
+    {
+        if (!_nameDebounceTimer.Enabled)
+        {
+            return;
+        }
+
+        _nameDebounceTimer.Stop();
+        UpdateSuggestedHomeForName();
+    }
+
+    private void EnsureDialogInsideWorkingArea()
+    {
+        if (IsDisposed || Disposing || !IsHandleCreated)
+        {
+            return;
+        }
+
+        var workingArea = Screen.FromControl(Owner ?? this).WorkingArea;
+        var left = Math.Clamp(Left, workingArea.Left, Math.Max(workingArea.Left, workingArea.Right - Width));
+        var top = Math.Clamp(Top, workingArea.Top, Math.Max(workingArea.Top, workingArea.Bottom - Height));
+        if (left != Left || top != Top)
+        {
+            Location = new Point(left, top);
+        }
     }
 
     private void UpdateSuggestedHomeForName()
@@ -797,10 +861,13 @@ public sealed class AccountDialog : Form
 
     private void ApplySectionBadgeStyle(PillLabel badge)
     {
-        badge.FillColor = UiDesign.Blend(_palette.SurfaceAltColor, _palette.PrimaryColor, 0.08F);
-        badge.StrokeColor = Color.FromArgb(78, _palette.AccentColor);
-        badge.ForeColor = _palette.PrimaryColor;
-        badge.Font = new Font(Font.FontFamily, 8.2F, FontStyle.Bold);
+        var dark = ThemeStyler.IsDark(_palette);
+        badge.FillColor = UiDesign.Blend(_palette.SurfaceAltColor, _palette.PrimaryColor, dark ? 0.20F : 0.08F);
+        badge.StrokeColor = Color.FromArgb(dark ? 136 : 78, _palette.AccentColor);
+        badge.ForeColor = dark
+            ? UiDesign.Blend(_palette.AccentColor, Color.White, 0.38F)
+            : _palette.PrimaryColor;
+        badge.Font = UiFontCache.Get(Font.FontFamily, 8.2F, FontStyle.Bold);
         badge.BackColor = Color.Transparent;
     }
 
@@ -879,6 +946,7 @@ public sealed class AccountDialog : Form
 
     private async Task GenerateOfficialOAuthLinkAsync()
     {
+        FlushPendingSuggestedHomeUpdate();
         if (!IsOfficialOAuthSelected)
         {
             return;
@@ -927,23 +995,32 @@ public sealed class AccountDialog : Form
         _oauthDraftVerified = false;
         _oauthLoginUrl = "";
         _oauthCancellation?.Dispose();
-        _oauthCancellation = new CancellationTokenSource();
+        var cancellation = new CancellationTokenSource();
+        _oauthCancellation = cancellation;
         _oauthLoginBusy = true;
         SetOAuthInputsBusy(true);
         UpdateAuthMode();
+
+        var dark = ThemeStyler.IsDark(_palette);
+        var activeAccentText = dark
+            ? UiDesign.Blend(_palette.AccentColor, Color.White, 0.38F)
+            : _palette.PrimaryColor;
+        var successBadgeText = dark
+            ? UiDesign.Blend(_palette.SuccessColor, Color.White, 0.28F)
+            : _palette.SuccessColor;
 
         var progress = new Progress<ChatGptOAuthAuthorization>(authorization =>
         {
             if (IsDisposed || Disposing || !IsOfficialOAuthSelected)
             {
-                _oauthCancellation?.Cancel();
+                try { cancellation.Cancel(); } catch (ObjectDisposedException) { }
                 return;
             }
 
             _oauthLoginUrl = authorization.LoginUrl;
             _generateLoginLinkButton.Text = "复制登录链接";
             _oauthStatusBadge.Text = "登录链接已复制，正在等待浏览器登录…";
-            _oauthStatusBadge.ForeColor = _palette.PrimaryColor;
+            _oauthStatusBadge.ForeColor = activeAccentText;
             CopyOAuthLoginUrl(showFailure: true);
         });
 
@@ -952,7 +1029,7 @@ public sealed class AccountDialog : Form
             _oauthLoginTask = _codex.LoginWithChatGptDraftAsync(
                 _oauthDraftRoot,
                 progress,
-                _oauthCancellation.Token);
+                cancellation.Token);
             var status = await _oauthLoginTask;
             if (IsDisposed || Disposing || !IsOfficialOAuthSelected)
             {
@@ -966,25 +1043,36 @@ public sealed class AccountDialog : Form
 
             _oauthDraftVerified = true;
             _oauthStatusBadge.Text = "✓ 已登录";
-            _oauthStatusBadge.ForeColor = _palette.SuccessColor;
+            _oauthStatusBadge.ForeColor = successBadgeText;
             _oauthStatusBadge.FillColor = UiDesign.Blend(
                 _palette.SurfaceAltColor,
                 _palette.SuccessColor,
-                0.12F);
-            _oauthStatusBadge.StrokeColor = Color.FromArgb(110, _palette.SuccessColor);
+                dark ? 0.20F : 0.12F);
+            _oauthStatusBadge.StrokeColor = Color.FromArgb(dark ? 140 : 110, _palette.SuccessColor);
             _generateLoginLinkButton.Text = "重新生成登录链接";
             ClearOAuthLoginClipboard();
             _oauthLoginUrl = "";
         }
-        catch (Exception ex) when (ex is InvalidOperationException or TimeoutException or IOException)
+        catch (OperationCanceledException)
         {
             if (!IsDisposed && !Disposing && IsOfficialOAuthSelected)
             {
-                _oauthStatusBadge.Text = _oauthCancellation?.IsCancellationRequested == true
+                _oauthStatusBadge.Text = "登录已取消";
+                _oauthStatusBadge.ForeColor = _palette.WarningColor;
+            }
+            ScheduleOAuthDraftCleanup();
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or TimeoutException or IOException)
+        {
+            var wasCanceled = false;
+            try { wasCanceled = cancellation.IsCancellationRequested; } catch (ObjectDisposedException) { wasCanceled = true; }
+            if (!IsDisposed && !Disposing && IsOfficialOAuthSelected)
+            {
+                _oauthStatusBadge.Text = wasCanceled
                     ? "登录已取消"
                     : "登录未完成，请重新生成链接";
                 _oauthStatusBadge.ForeColor = _palette.WarningColor;
-                if (_oauthCancellation?.IsCancellationRequested != true)
+                if (!wasCanceled)
                 {
                     MessageBox.Show(
                         this,
@@ -999,11 +1087,14 @@ public sealed class AccountDialog : Form
         finally
         {
             _oauthLoginBusy = false;
-            SetOAuthInputsBusy(false);
-            _oauthCancellation?.Dispose();
-            _oauthCancellation = null;
+            if (ReferenceEquals(_oauthCancellation, cancellation))
+            {
+                _oauthCancellation = null;
+                cancellation.Dispose();
+            }
             if (!IsDisposed && !Disposing)
             {
+                SetOAuthInputsBusy(false);
                 UpdateAuthMode();
             }
         }
@@ -1155,143 +1246,201 @@ public sealed class AccountDialog : Form
 
     private void UpdateAuthMode()
     {
-        var isApi = IsCompatibleApiSelected;
-        var isOAuth = IsOfficialOAuthSelected;
-        var useTokenUpdateButton = IsAccessTokenSelected && !_isNewAccount;
-        _credentialSectionBadge.Text = isApi
-            ? "API 连接"
-            : isOAuth
-                ? "官方登录"
-                : "登录凭据";
-        _secretLabel.Text = isApi ? "API Key" : "访问令牌";
-        _secretNote.Text = isOAuth
-            ? $"点击登录方式右侧的“生成登录链接”。链接只会复制到剪贴板，不会自动打开浏览器；请自行粘贴并确认 ChatGPT 账号。只有官方回调完成并显示“✓ 已登录”后才能保存。\nOAuth 凭据只会保存在当前账号目录：{_homeBox.Text}"
-            : isApi
-                ? $"API Key 只会保存到当前账号目录：{_homeBox.Text}\n新增时必填；编辑时留空会保留该目录中的原 API Key。"
-                : useTokenUpdateButton
-                    ? string.IsNullOrWhiteSpace(_pendingAccessToken)
-                        ? "当前 Token 保持不变。只有点击“更新 Token”并保存账号后，才会替换现有 Token。"
-                        : "已选择新的 Token；点击“保存”后才会更新。若取消编辑，现有 Token 不会改变。"
-                    : $"Access Token 只会保存到当前账号目录：{_homeBox.Text}\n只填 Token 本体；不要填 sk- API Key、JSON 或 Bearer 前缀。";
-        _secretNoteCard.Height = MeasureInfoCardHeight(
-            _secretNoteCard,
-            _secretNote,
-            isApi ? 70 : 82);
-        _secretNoteCard.PerformLayout();
-
-        _secretLabel.Visible = !isOAuth;
-        _secretLabel.Enabled = !isOAuth;
-        _secretShell.Visible = !isOAuth && !useTokenUpdateButton;
-        _secretShell.Enabled = !isOAuth && !useTokenUpdateButton;
-        _secretBox.Visible = !isOAuth && !useTokenUpdateButton;
-        _secretBox.Enabled = !isOAuth && !useTokenUpdateButton;
-        _updateTokenButton.Visible = useTokenUpdateButton;
-        _updateTokenButton.Enabled = useTokenUpdateButton;
-        _generateLoginLinkButton.Visible = isOAuth;
-        _generateLoginLinkButton.Enabled = isOAuth &&
-            _codex != null &&
-            (!_oauthLoginBusy || !string.IsNullOrWhiteSpace(_oauthLoginUrl));
-        _authKindShell.Width = isOAuth
-            ? Math.Max(
-                220,
-                _generateLoginLinkButton.Left - _authKindShell.Left -
-                Math.Max(8, (int)Math.Ceiling(12 * GetCurrentLayoutScale())))
-            : _homeShell.Width;
-        _oauthStatusBadge.Visible = isOAuth;
-        _oauthStatusBadge.Enabled = isOAuth;
-
-        if (isOAuth)
+        if (_updatingLayout)
         {
-            var verified = HasVerifiedOAuthCredential();
-            if (_oauthLoginBusy)
+            return;
+        }
+        _updatingLayout = true;
+        try
+        {
+            var isApi = IsCompatibleApiSelected;
+            var isOAuth = IsOfficialOAuthSelected;
+            var useTokenUpdateButton = IsAccessTokenSelected && !_isNewAccount;
+            var dark = ThemeStyler.IsDark(_palette);
+            _credentialSectionBadge.Text = isApi
+                ? "API 连接"
+                : isOAuth
+                    ? "官方登录"
+                    : "登录凭据";
+            _secretLabel.Text = isApi ? "API Key" : "访问令牌";
+            _secretNote.Text = isOAuth
+                ? $"点击登录方式右侧的“生成登录链接”。链接只会复制到剪贴板，不会自动打开浏览器；请自行粘贴并确认 ChatGPT 账号。只有官方回调完成并显示“✓ 已登录”后才能保存。\nOAuth 凭据只会保存在当前账号目录：{_homeBox.Text}"
+                : isApi
+                    ? $"API Key 只会保存到当前账号目录：{_homeBox.Text}\n新增时必填；编辑时留空会保留该目录中的原 API Key。"
+                    : useTokenUpdateButton
+                        ? string.IsNullOrWhiteSpace(_pendingAccessToken)
+                            ? "当前 Token 保持不变。只有点击“更新 Token”并保存账号后，才会替换现有 Token。"
+                            : "已选择新的 Token；点击“保存”后才会更新。若取消编辑，现有 Token 不会改变。"
+                        : $"Access Token 只会保存到当前账号目录：{_homeBox.Text}\n只填 Token 本体；不要填 sk- API Key、JSON 或 Bearer 前缀。";
+            _secretNoteCard.Height = MeasureInfoCardHeight(
+                _secretNoteCard,
+                _secretNote,
+                isApi ? 70 : 82);
+            _secretNoteCard.PerformLayout();
+
+            _secretLabel.Visible = !isOAuth;
+            _secretLabel.Enabled = !isOAuth;
+            _secretShell.Visible = !isOAuth && !useTokenUpdateButton;
+            _secretShell.Enabled = !isOAuth && !useTokenUpdateButton;
+            _secretBox.Visible = !isOAuth && !useTokenUpdateButton;
+            _secretBox.Enabled = !isOAuth && !useTokenUpdateButton;
+            _updateTokenButton.Visible = useTokenUpdateButton;
+            _updateTokenButton.Enabled = useTokenUpdateButton;
+            _generateLoginLinkButton.Visible = isOAuth;
+            _generateLoginLinkButton.Enabled = isOAuth &&
+                _codex != null &&
+                (!_oauthLoginBusy || !string.IsNullOrWhiteSpace(_oauthLoginUrl));
+            _authKindShell.Width = isOAuth
+                ? Math.Max(
+                    220,
+                    _generateLoginLinkButton.Left - _authKindShell.Left -
+                    Math.Max(8, (int)Math.Ceiling(12 * GetCurrentLayoutScale())))
+                : _homeShell.Width;
+            _oauthStatusBadge.Visible = isOAuth;
+            _oauthStatusBadge.Enabled = isOAuth;
+
+            if (isOAuth)
             {
-                _oauthStatusBadge.Text = string.IsNullOrWhiteSpace(_oauthLoginUrl)
-                    ? "正在生成 OpenAI 官方登录链接…"
-                    : "登录链接已复制，正在等待浏览器登录…";
-                _oauthStatusBadge.ForeColor = _palette.PrimaryColor;
-                _generateLoginLinkButton.Text = string.IsNullOrWhiteSpace(_oauthLoginUrl)
-                    ? "正在生成…"
-                    : "复制登录链接";
-            }
-            else if (verified)
-            {
-                _oauthStatusBadge.Text = "✓ 已登录";
-                _oauthStatusBadge.ForeColor = _palette.SuccessColor;
-                _oauthStatusBadge.FillColor = UiDesign.Blend(
-                    _palette.SurfaceAltColor,
-                    _palette.SuccessColor,
-                    0.12F);
-                _oauthStatusBadge.StrokeColor = Color.FromArgb(110, _palette.SuccessColor);
-                _generateLoginLinkButton.Text = _oauthDraftVerified
-                    ? "重新生成登录链接"
-                    : "生成新登录链接";
+                var verified = HasVerifiedOAuthCredential();
+                if (_oauthLoginBusy)
+                {
+                    _oauthStatusBadge.Text = string.IsNullOrWhiteSpace(_oauthLoginUrl)
+                        ? "正在生成 OpenAI 官方登录链接…"
+                        : "登录链接已复制，正在等待浏览器登录…";
+                    _oauthStatusBadge.ForeColor = dark
+                        ? UiDesign.Blend(_palette.AccentColor, Color.White, 0.38F)
+                        : _palette.PrimaryColor;
+                    _generateLoginLinkButton.Text = string.IsNullOrWhiteSpace(_oauthLoginUrl)
+                        ? "正在生成…"
+                        : "复制登录链接";
+                }
+                else if (verified)
+                {
+                    _oauthStatusBadge.Text = "✓ 已登录";
+                    _oauthStatusBadge.ForeColor = dark
+                        ? UiDesign.Blend(_palette.SuccessColor, Color.White, 0.28F)
+                        : _palette.SuccessColor;
+                    _oauthStatusBadge.FillColor = UiDesign.Blend(
+                        _palette.SurfaceAltColor,
+                        _palette.SuccessColor,
+                        dark ? 0.20F : 0.12F);
+                    _oauthStatusBadge.StrokeColor = Color.FromArgb(dark ? 140 : 110, _palette.SuccessColor);
+                    _generateLoginLinkButton.Text = _oauthDraftVerified
+                        ? "重新生成登录链接"
+                        : "生成新登录链接";
+                }
+                else
+                {
+                    _oauthStatusBadge.Text = "尚未登录；请先生成链接并在浏览器完成 ChatGPT 登录";
+                    _oauthStatusBadge.ForeColor = _palette.MutedTextColor;
+                    _oauthStatusBadge.FillColor = UiDesign.Blend(
+                        _palette.SurfaceAltColor,
+                        _palette.PrimaryColor,
+                        dark ? 0.12F : 0.05F);
+                    _oauthStatusBadge.StrokeColor = UiDesign.Blend(
+                        _palette.BorderColor,
+                        _palette.PrimaryColor,
+                        dark ? 0.36F : 0.24F);
+                    _generateLoginLinkButton.Text = "生成登录链接";
+                }
+
+                _saveButton.Enabled = verified && !_oauthLoginBusy;
             }
             else
             {
-                _oauthStatusBadge.Text = "尚未登录；请先生成链接并在浏览器完成 ChatGPT 登录";
-                _oauthStatusBadge.ForeColor = _palette.MutedTextColor;
-                _oauthStatusBadge.FillColor = UiDesign.Blend(
-                    _palette.SurfaceAltColor,
-                    _palette.PrimaryColor,
-                    0.05F);
-                _oauthStatusBadge.StrokeColor = UiDesign.Blend(
-                    _palette.BorderColor,
-                    _palette.PrimaryColor,
-                    0.24F);
-                _generateLoginLinkButton.Text = "生成登录链接";
+                _saveButton.Enabled = true;
             }
 
-            _saveButton.Enabled = verified && !_oauthLoginBusy;
-        }
-        else
-        {
-            _saveButton.Enabled = true;
-        }
-
-        foreach (var control in _apiControls)
-        {
-            control.Enabled = isApi;
-            control.Visible = isApi;
-        }
-
-        if (isApi)
-        {
-            _apiNoteCard.Height = MeasureInfoCardHeight(_apiNoteCard, _apiNote, 54);
-            _apiNoteCard.PerformLayout();
-        }
-
-        var scale = GetCurrentLayoutScale();
-        if (isApi)
-        {
-            // The credential note grows with wrapped paths and display text size.
-            // Position all API rows from its measured bottom, never from fixed Y values.
-            var rowTop = _secretNoteCard.Bottom + (int)Math.Ceiling(12 * scale);
-            var rowStep = _providerShell.Height + (int)Math.Ceiling(8 * scale);
-            for (var i = 0; i < _apiControls.Length - 1; i++)
+            foreach (var control in _apiControls)
             {
-                var row = i < 4 ? 0 : i < 6 ? 1 : 2;
-                _apiControls[i].Top = rowTop + row * rowStep + (i % 2 == 0 ? (int)Math.Ceiling(7 * scale) : 0);
+                control.Enabled = isApi;
+                control.Visible = isApi;
             }
-            _apiNoteCard.Top = _modelShell.Bottom + (int)Math.Ceiling(8 * scale);
+
+            if (isApi)
+            {
+                _apiNoteCard.Height = MeasureInfoCardHeight(_apiNoteCard, _apiNote, 54);
+                _apiNoteCard.PerformLayout();
+            }
+
+            var scale = GetCurrentLayoutScale();
+            if (_formCard.AutoScroll)
+            {
+                _formCard.AutoScrollPosition = Point.Empty;
+            }
+            if (isApi)
+            {
+                // The credential note grows with wrapped paths and display text size.
+                // Position all API rows from its measured bottom, never from fixed Y values.
+                var rowTop = _secretNoteCard.Bottom + (int)Math.Ceiling(12 * scale);
+                var rowStep = _providerShell.Height + (int)Math.Ceiling(8 * scale);
+                for (var i = 0; i < _apiControls.Length - 1; i++)
+                {
+                    var row = i < 4 ? 0 : i < 6 ? 1 : 2;
+                    _apiControls[i].Top = rowTop + row * rowStep + (i % 2 == 0 ? (int)Math.Ceiling(7 * scale) : 0);
+                }
+                _apiNoteCard.Top = _modelShell.Bottom + (int)Math.Ceiling(8 * scale);
+            }
+            var cardBottomPadding = Math.Max(14, (int)Math.Ceiling(18 * scale));
+            var footerGap = Math.Max(12, (int)Math.Ceiling(16 * scale));
+            var bottomMargin = Math.Max(14, (int)Math.Ceiling(18 * scale));
+            var horizontalMargin = Math.Max(12, (int)Math.Ceiling(16 * scale));
+            var footerButtonGap = Math.Max(10, (int)Math.Ceiling(12 * scale));
+            var saveTextWidth = TextRenderer.MeasureText(_saveButton.Text, _saveButton.Font, Size.Empty,
+                TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding).Width;
+            _saveButton.Width = Math.Max((int)Math.Ceiling(140 * scale),
+                saveTextWidth + 2 * Math.Max(10, _saveButton.Padding.Horizontal / 2) + (int)Math.Ceiling(8 * scale));
+            var contentBottom = isApi ? _apiNoteCard.Bottom : _secretNoteCard.Bottom;
+            var desiredCardHeight = contentBottom + cardBottomPadding;
+            var desiredClientWidth = Math.Max(ClientSize.Width, _formCard.Right + horizontalMargin);
+            var desiredClientHeight = _formCard.Top + desiredCardHeight + footerGap + _saveButton.Height + bottomMargin;
+
+            var targetClientHeight = desiredClientHeight;
+            var needsScroll = false;
+            if (IsHandleCreated || Visible)
+            {
+                var workingArea = Screen.FromControl(Owner ?? this).WorkingArea;
+                var nonClientHeight = Math.Max(0, Height - ClientSize.Height);
+                var maxClientHeight = Math.Max(
+                    (int)Math.Ceiling(420 * scale),
+                    workingArea.Height - nonClientHeight - 24);
+                if (desiredClientHeight > maxClientHeight)
+                {
+                    targetClientHeight = maxClientHeight;
+                    needsScroll = true;
+                }
+            }
+
+            if (needsScroll)
+            {
+                _formCard.AutoScroll = true;
+                _formCard.AutoScrollMinSize = new Size(0, desiredCardHeight);
+                _formCard.Height = Math.Max(
+                    (int)Math.Ceiling(200 * scale),
+                    targetClientHeight - bottomMargin - _saveButton.Height - footerGap - _formCard.Top);
+                if (_formCard.IsHandleCreated)
+                {
+                    NativeWindowTheme.ApplyScrollable(_formCard, dark);
+                }
+            }
+            else
+            {
+                _formCard.AutoScroll = false;
+                _formCard.AutoScrollMinSize = Size.Empty;
+                _formCard.Height = desiredCardHeight;
+            }
+
+            ClientSize = new Size(desiredClientWidth, targetClientHeight);
+            _footerDivider.Top = _formCard.Bottom + Math.Max(6, (int)Math.Ceiling(8 * scale));
+            _saveButton.Top = _formCard.Bottom + footerGap;
+            _cancelButton.Top = _saveButton.Top;
+            _cancelButton.Left = ClientSize.Width - horizontalMargin - _cancelButton.Width;
+            _saveButton.Left = _cancelButton.Left - footerButtonGap - _saveButton.Width;
         }
-        var cardBottomPadding = Math.Max(14, (int)Math.Ceiling(18 * scale));
-        var footerGap = Math.Max(12, (int)Math.Ceiling(16 * scale));
-        var bottomMargin = Math.Max(14, (int)Math.Ceiling(18 * scale));
-        var horizontalMargin = Math.Max(12, (int)Math.Ceiling(16 * scale));
-        var footerButtonGap = Math.Max(10, (int)Math.Ceiling(12 * scale));
-        var saveTextWidth = TextRenderer.MeasureText(_saveButton.Text, _saveButton.Font, Size.Empty,
-            TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding).Width;
-        _saveButton.Width = Math.Max((int)Math.Ceiling(140 * scale),
-            saveTextWidth + 2 * Math.Max(10, _saveButton.Padding.Horizontal / 2) + (int)Math.Ceiling(8 * scale));
-        var contentBottom = isApi ? _apiNoteCard.Bottom : _secretNoteCard.Bottom;
-        _formCard.Height = contentBottom + cardBottomPadding;
-        _footerDivider.Top = _formCard.Bottom + Math.Max(6, (int)Math.Ceiling(8 * scale));
-        _saveButton.Top = _formCard.Bottom + footerGap;
-        _cancelButton.Top = _saveButton.Top;
-        var desiredClientWidth = Math.Max(ClientSize.Width, _formCard.Right + horizontalMargin);
-        ClientSize = new Size(desiredClientWidth, _saveButton.Bottom + bottomMargin);
-        _cancelButton.Left = ClientSize.Width - horizontalMargin - _cancelButton.Width;
-        _saveButton.Left = _cancelButton.Left - footerButtonGap - _saveButton.Width;
+        finally
+        {
+            _updatingLayout = false;
+        }
     }
 
     private const uint EmSetSel = 0x00B1;

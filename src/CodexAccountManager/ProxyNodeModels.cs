@@ -31,6 +31,8 @@ public sealed class ProxyNodeRecord
     // an ephemeral Xray config.  The raw URI is never rendered or written to logs.
     [JsonPropertyName("encryptedNativeUri")] public string? EncryptedNativeUri { get; set; }
     [JsonPropertyName("encryptedNativeOutbound")] public string? EncryptedNativeOutbound { get; set; }
+    // Deterministic non-reversible SHA-256 hex digest of the canonical native URI for deduplication.
+    [JsonPropertyName("nativeUriFingerprint")] public string? NativeUriFingerprint { get; set; }
     [JsonPropertyName("enabled")] public bool Enabled { get; set; } = true;
     [JsonPropertyName("lastHealthTestAtUtc")] public DateTimeOffset? LastHealthTestAtUtc { get; set; }
     [JsonPropertyName("lastTcpMilliseconds")] public double? LastTcpMilliseconds { get; set; }
@@ -62,10 +64,26 @@ public sealed class ProxyNodeRecord
 
     public void SetNativeUri(string? uri)
     {
-        EncryptedNativeUri = string.IsNullOrWhiteSpace(uri) ? null : ProxyNodeStore.Protect(uri.Trim());
+        if (string.IsNullOrWhiteSpace(uri))
+        {
+            EncryptedNativeUri = null;
+            NativeUriFingerprint = null;
+            return;
+        }
+        var trimmed = uri.Trim();
+        EncryptedNativeUri = ProxyNodeStore.Protect(trimmed);
+        NativeUriFingerprint = ProxyNodeStore.ComputeNativeUriFingerprint(trimmed);
     }
 
-    public bool TryGetNativeUri(out string uri) => ProxyNodeStore.TryUnprotect(EncryptedNativeUri, out uri);
+    public bool TryGetNativeUri(out string uri)
+    {
+        var ok = ProxyNodeStore.TryUnprotect(EncryptedNativeUri, out uri);
+        if (ok && string.IsNullOrWhiteSpace(NativeUriFingerprint) && !string.IsNullOrWhiteSpace(uri))
+        {
+            NativeUriFingerprint = ProxyNodeStore.ComputeNativeUriFingerprint(uri);
+        }
+        return ok;
+    }
 
     public bool TryGetProtocol(out ProxyNodeProtocol protocol) =>
         Enum.TryParse(EffectiveScheme.ToLowerInvariant() switch { "ss" or "shadowsocks" => "Shadowsocks", "hy2" => "Hysteria2", _ => EffectiveScheme }, true, out protocol) &&
@@ -126,6 +144,7 @@ internal sealed class ProxyBindingsDocument
 public sealed class ProxyNodeStore
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+    private static readonly object StoreGate = new();
     public const int CurrentSchemaVersion = 1;
     public string RootPath { get; }
     public string NodesPath => Path.Combine(RootPath, "proxy-nodes.json");
@@ -137,21 +156,38 @@ public sealed class ProxyNodeStore
 
     public List<ProxyNodeRecord> LoadNodes()
     {
+        NodesLoadFailed = false;
         try
         {
             if (!File.Exists(NodesPath)) return [];
-            var doc = JsonSerializer.Deserialize<ProxyNodesDocument>(File.ReadAllText(NodesPath));
-            return doc?.Nodes?.Where(n => n != null && !string.IsNullOrWhiteSpace(n.NodeId)).ToList() ?? [];
+            var json = AtomicFilePersistence.ReadAllTextWithRetry(NodesPath);
+            var doc = JsonSerializer.Deserialize<ProxyNodesDocument>(json);
+            var nodes = doc?.Nodes?.Where(n => n != null && !string.IsNullOrWhiteSpace(n.NodeId)).ToList() ?? [];
+            foreach (var node in nodes)
+            {
+                BackfillNativeFingerprint(node);
+            }
+            return nodes;
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return [];
         }
         catch { NodesLoadFailed = true; return []; }
     }
     public List<AccountProxyBinding> LoadBindings()
     {
+        BindingsLoadFailed = false;
         try
         {
             if (!File.Exists(BindingsPath)) return [];
-            var doc = JsonSerializer.Deserialize<ProxyBindingsDocument>(File.ReadAllText(BindingsPath));
-            return doc?.Bindings?.Where(b => !string.IsNullOrWhiteSpace(b.AccountKey)).ToList() ?? [];
+            var json = AtomicFilePersistence.ReadAllTextWithRetry(BindingsPath);
+            var doc = JsonSerializer.Deserialize<ProxyBindingsDocument>(json);
+            return doc?.Bindings?.Where(b => b != null && !string.IsNullOrWhiteSpace(b.AccountKey)).ToList() ?? [];
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return [];
         }
         catch { BindingsLoadFailed = true; return []; }
     }
@@ -159,45 +195,125 @@ public sealed class ProxyNodeStore
     public void SaveBindings(IEnumerable<AccountProxyBinding> bindings) => AtomicWrite(BindingsPath, new ProxyBindingsDocument { Bindings = bindings.ToList() });
     public void SetBinding(AccountProxyBinding binding)
     {
-        var list = LoadBindings();
-        list.RemoveAll(x => x.AccountKey.Equals(binding.AccountKey, StringComparison.Ordinal));
-        binding.UpdatedAtUtc = DateTimeOffset.UtcNow;
-        list.Add(binding);
-        SaveBindings(list);
+        lock (StoreGate)
+        {
+            var list = LoadBindings();
+            if (BindingsLoadFailed) throw new IOException("账号代理绑定配置读取失败，已阻止覆盖保存。");
+            list.RemoveAll(x => x.AccountKey.Equals(binding.AccountKey, StringComparison.Ordinal));
+            binding.UpdatedAtUtc = DateTimeOffset.UtcNow;
+            list.Add(binding);
+            SaveBindings(list);
+        }
     }
     public AccountProxyBinding? GetBinding(string accountKey) => LoadBindings().FirstOrDefault(x => x.AccountKey.Equals(accountKey, StringComparison.Ordinal));
-    public void RemoveBinding(string accountKey) => SaveBindings(LoadBindings().Where(x => !x.AccountKey.Equals(accountKey, StringComparison.Ordinal)));
+    public void RemoveBinding(string accountKey)
+    {
+        if (string.IsNullOrWhiteSpace(accountKey)) return;
+        lock (StoreGate)
+        {
+            var list = LoadBindings();
+            if (BindingsLoadFailed) return;
+            if (list.RemoveAll(x => x.AccountKey.Equals(accountKey, StringComparison.Ordinal)) > 0)
+            {
+                SaveBindings(list);
+            }
+        }
+    }
     public void SetNode(ProxyNodeRecord node)
     {
         if (!node.TryValidate(out var error)) throw new InvalidDataException(error);
-        var list = LoadNodes();
-        list.RemoveAll(x => x.NodeId.Equals(node.NodeId, StringComparison.OrdinalIgnoreCase));
-        list.Add(node);
-        SaveNodes(list);
+        BackfillNativeFingerprint(node);
+        lock (StoreGate)
+        {
+            var list = LoadNodes();
+            if (NodesLoadFailed) throw new IOException("代理节点配置读取失败，已阻止覆盖保存。");
+            list.RemoveAll(x => x.NodeId.Equals(node.NodeId, StringComparison.OrdinalIgnoreCase));
+            list.Add(node);
+            SaveNodes(list);
+        }
+    }
+    public List<ProxyNodeRecord> MergeProbeResults(IEnumerable<ProxyNodeRecord> probedNodes)
+    {
+        ArgumentNullException.ThrowIfNull(probedNodes);
+        var probedById = new Dictionary<string, ProxyNodeRecord>(StringComparer.OrdinalIgnoreCase);
+        foreach (var probed in probedNodes)
+        {
+            if (probed != null && !string.IsNullOrWhiteSpace(probed.NodeId))
+            {
+                probedById[probed.NodeId] = probed;
+            }
+        }
+
+        lock (StoreGate)
+        {
+            var current = LoadNodes();
+            if (NodesLoadFailed || probedById.Count == 0)
+            {
+                return current;
+            }
+
+            var changed = false;
+            foreach (var existing in current)
+            {
+                if (!probedById.TryGetValue(existing.NodeId, out var probed))
+                {
+                    continue;
+                }
+                existing.LastHealthTestAtUtc = probed.LastHealthTestAtUtc;
+                existing.LastTcpMilliseconds = probed.LastTcpMilliseconds;
+                existing.LastTlsMilliseconds = probed.LastTlsMilliseconds;
+                existing.LastFirstResponseMilliseconds = probed.LastFirstResponseMilliseconds;
+                existing.LastExitIp = probed.LastExitIp;
+                existing.LastExitIpObservedAtUtc = probed.LastExitIpObservedAtUtc;
+                existing.ExitIpChanged = probed.ExitIpChanged;
+                existing.LastHealthError = probed.LastHealthError;
+                changed = true;
+            }
+            if (changed)
+            {
+                SaveNodes(current);
+            }
+            return current;
+        }
     }
     internal void MarkRuntimeFailure(string nodeId, string reason)
     {
         if (string.IsNullOrWhiteSpace(nodeId)) return;
-        var list = LoadNodes();
-        var node = list.FirstOrDefault(x => x.NodeId.Equals(nodeId, StringComparison.OrdinalIgnoreCase));
-        if (node == null) return;
-        node.LastHealthTestAtUtc = DateTimeOffset.UtcNow;
-        node.LastTcpMilliseconds = null;
-        node.LastTlsMilliseconds = null;
-        node.LastFirstResponseMilliseconds = null;
-        node.LastHealthError = string.IsNullOrWhiteSpace(reason)
-            ? "运行时请求失败。"
-            : reason;
-        // Keep LastExitIp for historical change detection, but LastHealthError makes
-        // the sidebar render it as “上次 …” rather than claiming it is current.
-        SaveNodes(list);
+        lock (StoreGate)
+        {
+            var list = LoadNodes();
+            if (NodesLoadFailed) return;
+            var node = list.FirstOrDefault(x => x.NodeId.Equals(nodeId, StringComparison.OrdinalIgnoreCase));
+            if (node == null) return;
+            node.LastHealthTestAtUtc = DateTimeOffset.UtcNow;
+            node.LastTcpMilliseconds = null;
+            node.LastTlsMilliseconds = null;
+            node.LastFirstResponseMilliseconds = null;
+            node.LastHealthError = string.IsNullOrWhiteSpace(reason)
+                ? "运行时请求失败。"
+                : reason;
+            // Keep LastExitIp for historical change detection, but LastHealthError makes
+            // the sidebar render it as “上次 …” rather than claiming it is current.
+            SaveNodes(list);
+        }
     }
     public void RemoveNode(string nodeId)
     {
-        SaveNodes(LoadNodes().Where(x => !x.NodeId.Equals(nodeId, StringComparison.OrdinalIgnoreCase)));
-        SaveBindings(LoadBindings().Select(binding => binding.NodeId?.Equals(nodeId, StringComparison.OrdinalIgnoreCase) == true
-            ? new AccountProxyBinding { AccountKey = binding.AccountKey, Mode = ProxyBindingMode.InheritGlobal, FallbackPolicy = binding.FallbackPolicy }
-            : binding));
+        lock (StoreGate)
+        {
+            var nodes = LoadNodes();
+            if (!NodesLoadFailed)
+            {
+                SaveNodes(nodes.Where(x => !x.NodeId.Equals(nodeId, StringComparison.OrdinalIgnoreCase)));
+            }
+            var bindings = LoadBindings();
+            if (!BindingsLoadFailed)
+            {
+                SaveBindings(bindings.Select(binding => binding.NodeId?.Equals(nodeId, StringComparison.OrdinalIgnoreCase) == true
+                    ? new AccountProxyBinding { AccountKey = binding.AccountKey, Mode = ProxyBindingMode.InheritGlobal, FallbackPolicy = binding.FallbackPolicy }
+                    : binding));
+            }
+        }
     }
     public ProxyImportPreview PreviewImport(string? text)
     {
@@ -219,15 +335,19 @@ public sealed class ProxyNodeStore
     public int ImportText(string? text)
     {
         var preview = PreviewImport(text);
-        var existing = LoadNodes();
-        var keys = new HashSet<string>(existing.Select(DedupKey), StringComparer.OrdinalIgnoreCase);
-        var added = 0;
-        foreach (var node in preview.Nodes)
+        lock (StoreGate)
         {
-            if (keys.Add(DedupKey(node))) { existing.Add(node); added++; }
+            var existing = LoadNodes();
+            if (NodesLoadFailed) throw new IOException("代理节点配置读取失败，已阻止导入覆盖。");
+            var keys = new HashSet<string>(existing.Select(DedupKey), StringComparer.OrdinalIgnoreCase);
+            var added = 0;
+            foreach (var node in preview.Nodes)
+            {
+                if (keys.Add(DedupKey(node))) { existing.Add(node); added++; }
+            }
+            SaveNodes(existing);
+            return added;
         }
-        SaveNodes(existing);
-        return added;
     }
     private static bool TryParse(string value, out ProxyNodeRecord node, out string error)
     {
@@ -258,9 +378,49 @@ public sealed class ProxyNodeStore
         }
         return true;
     }
-    private static string DedupKey(ProxyNodeRecord node) => node.IsNativeProtocol
-        ? $"native|{node.Scheme}|{node.EncryptedNativeUri}"
-        : $"{node.Scheme}|{node.Address}|{node.Port}|{node.Username}";
+    internal static string? ComputeNativeUriFingerprint(string? uri)
+    {
+        if (string.IsNullOrWhiteSpace(uri)) return null;
+        var trimmed = uri.Trim();
+        var marker = trimmed.IndexOf("://", StringComparison.Ordinal);
+        var canonical = marker > 0
+            ? trimmed[..marker].ToLowerInvariant() + trimmed[marker..]
+            : trimmed;
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical)));
+    }
+
+    private static void BackfillNativeFingerprint(ProxyNodeRecord node)
+    {
+        if (!node.IsNativeProtocol || !string.IsNullOrWhiteSpace(node.NativeUriFingerprint)) return;
+        if (!string.IsNullOrWhiteSpace(node.EncryptedNativeUri))
+        {
+            _ = node.TryGetNativeUri(out _);
+        }
+        else if (!string.IsNullOrWhiteSpace(node.EncryptedNativeOutbound) &&
+                 TryUnprotect(node.EncryptedNativeOutbound, out var outbound) &&
+                 !string.IsNullOrWhiteSpace(outbound))
+        {
+            node.NativeUriFingerprint = ComputeNativeUriFingerprint(outbound);
+        }
+    }
+
+    private static string DedupKey(ProxyNodeRecord node)
+    {
+        if (!node.IsNativeProtocol)
+        {
+            return $"{node.Scheme}|{node.Address}|{node.Port}|{node.Username}";
+        }
+        BackfillNativeFingerprint(node);
+        var scheme = node.EffectiveScheme.ToLowerInvariant() switch
+        {
+            "shadowsocks" => "ss",
+            "hy2" => "hysteria2",
+            var other => other
+        };
+        return !string.IsNullOrWhiteSpace(node.NativeUriFingerprint)
+            ? $"native|{scheme}|{node.NativeUriFingerprint}"
+            : $"native|{scheme}|{node.Address}|{node.Port}|{node.NodeId}";
+    }
 
     private static string Mask(string value)
     {
@@ -291,9 +451,7 @@ public sealed class ProxyNodeStore
     }
     private static void AtomicWrite<T>(string path, T value)
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!); var tmp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-        try { File.WriteAllText(tmp, JsonSerializer.Serialize(value, JsonOptions), new UTF8Encoding(false)); File.Move(tmp, path, true); }
-        finally { if (File.Exists(tmp)) File.Delete(tmp); }
+        AtomicFilePersistence.WriteAllText(path, JsonSerializer.Serialize(value, JsonOptions));
     }
 
     internal static void Validate()
@@ -305,15 +463,58 @@ public sealed class ProxyNodeStore
             var preview = store.PreviewImport("http://user:pass@example.com:8080\nhttp://user:pass@example.com:8080\nsocks5://127.0.0.1:1080\nvless://bad");
             if (preview.Nodes.Count != 2 || preview.DuplicateCount != 1 || preview.InvalidEntries.Count != 1 || !preview.Nodes[0].HasPassword || !TryUnprotect(preview.Nodes[0].EncryptedPassword, out var pass) || pass != "pass")
                 throw new InvalidOperationException("Proxy URL parsing/import validation failed.");
+            var vlessSample = "vless://00000000-0000-0000-0000-000000000002@127.0.0.1:443?encryption=none&security=tls&type=tcp#vless-test";
             var vmessPayload = Convert.ToBase64String(Encoding.UTF8.GetBytes("{\"v\":2,\"ps\":\"vmess-test\",\"add\":\"127.0.0.1\",\"port\":443,\"id\":\"00000000-0000-0000-0000-000000000001\",\"aid\":0,\"net\":\"tcp\",\"tls\":\"tls\"}"));
             var nativePreview = store.PreviewImport(
-                "vless://00000000-0000-0000-0000-000000000002@127.0.0.1:443?encryption=none&security=tls&type=tcp#vless-test\n" +
+                vlessSample + "\n" +
+                vlessSample + "\n" +
                 "vmess://" + vmessPayload + "\n" +
                 "trojan://password@127.0.0.1:443?security=tls#trojan-test\n" +
                 "ss://aes-128-gcm:password@127.0.0.1:8388#ss-test");
-            if (nativePreview.Nodes.Count != 4 || nativePreview.InvalidEntries.Count != 0 || nativePreview.Nodes.Any(node => !node.IsNativeProtocol || !node.TryGetNativeUri(out _)))
-                throw new InvalidOperationException("Native subscription protocol parsing failed.");
+            if (nativePreview.Nodes.Count != 4 || nativePreview.DuplicateCount != 1 || nativePreview.InvalidEntries.Count != 0 ||
+                nativePreview.Nodes.Any(node => !node.IsNativeProtocol || !node.TryGetNativeUri(out _) || string.IsNullOrWhiteSpace(node.NativeUriFingerprint)))
+                throw new InvalidOperationException("Native subscription protocol parsing/dedup failed.");
+            // Verify legacy persisted native node without NativeUriFingerprint backfills on load and deduplicates re-import.
+            var legacyNative = nativePreview.Nodes[0];
+            legacyNative.NativeUriFingerprint = null;
+            store.SaveNodes([legacyNative]);
+            if (store.ImportText(vlessSample) != 0)
+                throw new InvalidOperationException("Native subscription re-import failed to deduplicate against legacy node.");
+            // Verify MergeProbeResults preserves disabled nodes and updates probed fields.
+            var enabledNode = preview.Nodes[0];
+            var disabledNode = preview.Nodes[1];
+            disabledNode.Enabled = false;
+            store.SaveNodes([enabledNode, disabledNode]);
+            var probedCopy = new ProxyNodeRecord
+            {
+                NodeId = enabledNode.NodeId,
+                Name = enabledNode.Name,
+                Scheme = enabledNode.Scheme,
+                Address = enabledNode.Address,
+                Port = enabledNode.Port,
+                LastHealthTestAtUtc = DateTimeOffset.UtcNow,
+                LastFirstResponseMilliseconds = 42,
+                LastExitIp = "203.0.113.5",
+                LastExitIpObservedAtUtc = DateTimeOffset.UtcNow
+            };
+            var merged = store.MergeProbeResults([probedCopy]);
+            if (merged.Count != 2 || !merged.Any(n => n.NodeId == disabledNode.NodeId && !n.Enabled) ||
+                merged.First(n => n.NodeId == enabledNode.NodeId).LastFirstResponseMilliseconds != 42)
+                throw new InvalidOperationException("MergeProbeResults dropped disabled nodes or failed to update probe results.");
+            disabledNode.Enabled = true;
+            // Verify NodesLoadFailed/BindingsLoadFailed reset cleanly after corrupt file recovery.
+            File.WriteAllText(store.NodesPath, "{corrupt");
+            _ = store.LoadNodes();
+            if (!store.NodesLoadFailed) throw new InvalidOperationException("Corrupt proxy-nodes.json did not set NodesLoadFailed.");
             store.SaveNodes(preview.Nodes);
+            _ = store.LoadNodes();
+            if (store.NodesLoadFailed) throw new InvalidOperationException("NodesLoadFailed remained sticky after valid reload.");
+            File.WriteAllText(store.BindingsPath, "{corrupt");
+            _ = store.LoadBindings();
+            if (!store.BindingsLoadFailed) throw new InvalidOperationException("Corrupt account-proxy-bindings.json did not set BindingsLoadFailed.");
+            store.SaveBindings([]);
+            _ = store.LoadBindings();
+            if (store.BindingsLoadFailed) throw new InvalidOperationException("BindingsLoadFailed remained sticky after valid reload.");
             var account = new AccountRecord { Name = "proxy-self-test", CodexHome = Path.Combine(root, "home") };
             var key = AccountProxyResolver.AccountKeyFor(account);
             store.SetBinding(new AccountProxyBinding { AccountKey = key, Mode = ProxyBindingMode.Disabled });
@@ -382,8 +583,9 @@ public sealed class AccountProxyResolver : IDisposable
         if (binding?.Mode == ProxyBindingMode.Disabled) return ProxyResolution.Fail("该账号已禁用代理，网关拒绝直连。");
         if (binding?.Mode == ProxyBindingMode.FixedNode)
         {
+            var nodes = _store.LoadNodes();
             if (_store.NodesLoadFailed && File.Exists(_store.NodesPath)) return ProxyResolution.Fail("代理节点配置损坏；为防止意外直连，网关已安全停止请求。");
-            var node = _store.LoadNodes().FirstOrDefault(n => n.NodeId.Equals(binding.NodeId, StringComparison.OrdinalIgnoreCase));
+            var node = nodes.FirstOrDefault(n => n.NodeId.Equals(binding.NodeId, StringComparison.OrdinalIgnoreCase));
             if (node != null && node.Enabled && node.TryValidate(out _))
             {
                 var fixedResolution = Build(node);

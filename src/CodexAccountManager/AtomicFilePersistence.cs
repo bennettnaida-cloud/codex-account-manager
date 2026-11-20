@@ -35,6 +35,11 @@ internal static class AtomicFilePersistence
                 return reader.ReadToEnd();
             }
             catch (Exception ex) when (
+                ex is FileNotFoundException or DirectoryNotFoundException)
+            {
+                throw;
+            }
+            catch (Exception ex) when (
                 ex is IOException or UnauthorizedAccessException)
             {
                 lastError = ex;

@@ -4,6 +4,8 @@ public partial class Form1
 {
     private static readonly TimeSpan GatewayQuotaSignalPollInterval =
         TimeSpan.FromMilliseconds(500);
+    private static readonly TimeSpan ConfirmedGatewayQuotaResetReconcileInterval =
+        TimeSpan.FromSeconds(2);
     private static readonly TimeSpan GatewayQuotaSignalRetryInterval =
         TimeSpan.FromMinutes(1);
     private static readonly TimeSpan GatewayRecoveryRetryInterval =
@@ -17,6 +19,8 @@ public partial class Form1
     private readonly HashSet<long> _patGatewayReconciledQuotaSignalSequences = [];
     private PatGatewayQuotaSignalStore? _patGatewayQuotaSignalStore;
     private DateTimeOffset? _patGatewayQuotaSignalCheckedAtUtc;
+    private DateTimeOffset? _confirmedGatewayQuotaResetCheckedAtUtc;
+    private DateTime _confirmedGatewayQuotaSignalLastWriteUtc = DateTime.MinValue;
     private DateTimeOffset? _patGatewayActivitySignalCheckedAtUtc;
     private DateTimeOffset? _patGatewaySuccessfulActivityCheckedAtUtc;
     private DateTimeOffset? _patGatewayRecoveryAttemptedAtUtc;
@@ -307,11 +311,31 @@ public partial class Form1
 
     private void ReconcileConfirmedGatewayQuotaResetSignals()
     {
+        var now = DateTimeOffset.UtcNow;
+        if (_confirmedGatewayQuotaResetCheckedAtUtc is { } lastChecked &&
+            now - lastChecked < ConfirmedGatewayQuotaResetReconcileInterval)
+        {
+            return;
+        }
+        _confirmedGatewayQuotaResetCheckedAtUtc = now;
+
         try
         {
             _patGatewayQuotaSignalStore ??=
                 new PatGatewayQuotaSignalStore(_store.RootPath);
-            var now = DateTimeOffset.UtcNow;
+            var signalPath = _patGatewayQuotaSignalStore.Path;
+            if (!File.Exists(signalPath))
+            {
+                _confirmedGatewayQuotaSignalLastWriteUtc = DateTime.MinValue;
+                return;
+            }
+            var writeTimeUtc = File.GetLastWriteTimeUtc(signalPath);
+            if (writeTimeUtc == _confirmedGatewayQuotaSignalLastWriteUtc)
+            {
+                return;
+            }
+            _confirmedGatewayQuotaSignalLastWriteUtc = writeTimeUtc;
+
             var changed = false;
             foreach (var signal in _patGatewayQuotaSignalStore.ReadLatestPerAccount(now))
             {
@@ -835,8 +859,14 @@ public partial class Form1
                 : $"当前实际模型请求已由 {observed.Name} 完成；正在刷新该账号官方额度…";
             if (currentChanged)
             {
+                var scrollY = _cardsPanel.IsDisposed ? 0 : Math.Max(0, -_cardsPanel.AutoScrollPosition.Y);
                 RenderCards();
-                ResetCardsScrollPosition();
+                if (!_cardsPanel.IsDisposed && scrollY > 0)
+                {
+                    _cardsPanel.PerformLayout();
+                    _cardsPanel.AutoScrollPosition = new Point(0, scrollY);
+                    _cardsPanel.InvalidateVisibleViewport(flush: true);
+                }
             }
             if (shouldRetargetOfficialRefresh && !observed.IsCompatibleApi)
             {

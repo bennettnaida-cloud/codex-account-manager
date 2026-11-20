@@ -1,9 +1,12 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace CodexAccountManager;
 
 public sealed class AppSettings
 {
+    [JsonIgnore] public bool LoadFailed { get; internal set; }
     public ThemeMode ThemeMode { get; set; } = ThemeMode.System;
     public WindowsClientMode WindowsClientMode { get; set; } =
         global::CodexAccountManager.WindowsClientMode.OfficialCodex;
@@ -146,6 +149,10 @@ public sealed class ThemePalette
 public sealed class ThemeService
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+    // Deduplicate corrupt-file backups per (path, length, lastWriteUtc) so periodic
+    // polling cannot flood disk with identical .bak copies of one damaged file.
+    private static readonly ConcurrentDictionary<string, (long Length, DateTime LastWriteUtc)> BackedUpCorruptSettings =
+        new(StringComparer.OrdinalIgnoreCase);
     // The gateway and a newly opened Manager can briefly overlap while an update or
     // account switch is being adopted.  Serialize the small atomic settings replace
     // across those processes so a transient MoveFile sharing violation cannot bubble
@@ -154,6 +161,9 @@ public sealed class ThemeService
         new(false, "Local\\CodexAccountManager.SettingsWrite");
     private readonly string _settingsPath;
 
+    public bool SettingsLoadFailed { get; private set; }
+    public string? LastCorruptSettingsBackupPath { get; private set; }
+
     public ThemeService(string rootPath)
     {
         _settingsPath = Path.Combine(rootPath, "appsettings.json");
@@ -161,13 +171,14 @@ public sealed class ThemeService
 
     public AppSettings LoadSettings()
     {
-        return TryLoadSettings(out var settings, out _)
-            ? settings
-            : new AppSettings();
+        _ = TryLoadSettings(out var settings, out _);
+        return settings;
     }
 
     internal bool TryLoadSettings(out AppSettings settings, out Exception? error)
     {
+        SettingsLoadFailed = false;
+        LastCorruptSettingsBackupPath = null;
         settings = new AppSettings();
         error = null;
         if (!File.Exists(_settingsPath))
@@ -180,9 +191,21 @@ public sealed class ThemeService
             try
             {
                 var json = AtomicFilePersistence.ReadAllTextWithRetry(_settingsPath, attempts: 1);
-                settings = JsonSerializer.Deserialize<AppSettings>(json) ?? new AppSettings();
+                if (string.IsNullOrWhiteSpace(json))
+                {
+                    throw new JsonException("Settings file is empty.");
+                }
+                var deserialized = JsonSerializer.Deserialize<AppSettings>(json) ??
+                                   throw new JsonException("Settings file deserialized to null.");
                 // Legacy value 0 selected the retired client; all desktop launches now use official Codex.
-                settings.WindowsClientMode = WindowsClientMode.OfficialCodex;
+                deserialized.WindowsClientMode = WindowsClientMode.OfficialCodex;
+                deserialized.LoadFailed = false;
+                settings = deserialized;
+                return true;
+            }
+            catch (Exception ex) when (
+                ex is FileNotFoundException or DirectoryNotFoundException)
+            {
                 return true;
             }
             catch (Exception ex) when (
@@ -196,12 +219,55 @@ public sealed class ThemeService
                 }
             }
         }
+
+        SettingsLoadFailed = true;
+        settings = new AppSettings { LoadFailed = true };
+        if (error is JsonException or NotSupportedException)
+        {
+            LastCorruptSettingsBackupPath = TryBackupCorruptSettingsFile();
+        }
         return false;
     }
 
-    public void SaveSettings(AppSettings settings)
+    private string? TryBackupCorruptSettingsFile()
+    {
+        try
+        {
+            var fullPath = Path.GetFullPath(_settingsPath);
+            var info = new FileInfo(fullPath);
+            if (!info.Exists)
+            {
+                return null;
+            }
+            var signature = (info.Length, info.LastWriteTimeUtc);
+            if (BackedUpCorruptSettings.TryGetValue(fullPath, out var existing) &&
+                existing == signature)
+            {
+                return null;
+            }
+            var backupPath = $"{fullPath}.corrupt-{DateTime.UtcNow:yyyyMMddHHmmssfff}.bak";
+            File.Copy(fullPath, backupPath, overwrite: false);
+            BackedUpCorruptSettings[fullPath] = signature;
+            return backupPath;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public void SaveSettings(AppSettings settings) =>
+        SaveSettings(settings, allowOverwriteCorrupt: false);
+
+    internal void SaveSettings(AppSettings settings, bool allowOverwriteCorrupt)
     {
         ArgumentNullException.ThrowIfNull(settings);
+        if (!allowOverwriteCorrupt && settings.LoadFailed && File.Exists(_settingsPath))
+        {
+            // Never allow an automatic startup/shutdown save of a fallback blank settings
+            // object to overwrite a corrupt or transiently unreadable appsettings.json.
+            return;
+        }
         settings.WindowsClientMode = WindowsClientMode.OfficialCodex;
         Directory.CreateDirectory(Path.GetDirectoryName(_settingsPath)!);
         var mutexAcquired = false;
@@ -223,6 +289,8 @@ public sealed class ThemeService
             AtomicFilePersistence.WriteAllText(
                 _settingsPath,
                 JsonSerializer.Serialize(settings, JsonOptions));
+            settings.LoadFailed = false;
+            SettingsLoadFailed = false;
         }
         finally
         {
@@ -268,6 +336,22 @@ public sealed class ThemeService
             if (new AppSettings().WindowsClientMode != WindowsClientMode.OfficialCodex ||
                 new WindowsClientAccountProjection().ClientMode != WindowsClientMode.OfficialCodex)
                 throw new InvalidOperationException("New settings and account projections must default to official Codex.");
+            // Corrupt JSON must be backed up, flag LoadFailed/SettingsLoadFailed, and never be overwritten by fallback saves.
+            const string corruptJson = "{not-valid-json";
+            File.WriteAllText(path, corruptJson);
+            var fallback = service.LoadSettings();
+            if (!service.SettingsLoadFailed || !fallback.LoadFailed ||
+                string.IsNullOrWhiteSpace(service.LastCorruptSettingsBackupPath) ||
+                !File.Exists(service.LastCorruptSettingsBackupPath))
+                throw new InvalidOperationException("Corrupt appsettings.json was not flagged or backed up.");
+            fallback.ProjectPath = root;
+            service.SaveSettings(fallback);
+            if (!string.Equals(File.ReadAllText(path), corruptJson, StringComparison.Ordinal))
+                throw new InvalidOperationException("Fallback settings save overwrote corrupt appsettings.json.");
+            File.WriteAllText(path, "{\"CurrentAccountName\":\"recovered\"}");
+            var recovered = service.LoadSettings();
+            if (service.SettingsLoadFailed || recovered.LoadFailed || recovered.CurrentAccountName != "recovered")
+                throw new InvalidOperationException("ThemeService did not clear SettingsLoadFailed after recovery.");
         }
         finally
         {

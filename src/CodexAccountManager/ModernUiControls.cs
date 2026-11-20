@@ -1,8 +1,82 @@
+using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
 
 namespace CodexAccountManager;
+
+internal static class UiFontCache
+{
+    private readonly record struct FontKey(string FamilyName, int SizeHundredths, FontStyle Style, GraphicsUnit Unit);
+
+    private static readonly ConcurrentDictionary<FontKey, Font> Cache = new();
+    private static int _exitHooked;
+
+    public static Font Get(
+        string familyName,
+        float size,
+        FontStyle style = FontStyle.Regular,
+        GraphicsUnit unit = GraphicsUnit.Point)
+    {
+        EnsureExitHook();
+        var safeFamily = string.IsNullOrWhiteSpace(familyName) ? "Microsoft YaHei UI" : familyName;
+        var clampedSize = Math.Max(4F, float.IsFinite(size) ? size : 9F);
+        var key = new FontKey(safeFamily, (int)Math.Round(clampedSize * 100F), style, unit);
+        return Cache.GetOrAdd(key, static k =>
+            new Font(k.FamilyName, k.SizeHundredths / 100F, k.Style, k.Unit));
+    }
+
+    public static Font Get(
+        FontFamily family,
+        float size,
+        FontStyle style = FontStyle.Regular,
+        GraphicsUnit unit = GraphicsUnit.Point) =>
+        Get(family?.Name ?? "Microsoft YaHei UI", size, style, unit);
+
+    private static void EnsureExitHook()
+    {
+        if (Interlocked.CompareExchange(ref _exitHooked, 1, 0) != 0)
+        {
+            return;
+        }
+
+        Application.ApplicationExit += static (_, _) => DisposeAll();
+        AppDomain.CurrentDomain.ProcessExit += static (_, _) => DisposeAll();
+    }
+
+    private static void DisposeAll()
+    {
+        foreach (var key in Cache.Keys)
+        {
+            if (Cache.TryRemove(key, out var font))
+            {
+                try
+                {
+                    font.Dispose();
+                }
+                catch
+                {
+                    // Process exit cleanup is best-effort.
+                }
+            }
+        }
+    }
+}
+
+internal enum ModernButtonGlyph
+{
+    None,
+    AccountSwitch,
+    UnifiedHistory,
+    StatusCheck,
+    QuotaUsage,
+    AccountRotation,
+    ThemeSettings,
+    SystemConfig,
+    ProxyManagement,
+    Plus,
+    Refresh
+}
 
 internal static class UiDesign
 {
@@ -10,6 +84,47 @@ internal static class UiDesign
     public const int RadiusMedium = 11;
     public const int RadiusLarge = 16;
     public const int ControlHeight = 42;
+
+    public static Color ResolveParentBackColor(Control control)
+    {
+        for (var parent = control.Parent; parent != null; parent = parent.Parent)
+        {
+            if (parent.BackColor.A == 255 && parent.BackColor != Color.Transparent)
+            {
+                return parent.BackColor;
+            }
+        }
+
+        return control.BackColor.A == 255 && control.BackColor != Color.Transparent
+            ? control.BackColor
+            : SystemColors.Control;
+    }
+
+    public static void PaintParentBackdrop(Graphics graphics, Control control)
+    {
+        if (control.Parent is RoundedPanel { UseGradient: true, ShowStarfield: false, GradientColor.A: > 0 } parentPanel &&
+            parentPanel.Width > 2 &&
+            parentPanel.Height > 2 &&
+            control.Width > 0 &&
+            control.Height > 0)
+        {
+            var parentGradientBounds = new RectangleF(
+                0.75F - control.Left,
+                0.75F - control.Top,
+                Math.Max(1F, parentPanel.Width - 1.5F),
+                Math.Max(1F, parentPanel.Height - 1.5F));
+            using var gradient = new LinearGradientBrush(
+                parentGradientBounds,
+                parentPanel.EffectiveBackColor,
+                parentPanel.EffectiveGradientColor,
+                LinearGradientMode.Horizontal);
+            graphics.FillRectangle(gradient, control.ClientRectangle);
+            return;
+        }
+
+        var backdrop = ResolveParentBackColor(control);
+        graphics.Clear(Color.FromArgb(255, backdrop.R, backdrop.G, backdrop.B));
+    }
 
     public static Color Blend(Color from, Color to, float amount)
     {
@@ -130,6 +245,9 @@ internal sealed class ModernButton : Button
     public string IconText { get; set; } = string.Empty;
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public ModernButtonGlyph IconGlyph { get; set; } = ModernButtonGlyph.None;
+
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public int IconWidth { get; set; } = 30;
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
@@ -227,27 +345,20 @@ internal sealed class ModernButton : Button
         base.OnKeyUp(kevent);
     }
 
-    protected override void OnResize(EventArgs e)
+    protected override void OnPaintBackground(PaintEventArgs pevent)
     {
-        base.OnResize(e);
-        UpdateRegion();
+        // AllPaintingInWmPaint + UserPaint: OnPaint paints the full surface including outer corners.
     }
 
-    private void UpdateRegion()
+    protected override void OnPaint(PaintEventArgs pevent)
     {
-        Region?.Dispose();
         if (Width <= 1 || Height <= 1)
         {
             return;
         }
 
-        using var path = UiDesign.CreateRoundedPath(new RectangleF(0F, 0F, Width, Height), Radius);
-        Region = new Region(path);
-    }
-
-    protected override void OnPaint(PaintEventArgs pevent)
-    {
         var graphics = pevent.Graphics;
+        UiDesign.PaintParentBackdrop(graphics, this);
         graphics.SmoothingMode = SmoothingMode.AntiAlias;
         graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
 
@@ -343,7 +454,8 @@ internal sealed class ModernButton : Button
             _ => TextFormatFlags.HorizontalCenter
         };
 
-        if (!string.IsNullOrEmpty(IconText))
+        var hasIcon = IconGlyph != ModernButtonGlyph.None || !string.IsNullOrEmpty(IconText);
+        if (hasIcon && IconWidth > 0)
         {
             var iconRect = new Rectangle(content.Left, content.Top, IconWidth, content.Height);
             if (ShowIconTile && IconTileColor.A > 0)
@@ -363,14 +475,23 @@ internal sealed class ModernButton : Button
                     graphics.DrawPath(tilePen, tilePath);
                 }
             }
-            using var iconFont = new Font(Font.FontFamily, Math.Max(9F, Font.Size + 1F), FontStyle.Regular, GraphicsUnit.Point);
-            iconRect = UiDesign.CenterTextVertically(graphics, IconText, iconFont, iconRect);
-            TextRenderer.DrawText(graphics, IconText, iconFont, iconRect, textColor,
-                TextFormatFlags.SingleLine |
-                TextFormatFlags.HorizontalCenter |
-                TextFormatFlags.VerticalCenter |
-                TextFormatFlags.NoPadding |
-                TextFormatFlags.NoPrefix);
+
+            if (IconGlyph != ModernButtonGlyph.None)
+            {
+                DrawVectorGlyph(graphics, IconGlyph, iconRect, textColor);
+            }
+            else
+            {
+                var iconFont = UiFontCache.Get(Font.FontFamily, Math.Max(9F, Font.Size + 1F), FontStyle.Regular);
+                var centeredIconRect = UiDesign.CenterTextVertically(graphics, IconText, iconFont, iconRect);
+                TextRenderer.DrawText(graphics, IconText, iconFont, centeredIconRect, textColor,
+                    TextFormatFlags.SingleLine |
+                    TextFormatFlags.HorizontalCenter |
+                    TextFormatFlags.VerticalCenter |
+                    TextFormatFlags.NoPadding |
+                    TextFormatFlags.NoPrefix);
+            }
+
             content.X += IconWidth + 8;
             content.Width = Math.Max(1, content.Width - IconWidth - 8);
             flags &= ~TextFormatFlags.HorizontalCenter;
@@ -425,6 +546,137 @@ internal sealed class ModernButton : Button
             using var focusPath = UiDesign.CreateRoundedPath(focusBounds, Math.Max(2, Radius - 2));
             using var focusPen = new Pen(FocusColor, 1F) { DashStyle = DashStyle.Dot };
             graphics.DrawPath(focusPen, focusPath);
+        }
+    }
+
+    private void DrawVectorGlyph(Graphics graphics, ModernButtonGlyph glyph, Rectangle iconRect, Color color)
+    {
+        var scale = Math.Max(1F, DeviceDpi / 96F);
+        var size = Math.Min(13.5F * scale, Math.Max(11F, Math.Min(iconRect.Width, iconRect.Height) * 0.56F));
+        var cx = iconRect.Left + (iconRect.Width / 2F);
+        var cy = iconRect.Top + (iconRect.Height / 2F);
+        var r = size / 2F;
+        using var pen = new Pen(color, Math.Max(1.45F, 1.4F * scale))
+        {
+            StartCap = LineCap.Round,
+            EndCap = LineCap.Round,
+            LineJoin = LineJoin.Round
+        };
+        using var brush = new SolidBrush(color);
+
+        switch (glyph)
+        {
+            case ModernButtonGlyph.AccountSwitch:
+                // Opposing horizontal swap arrows
+                var topY = cy - (r * 0.42F);
+                var botY = cy + (r * 0.42F);
+                graphics.DrawLine(pen, cx - (r * 0.78F), topY, cx + (r * 0.78F), topY);
+                graphics.DrawLines(pen,
+                [
+                    new PointF(cx + (r * 0.34F), topY - (r * 0.36F)),
+                    new PointF(cx + (r * 0.78F), topY),
+                    new PointF(cx + (r * 0.34F), topY + (r * 0.36F))
+                ]);
+                graphics.DrawLine(pen, cx + (r * 0.78F), botY, cx - (r * 0.78F), botY);
+                graphics.DrawLines(pen,
+                [
+                    new PointF(cx - (r * 0.34F), botY - (r * 0.36F)),
+                    new PointF(cx - (r * 0.78F), botY),
+                    new PointF(cx - (r * 0.34F), botY + (r * 0.36F))
+                ]);
+                break;
+
+            case ModernButtonGlyph.UnifiedHistory:
+                // Clean clock dial with hands
+                var dial = new RectangleF(cx - (r * 0.86F), cy - (r * 0.86F), r * 1.72F, r * 1.72F);
+                graphics.DrawEllipse(pen, dial);
+                graphics.DrawLines(pen,
+                [
+                    new PointF(cx, cy - (r * 0.48F)),
+                    new PointF(cx, cy),
+                    new PointF(cx + (r * 0.40F), cy + (r * 0.24F))
+                ]);
+                break;
+
+            case ModernButtonGlyph.StatusCheck:
+                // Crisp checkmark inside subtle ring
+                var ring = new RectangleF(cx - (r * 0.86F), cy - (r * 0.86F), r * 1.72F, r * 1.72F);
+                graphics.DrawEllipse(pen, ring);
+                graphics.DrawLines(pen,
+                [
+                    new PointF(cx - (r * 0.40F), cy + (r * 0.02F)),
+                    new PointF(cx - (r * 0.10F), cy + (r * 0.34F)),
+                    new PointF(cx + (r * 0.44F), cy - (r * 0.30F))
+                ]);
+                break;
+
+            case ModernButtonGlyph.QuotaUsage:
+                // Three ascending usage bars
+                var baseLine = cy + (r * 0.74F);
+                var barPenWidth = Math.Max(2F, 1.85F * scale);
+                using (var barPen = new Pen(color, barPenWidth) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                {
+                    graphics.DrawLine(barPen, cx - (r * 0.58F), baseLine, cx - (r * 0.58F), cy + (r * 0.06F));
+                    graphics.DrawLine(barPen, cx, baseLine, cx, cy - (r * 0.32F));
+                    graphics.DrawLine(barPen, cx + (r * 0.58F), baseLine, cx + (r * 0.58F), cy - (r * 0.74F));
+                }
+                break;
+
+            case ModernButtonGlyph.AccountRotation:
+            case ModernButtonGlyph.Refresh:
+                // Clean circular arrow
+                var arcRect = new RectangleF(cx - (r * 0.82F), cy - (r * 0.82F), r * 1.64F, r * 1.64F);
+                graphics.DrawArc(pen, arcRect, -45F, 290F);
+                var tipX = cx + (r * 0.58F);
+                var tipY = cy - (r * 0.58F);
+                graphics.DrawLines(pen,
+                [
+                    new PointF(tipX - (r * 0.40F), tipY - (r * 0.08F)),
+                    new PointF(tipX, tipY),
+                    new PointF(tipX - (r * 0.04F), tipY + (r * 0.42F))
+                ]);
+                break;
+
+            case ModernButtonGlyph.ThemeSettings:
+                // Half-filled contrast disc
+                var disc = new RectangleF(cx - (r * 0.84F), cy - (r * 0.84F), r * 1.68F, r * 1.68F);
+                graphics.DrawEllipse(pen, disc);
+                graphics.FillPie(brush, disc, -90F, 180F);
+                break;
+
+            case ModernButtonGlyph.SystemConfig:
+                // Clean 6-tooth gear ring
+                var outerR = r * 0.86F;
+                var innerR = r * 0.52F;
+                for (var i = 0; i < 6; i++)
+                {
+                    var angle = i * MathF.PI / 3F;
+                    var cos = MathF.Cos(angle);
+                    var sin = MathF.Sin(angle);
+                    graphics.DrawLine(
+                        pen,
+                        cx + (cos * innerR),
+                        cy + (sin * innerR),
+                        cx + (cos * outerR),
+                        cy + (sin * outerR));
+                }
+                var hub = new RectangleF(cx - innerR, cy - innerR, innerR * 2F, innerR * 2F);
+                graphics.DrawEllipse(pen, hub);
+                break;
+
+            case ModernButtonGlyph.ProxyManagement:
+                // Network relay globe
+                var globe = new RectangleF(cx - (r * 0.84F), cy - (r * 0.84F), r * 1.68F, r * 1.68F);
+                var meridian = new RectangleF(cx - (r * 0.40F), cy - (r * 0.84F), r * 0.80F, r * 1.68F);
+                graphics.DrawEllipse(pen, globe);
+                graphics.DrawEllipse(pen, meridian);
+                graphics.DrawLine(pen, cx - (r * 0.80F), cy, cx + (r * 0.80F), cy);
+                break;
+
+            case ModernButtonGlyph.Plus:
+                graphics.DrawLine(pen, cx - (r * 0.68F), cy, cx + (r * 0.68F), cy);
+                graphics.DrawLine(pen, cx, cy - (r * 0.68F), cx, cy + (r * 0.68F));
+                break;
         }
     }
 }
@@ -500,9 +752,24 @@ internal sealed class ModernToggleSwitch : CheckBox
 
     protected override void OnPaint(PaintEventArgs eventArgs)
     {
+        if (Width <= 1 || Height <= 1)
+        {
+            return;
+        }
+
         var graphics = eventArgs.Graphics;
         graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        graphics.Clear(BackColor);
+        var effectiveBack = BackColor.A == 255 && BackColor != Color.Transparent
+            ? BackColor
+            : UiDesign.ResolveParentBackColor(this);
+        if (BackColor.A < 255 || BackColor == Color.Transparent)
+        {
+            UiDesign.PaintParentBackdrop(graphics, this);
+        }
+        else
+        {
+            graphics.Clear(effectiveBack);
+        }
 
         var trackWidth = Math.Clamp(Width / 3, 34, 42);
         var trackHeight = Math.Clamp(Height - 10, 18, 22);
@@ -518,7 +785,7 @@ internal sealed class ModernToggleSwitch : CheckBox
             Height);
         var textColor = Enabled
             ? TextColor
-            : UiDesign.Blend(TextColor, BackColor, 0.48F);
+            : UiDesign.Blend(TextColor, effectiveBack, 0.48F);
         var textFlags = TextFormatFlags.Left |
                         TextFormatFlags.VerticalCenter |
                         TextFormatFlags.SingleLine |
@@ -539,7 +806,7 @@ internal sealed class ModernToggleSwitch : CheckBox
         }
         if (!Enabled)
         {
-            trackColor = UiDesign.Blend(trackColor, BackColor, 0.45F);
+            trackColor = UiDesign.Blend(trackColor, effectiveBack, 0.45F);
         }
         using (var trackPath = UiDesign.CreateRoundedPath(track, track.Height / 2F))
         using (var trackBrush = new SolidBrush(trackColor))
@@ -565,7 +832,7 @@ internal sealed class ModernToggleSwitch : CheckBox
         if (Focused && ShowFocusCues)
         {
             var focus = Rectangle.Inflate(ClientRectangle, -2, -2);
-            ControlPaint.DrawFocusRectangle(graphics, focus, TextColor, BackColor);
+            ControlPaint.DrawFocusRectangle(graphics, focus, TextColor, effectiveBack);
         }
     }
 }
@@ -743,21 +1010,14 @@ internal sealed class ModernInputShell : Panel
         Invalidate();
     }
 
-    protected override void OnResize(EventArgs eventargs)
+    protected override void OnPaintBackground(PaintEventArgs e)
     {
-        base.OnResize(eventargs);
-        Region?.Dispose();
         if (Width <= 1 || Height <= 1)
         {
             return;
         }
 
-        using var path = UiDesign.CreateRoundedPath(new RectangleF(0F, 0F, Width, Height), Radius);
-        Region = new Region(path);
-    }
-
-    protected override void OnPaintBackground(PaintEventArgs e)
-    {
+        UiDesign.PaintParentBackdrop(e.Graphics, this);
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
         using var path = UiDesign.CreateRoundedPath(
             new RectangleF(0.5F, 0.5F, Math.Max(1F, Width - 1F), Math.Max(1F, Height - 1F)),
@@ -768,6 +1028,11 @@ internal sealed class ModernInputShell : Panel
 
     protected override void OnPaint(PaintEventArgs e)
     {
+        if (Width <= 1 || Height <= 1)
+        {
+            return;
+        }
+
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
         var dpiScale = Math.Max(1F, DeviceDpi / 96F);
         var borderWidth = _focused
@@ -944,7 +1209,7 @@ internal sealed class ThemePicker : Control
         AccessibleRole = AccessibleRole.ComboBox;
         AccessibleName = "外观模式";
         Size = new Size(216, 46);
-        Font = new Font("Microsoft YaHei UI", 9F);
+        Font = UiFontCache.Get("Microsoft YaHei UI", 9F);
         _menu.Opened += (_, _) =>
         {
             _menuOpen = true;
@@ -1135,6 +1400,11 @@ internal sealed class ThemePicker : Control
 
     protected override void OnPaint(PaintEventArgs e)
     {
+        if (Width <= 1 || Height <= 1)
+        {
+            return;
+        }
+
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
         var bounds = new RectangleF(0.75F, 0.75F, Math.Max(1F, Width - 1.5F), Math.Max(1F, Height - 1.5F));
         using var path = UiDesign.CreateRoundedPath(bounds, Math.Max(8, ScaleLogical(10)));
@@ -1301,7 +1571,12 @@ internal sealed class ThemePicker : Control
 
     private void RebuildMenu()
     {
+        var previousItems = _menu.Items.Cast<ToolStripItem>().ToArray();
         _menu.Items.Clear();
+        foreach (var previousItem in previousItems)
+        {
+            previousItem.Dispose();
+        }
         for (var index = 0; index < _items.Count; index++)
         {
             var itemIndex = index;
@@ -1360,6 +1635,11 @@ internal sealed class ThemePickerMenuRenderer(
 {
     protected override void OnRenderToolStripBackground(ToolStripRenderEventArgs e)
     {
+        if (e.AffectedBounds.Width <= 0 || e.AffectedBounds.Height <= 0)
+        {
+            return;
+        }
+
         using var brush = new LinearGradientBrush(
             e.AffectedBounds,
             backColor,
@@ -1436,6 +1716,11 @@ internal sealed class PillLabel : Label
 
     protected override void OnPaint(PaintEventArgs e)
     {
+        if (Width <= 1 || Height <= 1)
+        {
+            return;
+        }
+
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
         var bounds = new RectangleF(0.5F, 0.5F, Math.Max(1F, Width - 1F), Math.Max(1F, Height - 1F));
         using var path = UiDesign.CreateRoundedPath(bounds, Height / 2F);
@@ -1532,6 +1817,11 @@ internal sealed class QuotaProgressBar : Control
 
     protected override void OnPaint(PaintEventArgs e)
     {
+        if (Width <= 1 || Height <= 1)
+        {
+            return;
+        }
+
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
         var track = new RectangleF(0F, 0F, Width, Height);
         using var trackPath = UiDesign.CreateRoundedPath(track, Height / 2F);
@@ -1544,7 +1834,13 @@ internal sealed class QuotaProgressBar : Control
             return;
         }
 
-        var fill = new RectangleF(0F, 0F, Math.Max(Height, fillWidth), Height);
+        var clampedFillWidth = Math.Min(Width, Math.Max(Height, fillWidth));
+        if (clampedFillWidth <= 0F)
+        {
+            return;
+        }
+
+        var fill = new RectangleF(0F, 0F, clampedFillWidth, Height);
         using var fillPath = UiDesign.CreateRoundedPath(fill, Height / 2F);
         using var fillBrush = new LinearGradientBrush(fill, FillColor, UiDesign.Blend(FillColor, Color.White, 0.18F), 0F);
         e.Graphics.FillPath(fillBrush, fillPath);

@@ -4,6 +4,7 @@ public partial class Form1
 {
     private readonly System.Windows.Forms.Timer _modelCatalogRefreshTimer = new() { Interval = 60_000 };
     private readonly CancellationTokenSource _modelCatalogRefreshCancellation = new();
+    private bool _modelCatalogRefreshDisposed;
     private bool _modelCatalogRefreshInProgress;
     private bool _compatibleModelRefreshInProgress;
     private bool _accessTokenModelRefreshInProgress;
@@ -33,6 +34,26 @@ public partial class Form1
             label.Text = status;
     }
 
+    private bool TryGetModelCatalogRefreshToken(out CancellationToken cancellationToken)
+    {
+        if (_formClosed || IsDisposed || Disposing || _modelCatalogRefreshDisposed)
+        {
+            cancellationToken = CancellationToken.None;
+            return false;
+        }
+
+        try
+        {
+            cancellationToken = _modelCatalogRefreshCancellation.Token;
+            return !cancellationToken.IsCancellationRequested;
+        }
+        catch (ObjectDisposedException)
+        {
+            cancellationToken = CancellationToken.None;
+            return false;
+        }
+    }
+
     private async Task RefreshAccountModelsManuallyAsync(Button button)
     {
         if (_compatibleModelRefreshInProgress || _accessTokenModelRefreshInProgress)
@@ -40,12 +61,15 @@ public partial class Form1
             _statusBox.Text = "账号模型正在后台同步，请等待本次完成后再检查。";
             return;
         }
+        if (!TryGetModelCatalogRefreshToken(out var cancellationToken))
+        {
+            return;
+        }
         _compatibleModelRefreshInProgress = _accessTokenModelRefreshInProgress = true;
         button.Enabled = false;
         SetAccountModelRefreshStatus("正在使用每个账号自己的凭据与绑定节点获取模型，不发送聊天请求…");
         try
         {
-            var cancellationToken = _modelCatalogRefreshCancellation.Token;
             var results = await Task.Run(async () =>
             {
                 var lines = new List<string>();
@@ -57,10 +81,12 @@ public partial class Form1
                         var count = account.IsAccessToken
                             ? await _codex.RefreshAccessTokenModelCatalogAsync(account.Name, cancellationToken)
                             : await _codex.RefreshCompatibleModelCatalogAsync(account.Name, cancellationToken);
-                        var config = File.ReadAllText(Path.Combine(account.CodexHome, "config.toml"));
-                        var custom = config.Replace("\r", "").Split('\n').TakeWhile(line => !line.TrimStart().StartsWith('['))
-                            .Any(line => System.Text.RegularExpressions.Regex.IsMatch(line, @"^\s*model_catalog_json\s*=") &&
-                                         !line.Contains("# codex-account-manager-model-catalog", StringComparison.Ordinal));
+                        var configPath = Path.Combine(account.CodexHome, "config.toml");
+                        var custom = File.Exists(configPath) &&
+                            File.ReadAllText(configPath).Replace("\r", "").Split('\n')
+                                .TakeWhile(line => !line.TrimStart().StartsWith('['))
+                                .Any(line => System.Text.RegularExpressions.Regex.IsMatch(line, @"^\s*model_catalog_json\s*=") &&
+                                             !line.Contains("# codex-account-manager-model-catalog", StringComparison.Ordinal));
                         lines.Add($"{account.Name}：已获取 {count} 条模型记录" +
                             (custom ? "；但当前使用自定义 model_catalog_json，未覆盖它，请自行检查该文件。" : "。"));
                     }
@@ -93,15 +119,21 @@ public partial class Form1
     {
         Shown += async (_, _) =>
         {
+            if (_formClosed || IsDisposed || Disposing || _modelCatalogRefreshDisposed) return;
             _modelCatalogRefreshTimer.Start();
             await RefreshAutomaticCatalogsAsync();
         };
-        _modelCatalogRefreshTimer.Tick += async (_, _) => await RefreshAutomaticCatalogsAsync();
+        _modelCatalogRefreshTimer.Tick += async (_, _) =>
+        {
+            if (_formClosed || IsDisposed || Disposing || _modelCatalogRefreshDisposed) return;
+            await RefreshAutomaticCatalogsAsync();
+        };
         FormClosed += (_, _) =>
         {
+            _modelCatalogRefreshDisposed = true;
             _modelCatalogRefreshTimer.Stop();
             _modelCatalogRefreshTimer.Dispose();
-            _modelCatalogRefreshCancellation.Cancel();
+            try { _modelCatalogRefreshCancellation.Cancel(); } catch (ObjectDisposedException) { }
             _modelCatalogRefreshCancellation.Dispose();
         };
     }
@@ -115,9 +147,9 @@ public partial class Form1
     {
         if (IsDisposed || Disposing || _compatibleModelRefreshInProgress ||
             DateTimeOffset.UtcNow < _nextAutomaticCompatibleModelCheckUtc) return;
+        if (!TryGetModelCatalogRefreshToken(out var cancellationToken)) return;
         _compatibleModelRefreshInProgress = true;
         _nextAutomaticCompatibleModelCheckUtc = DateTimeOffset.UtcNow.AddMinutes(15);
-        var cancellationToken = _modelCatalogRefreshCancellation.Token;
         try
         {
             // Discovery runs independently of the price update preference and off the UI
@@ -142,6 +174,7 @@ public partial class Form1
         if (IsDisposed || Disposing || _modelCatalogRefreshInProgress ||
             !ModelCatalogService.Current.AutomaticPriceUpdatesEnabled ||
             DateTimeOffset.UtcNow < _nextAutomaticPriceCheckUtc) return;
+        if (!TryGetModelCatalogRefreshToken(out var cancellationToken)) return;
         _modelCatalogRefreshInProgress = true;
         _nextAutomaticPriceCheckUtc = DateTimeOffset.UtcNow.AddMinutes(15);
         try
@@ -149,7 +182,7 @@ public partial class Form1
             // Read the configured proxy without saving edited controls or changing accounts.
             var proxy = CodexCliService.BuildPatGatewayProxyUri(_appSettings);
             if (string.IsNullOrWhiteSpace(proxy)) proxy = CodexCliService.GetWindowsProxyUri();
-            await ModelCatalogService.CheckAndSaveOfficialAsync(proxy, _modelCatalogRefreshCancellation.Token);
+            await ModelCatalogService.CheckAndSaveOfficialAsync(proxy, cancellationToken);
             if (IsDisposed || Disposing) return;
             _nextAutomaticPriceCheckUtc = DateTimeOffset.UtcNow.AddHours(6);
             InvalidateQuotaUsageCache(clearCachedData: true);
@@ -175,9 +208,9 @@ public partial class Form1
     {
         if (IsDisposed || Disposing || _accessTokenModelRefreshInProgress ||
             DateTimeOffset.UtcNow < _nextAutomaticAccessTokenModelCheckUtc) return;
+        if (!TryGetModelCatalogRefreshToken(out var cancellationToken)) return;
         _accessTokenModelRefreshInProgress = true;
         _nextAutomaticAccessTokenModelCheckUtc = DateTimeOffset.UtcNow.AddMinutes(15);
-        var cancellationToken = _modelCatalogRefreshCancellation.Token;
         try
         {
             // Query the account's remote catalog independently of the static desktop

@@ -1674,6 +1674,16 @@ internal sealed class PassiveQuotaGauge : Control
                (0.0722D * Linearize(color.B));
     }
 
+    private string? _cachedPercentText;
+    private Size _cachedPercentBoundsKey;
+    private string? _cachedPercentFontFamily;
+    private float _cachedPercentMinSize;
+    private float _cachedPercentMaxSize;
+    private float _cachedPercentDpi;
+    private float _cachedPercentPointSize;
+    private SizeF _cachedPercentValueSize;
+    private SizeF _cachedPercentSuffixSize;
+
     private void DrawCenteredPercentage(
         Graphics graphics,
         string value,
@@ -1683,10 +1693,6 @@ internal sealed class PassiveQuotaGauge : Control
         float maximumPointSize,
         float dpi)
     {
-        Font? valueFont = null;
-        Font? suffixFont = null;
-        SizeF valueSize = SizeF.Empty;
-        SizeF suffixSize = SizeF.Empty;
         var gap = Math.Max(1F * dpi, bounds.Width * 0.012F);
         using var format = new StringFormat(StringFormat.GenericTypographic)
         {
@@ -1694,86 +1700,117 @@ internal sealed class PassiveQuotaGauge : Control
                           StringFormatFlags.NoWrap
         };
 
-        for (var pointSize = maximumPointSize;
-             pointSize >= minimumPointSize;
-             pointSize -= 0.5F)
+        var fontFamily = Font.FontFamily;
+        var fontFamilyName = fontFamily.Name;
+        var boundsKey = new Size(
+            (int)Math.Round(bounds.Width * 10F),
+            (int)Math.Round(bounds.Height * 10F));
+        var cacheHit =
+            _cachedPercentPointSize > 0F &&
+            string.Equals(_cachedPercentText, value, StringComparison.Ordinal) &&
+            _cachedPercentBoundsKey == boundsKey &&
+            string.Equals(_cachedPercentFontFamily, fontFamilyName, StringComparison.Ordinal) &&
+            MathF.Abs(_cachedPercentMinSize - minimumPointSize) < 0.01F &&
+            MathF.Abs(_cachedPercentMaxSize - maximumPointSize) < 0.01F &&
+            MathF.Abs(_cachedPercentDpi - dpi) < 0.01F;
+
+        float fittedPointSize;
+        SizeF valueSize;
+        SizeF suffixSize;
+        Font valueFont;
+        Font suffixFont;
+
+        if (cacheHit)
         {
-            var candidateValue = new Font(
-                Font.FontFamily,
-                pointSize,
-                FontStyle.Bold,
-                GraphicsUnit.Point);
-            var candidateSuffix = new Font(
-                Font.FontFamily,
-                Math.Max(5F, pointSize * 0.46F),
-                FontStyle.Bold,
-                GraphicsUnit.Point);
-            var candidateValueSize = graphics.MeasureString(value, candidateValue, PointF.Empty, format);
-            var candidateSuffixSize = graphics.MeasureString("%", candidateSuffix, PointF.Empty, format);
-            var totalWidth = candidateValueSize.Width + gap + candidateSuffixSize.Width;
-            var totalHeight = Math.Max(
-                candidateValueSize.Height,
-                candidateSuffixSize.Height + (candidateValueSize.Height * 0.1F));
-            if (totalWidth <= bounds.Width + 0.5F && totalHeight <= bounds.Height + 0.5F)
+            fittedPointSize = _cachedPercentPointSize;
+            valueFont = UiFontCache.Get(fontFamily, fittedPointSize, FontStyle.Bold, GraphicsUnit.Point);
+            suffixFont = UiFontCache.Get(fontFamily, Math.Max(5F, fittedPointSize * 0.46F), FontStyle.Bold, GraphicsUnit.Point);
+            valueSize = _cachedPercentValueSize;
+            suffixSize = _cachedPercentSuffixSize;
+        }
+        else
+        {
+            fittedPointSize = Math.Max(5F, minimumPointSize);
+            valueFont = UiFontCache.Get(fontFamily, fittedPointSize, FontStyle.Bold, GraphicsUnit.Point);
+            suffixFont = UiFontCache.Get(fontFamily, Math.Max(5F, fittedPointSize * 0.46F), FontStyle.Bold, GraphicsUnit.Point);
+            valueSize = SizeF.Empty;
+            suffixSize = SizeF.Empty;
+
+            for (var pointSize = maximumPointSize;
+                 pointSize >= minimumPointSize;
+                 pointSize -= 0.5F)
             {
-                valueFont = candidateValue;
-                suffixFont = candidateSuffix;
-                valueSize = candidateValueSize;
-                suffixSize = candidateSuffixSize;
-                break;
+                var candidateValue = UiFontCache.Get(
+                    fontFamily,
+                    pointSize,
+                    FontStyle.Bold,
+                    GraphicsUnit.Point);
+                var candidateSuffix = UiFontCache.Get(
+                    fontFamily,
+                    Math.Max(5F, pointSize * 0.46F),
+                    FontStyle.Bold,
+                    GraphicsUnit.Point);
+                var candidateValueSize = graphics.MeasureString(value, candidateValue, PointF.Empty, format);
+                var candidateSuffixSize = graphics.MeasureString("%", candidateSuffix, PointF.Empty, format);
+                var candidateWidth = candidateValueSize.Width + gap + candidateSuffixSize.Width;
+                var candidateHeight = Math.Max(
+                    candidateValueSize.Height,
+                    candidateSuffixSize.Height + (candidateValueSize.Height * 0.1F));
+                if (candidateWidth <= bounds.Width + 0.5F && candidateHeight <= bounds.Height + 0.5F)
+                {
+                    fittedPointSize = pointSize;
+                    valueFont = candidateValue;
+                    suffixFont = candidateSuffix;
+                    valueSize = candidateValueSize;
+                    suffixSize = candidateSuffixSize;
+                    break;
+                }
             }
 
-            candidateValue.Dispose();
-            candidateSuffix.Dispose();
-        }
-
-        valueFont ??= new Font(
-            Font.FontFamily,
-            Math.Max(5F, minimumPointSize),
-            FontStyle.Bold,
-            GraphicsUnit.Point);
-        suffixFont ??= new Font(
-            Font.FontFamily,
-            Math.Max(5F, minimumPointSize * 0.46F),
-            FontStyle.Bold,
-            GraphicsUnit.Point);
-        if (valueSize.IsEmpty)
-        {
-            valueSize = graphics.MeasureString(value, valueFont, PointF.Empty, format);
-            suffixSize = graphics.MeasureString("%", suffixFont, PointF.Empty, format);
-        }
-
-        using (valueFont)
-        using (suffixFont)
-        {
-            var totalWidth = valueSize.Width + gap + suffixSize.Width;
-            var valueLeft = bounds.Left + ((bounds.Width - totalWidth) / 2F);
-            var valueTop = bounds.Top + ((bounds.Height - valueSize.Height) / 2F);
-            var suffixLeft = valueLeft + valueSize.Width + gap;
-            var suffixTop = valueTop + (valueSize.Height * 0.1F);
-            var shadowColor = RelativeLuminance(color) > 0.5D
-                ? Color.FromArgb(38, Color.Black)
-                : Color.FromArgb(30, Color.White);
-            var shadowOffset = Math.Max(0.6F * dpi, 0.75F);
-            using (var shadowBrush = new SolidBrush(shadowColor))
+            if (valueSize.IsEmpty)
             {
-                graphics.DrawString(
-                    value,
-                    valueFont,
-                    shadowBrush,
-                    new PointF(valueLeft, valueTop + shadowOffset),
-                    format);
-                graphics.DrawString(
-                    "%",
-                    suffixFont,
-                    shadowBrush,
-                    new PointF(suffixLeft, suffixTop + shadowOffset),
-                    format);
+                valueSize = graphics.MeasureString(value, valueFont, PointF.Empty, format);
+                suffixSize = graphics.MeasureString("%", suffixFont, PointF.Empty, format);
             }
-            using var textBrush = new SolidBrush(color);
-            graphics.DrawString(value, valueFont, textBrush, new PointF(valueLeft, valueTop), format);
-            graphics.DrawString("%", suffixFont, textBrush, new PointF(suffixLeft, suffixTop), format);
+
+            _cachedPercentText = value;
+            _cachedPercentBoundsKey = boundsKey;
+            _cachedPercentFontFamily = fontFamilyName;
+            _cachedPercentMinSize = minimumPointSize;
+            _cachedPercentMaxSize = maximumPointSize;
+            _cachedPercentDpi = dpi;
+            _cachedPercentPointSize = fittedPointSize;
+            _cachedPercentValueSize = valueSize;
+            _cachedPercentSuffixSize = suffixSize;
         }
+
+        var totalWidth = valueSize.Width + gap + suffixSize.Width;
+        var valueLeft = bounds.Left + ((bounds.Width - totalWidth) / 2F);
+        var valueTop = bounds.Top + ((bounds.Height - valueSize.Height) / 2F);
+        var suffixLeft = valueLeft + valueSize.Width + gap;
+        var suffixTop = valueTop + (valueSize.Height * 0.1F);
+        var shadowColor = RelativeLuminance(color) > 0.5D
+            ? Color.FromArgb(38, Color.Black)
+            : Color.FromArgb(30, Color.White);
+        var shadowOffset = Math.Max(0.6F * dpi, 0.75F);
+        using (var shadowBrush = new SolidBrush(shadowColor))
+        {
+            graphics.DrawString(
+                value,
+                valueFont,
+                shadowBrush,
+                new PointF(valueLeft, valueTop + shadowOffset),
+                format);
+            graphics.DrawString(
+                "%",
+                suffixFont,
+                shadowBrush,
+                new PointF(suffixLeft, suffixTop + shadowOffset),
+                format);
+        }
+        using var textBrush = new SolidBrush(color);
+        graphics.DrawString(value, valueFont, textBrush, new PointF(valueLeft, valueTop), format);
+        graphics.DrawString("%", suffixFont, textBrush, new PointF(suffixLeft, suffixTop), format);
     }
 
     private void SetColor(ref Color field, Color value)

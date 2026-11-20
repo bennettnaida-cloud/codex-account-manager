@@ -38,6 +38,8 @@ pat-gateway-control-v1
 .vs/
 bin/
 obj/
+__pycache__/
+*.pyc
 
 # 发布脚本使用的脱敏空白模板（允许进入源码仓库）
 !packaging/defaults/

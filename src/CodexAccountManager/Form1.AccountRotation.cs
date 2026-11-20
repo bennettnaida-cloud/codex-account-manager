@@ -72,9 +72,9 @@ public partial class Form1
         const int leftPadding = 24;
         const int rightPadding = 24;
         const int labelToggleGap = 12;
-        using var stateMeasurementFont = new Font(Font.FontFamily, 9F, FontStyle.Bold);
-        using var affinityMeasurementFont = new Font(Font.FontFamily, 8.7F, FontStyle.Bold);
-        using var titleMeasurementFont = new Font(Font.FontFamily, 10.4F, FontStyle.Bold);
+        var stateMeasurementFont = UiFontCache.Get(Font.FontFamily, 9F, FontStyle.Bold);
+        var affinityMeasurementFont = UiFontCache.Get(Font.FontFamily, 8.7F, FontStyle.Bold);
+        var titleMeasurementFont = UiFontCache.Get(Font.FontFamily, 10.4F, FontStyle.Bold);
         static int MeasureFixedLabel(string text, Font font) =>
             TextRenderer.MeasureText(
                 text,
@@ -100,17 +100,23 @@ public partial class Form1
         // two-column layout only when the left column can physically fit the title; at
         // smaller widths the controls move below the text instead of being ellipsized.
         var horizontal = width >= leftPadding + titleWidth + 28 + rightColumnWidth + rightPadding;
-        var switchLeft = Math.Max(
-            leftPadding,
-            width - rightPadding - toggleWidth);
+        var availableControlsWidth = Math.Max(toggleWidth + labelToggleGap + 48, width - leftPadding - rightPadding);
+        var effectiveRightLabelWidth = Math.Min(
+            rightLabelWidth,
+            Math.Max(48, availableControlsWidth - toggleWidth - labelToggleGap));
+        var switchLeft = horizontal
+            ? Math.Max(leftPadding, width - rightPadding - toggleWidth)
+            : Math.Min(
+                Math.Max(leftPadding, width - rightPadding - toggleWidth),
+                leftPadding + effectiveRightLabelWidth + labelToggleGap);
         var rightLabelLeft = horizontal
-            ? Math.Max(leftPadding, switchLeft - labelToggleGap - rightLabelWidth)
-            : Math.Max(leftPadding, switchLeft - labelToggleGap - rightLabelWidth);
+            ? Math.Max(leftPadding, switchLeft - labelToggleGap - effectiveRightLabelWidth)
+            : leftPadding;
         var summaryTextWidth = horizontal
             ? Math.Max(titleWidth, rightLabelLeft - leftPadding - 16)
             : Math.Max(titleWidth, width - leftPadding - rightPadding);
         var countsText = $"使用 {primaryCount}  ·  备用 {backupCount}  ·  未参与 {noneCount}";
-        using var countsMeasurementFont = new Font(Font.FontFamily, 8.9F);
+        var countsMeasurementFont = UiFontCache.Get(Font.FontFamily, 8.9F);
         const int titleTop = 12;
         const int titleHeight = 34;
         const int countsTop = 52;
@@ -121,7 +127,7 @@ public partial class Form1
             27);
         var cursorSummaryTop = countsTop + countsHeight + 4;
         var cursorSummaryText = BuildAccountRotationCursorSummary();
-        using var cursorSummaryMeasurementFont = new Font(Font.FontFamily, 8.5F);
+        var cursorSummaryMeasurementFont = UiFontCache.Get(Font.FontFamily, 8.5F);
         var cursorSummaryHeight = MeasureAccountRotationWrappedTextHeight(
             cursorSummaryText,
             cursorSummaryMeasurementFont,
@@ -156,7 +162,7 @@ public partial class Form1
             Width = summaryTextWidth,
             Height = titleHeight,
             MinimumSize = new Size(titleWidth, titleHeight),
-            Font = new Font(Font.FontFamily, 10.4F, FontStyle.Bold),
+            Font = UiFontCache.Get(Font.FontFamily, 10.4F, FontStyle.Bold),
             TextAlign = ContentAlignment.MiddleLeft,
             AutoEllipsis = false,
             UseCompatibleTextRendering = true,
@@ -172,7 +178,7 @@ public partial class Form1
             Top = countsTop,
             Width = summaryTextWidth,
             Height = countsHeight,
-            Font = new Font(Font.FontFamily, 8.9F),
+            Font = UiFontCache.Get(Font.FontFamily, 8.9F),
             TextAlign = ContentAlignment.MiddleLeft,
             AutoEllipsis = false,
             UseCompatibleTextRendering = true,
@@ -188,7 +194,7 @@ public partial class Form1
             Top = cursorSummaryTop,
             Width = summaryTextWidth,
             Height = cursorSummaryHeight,
-            Font = new Font(Font.FontFamily, 8.5F),
+            Font = UiFontCache.Get(Font.FontFamily, 8.5F),
             TextAlign = ContentAlignment.MiddleLeft,
             AutoEllipsis = false,
             UseCompatibleTextRendering = true,
@@ -197,16 +203,19 @@ public partial class Form1
         ThemeStyler.ApplyLabel(cursorSummary, _palette, true);
         panel.Controls.Add(cursorSummary);
 
+        var effectiveStateWidth = Math.Min(stateWidth, effectiveRightLabelWidth);
         var state = new Label
         {
             Text = enabled ? "开启" : "关闭",
-            Left = rightLabelLeft,
+            Left = horizontal
+                ? Math.Max(leftPadding, switchLeft - labelToggleGap - effectiveStateWidth)
+                : rightLabelLeft,
             Top = switchTop,
-            Width = stateWidth,
+            Width = effectiveStateWidth,
             Height = 34,
-            MinimumSize = new Size(stateWidth, 34),
-            Font = new Font(Font.FontFamily, 9F, FontStyle.Bold),
-            TextAlign = ContentAlignment.MiddleRight,
+            MinimumSize = new Size(effectiveStateWidth, 34),
+            Font = UiFontCache.Get(Font.FontFamily, 9F, FontStyle.Bold),
+            TextAlign = horizontal ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft,
             AutoEllipsis = false,
             UseCompatibleTextRendering = true,
             UseMnemonic = false
@@ -242,10 +251,10 @@ public partial class Form1
                 Text = AccountRotationConfiguration.UsesCpaRoundRobin(_appSettings) ? "CPA 轮询" : "CPA 优先",
                 Left = rightLabelLeft,
                 Top = affinityTop,
-                Width = rightColumnWidth,
+                Width = Math.Min(rightColumnWidth, Math.Max(120, width - rightLabelLeft - rightPadding)),
                 Height = 34,
-                Font = new Font(Font.FontFamily, 8.7F, FontStyle.Bold),
-                TextAlign = ContentAlignment.MiddleRight,
+                Font = UiFontCache.Get(Font.FontFamily, 8.7F, FontStyle.Bold),
+                TextAlign = horizontal ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft,
                 UseMnemonic = false
             };
             ThemeStyler.ApplyLabel(mode, _palette);
@@ -257,16 +266,19 @@ public partial class Form1
             return panel;
         }
         var affinityEnabled = _appSettings.AccountRotationSessionAffinityEnabled;
+        var effectiveAffinityWidth = Math.Min(affinityWidth, effectiveRightLabelWidth);
         var affinityState = new Label
         {
             Text = affinityEnabled ? "会话粘性" : "粘性关闭",
-            Left = switchLeft - labelToggleGap - affinityWidth,
+            Left = horizontal
+                ? Math.Max(leftPadding, switchLeft - labelToggleGap - effectiveAffinityWidth)
+                : rightLabelLeft,
             Top = affinityTop,
-            Width = affinityWidth,
+            Width = effectiveAffinityWidth,
             Height = 34,
-            MinimumSize = new Size(affinityWidth, 34),
-            Font = new Font(Font.FontFamily, 8.7F, FontStyle.Bold),
-            TextAlign = ContentAlignment.MiddleRight,
+            MinimumSize = new Size(effectiveAffinityWidth, 34),
+            Font = UiFontCache.Get(Font.FontFamily, 8.7F, FontStyle.Bold),
+            TextAlign = horizontal ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft,
             AutoEllipsis = false,
             UseCompatibleTextRendering = true,
             UseMnemonic = false
@@ -426,7 +438,7 @@ public partial class Form1
             Top = 5,
             Width = Math.Max(140, Math.Min(230, countLeft - 32)),
             Height = 40,
-            Font = new Font(Font.FontFamily, 9.6F, FontStyle.Bold),
+            Font = UiFontCache.Get(Font.FontFamily, 9.6F, FontStyle.Bold),
             TextAlign = ContentAlignment.MiddleLeft,
             UseMnemonic = false
         };
@@ -443,7 +455,7 @@ public partial class Form1
                 Top = 8,
                 Width = Math.Max(100, countLeft - 262),
                 Height = 34,
-                Font = new Font(Font.FontFamily, 8.4F),
+                Font = UiFontCache.Get(Font.FontFamily, 8.4F),
                 TextAlign = ContentAlignment.MiddleRight,
                 AutoEllipsis = true,
                 UseMnemonic = false
@@ -484,7 +496,7 @@ public partial class Form1
             Top = 10,
             Width = Math.Max(160, width - 44),
             Height = 40,
-            Font = new Font(Font.FontFamily, 8.8F),
+            Font = UiFontCache.Get(Font.FontFamily, 8.8F),
             TextAlign = ContentAlignment.MiddleLeft,
             UseMnemonic = false
         };
@@ -532,26 +544,42 @@ public partial class Form1
         orderBadge.Height = 30;
         row.Controls.Add(orderBadge);
 
-        const int arrowWidth = 42;
-        const int gap = 8;
-        const int noneButtonWidth = 92;
+        var arrowWidth = 42;
+        var gap = 8;
+        var noneButtonWidth = 92;
         // Keep the primary action visually distinct from pool/order maintenance.  It
         // arms the authenticated request-boundary route and never calls the destructive
         // desktop profile switch used by the ordinary "启动" button.
-        const int activeButtonWidth = 124;
+        var activeButtonWidth = 124;
+        var measuredPoolWidth = MeasureAccountRotationPoolActionWidth();
         var poolButtonWidth = horizontal
-            ? Math.Max(176, MeasureAccountRotationPoolActionWidth())
-            : Math.Min(
-                Math.Max(150, MeasureAccountRotationPoolActionWidth()),
-                Math.Max(
-                    132,
-                    Math.Min(360, Math.Max(300, width - 44)) -
-                    activeButtonWidth -
-                    noneButtonWidth -
-                    (arrowWidth * 2) -
-                    (gap * 4)));
+            ? Math.Max(176, measuredPoolWidth)
+            : Math.Max(150, measuredPoolWidth);
         var controlsWidth = activeButtonWidth + poolButtonWidth + noneButtonWidth +
                             (arrowWidth * 2) + (gap * 4);
+        var maxControlsWidth = Math.Max(220, width - 44);
+        if (!horizontal && controlsWidth > maxControlsWidth)
+        {
+            var fixedOther = activeButtonWidth + noneButtonWidth + (arrowWidth * 2) + (gap * 4);
+            if (maxControlsWidth - fixedOther >= 116)
+            {
+                poolButtonWidth = maxControlsWidth - fixedOther;
+            }
+            else
+            {
+                gap = 6;
+                var scaleFactor = (double)(maxControlsWidth - (gap * 4)) /
+                                  Math.Max(1, activeButtonWidth + poolButtonWidth + noneButtonWidth + (arrowWidth * 2));
+                arrowWidth = Math.Max(30, (int)Math.Floor(arrowWidth * scaleFactor));
+                noneButtonWidth = Math.Max(64, (int)Math.Floor(noneButtonWidth * scaleFactor));
+                activeButtonWidth = Math.Max(82, (int)Math.Floor(activeButtonWidth * scaleFactor));
+                poolButtonWidth = Math.Max(
+                    88,
+                    maxControlsWidth - activeButtonWidth - noneButtonWidth - (arrowWidth * 2) - (gap * 4));
+            }
+            controlsWidth = activeButtonWidth + poolButtonWidth + noneButtonWidth +
+                            (arrowWidth * 2) + (gap * 4);
+        }
         var actionWidth = controlsWidth;
         var summaryWidth = horizontal
             ? Math.Max(180, width - 94 - actionWidth - 26)
@@ -563,7 +591,7 @@ public partial class Form1
             Top = 10,
             Width = summaryWidth,
             Height = 34,
-            Font = new Font(Font.FontFamily, 9.7F, FontStyle.Bold),
+            Font = UiFontCache.Get(Font.FontFamily, 9.7F, FontStyle.Bold),
             TextAlign = ContentAlignment.MiddleLeft,
             AutoEllipsis = true,
             UseMnemonic = false
@@ -578,7 +606,7 @@ public partial class Form1
             Top = 44,
             Width = summaryWidth,
             Height = 42,
-            Font = new Font(Font.FontFamily, 8.4F),
+            Font = UiFontCache.Get(Font.FontFamily, 8.4F),
             TextAlign = ContentAlignment.MiddleLeft,
             AutoEllipsis = false,
             UseMnemonic = false
@@ -675,6 +703,7 @@ public partial class Form1
             "↑",
             arrowLeft,
             controlsTop,
+            arrowWidth,
             "上移",
             canMove && index > 0);
         up.Click += (_, _) => MoveAccountRotationAccount(account, -1);
@@ -684,6 +713,7 @@ public partial class Form1
             "↓",
             arrowLeft + arrowWidth + gap,
             controlsTop,
+            arrowWidth,
             "下移",
             canMove && index >= 0 && index < count - 1);
         down.Click += (_, _) => MoveAccountRotationAccount(account, 1);
@@ -725,13 +755,14 @@ public partial class Form1
         string symbol,
         int left,
         int top,
+        int width,
         string accessibleName,
         bool enabled)
     {
-        var button = MakeActionButton(symbol, left, top, 42, primary: false);
+        var button = MakeActionButton(symbol, left, top, width, primary: false);
         button.Height = 42;
         button.Padding = Padding.Empty;
-        button.Font = new Font(Font.FontFamily, 12F, FontStyle.Bold);
+        button.Font = UiFontCache.Get(Font.FontFamily, 12F, FontStyle.Bold);
         button.Enabled = enabled;
         button.AccessibleName = accessibleName;
         _toolTip.SetToolTip(button, accessibleName);
@@ -911,7 +942,7 @@ public partial class Form1
 
     private int MeasureAccountRotationPoolActionWidth()
     {
-        using var buttonFont = new Font(Font.FontFamily, 8.9F);
+        var buttonFont = UiFontCache.Get(Font.FontFamily, 8.9F);
         var measuredWidth = new[] { "放入备用轮换池", "放入使用轮换池" }
             .Select(text => TextRenderer.MeasureText(
                 text,

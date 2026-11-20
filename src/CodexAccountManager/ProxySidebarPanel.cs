@@ -42,6 +42,8 @@ internal sealed class ProxySidebarPanel : Panel
     private Label _nodesSubtitle = null!;
     private ThemePalette _palette = null!;
     private IReadOnlyList<AccountRecord> _currentAccounts = [];
+    private Dictionary<string, AccountProxyBinding> _bindingsCache = new(StringComparer.Ordinal);
+    private bool _bindingsCacheLoaded;
     private CancellationTokenSource? _testCancellation;
     private bool _testRunning;
     private bool _disposed;
@@ -53,6 +55,8 @@ internal sealed class ProxySidebarPanel : Panel
         Dock = DockStyle.None;
         AutoScroll = true;
         Padding = new Padding(2, 4, 2, 8);
+        Font = UiFontCache.Get("Microsoft YaHei UI", 9.25F);
+        HandleCreated += (_, _) => ApplyScrollableTheme();
         Build();
     }
 
@@ -150,7 +154,8 @@ internal sealed class ProxySidebarPanel : Panel
         _nodes.HeaderStyle = ColumnHeaderStyle.Nonclickable;
         _nodes.BorderStyle = BorderStyle.FixedSingle;
         _nodes.GridLines = true;
-        _nodes.Font = new Font("Microsoft YaHei UI", 10F);
+        _nodes.Font = UiFontCache.Get("Microsoft YaHei UI", 10F);
+        _nodes.HandleCreated += (_, _) => ApplyScrollableTheme();
         _nodes.Columns.Add("节点名称");
         _nodes.Columns.Add("协议");
         _nodes.Columns.Add("地址");
@@ -206,7 +211,7 @@ internal sealed class ProxySidebarPanel : Panel
         AutoEllipsis = true,
         UseMnemonic = false,
         UseCompatibleTextRendering = true,
-        Font = new Font(SystemFonts.DefaultFont.FontFamily, size, strong ? FontStyle.Bold : FontStyle.Regular),
+        Font = UiFontCache.Get("Microsoft YaHei UI", size, strong ? FontStyle.Bold : FontStyle.Regular),
         Tag = muted ? "muted" : "label"
     };
 
@@ -215,10 +220,18 @@ internal sealed class ProxySidebarPanel : Panel
         button.Text = text;
         button.Height = 44;
         button.Radius = 11;
-        button.Font = new Font("Microsoft YaHei UI", 10F, primary ? FontStyle.Bold : FontStyle.Regular);
+        button.Font = UiFontCache.Get("Microsoft YaHei UI", 10F, primary ? FontStyle.Bold : FontStyle.Regular);
         button.Tag = primary ? "proxy-primary" : "proxy-soft";
         button.ShowIconTile = false;
         button.IconWidth = 0;
+    }
+
+    private void ApplyScrollableTheme()
+    {
+        if (!IsUsable || _palette == null) return;
+        var dark = ThemeStyler.IsDark(_palette);
+        NativeWindowTheme.ApplyScrollable(this, dark);
+        NativeWindowTheme.ApplyScrollable(_nodes, dark);
     }
 
     private void LayoutWorkspace()
@@ -378,6 +391,7 @@ internal sealed class ProxySidebarPanel : Panel
         }
         _nodes.BackColor = palette.InputBackColor;
         _nodes.ForeColor = palette.TextColor;
+        ApplyScrollableTheme();
         _nodes.Invalidate();
         UpdateBoundNodeHighlight();
     }
@@ -399,18 +413,47 @@ internal sealed class ProxySidebarPanel : Panel
         if (key != null) _account.SelectedItem = key; if (_account.SelectedIndex < 0 && _account.Items.Count > 0) _account.SelectedIndex = 0;
         RefreshNodes(); LoadBinding();
     }
+    private void ReloadBindingsCache()
+    {
+        var bindings = _store.LoadBindings();
+        var cache = new Dictionary<string, AccountProxyBinding>(StringComparer.Ordinal);
+        foreach (var binding in bindings)
+        {
+            if (!string.IsNullOrWhiteSpace(binding.AccountKey))
+            {
+                cache[binding.AccountKey] = binding;
+            }
+        }
+        _bindingsCache = cache;
+        _bindingsCacheLoaded = true;
+    }
+
+    private AccountProxyBinding? GetCachedBinding(string accountKey)
+    {
+        if (!_bindingsCacheLoaded)
+        {
+            ReloadBindingsCache();
+        }
+        return _bindingsCache.GetValueOrDefault(accountKey);
+    }
+
     public void RefreshNodes()
     {
         if (!IsUsable) return;
+        ReloadBindingsCache();
         var selectedNodeId = SelectedNode()?.NodeId;
         var nodes = _store.LoadNodes();
         _nodes.BeginUpdate();
         _nodes.Items.Clear();
         foreach (var node in nodes)
         {
-            var latency = node.Enabled && string.IsNullOrWhiteSpace(node.LastHealthError) && node.LastFirstResponseMilliseconds.HasValue
-                ? $"{node.LastFirstResponseMilliseconds.Value:0} ms"
-                : "-1";
+            var latency = !node.Enabled
+                ? "已禁用"
+                : string.IsNullOrWhiteSpace(node.LastHealthError) && node.LastFirstResponseMilliseconds.HasValue
+                    ? $"{node.LastFirstResponseMilliseconds.Value:0} ms"
+                    : node.LastHealthTestAtUtc.HasValue || !string.IsNullOrWhiteSpace(node.LastHealthError)
+                        ? "失败"
+                        : "未检测";
             var exitIp = FormatExitIpForList(node);
             var item = new ListViewItem(node.Name) { Tag = node };
             item.SubItems.Add(CompactProtocol(node.EffectiveScheme));
@@ -445,7 +488,7 @@ internal sealed class ProxySidebarPanel : Panel
     private void LoadBinding()
     {
         if (!IsUsable) return;
-        var account = SelectedAccount(); var binding = account == null ? null : _store.GetBinding(AccountProxyResolver.AccountKeyFor(account));
+        var account = SelectedAccount(); var binding = account == null ? null : GetCachedBinding(AccountProxyResolver.AccountKeyFor(account));
         _mode.SelectedIndex = binding?.Mode switch { ProxyBindingMode.FixedNode => 1, ProxyBindingMode.Disabled => 2, _ => 0 };
         _fallback.SelectedIndex = binding?.FallbackPolicy == ProxyFallbackPolicy.InheritGlobal ? 1 : 0;
         var idx = binding?.NodeId == null ? 0 : Enumerable.Range(1, Math.Max(0, _node.Items.Count - 1)).FirstOrDefault(i => (_node.Items[i] as NodeItem)?.Node.NodeId.Equals(binding.NodeId, StringComparison.OrdinalIgnoreCase) == true, 0);
@@ -479,12 +522,12 @@ internal sealed class ProxySidebarPanel : Panel
     {
         if (!IsUsable) return;
         var account = SelectedAccount();
-        var binding = account == null ? null : _store.GetBinding(AccountProxyResolver.AccountKeyFor(account));
+        var binding = account == null ? null : GetCachedBinding(AccountProxyResolver.AccountKeyFor(account));
         var boundNodeId = binding?.Mode == ProxyBindingMode.FixedNode ? binding.NodeId : null;
         var highlightBack = _palette == null
             ? Color.FromArgb(220, 237, 255)
-            : Color.FromArgb(218, _palette.PrimaryColor.R, _palette.PrimaryColor.G, _palette.PrimaryColor.B);
-        var highlightText = _palette == null ? Color.FromArgb(24, 83, 160) : _palette.PrimaryColor;
+            : UiDesign.Blend(_nodes.BackColor, _palette.PrimaryColor, ThemeStyler.IsDark(_palette) ? 0.24F : 0.14F);
+        var highlightText = _nodes.ForeColor;
         foreach (ListViewItem item in _nodes.Items)
         {
             var matches = boundNodeId != null && item.Tag is ProxyNodeRecord node &&
@@ -513,7 +556,6 @@ internal sealed class ProxySidebarPanel : Panel
     {
         if (!IsUsable) return;
         _node.Enabled = _mode.SelectedIndex == 1; _fallback.Enabled = _mode.SelectedIndex == 1;
-        var account = SelectedAccount(); var binding = account == null ? null : _store.GetBinding(AccountProxyResolver.AccountKeyFor(account));
         _bindingHint.Text = _mode.SelectedIndex switch { 0 => "未配置账号级策略，将使用系统配置中的全局代理。", 1 => "自动轮换时会与实际候选账号一起切换代理。", _ => "已禁用直连与代理回退，网关将安全失败。" };
     }
     private void UpdateNodeMetrics()
@@ -521,21 +563,36 @@ internal sealed class ProxySidebarPanel : Panel
         if (!IsUsable) return;
         var node = SelectedNode();
         if (node == null) { SetMetrics("选择节点查看测速与出口 IP 状态。\n\n选中节点后可测试 TCP、TLS、HTTPS 首响应和出口 IP。"); return; }
+        if (!_bindingsCacheLoaded)
+        {
+            ReloadBindingsCache();
+        }
         var exit = string.IsNullOrWhiteSpace(node.LastExitIp)
             ? "未检测"
             : HasCurrentExitIp(node)
                 ? node.LastExitIp + (node.ExitIpChanged ? "（已变化）" : "")
                 : $"未确认（上次 {node.LastExitIp}）";
-        var bound = _store.LoadBindings().Count(b => b.Mode == ProxyBindingMode.FixedNode && b.NodeId?.Equals(node.NodeId, StringComparison.OrdinalIgnoreCase) == true);
-        var names = _currentAccounts.Where(account => _store.GetBinding(AccountProxyResolver.AccountKeyFor(account)) is { Mode: ProxyBindingMode.FixedNode } binding && binding.NodeId?.Equals(node.NodeId, StringComparison.OrdinalIgnoreCase) == true).Select(account => account.Name).ToArray();
+        var bound = _bindingsCache.Values.Count(b => b.Mode == ProxyBindingMode.FixedNode && b.NodeId?.Equals(node.NodeId, StringComparison.OrdinalIgnoreCase) == true);
+        var names = _currentAccounts
+            .Where(account => _bindingsCache.TryGetValue(AccountProxyResolver.AccountKeyFor(account), out var binding) &&
+                              binding.Mode == ProxyBindingMode.FixedNode &&
+                              binding.NodeId?.Equals(node.NodeId, StringComparison.OrdinalIgnoreCase) == true)
+            .Select(account => account.Name)
+            .ToArray();
+        var testedOrFailed = node.LastHealthTestAtUtc.HasValue || !string.IsNullOrWhiteSpace(node.LastHealthError);
         SetMetrics($"{node.DisplayUrl}\nTCP：{Format(node.LastTcpMilliseconds)} · TLS：{Format(node.LastTlsMilliseconds)} · 首响应：{Format(node.LastFirstResponseMilliseconds)}\n出口 IP：{exit} · 已绑定账号：{bound}\n{(names.Length == 0 ? "暂无账号绑定" : string.Join("、", names))}");
-        static string Format(double? value) => value.HasValue ? $"{value.Value:0} ms" : "-1";
+        string Format(double? value) => value.HasValue ? $"{value.Value:0} ms" : (testedOrFailed ? "失败" : "未检测");
     }
     private void SaveBinding()
     {
         var account = SelectedAccount(); if (account == null) return; var key = AccountProxyResolver.AccountKeyFor(account);
         var node = _node.SelectedItem as NodeItem;
-        _store.SetBinding(new AccountProxyBinding { AccountKey = key, Mode = _mode.SelectedIndex switch { 1 => ProxyBindingMode.FixedNode, 2 => ProxyBindingMode.Disabled, _ => ProxyBindingMode.InheritGlobal }, NodeId = node?.Node.NodeId, FallbackPolicy = _fallback.SelectedIndex == 1 ? ProxyFallbackPolicy.InheritGlobal : ProxyFallbackPolicy.FailClosed });
+        var binding = new AccountProxyBinding { AccountKey = key, Mode = _mode.SelectedIndex switch { 1 => ProxyBindingMode.FixedNode, 2 => ProxyBindingMode.Disabled, _ => ProxyBindingMode.InheritGlobal }, NodeId = node?.Node.NodeId, FallbackPolicy = _fallback.SelectedIndex == 1 ? ProxyFallbackPolicy.InheritGlobal : ProxyFallbackPolicy.FailClosed };
+        _store.SetBinding(binding);
+        _bindingsCache[key] = binding;
+        _bindingsCacheLoaded = true;
+        UpdateBoundNodeHighlight();
+        UpdateNodeMetrics();
         ReportStatus($"已保存账号“{account.Name}”的代理绑定。已走本版本网关的会话从下一次请求生效；旧直连会话请从账号卡片重新启动 Codex（三种启动方式均支持），无需切换系统代理。");
     }
     private void EditNode(ProxyNodeRecord? existing)
@@ -777,10 +834,9 @@ internal sealed class ProxySidebarPanel : Panel
             {
                 if (item.Tag is ProxyNodeRecord listed && listed.NodeId.Equals(node.NodeId, StringComparison.OrdinalIgnoreCase))
                 {
-                    // The fourth column is latency, not a free-form status field. Keep
-                    // failures as -1 and show the diagnostic in the metrics card so a
-                    // stale value such as “节点异常” cannot be mistaken for latency.
-                    if (item.SubItems.Count > 3) item.SubItems[3].Text = "-1";
+                    // The fourth column is latency, not a free-form status field. Render
+                    // failed probes as “失败” and show the diagnostic in the metrics card.
+                    if (item.SubItems.Count > 3) item.SubItems[3].Text = "失败";
                     if (item.SubItems.Count > 4) item.SubItems[4].Text = FormatExitIpForList(node);
                     break;
                 }
@@ -847,7 +903,7 @@ internal sealed class ProxySidebarPanel : Panel
             }
             node.LastHealthError = null;
             _store.SetNode(node);
-            UpdateNodeMetrics();
+            RefreshNodes();
             SetMetrics(_metrics.Text + $"\n本次总耗时（含响应体）：{totalMs:0} ms · HTTP {(int)response.StatusCode}\n测试耗时：{started.ElapsedMilliseconds} ms");
             ReportStatus("节点 TCP、TLS、HTTPS 首响应测试完成；出口 IP 检测失败不会误判节点不可用。");
         }
@@ -922,8 +978,8 @@ internal sealed class ProxySidebarPanel : Panel
         node.LastHealthTestAtUtc = DateTimeOffset.UtcNow;
         node.LastHealthError = null;
         _store.SetNode(node);
-        UpdateNodeMetrics();
-        SetMetrics(_metrics.Text + $"\n连续 HTTPS 首响应：{samples.Count}/{sampleCount}\nP50：{Percentile(samples, .50):0} ms · P90：{Percentile(samples, .90):0} ms\nTCP P50：{(tcpSamples.Count == 0 ? "-1" : Percentile(tcpSamples, .50).ToString("0") + " ms")} · 总耗时：{started.ElapsedMilliseconds} ms\n测试目标：chatgpt.com/backend-api/models");
+        RefreshNodes();
+        SetMetrics(_metrics.Text + $"\n连续 HTTPS 首响应：{samples.Count}/{sampleCount}\nP50：{Percentile(samples, .50):0} ms · P90：{Percentile(samples, .90):0} ms\nTCP P50：{(tcpSamples.Count == 0 ? "失败" : Percentile(tcpSamples, .50).ToString("0") + " ms")} · 总耗时：{started.ElapsedMilliseconds} ms\n测试目标：chatgpt.com/backend-api/models");
         ReportStatus("连续测速完成；P50/P90 现在统计真实 HTTPS 首响应，不再只是 TCP 粗测。");
     }
 
@@ -1078,7 +1134,7 @@ internal sealed class ProxySidebarPanel : Panel
                 node.LastExitIpObservedAtUtc = now;
             }
         }
-        _store.SaveNodes(nodes);
+        _store.MergeProbeResults(nodes);
         RefreshNodes();
 
         var failed = results.Length - results.Count(result => result.Success);
@@ -1112,7 +1168,7 @@ internal sealed class ProxyNodeEditDialog : Form
         MaximizeBox = false;
         MinimizeBox = false;
         AutoScaleMode = AutoScaleMode.Dpi;
-        BackColor = palette.SurfaceColor;
+        Font = UiFontCache.Get("Microsoft YaHei UI", 9F);
         var fields = new[] { ("名称", _name), ("协议", _scheme), ("地址", _address), ("端口", _port), ("用户名", _user), ("密码", _password) };
         for (var i = 0; i < fields.Length; i++)
         {
@@ -1123,7 +1179,7 @@ internal sealed class ProxyNodeEditDialog : Form
                 TextAlign = ContentAlignment.MiddleLeft,
                 ForeColor = palette.TextColor,
                 BackColor = Color.Transparent,
-                Font = new Font(SystemFonts.DefaultFont.FontFamily, 9F, FontStyle.Bold)
+                Font = UiFontCache.Get("Microsoft YaHei UI", 9F, FontStyle.Bold)
             };
             label.SetBounds(28, 26 + i * 48, 82, 34);
             Controls.Add(label);
@@ -1132,7 +1188,7 @@ internal sealed class ProxyNodeEditDialog : Form
             input.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
             input.BackColor = palette.InputBackColor;
             input.ForeColor = palette.TextColor;
-            input.Font = new Font(SystemFonts.DefaultFont.FontFamily, 9F);
+            input.Font = UiFontCache.Get("Microsoft YaHei UI", 9F);
             Controls.Add(input);
         }
         _password.UseSystemPasswordChar = true;
@@ -1141,6 +1197,18 @@ internal sealed class ProxyNodeEditDialog : Form
         _address.Text = existing?.Address ?? "";
         _port.Text = existing?.Port.ToString() ?? "8080";
         _user.Text = existing?.Username ?? "";
+
+        var cancel = new ModernButton
+        {
+            Text = "取消",
+            DialogResult = DialogResult.Cancel,
+            Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
+            Radius = 11
+        };
+        cancel.SetBounds(ClientSize.Width - 300, ClientSize.Height - 58, 110, 42);
+        ThemeStyler.ApplySoftButton(cancel, palette);
+        Controls.Add(cancel);
+
         var save = new ModernButton
         {
             Text = "保存节点",
@@ -1152,7 +1220,20 @@ internal sealed class ProxyNodeEditDialog : Form
         ThemeStyler.ApplyPrimaryButton(save, palette);
         save.Click += (_, _) =>
         {
-            if (!int.TryParse(_port.Text, out var port)) { DialogResult = DialogResult.None; return; }
+            if (string.IsNullOrWhiteSpace(_name.Text))
+            {
+                MessageBox.Show(this, "请填写节点名称。", "节点配置", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                _name.Focus();
+                DialogResult = DialogResult.None;
+                return;
+            }
+            if (!int.TryParse(_port.Text.Trim(), out var port) || port is < 1 or > 65535)
+            {
+                MessageBox.Show(this, "端口必须是 1-65535 之间的有效整数。", "节点配置", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                _port.Focus();
+                DialogResult = DialogResult.None;
+                return;
+            }
             var node = existing ?? new ProxyNodeRecord();
             node.Name = _name.Text.Trim();
             node.Scheme = _scheme.Text.Trim().ToLowerInvariant();
@@ -1162,7 +1243,7 @@ internal sealed class ProxyNodeEditDialog : Form
             if (!string.IsNullOrEmpty(_password.Text)) node.SetPassword(_password.Text);
             if (!node.TryValidate(out var validationError))
             {
-                MessageBox.Show(validationError, "节点配置", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show(this, validationError, "节点配置", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 DialogResult = DialogResult.None;
                 return;
             }
@@ -1170,6 +1251,8 @@ internal sealed class ProxyNodeEditDialog : Form
         };
         Controls.Add(save);
         AcceptButton = save;
+        CancelButton = cancel;
+        ThemeStyler.ApplyDialog(this, palette);
     }
 }
 
@@ -1179,6 +1262,7 @@ internal sealed class ProxyImportDialog : Form
     public string TextValue => _text.Text;
     public ProxyImportDialog(ThemePalette palette)
     {
+        var dark = ThemeStyler.IsDark(palette);
         Text = "批量导入代理 URL";
         ClientSize = new Size(760, 520);
         MinimumSize = new Size(620, 440);
@@ -1187,16 +1271,17 @@ internal sealed class ProxyImportDialog : Form
         MaximizeBox = false;
         MinimizeBox = false;
         AutoScaleMode = AutoScaleMode.Dpi;
-        BackColor = palette.SurfaceColor;
+        Font = UiFontCache.Get("Microsoft YaHei UI", 9F);
         _text.Multiline = true;
         _text.ScrollBars = ScrollBars.Both;
         _text.AcceptsTab = true;
         _text.WordWrap = false;
-        _text.Font = new Font(SystemFonts.DefaultFont.FontFamily, 9.5F);
+        _text.Font = UiFontCache.Get("Microsoft YaHei UI", 9.5F);
         _text.SetBounds(24, 24, ClientSize.Width - 48, ClientSize.Height - 142);
         _text.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
         _text.BackColor = palette.InputBackColor;
         _text.ForeColor = palette.TextColor;
+        _text.HandleCreated += (_, _) => NativeWindowTheme.ApplyScrollable(_text, dark);
         Controls.Add(_text);
         var hint = new Label
         {
@@ -1207,10 +1292,22 @@ internal sealed class ProxyImportDialog : Form
             ForeColor = palette.MutedTextColor,
             BackColor = Color.Transparent,
             Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
-            Font = new Font(SystemFonts.DefaultFont.FontFamily, 8.7F)
+            Font = UiFontCache.Get("Microsoft YaHei UI", 8.7F)
         };
         hint.SetBounds(24, ClientSize.Height - 106, ClientSize.Width - 48, 30);
         Controls.Add(hint);
+
+        var cancel = new ModernButton
+        {
+            Text = "取消",
+            DialogResult = DialogResult.Cancel,
+            Anchor = AnchorStyles.Bottom | AnchorStyles.Right,
+            Radius = 11
+        };
+        cancel.SetBounds(ClientSize.Width - 306, ClientSize.Height - 62, 110, 42);
+        ThemeStyler.ApplySoftButton(cancel, palette);
+        Controls.Add(cancel);
+
         var ok = new ModernButton
         {
             Text = "预览并导入",
@@ -1222,5 +1319,7 @@ internal sealed class ProxyImportDialog : Form
         ThemeStyler.ApplyPrimaryButton(ok, palette);
         Controls.Add(ok);
         AcceptButton = ok;
+        CancelButton = cancel;
+        ThemeStyler.ApplyDialog(this, palette);
     }
 }

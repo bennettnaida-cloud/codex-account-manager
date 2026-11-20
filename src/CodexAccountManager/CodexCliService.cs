@@ -108,6 +108,8 @@ public sealed partial class CodexCliService
     private static readonly TimeSpan CompatibleApiVerifiedModelLifetime = TimeSpan.FromMinutes(30);
     private static readonly TimeSpan CompatibleApiVerifiedModelFutureClockSkew = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan CompatibleApiLaunchPreflightTimeout = TimeSpan.FromSeconds(6);
+    // 3 attempts * 6s + 1s + 2s backoff = 21s header worst-case, plus 3s headroom for /models body read.
+    private static readonly TimeSpan CompatibleApiLaunchPreflightTotalTimeout = TimeSpan.FromSeconds(24);
     private static readonly TimeSpan CompatibleApiProxyConnectTimeout = TimeSpan.FromMilliseconds(1200);
     private static readonly TimeSpan MinimalQuotaTestTimeout = TimeSpan.FromSeconds(25);
     private const int MinimalQuotaTestResponseMaxBytes = 512 * 1024;
@@ -8945,28 +8947,23 @@ public sealed partial class CodexCliService
         using var client = configuredProxy != null
             ? ProxyHttpClientFactory.Create(proxyResolution, proxyResolver.GetNode(proxyResolution.NodeId))
             : new HttpClient(new HttpClientHandler { UseProxy = false }) { Timeout = Timeout.InfiniteTimeSpan };
-        using var request = new HttpRequestMessage(HttpMethod.Get, modelsUri);
         var credential = ReadAccessTokenCredential(Path.Combine(account.CodexHome, AuthFileName));
         var catalogIdentity = CompatibleModelCatalogIdentity(account, credential);
-        request.Headers.TryAddWithoutValidation(
-            "Authorization",
-            "Bearer " + credential);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(CompatibleApiLaunchPreflightTimeout);
+        // Metadata GET only: tolerate brief boot/tunnel recovery without retrying
+        // generation, changing credentials, or accepting a cached catalog as live.
+        timeout.CancelAfter(CompatibleApiLaunchPreflightTotalTimeout);
 
         HttpResponseMessage response;
         try
         {
-            response = await client.SendAsync(
-                request,
-                HttpCompletionOption.ResponseHeadersRead,
-                timeout.Token);
+            response = await SendCompatibleMetadataWithRetryAsync(client, modelsUri, credential, timeout.Token);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             throw BuildCompatibleApiLaunchPreflightError(
                 account,
-                $"通过当前网络访问 {BuildSafeAuthorityLabel(baseUri)} 超过 {CompatibleApiLaunchPreflightTimeout.TotalSeconds:0} 秒仍未响应。" +
+                $"通过当前网络访问 {BuildSafeAuthorityLabel(baseUri)} 在启动等待及重试后仍未响应。" +
                 BuildCompatibleApiProxyHint(configuredProxy));
         }
         catch (HttpRequestException ex)
@@ -9022,8 +9019,8 @@ public sealed partial class CodexCliService
             {
                 throw BuildCompatibleApiLaunchPreflightError(
                     account,
-                    $"兼容 API {BuildSafeAuthorityLabel(baseUri)} 已响应，但读取模型目录超过 " +
-                    $"{CompatibleApiLaunchPreflightTimeout.TotalSeconds:0} 秒。" +
+                    $"兼容 API {BuildSafeAuthorityLabel(baseUri)} 已响应，但读取模型目录超时（总等待超过 " +
+                    $"{CompatibleApiLaunchPreflightTotalTimeout.TotalSeconds:0} 秒）。" +
                     BuildCompatibleApiProxyHint(configuredProxy));
             }
             catch (Exception ex) when (ex is HttpRequestException or IOException or ObjectDisposedException)
@@ -9097,6 +9094,31 @@ public sealed partial class CodexCliService
             throw BuildCompatibleApiLaunchPreflightError(
                 account,
                 $"模型 ID“{configuredModel}”不在接口 /models 返回的列表中。请在“编辑 API”里改成准确的模型 ID。{suggestionText}");
+        }
+    }
+
+    private static async Task<HttpResponseMessage> SendCompatibleMetadataWithRetryAsync(
+        HttpClient client, Uri uri, string credential, CancellationToken token)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            token.ThrowIfCancellationRequested();
+            using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+            request.Headers.TryAddWithoutValidation("Authorization", "Bearer " + credential);
+            using var attemptTimeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+            attemptTimeout.CancelAfter(CompatibleApiLaunchPreflightTimeout);
+            try
+            {
+                var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, attemptTimeout.Token);
+                if (attempt >= 2 || response.StatusCode is not
+                    (HttpStatusCode.BadGateway or HttpStatusCode.ServiceUnavailable or HttpStatusCode.GatewayTimeout))
+                    return response;
+                response.Dispose();
+            }
+            catch (HttpRequestException) when (attempt < 2 && !token.IsCancellationRequested) { }
+            catch (OperationCanceledException) when (attempt < 2 && !token.IsCancellationRequested) { }
+            LaunchPhase("launch-model-discovery-retry", "接口暂未就绪，正在等待网络和后台服务恢复…");
+            await Task.Delay(TimeSpan.FromSeconds(attempt + 1), token);
         }
     }
 

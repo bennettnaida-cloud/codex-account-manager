@@ -31,6 +31,11 @@ internal sealed class CustomCodexThemeDialog : Form
     private readonly Dictionary<string, Button> _colorButtons = new(StringComparer.Ordinal);
     private readonly CodexThemePreviewControl _preview = new();
     private string? _backgroundImagePath;
+    private string? _validatedBackgroundPath;
+    private long _validatedBackgroundLength;
+    private DateTime _validatedBackgroundWriteUtc;
+    private int _backgroundLoadVersion;
+    private bool _closed;
 
     public CustomCodexTheme Theme { get; private set; }
 
@@ -117,7 +122,7 @@ internal sealed class CustomCodexThemeDialog : Form
         _chooseBackgroundButton.Text = "选择照片";
         _chooseBackgroundButton.SetBounds(84, 320, 126, 34);
         ThemeStyler.ApplySoftButton(_chooseBackgroundButton, _palette);
-        _chooseBackgroundButton.Click += (_, _) => ChooseBackgroundImage();
+        _chooseBackgroundButton.Click += async (_, _) => await ChooseBackgroundImageAsync();
         editor.Controls.Add(_chooseBackgroundButton);
         _clearBackgroundButton.Text = "清除";
         _clearBackgroundButton.SetBounds(220, 320, 126, 34);
@@ -191,6 +196,8 @@ internal sealed class CustomCodexThemeDialog : Form
         LayoutPreview();
         FormClosed += (_, _) =>
         {
+            _closed = true;
+            _backgroundLoadVersion++;
             SetBackgroundThumbnail(null);
             _toolTip.Dispose();
         };
@@ -258,6 +265,10 @@ internal sealed class CustomCodexThemeDialog : Form
             ? null
             : Theme.BackgroundImagePath;
         UpdateBackgroundSelectionUi();
+        if (!string.IsNullOrWhiteSpace(_backgroundImagePath) && File.Exists(_backgroundImagePath))
+        {
+            _ = LoadBackgroundImageAsync(_backgroundImagePath, showError: false);
+        }
         SetSwatch("accent", ParseColor(Theme.AccentColor, Color.FromArgb(77, 184, 146)));
         SetSwatch("surface", ParseColor(Theme.SurfaceColor, Color.FromArgb(13, 26, 22)));
         SetSwatch("ink", ParseColor(Theme.InkColor, Color.FromArgb(232, 245, 238)));
@@ -280,7 +291,15 @@ internal sealed class CustomCodexThemeDialog : Form
         RefreshPreview();
     }
 
-    private void ChooseBackgroundImage()
+    private sealed record DecodedBackgroundResult(
+        bool Success,
+        Bitmap? Thumbnail,
+        Bitmap? Preview,
+        long FileLength,
+        DateTime LastWriteTimeUtc,
+        string Error);
+
+    private async Task ChooseBackgroundImageAsync()
     {
         using var dialog = new OpenFileDialog
         {
@@ -298,32 +317,74 @@ internal sealed class CustomCodexThemeDialog : Form
             return;
         }
 
-        if (!TryLoadValidatedBackground(dialog.FileName, out var thumbnail, out var validationError))
-        {
-            MessageBox.Show(
-                this,
-                validationError,
-                "无法使用这张照片",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Warning);
-            return;
-        }
+        await LoadBackgroundImageAsync(dialog.FileName, showError: true);
+    }
 
-        _backgroundImagePath = dialog.FileName;
-        SetBackgroundThumbnail(thumbnail);
-        UpdateBackgroundSelectionUi(loadThumbnail: false);
-        RefreshPreview();
+    private async Task LoadBackgroundImageAsync(string path, bool showError)
+    {
+        var version = ++_backgroundLoadVersion;
+        _chooseBackgroundButton.Enabled = false;
+        try
+        {
+            var result = await Task.Run(() => DecodeAndDownsampleBackground(path));
+            if (_closed || IsDisposed || Disposing || version != _backgroundLoadVersion)
+            {
+                result.Thumbnail?.Dispose();
+                result.Preview?.Dispose();
+                return;
+            }
+
+            if (!result.Success)
+            {
+                result.Thumbnail?.Dispose();
+                result.Preview?.Dispose();
+                if (showError)
+                {
+                    MessageBox.Show(
+                        this,
+                        result.Error,
+                        "无法使用这张照片",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                }
+                else
+                {
+                    SetBackgroundThumbnail(null);
+                    _preview.SetBackgroundBitmap(null, null);
+                }
+                return;
+            }
+
+            _backgroundImagePath = path;
+            _validatedBackgroundPath = path;
+            _validatedBackgroundLength = result.FileLength;
+            _validatedBackgroundWriteUtc = result.LastWriteTimeUtc;
+            SetBackgroundThumbnail(result.Thumbnail);
+            _preview.SetBackgroundBitmap(path, result.Preview);
+            UpdateBackgroundSelectionUi();
+            RefreshPreview();
+        }
+        finally
+        {
+            if (!_closed && !IsDisposed && !Disposing && !_chooseBackgroundButton.IsDisposed)
+            {
+                _chooseBackgroundButton.Enabled = true;
+            }
+        }
     }
 
     private void ClearBackgroundImage()
     {
+        _backgroundLoadVersion++;
         _backgroundImagePath = null;
+        _validatedBackgroundPath = null;
         SetBackgroundThumbnail(null);
-        UpdateBackgroundSelectionUi(loadThumbnail: false);
+        _preview.SetBackgroundBitmap(null, null);
+        UpdateBackgroundSelectionUi();
         RefreshPreview();
     }
 
-    private void UpdateBackgroundSelectionUi(bool loadThumbnail = true)
+    private void UpdateBackgroundSelectionUi()
     {
         var hasImage = !string.IsNullOrWhiteSpace(_backgroundImagePath) && File.Exists(_backgroundImagePath);
         _backgroundPathBox.Text = hasImage ? Path.GetFileName(_backgroundImagePath) : string.Empty;
@@ -340,19 +401,6 @@ internal sealed class CustomCodexThemeDialog : Form
         {
             _toolTip.SetToolTip(_backgroundPathBox, null);
         }
-        if (!loadThumbnail)
-        {
-            return;
-        }
-
-        if (hasImage && TryLoadValidatedBackground(_backgroundImagePath!, out var thumbnail, out _))
-        {
-            SetBackgroundThumbnail(thumbnail);
-        }
-        else
-        {
-            SetBackgroundThumbnail(null);
-        }
     }
 
     private void SetBackgroundThumbnail(Image? image)
@@ -365,47 +413,43 @@ internal sealed class CustomCodexThemeDialog : Form
         }
     }
 
-    private static bool TryLoadValidatedBackground(string path, out Bitmap? image, out string error)
+    private static DecodedBackgroundResult DecodeAndDownsampleBackground(string path)
     {
-        image = null;
-        error = string.Empty;
+        Bitmap? thumbnail = null;
+        Bitmap? preview = null;
         try
         {
             var info = new FileInfo(path);
             if (!info.Exists)
             {
-                error = "选择的背景照片已不存在。";
-                return false;
+                return new DecodedBackgroundResult(false, null, null, 0, DateTime.MinValue, "选择的背景照片已不存在。");
             }
             if (info.Length is < 1 or > 16 * 1024 * 1024)
             {
-                error = "背景照片大小必须在 16 MB 以内。";
-                return false;
+                return new DecodedBackgroundResult(false, null, null, 0, DateTime.MinValue, "背景照片大小必须在 16 MB 以内。");
             }
 
             using var stream = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
             using var source = Image.FromStream(stream, useEmbeddedColorManagement: true, validateImageData: true);
             if (source.Width < 64 || source.Height < 64)
             {
-                error = "背景照片至少需要 64 × 64 像素。";
-                return false;
+                return new DecodedBackgroundResult(false, null, null, 0, DateTime.MinValue, "背景照片至少需要 64 × 64 像素。");
             }
             if (source.Width > 16384 || source.Height > 16384 ||
                 (long)source.Width * source.Height > 50_000_000L)
             {
-                error = "背景照片分辨率过大，请选择不超过 5000 万像素的图片。";
-                return false;
+                return new DecodedBackgroundResult(false, null, null, 0, DateTime.MinValue, "背景照片分辨率过大，请选择不超过 5000 万像素的图片。");
             }
 
-            image = new Bitmap(source);
-            return true;
+            thumbnail = CodexThemePreviewControl.DownsampleBitmap(source, 160);
+            preview = CodexThemePreviewControl.DownsampleBitmap(source, 1280);
+            return new DecodedBackgroundResult(true, thumbnail, preview, info.Length, info.LastWriteTimeUtc, string.Empty);
         }
         catch (Exception ex) when (ex is ArgumentException or ExternalException or IOException or UnauthorizedAccessException)
         {
-            error = "文件不是可读取的 JPG 或 PNG 图片，或者文件已经损坏。";
-            image?.Dispose();
-            image = null;
-            return false;
+            thumbnail?.Dispose();
+            preview?.Dispose();
+            return new DecodedBackgroundResult(false, null, null, 0, DateTime.MinValue, "文件不是可读取的 JPG 或 PNG 图片，或者文件已经损坏。");
         }
     }
 
@@ -433,7 +477,10 @@ internal sealed class CustomCodexThemeDialog : Form
         _preview.Contrast = (int)_contrastBox.Value;
         var codeIndex = Math.Clamp(_codeThemeBox.SelectedIndex, 0, CodeThemes.Length - 1);
         _preview.CodeThemeId = CodeThemes[codeIndex].Id;
-        _preview.SetBackgroundImage(_backgroundImagePath);
+        if (string.IsNullOrWhiteSpace(_backgroundImagePath))
+        {
+            _preview.SetBackgroundBitmap(null, null);
+        }
         _preview.Invalidate();
     }
 
@@ -453,12 +500,23 @@ internal sealed class CustomCodexThemeDialog : Form
         }
         if (!string.IsNullOrWhiteSpace(_backgroundImagePath))
         {
-            if (!TryLoadValidatedBackground(_backgroundImagePath, out var validatedImage, out var validationError))
+            var info = new FileInfo(_backgroundImagePath);
+            var alreadyValidated =
+                string.Equals(_validatedBackgroundPath, _backgroundImagePath, StringComparison.OrdinalIgnoreCase) &&
+                info.Exists &&
+                info.Length == _validatedBackgroundLength &&
+                info.LastWriteTimeUtc == _validatedBackgroundWriteUtc;
+            if (!alreadyValidated)
             {
-                MessageBox.Show(this, validationError, "无法使用这张照片", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
+                var validated = DecodeAndDownsampleBackground(_backgroundImagePath);
+                validated.Thumbnail?.Dispose();
+                validated.Preview?.Dispose();
+                if (!validated.Success)
+                {
+                    MessageBox.Show(this, validated.Error, "无法使用这张照片", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
             }
-            validatedImage?.Dispose();
         }
 
         var codeIndex = Math.Clamp(_codeThemeBox.SelectedIndex, 0, CodeThemes.Length - 1);
@@ -539,6 +597,43 @@ internal sealed class CodexThemePreviewControl : Control
         return new Size(width, height);
     }
 
+    internal static Bitmap DownsampleBitmap(Image source, int maxDimension)
+    {
+        var maxSide = Math.Max(source.Width, source.Height);
+        if (maxSide <= maxDimension)
+        {
+            return new Bitmap(source);
+        }
+
+        var ratio = maxDimension / (double)maxSide;
+        var targetWidth = Math.Max(1, (int)Math.Round(source.Width * ratio));
+        var targetHeight = Math.Max(1, (int)Math.Round(source.Height * ratio));
+        var resized = new Bitmap(targetWidth, targetHeight);
+        using (var graphics = Graphics.FromImage(resized))
+        {
+            graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            graphics.CompositingQuality = CompositingQuality.HighQuality;
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            graphics.DrawImage(source, 0, 0, targetWidth, targetHeight);
+        }
+        return resized;
+    }
+
+    public void SetBackgroundBitmap(string? path, Bitmap? ownedBitmap)
+    {
+        var normalized = string.IsNullOrWhiteSpace(path) ? null : Path.GetFullPath(path);
+        _staticPreviewImage?.Dispose();
+        _staticPreviewImage = null;
+        _staticPreviewImagePath = null;
+        if (!ReferenceEquals(_backgroundImage, ownedBitmap))
+        {
+            _backgroundImage?.Dispose();
+        }
+        _backgroundImage = ownedBitmap;
+        _backgroundImagePath = normalized;
+        Invalidate();
+    }
+
     public void SetBackgroundImage(string? path)
     {
         var normalized = string.IsNullOrWhiteSpace(path) ? null : Path.GetFullPath(path);
@@ -560,7 +655,7 @@ internal sealed class CodexThemePreviewControl : Control
             {
                 using var stream = File.Open(normalized, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
                 using var source = Image.FromStream(stream);
-                _backgroundImage = new Bitmap(source);
+                _backgroundImage = DownsampleBitmap(source, 1280);
             }
             catch
             {
@@ -591,7 +686,7 @@ internal sealed class CodexThemePreviewControl : Control
             {
                 using var stream = File.Open(normalized, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
                 using var source = Image.FromStream(stream);
-                _staticPreviewImage = new Bitmap(source);
+                _staticPreviewImage = DownsampleBitmap(source, 1280);
             }
             catch
             {

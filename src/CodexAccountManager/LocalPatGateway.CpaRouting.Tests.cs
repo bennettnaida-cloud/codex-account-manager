@@ -219,7 +219,7 @@ internal sealed partial class LocalPatGatewayHost
             stop.Cancel(); upstream.Stop(); gateway.Stop();
             if (pump != null) { try { await pump; } catch (OperationCanceledException) { } catch (HttpListenerException) { } }
             try { await Task.WhenAll(workers); } catch (OperationCanceledException) { }
-            if (host != null) foreach (var connection in host._clients.Values) connection.Dispose();
+            host?.DisposeUpstreamClients();
             Environment.SetEnvironmentVariable("CODEX_ACCOUNT_MANAGER_HOME", oldRoot);
             Environment.SetEnvironmentVariable("CODEX_ACCOUNT_MANAGER_SHARED_CODEX_HOME", oldShared);
             if (Directory.Exists(root)) Directory.Delete(root, recursive: true);

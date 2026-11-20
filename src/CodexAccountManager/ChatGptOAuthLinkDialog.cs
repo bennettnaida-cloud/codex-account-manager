@@ -20,14 +20,14 @@ internal sealed class ChatGptOAuthLinkDialog : Form
 
         Text = "ChatGPT 官方网页登录";
         StartPosition = FormStartPosition.CenterParent;
+        AutoScaleMode = AutoScaleMode.Dpi;
         ClientSize = new Size(720, 430);
         MinimumSize = new Size(660, 410);
         MaximizeBox = false;
         MinimizeBox = false;
         ShowInTaskbar = false;
-        BackColor = palette.FormBackColor;
-        ForeColor = palette.TextColor;
-        Font = new Font("Microsoft YaHei UI", 9F);
+        DoubleBuffered = true;
+        Font = UiFontCache.Get("Microsoft YaHei UI", 9F);
 
         var layout = new TableLayoutPanel
         {
@@ -35,7 +35,7 @@ internal sealed class ChatGptOAuthLinkDialog : Form
             Padding = new Padding(28, 24, 28, 22),
             ColumnCount = 2,
             RowCount = 7,
-            BackColor = palette.FormBackColor
+            BackColor = palette.SurfaceColor
         };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150F));
@@ -51,7 +51,7 @@ internal sealed class ChatGptOAuthLinkDialog : Form
         {
             Text = $"为“{accountName}”登录 ChatGPT",
             Dock = DockStyle.Fill,
-            Font = new Font(Font.FontFamily, 15F, FontStyle.Bold),
+            Font = UiFontCache.Get(Font.FontFamily, 15F, FontStyle.Bold),
             TextAlign = ContentAlignment.MiddleLeft,
             AutoEllipsis = true
         };
@@ -86,7 +86,7 @@ internal sealed class ChatGptOAuthLinkDialog : Form
             Text = _loginUrl,
             ReadOnly = true,
             Dock = DockStyle.Fill,
-            Font = new Font("Consolas", 9F),
+            Font = UiFontCache.Get("Consolas", 9F),
             ShortcutsEnabled = true,
             TabStop = true
         };
@@ -138,6 +138,7 @@ internal sealed class ChatGptOAuthLinkDialog : Form
         layout.SetColumnSpan(cancel, 2);
 
         Controls.Add(layout);
+        ThemeStyler.ApplyDialog(this, palette);
         AcceptButton = copyUrl;
         CancelButton = cancel;
         Shown += (_, _) => CopyLoginUrl(showFailure: true);

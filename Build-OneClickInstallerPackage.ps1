@@ -14,8 +14,7 @@ $discoveredAppPaths = @(
 )
 $preferredAppPaths = @(
     $discoveredAppPaths
-    (Join-Path $root 'dist\CodexAccountManager-2.3.2-hotfix\CodexAccountManager.exe')
-    (Join-Path $root 'dist\CodexAccountManager-2.3.2-fixed\CodexAccountManager.exe')
+    (Join-Path $root ("dist\CodexAccountManager-" + $currentVersion + "\CodexAccountManager.exe"))
     (Join-Path $root 'dist\CodexAccountManager\CodexAccountManager.exe')
 )
 $appExe = if ([string]::IsNullOrWhiteSpace($env:CODEX_ACCOUNT_MANAGER_APP_EXE)) {
