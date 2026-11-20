@@ -64,8 +64,7 @@ public partial class Form1 : Form
         IReadOnlyList<PassiveQuotaTrendPoint> Points,
         string EmptyText,
         DateTimeOffset FromUtc,
-        DateTimeOffset ThroughUtc,
-        IReadOnlyList<PassiveQuotaAssessmentWindow>? AssessmentWindows = null);
+        DateTimeOffset ThroughUtc);
 
     private sealed record AccountGroupSection(
         string Key,
@@ -1271,7 +1270,7 @@ public partial class Form1 : Form
         };
         _cardsPanel.Name = "WorkspaceListPanel";
         _cardsPanel.HandleCreated += (_, _) =>
-            NativeWindowTheme.ApplyScrollable(_cardsPanel, UsesCosmicDarkBackdrop());
+            NativeWindowTheme.ApplyScrollable(_cardsPanel, ThemeStyler.IsDark(_palette));
         _accountLayout.Controls.Add(_cardsPanel, 0, 0);
 
         SizeChanged += (_, _) => RestoreWorkspaceAfterMinimize();
@@ -1518,18 +1517,15 @@ public partial class Form1 : Form
         footer.BringToFront();
     }
 
-    private bool UsesCosmicDarkBackdrop() =>
-        WorkspaceBackdropPanel.UsesDarkCosmicBackdrop(
-            ThemeService.ResolveEffectiveThemeMode(_appSettings.ThemeMode));
-
     private void ApplyTheme(bool renderCards = true)
     {
         _palette = _themeService.GetPalette(_appSettings.ThemeMode);
         var resolvedThemeMode = ThemeService.ResolveEffectiveThemeMode(_appSettings.ThemeMode);
+        var isDark = ThemeStyler.IsDark(_palette);
         BackColor = _palette.FormBackColor;
         _contentPanel?.SetTheme(resolvedThemeMode, _palette);
-        NativeWindowTheme.Apply(this, ThemeStyler.IsDark(_palette));
-        NativeWindowTheme.ApplyScrollable(_cardsPanel, UsesCosmicDarkBackdrop());
+        NativeWindowTheme.Apply(this, isDark);
+        NativeWindowTheme.ApplyScrollable(_cardsPanel, isDark);
 
         ApplyThemeRecursive(this);
         _proxySidebar?.ApplyPalette(_palette);
@@ -1537,8 +1533,7 @@ public partial class Form1 : Form
         if (_searchShell != null)
         {
             ThemeStyler.ApplyInputShell(_searchShell, _palette);
-            var dark = ThemeStyler.IsDark(_palette);
-            if (dark)
+            if (isDark)
             {
                 _searchShell.FillColor = UiDesign.Blend(_palette.InputBackColor, _palette.HeroStartColor, 0.24F);
                 _searchShell.BorderColor = Color.FromArgb(148, UiDesign.Blend(_palette.BorderColor, _palette.AccentColor, 0.42F));
@@ -1548,11 +1543,11 @@ public partial class Form1 : Form
             else
             {
                 _searchShell.FillColor = resolvedThemeMode == ThemeMode.PorcelainLight
-                    ? Color.FromArgb(244, 250, 248)
-                    : Color.FromArgb(245, 248, 255);
+                    ? Color.FromArgb(250, 253, 252)
+                    : Color.FromArgb(252, 253, 255);
                 _searchShell.BorderColor = resolvedThemeMode == ThemeMode.PorcelainLight
-                    ? Color.FromArgb(174, 214, 206)
-                    : Color.FromArgb(182, 204, 255);
+                    ? Color.FromArgb(199, 223, 218)
+                    : Color.FromArgb(207, 217, 242);
                 _searchShell.FocusBorderColor = _palette.AccentColor;
                 _searchShell.GlyphColor = UiDesign.Blend(_palette.MutedTextColor, _palette.PrimaryColor, 0.28F);
             }
@@ -1579,6 +1574,39 @@ public partial class Form1 : Form
         Invalidate(true);
     }
 
+    private Color GetWorkspaceChromeTitleColor()
+    {
+        var resolvedThemeMode = ThemeService.ResolveEffectiveThemeMode(_appSettings.ThemeMode);
+        return resolvedThemeMode switch
+        {
+            ThemeMode.Dark or ThemeMode.NebulaDark => _palette.HeroTextColor,
+            ThemeMode.PorcelainLight => Color.FromArgb(19, 43, 40),
+            _ => Color.FromArgb(19, 29, 54)
+        };
+    }
+
+    private Color GetWorkspaceChromeSubtitleColor()
+    {
+        var resolvedThemeMode = ThemeService.ResolveEffectiveThemeMode(_appSettings.ThemeMode);
+        return resolvedThemeMode switch
+        {
+            ThemeMode.Dark or ThemeMode.NebulaDark => UiDesign.Blend(_palette.HeroMutedTextColor, Color.White, 0.28F),
+            ThemeMode.PorcelainLight => Color.FromArgb(72, 102, 98),
+            _ => Color.FromArgb(75, 92, 126)
+        };
+    }
+
+    private Color GetWorkspaceStatusTextColor()
+    {
+        var resolvedThemeMode = ThemeService.ResolveEffectiveThemeMode(_appSettings.ThemeMode);
+        return resolvedThemeMode switch
+        {
+            ThemeMode.Dark or ThemeMode.NebulaDark => UiDesign.Blend(_palette.HeroMutedTextColor, Color.White, 0.32F),
+            ThemeMode.PorcelainLight => Color.FromArgb(58, 86, 82),
+            _ => Color.FromArgb(61, 78, 112)
+        };
+    }
+
     private byte GetFloatingCardOpacity(bool emphasized = false)
     {
         var dark = ThemeStyler.IsDark(_palette);
@@ -1586,7 +1614,7 @@ public partial class Form1 : Form
         {
             return emphasized ? (byte)206 : (byte)192;
         }
-        return emphasized ? (byte)234 : (byte)226;
+        return emphasized ? (byte)248 : (byte)244;
     }
 
     private Color GetFloatingCardBorderColor(Color accent, bool emphasized = false)
@@ -1599,9 +1627,13 @@ public partial class Form1 : Form
                 : Color.FromArgb(132, UiDesign.Blend(_palette.BorderColor, _palette.AccentColor, 0.30F));
         }
 
+        var resolvedThemeMode = ThemeService.ResolveEffectiveThemeMode(_appSettings.ThemeMode);
+        var hairline = resolvedThemeMode == ThemeMode.PorcelainLight
+            ? Color.FromArgb(199, 223, 218)  // #C7DFDA
+            : Color.FromArgb(207, 217, 242); // #CFD9F2
         return emphasized
-            ? Color.FromArgb(228, UiDesign.Blend(Color.White, accent, 0.32F))
-            : Color.FromArgb(192, UiDesign.Blend(Color.White, accent, 0.16F));
+            ? UiDesign.Blend(hairline, accent, 0.32F)
+            : hairline;
     }
 
     private Color GetFloatingCardShadowColor(bool emphasized = false)
@@ -1612,7 +1644,10 @@ public partial class Form1 : Form
             return Color.FromArgb(emphasized ? 104 : 78, 0, 0, 0);
         }
 
-        return Color.FromArgb(emphasized ? 88 : 64, 5, 9, 26);
+        var resolvedThemeMode = ThemeService.ResolveEffectiveThemeMode(_appSettings.ThemeMode);
+        return resolvedThemeMode == ThemeMode.PorcelainLight
+            ? Color.FromArgb(emphasized ? 34 : 24, 34, 78, 72)
+            : Color.FromArgb(emphasized ? 36 : 26, 48, 68, 128);
     }
 
     private void ApplyHeaderPanelTheme()
@@ -1631,6 +1666,7 @@ public partial class Form1 : Form
                 _headerPanel.SurfaceOpacity = 80;
                 _headerPanel.BorderColor = Color.FromArgb(96, 76, 194, 244);
                 _headerPanel.DecorationColor = Color.FromArgb(165, _palette.AccentColor);
+                _headerPanel.ShowStarfield = true;
                 break;
 
             case ThemeMode.NebulaDark:
@@ -1639,30 +1675,33 @@ public partial class Form1 : Form
                 _headerPanel.SurfaceOpacity = 82;
                 _headerPanel.BorderColor = Color.FromArgb(100, 196, 138, 252);
                 _headerPanel.DecorationColor = Color.FromArgb(168, _palette.AccentColor);
+                _headerPanel.ShowStarfield = true;
                 break;
 
             case ThemeMode.PorcelainLight:
-                _headerPanel.BackColor = Color.FromArgb(12, 34, 36);
-                _headerPanel.GradientColor = Color.FromArgb(24, 54, 62);
-                _headerPanel.SurfaceOpacity = 74;
-                _headerPanel.BorderColor = Color.FromArgb(96, 128, 214, 198);
-                _headerPanel.DecorationColor = Color.FromArgb(165, Color.FromArgb(126, 232, 214));
+                // 青瓷浅色: bright translucent frosted-white porcelain glass over the airy celadon canvas.
+                _headerPanel.BackColor = Color.FromArgb(255, 255, 255);
+                _headerPanel.GradientColor = Color.FromArgb(244, 251, 249);
+                _headerPanel.SurfaceOpacity = 174;
+                _headerPanel.BorderColor = Color.FromArgb(56, 102, 148, 140);
+                _headerPanel.DecorationColor = Color.FromArgb(56, _palette.AccentColor);
+                _headerPanel.ShowStarfield = false;
                 break;
 
             default:
-                // 极光浅色: translucent cosmic glass header so the deep indigo-violet starry sky
-                // and diagonal shooting meteors shine right through the compact 68px top bar.
-                _headerPanel.BackColor = Color.FromArgb(14, 21, 52);
-                _headerPanel.GradientColor = Color.FromArgb(30, 29, 78);
-                _headerPanel.SurfaceOpacity = 70;
-                _headerPanel.BorderColor = Color.FromArgb(102, 162, 188, 255);
-                _headerPanel.DecorationColor = Color.FromArgb(170, Color.FromArgb(142, 186, 255));
+                // 极光浅色: bright translucent frosted-white glass over the luminous pastel aurora canvas.
+                _headerPanel.BackColor = Color.FromArgb(255, 255, 255);
+                _headerPanel.GradientColor = Color.FromArgb(246, 249, 255);
+                _headerPanel.SurfaceOpacity = 172;
+                _headerPanel.BorderColor = Color.FromArgb(56, 116, 138, 196);
+                _headerPanel.DecorationColor = Color.FromArgb(56, _palette.AccentColor);
+                _headerPanel.ShowStarfield = false;
                 break;
         }
 
         _headerPanel.ShadowColor = Color.Transparent;
-        _headerTitle.ForeColor = _palette.HeroTextColor;
-        _headerSubtitle.ForeColor = UiDesign.Blend(_palette.HeroMutedTextColor, Color.White, 0.28F);
+        _headerTitle.ForeColor = GetWorkspaceChromeTitleColor();
+        _headerSubtitle.ForeColor = GetWorkspaceChromeSubtitleColor();
         _headerTitle.BackColor = Color.Transparent;
         _headerSubtitle.BackColor = Color.Transparent;
         _headerPanel.Invalidate(invalidateChildren: true);
@@ -1690,17 +1729,17 @@ public partial class Form1 : Form
                     break;
 
                 case ThemeMode.PorcelainLight:
-                    _statusBarPanel.BackColor = Color.FromArgb(11, 32, 34);
-                    _statusBarPanel.GradientColor = Color.FromArgb(20, 48, 54);
-                    _statusBarPanel.SurfaceOpacity = 88;
-                    _statusBarPanel.BorderColor = Color.FromArgb(82, 120, 204, 192);
+                    _statusBarPanel.BackColor = Color.FromArgb(255, 255, 255);
+                    _statusBarPanel.GradientColor = Color.FromArgb(244, 251, 249);
+                    _statusBarPanel.SurfaceOpacity = 178;
+                    _statusBarPanel.BorderColor = Color.FromArgb(56, 102, 148, 140);
                     break;
 
                 default:
-                    _statusBarPanel.BackColor = Color.FromArgb(12, 19, 46);
-                    _statusBarPanel.GradientColor = Color.FromArgb(24, 28, 68);
-                    _statusBarPanel.SurfaceOpacity = 86;
-                    _statusBarPanel.BorderColor = Color.FromArgb(86, 152, 180, 255);
+                    _statusBarPanel.BackColor = Color.FromArgb(255, 255, 255);
+                    _statusBarPanel.GradientColor = Color.FromArgb(246, 249, 255);
+                    _statusBarPanel.SurfaceOpacity = 176;
+                    _statusBarPanel.BorderColor = Color.FromArgb(56, 116, 138, 196);
                     break;
             }
             _statusBarPanel.ShadowColor = Color.Transparent;
@@ -1708,7 +1747,7 @@ public partial class Form1 : Form
         }
 
         _statusBox.BackColor = Color.Transparent;
-        _statusBox.ForeColor = UiDesign.Blend(_palette.HeroMutedTextColor, Color.White, 0.32F);
+        _statusBox.ForeColor = GetWorkspaceStatusTextColor();
     }
 
     private void ApplyThemeRecursive(Control control)
@@ -1762,13 +1801,13 @@ public partial class Form1 : Form
                 {
                     label.BackColor = Color.Transparent;
                     label.ForeColor = label.Name == "HeaderSubtitle"
-                        ? UiDesign.Blend(_palette.HeroMutedTextColor, Color.White, 0.28F)
-                        : _palette.HeroTextColor;
+                        ? GetWorkspaceChromeSubtitleColor()
+                        : GetWorkspaceChromeTitleColor();
                 }
                 else if (IsInsideNamedControl(label, "StatusBarPanel"))
                 {
                     label.BackColor = Color.Transparent;
-                    label.ForeColor = UiDesign.Blend(_palette.HeroMutedTextColor, Color.White, 0.32F);
+                    label.ForeColor = GetWorkspaceStatusTextColor();
                 }
                 else if (IsInsideNamedControl(label, "Sidebar"))
                 {
@@ -3031,7 +3070,6 @@ public partial class Form1 : Form
                 binding.Chart.Samples = chartSamples;
             }
             binding.Chart.EmptyText = trendData.EmptyText;
-            binding.Chart.AssessmentWindows = trendData.AssessmentWindows ?? [];
             binding.ExportButton.Tag = trendData.Points;
             binding.ModelDistribution.RangeLabel = GetModelDistributionRangeLabel(_quotaTrendRange);
             binding.ModelDistribution.Items = modelDistributionItems;
@@ -8118,7 +8156,7 @@ public partial class Form1 : Form
             TextAlign = ContentAlignment.MiddleLeft
         };
         libraryTitle.BackColor = Color.Transparent;
-        libraryTitle.ForeColor = _palette.HeroTextColor;
+        libraryTitle.ForeColor = GetWorkspaceChromeTitleColor();
         libraryHeader.Controls.Add(libraryTitle);
         var librarySubtitle = new Label
         {
@@ -8133,7 +8171,7 @@ public partial class Form1 : Form
             UseCompatibleTextRendering = true
         };
         librarySubtitle.BackColor = Color.Transparent;
-        librarySubtitle.ForeColor = UiDesign.Blend(_palette.HeroMutedTextColor, Color.White, 0.24F);
+        librarySubtitle.ForeColor = GetWorkspaceChromeSubtitleColor();
         libraryHeader.Controls.Add(librarySubtitle);
         var editCustom = MakeActionButton(
             "自定义主题",
@@ -8215,7 +8253,7 @@ public partial class Form1 : Form
             UseCompatibleTextRendering = true
         };
         title.BackColor = Color.Transparent;
-        title.ForeColor = _palette.HeroTextColor;
+        title.ForeColor = GetWorkspaceChromeTitleColor();
         header.Controls.Add(title);
         var subtitle = new Label
         {
@@ -8230,7 +8268,7 @@ public partial class Form1 : Form
             UseCompatibleTextRendering = true
         };
         subtitle.BackColor = Color.Transparent;
-        subtitle.ForeColor = UiDesign.Blend(_palette.HeroMutedTextColor, Color.White, 0.24F);
+        subtitle.ForeColor = GetWorkspaceChromeSubtitleColor();
         header.Controls.Add(subtitle);
         return header;
     }
@@ -8860,13 +8898,59 @@ public partial class Form1 : Form
         ResetCardsScrollPosition();
     }
 
+    private Color GetSystemConfigDividerColor()
+    {
+        var dark = ThemeStyler.IsDark(_palette);
+        return dark
+            ? UiDesign.Blend(_palette.CardColor, _palette.MutedTextColor, 0.25F)
+            : UiDesign.Blend(_palette.CardColor, _palette.MutedTextColor, 0.20F);
+    }
+
+    private Control CreateSystemConfigDivider(int left, int top, int width) =>
+        new Panel
+        {
+            Left = left,
+            Top = top,
+            Width = Math.Max(1, width),
+            Height = Math.Max(1, (int)Math.Round(Math.Max(1F, DeviceDpi / 96F))),
+            BackColor = GetSystemConfigDividerColor(),
+            Margin = Padding.Empty
+        };
+
+    private int MeasurePillLabelWidth(string text, Font font, int height, bool showDot, int minimumWidth = 0)
+    {
+        var dpiScale = Math.Max(1F, DeviceDpi / 96F);
+        var measured = TextRenderer.MeasureText(
+            string.IsNullOrEmpty(text) ? " " : text,
+            font,
+            Size.Empty,
+            TextFormatFlags.SingleLine | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+        // PillLabel inflates by 10px each side (20px) and reserves dotSize + 7px when ShowDot is true.
+        var dotReserve = showDot ? Math.Max(5, Math.Min(8, height / 4)) + 7 : 0;
+        var paddingReserve = Math.Max(28, (int)Math.Ceiling(32 * dpiScale));
+        return Math.Max(minimumWidth, measured.Width + dotReserve + paddingReserve);
+    }
+
+    private static int MeasureWrappedLabelHeight(string text, Font font, int width, int minimumHeight)
+    {
+        var measured = TextRenderer.MeasureText(
+            string.IsNullOrEmpty(text) ? " " : text,
+            font,
+            new Size(Math.Max(80, width), int.MaxValue),
+            TextFormatFlags.WordBreak | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+        return Math.Max(minimumHeight, measured.Height + 6);
+    }
+
     private Control CreateSystemConfigPanel(int width)
     {
+        var dpiScale = Math.Max(1F, DeviceDpi / 96F);
+        int Scale(int logicalPx) => Math.Max(1, (int)Math.Round(logicalPx * dpiScale));
+
         var panel = new RoundedPanel
         {
             Width = width,
-            Height = 648,
-            Radius = 16,
+            Height = Scale(600),
+            Radius = Scale(16),
             BorderColor = GetFloatingCardBorderColor(_palette.AccentColor),
             BackColor = _palette.CardColor,
             SurfaceOpacity = GetFloatingCardOpacity(),
@@ -8879,124 +8963,170 @@ public partial class Form1 : Form
             // right margin here becomes part of the child width and creates an
             // unnecessary outer horizontal scrollbar on the system-config page.
             Margin = new Padding(0, 0, 0, CardGap),
-            Padding = new Padding(22)
+            Padding = new Padding(Scale(22))
         };
 
-        var innerLeft = 24;
-        var innerWidth = width - 48;
+        var innerLeft = Scale(24);
+        var innerWidth = Math.Max(Scale(360), width - (innerLeft * 2));
+        var titleFont = UiFontCache.Get(Font.FontFamily, 11.2F, FontStyle.Bold);
+        var subtitleFont = UiFontCache.Get(Font.FontFamily, 8.7F, FontStyle.Regular);
+        var rowLabelFont = UiFontCache.Get(Font.FontFamily, 9F, FontStyle.Bold);
+        var valueFont = UiFontCache.Get(Font.FontFamily, 8.9F, FontStyle.Regular);
+        var inputFont = UiFontCache.Get(Font.FontFamily, 9.2F, FontStyle.Regular);
+        var noteFont = UiFontCache.Get(Font.FontFamily, 8.3F, FontStyle.Regular);
+
+        var y = Scale(20);
+        var titleHeight = Math.Max(Scale(28), TextRenderer.MeasureText(
+            "目录与代理设置",
+            titleFont,
+            Size.Empty,
+            TextFormatFlags.SingleLine | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix).Height + Scale(4));
         var title = new Label
         {
             Text = "目录与代理设置",
             Left = innerLeft,
-            Top = 22,
-            Width = 240,
-            Height = 38,
-            Font = new Font(Font.FontFamily, 11F, FontStyle.Bold),
-            AutoEllipsis = true
+            Top = y,
+            Width = innerWidth,
+            Height = titleHeight,
+            Font = titleFont,
+            AutoEllipsis = true,
+            UseMnemonic = false
         };
         ThemeStyler.ApplyLabel(title, _palette);
         panel.Controls.Add(title);
+        y = title.Bottom + Scale(3);
 
+        var subtitleText = "项目目录、Codex 启动路径、PAT 网关代理、额度轮换与应用版本。";
         var subtitle = new Label
         {
-            Text = "项目配置、Codex 启动位置与 PAT 网关上游代理。",
+            Text = subtitleText,
             Left = innerLeft,
-            Top = 62,
+            Top = y,
             Width = innerWidth,
-            Height = 28,
-            Font = new Font(Font.FontFamily, 8.8F),
-            AutoEllipsis = true
+            Height = MeasureWrappedLabelHeight(subtitleText, subtitleFont, innerWidth, Scale(22)),
+            Font = subtitleFont,
+            AutoEllipsis = false,
+            UseMnemonic = false
         };
         ThemeStyler.ApplyLabel(subtitle, _palette, true);
         panel.Controls.Add(subtitle);
+        y = subtitle.Bottom + Scale(12);
 
+        panel.Controls.Add(CreateSystemConfigDivider(innerLeft, y, innerWidth));
+        y += Scale(14);
+
+        var measuredLabelWidth = TextRenderer.MeasureText(
+            "项目根目录",
+            rowLabelFont,
+            Size.Empty,
+            TextFormatFlags.SingleLine | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix).Width;
+        var labelWidth = Math.Max(Scale(106), measuredLabelWidth + Scale(22));
+
+        var actionWidth = new[] { "打开根目录", "选择目录", "自动检测", "关闭网关", "打开网关", "关闭轮换", "打开轮换", "检查更新" }
+            .Max(text => MeasureActionButtonWidth(text, Scale(138)));
+        actionWidth = Math.Min(actionWidth, Math.Max(Scale(138), innerWidth / 3));
+        var actionLeft = innerLeft + innerWidth - actionWidth;
+        var fieldLeft = innerLeft + labelWidth + Scale(10);
+        var fieldGap = Scale(14);
+        var fieldWidth = Math.Max(Scale(120), actionLeft - fieldLeft - fieldGap);
+
+        var controlHeight = Scale(40);
+        var buttonHeight = Scale(38);
+        var buttonOffsetY = (controlHeight - buttonHeight) / 2;
+        var rowGap = Scale(12);
+        var sectionGap = Scale(14);
+
+        Label MakeRowLabel(string text, int top)
+        {
+            var label = new Label
+            {
+                Text = text,
+                Left = innerLeft,
+                Top = top,
+                Width = labelWidth,
+                Height = controlHeight,
+                Font = rowLabelFont,
+                AutoEllipsis = false,
+                UseMnemonic = false,
+                TextAlign = ContentAlignment.MiddleLeft
+            };
+            ThemeStyler.ApplyLabel(label, _palette, true);
+            return label;
+        }
+
+        // Section 1: Directories
         var rootLabel = new Label
         {
             Text = "项目根目录",
             Left = innerLeft,
-            Top = 112,
+            Top = y,
             Width = 150,
-            Height = 38,
-            Font = new Font(Font.FontFamily, 9F, FontStyle.Bold),
+            Height = controlHeight,
+            Font = rowLabelFont,
             AutoEllipsis = false,
             UseMnemonic = false,
             TextAlign = ContentAlignment.MiddleLeft
         };
+        rootLabel.Width = labelWidth;
         ThemeStyler.ApplyLabel(rootLabel, _palette, true);
         panel.Controls.Add(rootLabel);
 
-        var configActionWidth = width >= 900 ? 224 : 196;
-        var configActionLeft = width - configActionWidth - 48;
-        var configFieldWidth = Math.Max(80, configActionLeft - (innerLeft + 164) - 16);
         var rootValue = new Label
         {
             Text = _store.RootPath,
-            Left = innerLeft + 164,
-            Top = 112,
-            Width = configFieldWidth,
-            Height = 38,
-            Font = new Font(Font.FontFamily, 9F),
+            Left = fieldLeft,
+            Top = y,
+            Width = fieldWidth,
+            Height = controlHeight,
+            Font = valueFont,
             AutoEllipsis = true,
-            TextAlign = ContentAlignment.MiddleLeft
-        };
-        ThemeStyler.ApplyLabel(rootValue, _palette);
-        panel.Controls.Add(rootValue);
-
-        var openRoot = MakeActionButton("打开根目录", configActionLeft, 104, configActionWidth, false);
-        openRoot.Click += (_, _) => OpenRootFolder();
-        panel.Controls.Add(openRoot);
-
-        var launchLabel = new Label
-        {
-            Text = "启动目录",
-            Left = innerLeft,
-            Top = 172,
-            Width = 150,
-            Height = 42,
-            Font = new Font(Font.FontFamily, 9F, FontStyle.Bold),
-            AutoEllipsis = false,
             UseMnemonic = false,
             TextAlign = ContentAlignment.MiddleLeft
         };
-        ThemeStyler.ApplyLabel(launchLabel, _palette, true);
-        panel.Controls.Add(launchLabel);
+        ThemeStyler.ApplyLabel(rootValue, _palette);
+        _toolTip.SetToolTip(rootValue, _store.RootPath);
+        panel.Controls.Add(rootValue);
+
+        var openRoot = MakeActionButton("打开根目录", actionLeft, y + buttonOffsetY, actionWidth, false);
+        openRoot.Height = buttonHeight;
+        openRoot.Click += (_, _) => OpenRootFolder();
+        panel.Controls.Add(openRoot);
+        y += controlHeight + rowGap;
+
+        panel.Controls.Add(MakeRowLabel("启动目录", y));
 
         _projectPathShell!.Parent?.Controls.Remove(_projectPathShell);
-        _projectPathShell.SetBounds(innerLeft + 164, 164, configFieldWidth, 46);
+        _projectPathShell.SetBounds(fieldLeft, y, fieldWidth, controlHeight);
+        _projectPathShell.Radius = Scale(10);
         _projectPathShell.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
-        _projectPathBox.Font = new Font(Font.FontFamily, 9.5F);
+        _projectPathBox.Font = inputFont;
         ThemeStyler.ApplyInput(_projectPathBox, _palette);
         ThemeStyler.ApplyInputShell(_projectPathShell, _palette);
         panel.Controls.Add(_projectPathShell);
 
-        var browse = MakeActionButton("选择目录", configActionLeft, 167, configActionWidth, false);
+        var browse = MakeActionButton("选择目录", actionLeft, y + buttonOffsetY, actionWidth, false);
+        browse.Height = buttonHeight;
         browse.Click += (_, _) => BrowseProjectPath();
         panel.Controls.Add(browse);
+        y += controlHeight + sectionGap;
 
-        var proxyAddressLabel = new Label
-        {
-            Text = "代理地址",
-            Left = innerLeft,
-            Top = 232,
-            Width = 150,
-            Height = 42,
-            Font = new Font(Font.FontFamily, 9F, FontStyle.Bold),
-            AutoEllipsis = false,
-            UseMnemonic = false,
-            TextAlign = ContentAlignment.MiddleLeft
-        };
-        ThemeStyler.ApplyLabel(proxyAddressLabel, _palette, true);
-        panel.Controls.Add(proxyAddressLabel);
+        panel.Controls.Add(CreateSystemConfigDivider(innerLeft, y, innerWidth));
+        y += sectionGap;
+
+        // Section 2: Upstream Proxy
+        panel.Controls.Add(MakeRowLabel("代理地址", y));
 
         _patGatewayProxyAddressShell!.Parent?.Controls.Remove(_patGatewayProxyAddressShell);
-        _patGatewayProxyAddressShell.SetBounds(innerLeft + 164, 226, configFieldWidth, 46);
+        _patGatewayProxyAddressShell.SetBounds(fieldLeft, y, fieldWidth, controlHeight);
+        _patGatewayProxyAddressShell.Radius = Scale(10);
         _patGatewayProxyAddressShell.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
-        _patGatewayProxyAddressBox.Font = new Font(Font.FontFamily, 9.5F);
+        _patGatewayProxyAddressBox.Font = inputFont;
         ThemeStyler.ApplyInput(_patGatewayProxyAddressBox, _palette);
         ThemeStyler.ApplyInputShell(_patGatewayProxyAddressShell, _palette);
         panel.Controls.Add(_patGatewayProxyAddressShell);
 
-        var autoProxy = MakeActionButton("自动检测", configActionLeft, 229, configActionWidth, false);
+        var autoProxy = MakeActionButton("自动检测", actionLeft, y + buttonOffsetY, actionWidth, false);
+        autoProxy.Height = buttonHeight;
         autoProxy.Click += async (_, _) =>
         {
             autoProxy.Enabled = false;
@@ -9013,61 +9143,39 @@ public partial class Form1 : Form
             }
         };
         panel.Controls.Add(autoProxy);
+        y += controlHeight + rowGap;
 
-        var proxyPortLabel = new Label
-        {
-            Text = "代理端口",
-            Left = innerLeft,
-            Top = 292,
-            Width = 150,
-            Height = 42,
-            Font = new Font(Font.FontFamily, 9F, FontStyle.Bold),
-            AutoEllipsis = false,
-            UseMnemonic = false,
-            TextAlign = ContentAlignment.MiddleLeft
-        };
-        ThemeStyler.ApplyLabel(proxyPortLabel, _palette, true);
-        panel.Controls.Add(proxyPortLabel);
+        panel.Controls.Add(MakeRowLabel("代理端口", y));
 
         _patGatewayProxyPortShell!.Parent?.Controls.Remove(_patGatewayProxyPortShell);
-        _patGatewayProxyPortShell.SetBounds(innerLeft + 164, 286, configFieldWidth, 46);
+        _patGatewayProxyPortShell.SetBounds(fieldLeft, y, fieldWidth, controlHeight);
+        _patGatewayProxyPortShell.Radius = Scale(10);
         _patGatewayProxyPortShell.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
-        _patGatewayProxyPortBox.Font = new Font(Font.FontFamily, 9.5F);
+        _patGatewayProxyPortBox.Font = inputFont;
         ThemeStyler.ApplyInput(_patGatewayProxyPortBox, _palette);
         ThemeStyler.ApplyInputShell(_patGatewayProxyPortShell, _palette);
         panel.Controls.Add(_patGatewayProxyPortShell);
 
         _patGatewayProxyDetectionLabel.Parent?.Controls.Remove(_patGatewayProxyDetectionLabel);
-        _patGatewayProxyDetectionLabel.SetBounds(configActionLeft, 282, configActionWidth, 54);
-        _patGatewayProxyDetectionLabel.Font = new Font(Font.FontFamily, 7.8F, FontStyle.Regular);
+        _patGatewayProxyDetectionLabel.SetBounds(actionLeft, y - Scale(2), actionWidth, controlHeight + Scale(4));
+        _patGatewayProxyDetectionLabel.Font = UiFontCache.Get(Font.FontFamily, 8F, FontStyle.Regular);
         _patGatewayProxyDetectionLabel.TextAlign = ContentAlignment.MiddleCenter;
         _patGatewayProxyDetectionLabel.AutoEllipsis = false;
         _patGatewayProxyDetectionLabel.UseCompatibleTextRendering = true;
         _patGatewayProxyDetectionLabel.UseMnemonic = false;
         ThemeStyler.ApplyLabel(_patGatewayProxyDetectionLabel, _palette, true);
         panel.Controls.Add(_patGatewayProxyDetectionLabel);
+        y += controlHeight + sectionGap;
 
-        var gatewayLabel = new Label
-        {
-            Text = "PAT 网关",
-            Left = innerLeft,
-            Top = 354,
-            Width = 150,
-            Height = 42,
-            Font = new Font(Font.FontFamily, 9F, FontStyle.Bold),
-            TextAlign = ContentAlignment.MiddleLeft,
-            UseMnemonic = false
-        };
-        ThemeStyler.ApplyLabel(gatewayLabel, _palette, true);
-        panel.Controls.Add(gatewayLabel);
+        panel.Controls.Add(CreateSystemConfigDivider(innerLeft, y, innerWidth));
+        y += sectionGap;
+
+        // Section 3: PAT Gateway & Quota Rotation
+        panel.Controls.Add(MakeRowLabel("PAT 网关", y));
 
         _patGatewayRuntimeStatusLabel.Parent?.Controls.Remove(_patGatewayRuntimeStatusLabel);
-        _patGatewayRuntimeStatusLabel.SetBounds(
-            innerLeft + 164,
-            354,
-            configFieldWidth,
-            42);
-        _patGatewayRuntimeStatusLabel.Font = new Font(Font.FontFamily, 8.8F);
+        _patGatewayRuntimeStatusLabel.SetBounds(fieldLeft, y, fieldWidth, controlHeight);
+        _patGatewayRuntimeStatusLabel.Font = valueFont;
         _patGatewayRuntimeStatusLabel.TextAlign = ContentAlignment.MiddleLeft;
         _patGatewayRuntimeStatusLabel.AutoEllipsis = true;
         _patGatewayRuntimeStatusLabel.UseMnemonic = false;
@@ -9075,78 +9183,82 @@ public partial class Form1 : Form
         panel.Controls.Add(_patGatewayRuntimeStatusLabel);
 
         _patGatewayToggleButton.Parent?.Controls.Remove(_patGatewayToggleButton);
-        _patGatewayToggleButton.SetBounds(configActionLeft, 351, configActionWidth, 42);
+        _patGatewayToggleButton.SetBounds(actionLeft, y + buttonOffsetY, actionWidth, buttonHeight);
         _patGatewayToggleButton.Tag = "soft";
-        _patGatewayToggleButton.Radius = 12;
-        _patGatewayToggleButton.Padding = new Padding(12, 0, 12, 0);
-        _patGatewayToggleButton.Font = new Font(Font.FontFamily, 8.9F);
+        _patGatewayToggleButton.Radius = Scale(12);
+        _patGatewayToggleButton.Padding = new Padding(Scale(12), 0, Scale(12), 0);
+        _patGatewayToggleButton.Font = UiFontCache.Get(Font.FontFamily, 8.9F);
         _patGatewayToggleButton.MinimumFontSize = 8F;
         _patGatewayToggleButton.AccessibleName = "打开或关闭本地 PAT 网关";
         ThemeStyler.ApplySoftButton(_patGatewayToggleButton, _palette);
         panel.Controls.Add(_patGatewayToggleButton);
         UpdatePatGatewayControls();
+        y += controlHeight + rowGap;
 
-        var autoRotationLabel = new Label
-        {
-            Text = "额度轮换",
-            Left = innerLeft,
-            Top = 414,
-            Width = 150,
-            Height = 42,
-            Font = new Font(Font.FontFamily, 9F, FontStyle.Bold),
-            TextAlign = ContentAlignment.MiddleLeft,
-            UseMnemonic = false
-        };
-        ThemeStyler.ApplyLabel(autoRotationLabel, _palette, true);
-        panel.Controls.Add(autoRotationLabel);
+        panel.Controls.Add(MakeRowLabel("额度轮换", y));
+
+        var badgeFont = UiFontCache.Get(Font.FontFamily, 8.4F, FontStyle.Bold);
+        var badgeHeight = Math.Max(Scale(30), TextRenderer.MeasureText(
+            "保留 10% / 3%",
+            badgeFont,
+            Size.Empty,
+            TextFormatFlags.SingleLine | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix).Height + Scale(10));
+        var badgeWidth = MeasurePillLabelWidth("保留 10% / 3%", badgeFont, badgeHeight, showDot: true, minimumWidth: Scale(128));
+        var badgeGap = Scale(10);
+        var inlineStatusWidth = actionLeft - badgeGap - badgeWidth - badgeGap - fieldLeft;
+        var badgeInline = inlineStatusWidth >= Scale(120);
 
         _patAutoRotationStatusLabel.Parent?.Controls.Remove(_patAutoRotationStatusLabel);
-        _patAutoRotationStatusLabel.SetBounds(innerLeft + 164, 414, configFieldWidth, 42);
-        _patAutoRotationStatusLabel.Font = new Font(Font.FontFamily, 8.8F);
+        _patAutoRotationStatusLabel.SetBounds(
+            fieldLeft,
+            y,
+            badgeInline ? inlineStatusWidth : fieldWidth,
+            controlHeight);
+        _patAutoRotationStatusLabel.Font = valueFont;
         _patAutoRotationStatusLabel.TextAlign = ContentAlignment.MiddleLeft;
         _patAutoRotationStatusLabel.AutoEllipsis = true;
         _patAutoRotationStatusLabel.UseMnemonic = false;
         ThemeStyler.ApplyLabel(_patAutoRotationStatusLabel, _palette);
         panel.Controls.Add(_patAutoRotationStatusLabel);
 
-        var rotationActionGap = 8;
-        var rotationActionWidth = (configActionWidth - rotationActionGap) / 2;
+        _patAutoRotationToggleButton.Parent?.Controls.Remove(_patAutoRotationToggleButton);
+        _patAutoRotationToggleButton.SetBounds(actionLeft, y + buttonOffsetY, actionWidth, buttonHeight);
+        _patAutoRotationToggleButton.Tag = "soft";
+        _patAutoRotationToggleButton.Radius = Scale(12);
+        _patAutoRotationToggleButton.Padding = new Padding(Scale(12), 0, Scale(12), 0);
+        _patAutoRotationToggleButton.Font = UiFontCache.Get(Font.FontFamily, 8.9F);
+        _patAutoRotationToggleButton.MinimumFontSize = 8F;
+        _patAutoRotationToggleButton.AccessibleName = "打开或关闭账号轮换";
+        ThemeStyler.ApplySoftButton(_patAutoRotationToggleButton, _palette);
+        panel.Controls.Add(_patAutoRotationToggleButton);
+
         _patAutoRotationThresholdBadge.Parent?.Controls.Remove(_patAutoRotationThresholdBadge);
-        _patAutoRotationThresholdBadge.SetBounds(
-            configActionLeft,
-            414,
-            rotationActionWidth,
-            36);
-        _patAutoRotationThresholdBadge.Font = UiFontCache.Get(Font.FontFamily, 8.4F, FontStyle.Bold);
+        var badgeLeft = badgeInline
+            ? actionLeft - badgeGap - badgeWidth
+            : fieldLeft;
+        var badgeTop = badgeInline
+            ? y + ((controlHeight - badgeHeight) / 2)
+            : y + controlHeight + Scale(6);
+        _patAutoRotationThresholdBadge.SetBounds(badgeLeft, badgeTop, badgeWidth, badgeHeight);
+        _patAutoRotationThresholdBadge.Font = badgeFont;
         _patAutoRotationThresholdBadge.TextAlign = ContentAlignment.MiddleCenter;
         _patAutoRotationThresholdBadge.ShowDot = true;
         _patAutoRotationThresholdBadge.AccessibleName = "轮换保留线：5h 剩余 10%，仅周额度剩余 3%";
         ApplyPatAutoRotationThresholdBadgeStyle();
         panel.Controls.Add(_patAutoRotationThresholdBadge);
-
-        _patAutoRotationToggleButton.Parent?.Controls.Remove(_patAutoRotationToggleButton);
-        _patAutoRotationToggleButton.SetBounds(
-            configActionLeft + rotationActionWidth + rotationActionGap,
-            411,
-            rotationActionWidth,
-            42);
-        _patAutoRotationToggleButton.Tag = "soft";
-        _patAutoRotationToggleButton.Radius = 12;
-        _patAutoRotationToggleButton.Font = UiFontCache.Get(Font.FontFamily, 8.6F);
-        _patAutoRotationToggleButton.MinimumFontSize = 7.8F;
-        _patAutoRotationToggleButton.AccessibleName = "打开或关闭账号轮换";
-        ThemeStyler.ApplySoftButton(_patAutoRotationToggleButton, _palette);
-        panel.Controls.Add(_patAutoRotationToggleButton);
         UpdatePatAutoRotationControls();
+        y = Math.Max(y + controlHeight, _patAutoRotationThresholdBadge.Bottom) + Scale(8);
 
+        const string rotationNoteText =
+            "5h 剩余 ≤10%、仅周额度剩余 ≤3% 时暂停该账号，新请求按使用池、备用池顺序换号。以最新官方额度为准；当前响应继续完成，额度恢复后重新可选。";
         var note = new Label
         {
-            Text = "5h 剩余 ≤10%、仅周额度剩余 ≤3% 时暂停该账号，新请求按使用池、备用池顺序换号。以最新官方额度为准；当前响应继续完成，额度恢复后重新可选。",
+            Text = rotationNoteText,
             Left = innerLeft,
-            Top = 478,
+            Top = y,
             Width = innerWidth,
-            Height = 72,
-            Font = new Font(Font.FontFamily, 8.5F),
+            Height = MeasureWrappedLabelHeight(rotationNoteText, noteFont, innerWidth, Scale(34)),
+            Font = noteFont,
             AutoEllipsis = false,
             UseMnemonic = false
         };
@@ -9155,12 +9267,37 @@ public partial class Form1 : Form
             note,
             "安全余量会结合最近请求消耗、剩余额度和网关额度拒绝信号自动计算；流式请求执行中不会更换该请求的账号。");
         panel.Controls.Add(note);
+        y = note.Bottom + sectionGap;
 
-        var manualUpdate = MakeActionButton("检查更新", configActionLeft, 574, configActionWidth, false);
+        panel.Controls.Add(CreateSystemConfigDivider(innerLeft, y, innerWidth));
+        y += sectionGap;
+
+        // Section 4: App Version & Updates
+        panel.Controls.Add(MakeRowLabel("应用版本", y));
+
+        var versionValue = new Label
+        {
+            Text = $"当前版本 {AppUpdateService.DisplayVersion} · 支持一键检查更新",
+            Left = fieldLeft,
+            Top = y,
+            Width = fieldWidth,
+            Height = controlHeight,
+            Font = valueFont,
+            AutoEllipsis = true,
+            UseMnemonic = false,
+            TextAlign = ContentAlignment.MiddleLeft
+        };
+        ThemeStyler.ApplyLabel(versionValue, _palette);
+        panel.Controls.Add(versionValue);
+
+        var manualUpdate = MakeActionButton("检查更新", actionLeft, y + buttonOffsetY, actionWidth, false);
+        manualUpdate.Height = buttonHeight;
         manualUpdate.AccessibleName = "手动检查应用更新";
         manualUpdate.Click += async (_, _) => await CheckForUpdatesAsync(manual: true);
         panel.Controls.Add(manualUpdate);
+        y += controlHeight;
 
+        panel.Height = y + Scale(22);
         return panel;
     }
 
@@ -10876,41 +11013,15 @@ public partial class Form1 : Form
             DateTimeOffset.Now);
     }
 
-    private Color GetPassiveQuotaStatusColor(PassiveQuotaStatus status) => status switch
-    {
-        PassiveQuotaStatus.Normal => _palette.SuccessColor,
-        PassiveQuotaStatus.Abnormal => _palette.DangerColor,
-        PassiveQuotaStatus.Indeterminate => _palette.WarningColor,
-        _ => _palette.MutedTextColor
-    };
-
-    private static string GetPassiveQuotaStatusText(PassiveQuotaStatus status) => status switch
-    {
-        PassiveQuotaStatus.Normal => "额度正常",
-        PassiveQuotaStatus.Abnormal => "额度异常",
-        PassiveQuotaStatus.Indeterminate => "额度待确认",
-        _ => "数据收集中"
-    };
-
     // The API reports whole percentages. Treat a value that is rendered as 0.0%
-    // as exhausted so an old capacity estimate can never be mistaken for an
-    // official quota fault after the active window has actually run out.
+    // as exhausted so the UI reflects official exhaustion clearly.
     private static bool IsOfficialQuotaExhausted(double? remainingPercent) =>
         remainingPercent is { } value && value <= 0.05D;
 
-    private static string GetPassiveQuotaPresentationText(
-        PassiveQuotaStatus status,
-        double? officialRemainingPercent) =>
-        IsOfficialQuotaExhausted(officialRemainingPercent)
-            ? "额度已用尽"
-            : GetPassiveQuotaStatusText(status);
-
-    private Color GetPassiveQuotaPresentationColor(
-        PassiveQuotaStatus status,
-        double? officialRemainingPercent) =>
-        IsOfficialQuotaExhausted(officialRemainingPercent)
-            ? _palette.DangerColor
-            : GetPassiveQuotaStatusColor(status);
+    private Color GetPassiveQuotaSummaryColor() =>
+        ThemeStyler.IsDark(_palette)
+            ? UiDesign.Blend(_palette.TextColor, _palette.AccentColor, 0.42F)
+            : UiDesign.Blend(_palette.TextColor, _palette.PrimaryColor, 0.45F);
 
     private static string GetPassiveQuotaPresentationToolTip(
         PassiveQuotaMonitoringResult monitoring,
@@ -10924,12 +11035,9 @@ public partial class Form1 : Form
                   GetPassiveQuotaEstimateSummary(monitoring, officialRemainingPercent);
         }
 
-        var estimateNote = monitoring.Estimate?.Status == PassiveQuotaStatus.Abnormal
-            ? "被动容量推测存在历史偏差：本地模型等值消耗低于参考阈值。这只反映估算与官方百分比之间的差异，不代表官方额度数据异常。"
-            : "被动容量推测仅作辅助参考，不是官方美元余额。";
         return "官方主额度窗口当前显示 0%，本窗口额度已用尽。" +
                Environment.NewLine +
-               estimateNote;
+               "剩余金额推算仅作辅助参考，不是官方美元余额。";
     }
 
     private static double? GetDisplayedQuotaCapacityUsd(PassiveQuotaMonitoringResult monitoring)
@@ -11025,16 +11133,15 @@ public partial class Form1 : Form
         var estimate = monitoring.Estimate;
         var hasStoppedEpoch = monitoring.State.StartedAtUtc.HasValue &&
                               monitoring.State.StoppedAtUtc.HasValue;
-        var visible = monitoring.IsEnabled || (hasStoppedEpoch && estimate != null);
-        badge.Visible = visible;
-        if (summary != null)
-        {
-            summary.Visible = visible;
-        }
+        var displayedCapacityUsd = GetDisplayedQuotaCapacityUsd(monitoring);
+        var hasEstimate = displayedCapacityUsd.HasValue;
+        var visible = monitoring.IsEnabled || (hasStoppedEpoch && hasEstimate);
         if (!visible)
         {
+            badge.Visible = false;
             if (summary != null)
             {
+                summary.Visible = false;
                 summary.Text = string.Empty;
                 _toolTip.SetToolTip(summary, null);
             }
@@ -11044,6 +11151,7 @@ public partial class Form1 : Form
         const double requiredPercentSpan = 2D;
         if (IsOfficialQuotaExhausted(latestOfficialRemainingPercent))
         {
+            badge.Visible = true;
             UpdateQuotaPill(badge, "额度已用尽", _palette.DangerColor);
             FitBadgeToContent();
             if (summary != null)
@@ -11058,44 +11166,46 @@ public partial class Form1 : Form
             return;
         }
 
-        if (monitoring.IsEnabled &&
-            (estimate == null || estimate.Status == PassiveQuotaStatus.Collecting))
+        if (monitoring.IsEnabled && !hasEstimate)
         {
             var observedSpan = Math.Clamp(estimate?.ObservedPercentSpan ?? 0D, 0D, requiredPercentSpan);
+            badge.Visible = true;
             UpdateQuotaPill(badge, "监测中", _palette.PrimaryColor);
             FitBadgeToContent();
             if (summary != null)
             {
+                summary.Top = badge.Bottom + 2;
                 summary.Text = $"首次估算 {observedSpan:0.#}/{requiredPercentSpan:0}%";
-                summary.ForeColor = _palette.PrimaryColor;
+                summary.ForeColor = GetPassiveQuotaSummaryColor();
                 summary.Visible = true;
                 _toolTip.SetToolTip(summary, summary.Text);
             }
             _toolTip.SetToolTip(
                 badge,
-                $"正在只读自然使用日志；当前滑动窗口已跨越 {observedSpan:0.#}%，达到 2% 后显示结果，之后会自动更新。" +
+                $"正在只读自然使用日志；当前滑动窗口已跨越 {observedSpan:0.#}%，达到 2% 后显示剩余金额估算，之后会自动更新。" +
                 (estimate == null ? string.Empty : Environment.NewLine + estimate.Reason));
             return;
         }
 
-        var status = estimate?.Status ?? PassiveQuotaStatus.Collecting;
-        var color = GetPassiveQuotaStatusColor(status);
-        var frozenPrefix = monitoring.IsEnabled ? string.Empty : "上一轮";
-        UpdateQuotaPill(
-            badge,
-            $"{frozenPrefix}{GetPassiveQuotaStatusText(status)}",
-            color);
-        FitBadgeToContent();
+        // Remaining-USD estimation is preserved without any anomaly/normality verdict pill.
+        badge.Visible = false;
         if (summary != null)
         {
-            if (GetDisplayedQuotaCapacityUsd(monitoring) is { } totalUsd)
+            if (hasEstimate)
             {
+                summary.Top = badge.Top;
                 summary.Text = GetPassiveQuotaSummaryText(
                     monitoring,
                     latestOfficialRemainingPercent);
+                summary.ForeColor = GetPassiveQuotaSummaryColor();
+                summary.Visible = true;
+                var statusNote = monitoring.IsEnabled
+                    ? string.Empty
+                    : Environment.NewLine + "监测已停止，当前显示上一轮保留的参考推算值。";
                 _toolTip.SetToolTip(
                     summary,
                     summary.Text +
+                    statusNote +
                     Environment.NewLine +
                     "前项按“容量参考 × 当前官方剩余百分比”自动换算；容量参考只在新的完整 2% 自然使用校准窗口完成后更新，避免整数百分比的单点波动造成容量抖动。" +
                     Environment.NewLine +
@@ -11103,19 +11213,11 @@ public partial class Form1 : Form
             }
             else
             {
-                summary.Text = "数据不足";
-            }
-
-            summary.ForeColor = color;
-            summary.Visible = true;
-            if (estimate?.EstimatedTotalUsd is not { })
-            {
-                _toolTip.SetToolTip(summary, summary.Text);
+                summary.Text = string.Empty;
+                summary.Visible = false;
+                _toolTip.SetToolTip(summary, null);
             }
         }
-        _toolTip.SetToolTip(
-            badge,
-            GetPassiveQuotaPresentationToolTip(monitoring, latestOfficialRemainingPercent));
     }
 
     private static string FormatQuotaRemaining(
@@ -11235,11 +11337,17 @@ public partial class Form1 : Form
         var monitoring = account.IsCompatibleApi
             ? null
             : GetPassiveQuotaMonitoringResult(account, usage);
-        var showsCapacity = monitoring != null &&
-            (monitoring.IsEnabled ||
-             (monitoring.State.StartedAtUtc.HasValue &&
-              monitoring.State.StoppedAtUtc.HasValue &&
-              monitoring.Estimate != null));
+        var primaryRemainingPercent = GetPrimaryDisplayedQuotaWindow(quotaLimitType, usage)?.RemainingPercent;
+        var hasDisplayedCapacity = monitoring != null && GetDisplayedQuotaCapacityUsd(monitoring).HasValue;
+        var hasStoppedEpoch = monitoring != null &&
+                              monitoring.State.StartedAtUtc.HasValue &&
+                              monitoring.State.StoppedAtUtc.HasValue;
+        var officialQuotaExhausted = monitoring != null && IsOfficialQuotaExhausted(primaryRemainingPercent);
+        var showsStatusPill = monitoring != null &&
+                              (officialQuotaExhausted || (monitoring.IsEnabled && !hasDisplayedCapacity));
+        var showsCapacitySummary = monitoring != null &&
+                                   !officialQuotaExhausted &&
+                                   (monitoring.IsEnabled || (hasStoppedEpoch && hasDisplayedCapacity));
         // The previous 1000/1120px breakpoints made a common 1280x768 desktop
         // (about 935-970px of actual workspace after the sidebar) use the tall
         // stacked card.  That produced hundreds of pixels of empty space compared
@@ -11296,7 +11404,11 @@ public partial class Form1 : Form
         var middleLeft = stacked ? 18 : horizontalGeometry.MiddleLeft;
         var middleWidth = stacked ? width - 36 : horizontalGeometry.MiddleWidth;
         var metricWidth = stacked ? (middleWidth - 20) / 3 : horizontalGeometry.MetricWidth;
-        var accountInfoHeight = showsCapacity ? 136 : 68;
+        var accountInfoHeight = showsStatusPill && showsCapacitySummary
+            ? 136
+            : showsStatusPill || showsCapacitySummary
+                ? 104
+                : 68;
         const int usageMetricHeight = 134;
         var infoTop = stacked
             ? 12
@@ -11346,27 +11458,25 @@ public partial class Form1 : Form
         Label? capacitySummary = null;
         if (!account.IsCompatibleApi)
         {
-            var estimate = monitoring!.Estimate;
-            var status = estimate?.Status ?? PassiveQuotaStatus.Collecting;
-            var primaryRemainingPercent = GetPrimaryDisplayedQuotaWindow(quotaLimitType, usage)?.RemainingPercent;
             capacityStatus = MakeBadge(
-                GetPassiveQuotaPresentationText(status, primaryRemainingPercent),
+                string.Empty,
                 18,
                 infoTop + 72,
-                Color.FromArgb(36, GetPassiveQuotaPresentationColor(status, primaryRemainingPercent)),
-                GetPassiveQuotaPresentationColor(status, primaryRemainingPercent));
+                Color.FromArgb(36, _palette.PrimaryColor),
+                _palette.PrimaryColor);
             var capacityStatusMaxWidth = Math.Min(220, Math.Max(132, nameWidth - 26));
             capacityStatus.Width = capacityStatusMaxWidth;
             capacityStatus.MaximumSize = new Size(capacityStatusMaxWidth, 0);
             capacityStatus.Height = 30;
             capacityStatus.Font = new Font(Font.FontFamily, 8F, FontStyle.Bold);
             capacityStatus.UseMnemonic = false;
+            capacityStatus.Visible = false;
             row.Controls.Add(capacityStatus);
 
             capacitySummary = new Label
             {
                 Left = 18,
-                Top = infoTop + 104,
+                Top = infoTop + 72,
                 Width = nameWidth - 26,
                 Height = 32,
                 Font = new Font(Font.FontFamily, 8F, FontStyle.Bold),
@@ -11382,7 +11492,7 @@ public partial class Form1 : Form
             UpdatePassiveQuotaStatus(
                 capacityStatus,
                 capacitySummary,
-                monitoring,
+                monitoring!,
                 primaryRemainingPercent);
         }
         var metrics = GetQuotaListUsageMetrics(usage);
@@ -11809,7 +11919,6 @@ public partial class Form1 : Form
             out var trendEmptyText,
             out var trendFromUtc,
             out var trendThroughUtc,
-            out var trendAssessmentWindows,
             out var exportButton);
         card.Controls.Add(trendToolbar);
 
@@ -11829,7 +11938,6 @@ public partial class Form1 : Form
                 GetQuotaTrendBucketSize(_quotaTrendRange),
                 ShouldTrimLeadingQuotaTrendBuckets(_quotaTrendRange),
                 GetQuotaTrendLeadingContextDuration(_quotaTrendRange)),
-            AssessmentWindows = trendAssessmentWindows,
             EmptyText = trendEmptyText,
             CostColor = _palette.PrimaryColor,
             CostFillColor = Color.FromArgb(72, _palette.PrimaryColor),
@@ -11838,7 +11946,6 @@ public partial class Form1 : Form
             ModelAccentColor = _palette.AccentColor,
             ModelOtherColor = _palette.MutedTextColor,
             RemainingColor = _palette.SuccessColor,
-            AbnormalRemainingColor = _palette.DangerColor,
             GridColor = _palette.DividerColor,
             TextColor = _palette.TextColor,
             MutedColor = _palette.MutedTextColor,
@@ -12028,15 +12135,15 @@ public partial class Form1 : Form
             _toolTip.SetToolTip(
                 toggle,
                 monitoring.IsEnabled
-                    ? "关闭后停止更新并保留上一轮结果；不会发送任何模型请求。"
-                    : "从点击时刻创建全新的监测周期；旧周期不会参与本轮正常/异常判断。");
+                    ? "关闭后停止更新并保留上一轮剩余金额推算参考；不会发送任何模型请求。"
+                    : "从点击时刻创建全新的监测周期；旧周期不会参与本轮剩余金额推算。");
             panel.Controls.Add(toggle);
         }
 
         var estimate = monitoring.Estimate;
         var quotaLimitType = ResolveQuotaLimitType(account, usage);
         var displayedQuotaWindow = GetPrimaryDisplayedQuotaWindow(quotaLimitType, usage);
-        var presentationStatus = estimate?.Status ?? PassiveQuotaStatus.Collecting;
+        var hasDisplayedCapacity = GetDisplayedQuotaCapacityUsd(monitoring).HasValue;
         var officialQuotaExhausted = !account.IsCompatibleApi &&
                                      IsOfficialQuotaExhausted(displayedQuotaWindow?.RemainingPercent);
         var hasStoppedMonitoringEpoch =
@@ -12046,23 +12153,21 @@ public partial class Form1 : Form
             : officialQuotaExhausted
                 ? "额度已用尽"
             : monitoring.IsEnabled
-                ? estimate == null || estimate.Status == PassiveQuotaStatus.Collecting
+                ? !hasDisplayedCapacity
                     ? $"监测 {Math.Clamp(estimate?.ObservedPercentSpan ?? 0D, 0D, 2D):0.#}/2%"
-                    : GetPassiveQuotaStatusText(presentationStatus)
+                    : "实时推算中"
                 : !hasStoppedMonitoringEpoch
                     ? "尚未开启"
-                    : estimate == null || estimate.Status == PassiveQuotaStatus.Collecting
-                    ? "上一轮数据不足"
-                        : $"上一轮{GetPassiveQuotaStatusText(presentationStatus)}";
+                    : !hasDisplayedCapacity
+                        ? "上一轮数据不足"
+                        : "已停止（保留参考）";
         var statusColor = account.IsCompatibleApi
             ? _palette.PrimaryColor
             : officialQuotaExhausted
                 ? _palette.DangerColor
-            : monitoring.IsEnabled && (estimate == null || estimate.Status == PassiveQuotaStatus.Collecting)
-                ? _palette.PrimaryColor
-                : estimate != null
-                    ? GetPassiveQuotaStatusColor(presentationStatus)
-                    : _palette.PrimaryColor;
+            : monitoring.IsEnabled
+                ? GetPassiveQuotaSummaryColor()
+                : _palette.MutedTextColor;
         // At normal widths the gauge owns a dedicated left column. This keeps
         // the visual hierarchy stable and gives the liquid display roughly one
         // third of the monitor instead of tucking a small gauge at the right.
@@ -12399,7 +12504,7 @@ public partial class Form1 : Form
         var estimate = monitoring.Estimate;
         var quotaLimitType = ResolveQuotaLimitType(account, usage);
         var displayedQuotaWindow = GetPrimaryDisplayedQuotaWindow(quotaLimitType, usage);
-        var presentationStatus = estimate?.Status ?? PassiveQuotaStatus.Collecting;
+        var hasDisplayedCapacity = GetDisplayedQuotaCapacityUsd(monitoring).HasValue;
         var officialQuotaExhausted = !account.IsCompatibleApi &&
                                      IsOfficialQuotaExhausted(displayedQuotaWindow?.RemainingPercent);
         var hasStoppedMonitoringEpoch =
@@ -12410,23 +12515,21 @@ public partial class Form1 : Form
             : officialQuotaExhausted
                 ? "额度已用尽"
             : monitoring.IsEnabled
-                ? estimate == null || estimate.Status == PassiveQuotaStatus.Collecting
+                ? !hasDisplayedCapacity
                     ? $"监测 {observedSpan:0.#}/2%"
-                    : GetPassiveQuotaStatusText(presentationStatus)
+                    : "实时推算中"
                 : !hasStoppedMonitoringEpoch
                     ? "尚未开启"
-                    : estimate == null || estimate.Status == PassiveQuotaStatus.Collecting
-                    ? "上一轮数据不足"
-                        : $"上一轮{GetPassiveQuotaStatusText(presentationStatus)}";
+                    : !hasDisplayedCapacity
+                        ? "上一轮数据不足"
+                        : "已停止（保留参考）";
         var statusColor = account.IsCompatibleApi
             ? _palette.PrimaryColor
             : officialQuotaExhausted
                 ? _palette.DangerColor
-            : monitoring.IsEnabled && (estimate == null || estimate.Status == PassiveQuotaStatus.Collecting)
-                ? _palette.PrimaryColor
-                : estimate != null
-                    ? GetPassiveQuotaStatusColor(presentationStatus)
-                    : _palette.PrimaryColor;
+            : monitoring.IsEnabled
+                ? GetPassiveQuotaSummaryColor()
+                : _palette.MutedTextColor;
 
         binding.Gauge.RemainingPercent = account.IsCompatibleApi
             ? null
@@ -12573,9 +12676,8 @@ public partial class Form1 : Form
                     now,
                     startingWindow?.UsedPercent,
                     startingWindow?.WindowMinutes);
-                _statusBox.Text = quotaLimitType == AccountQuotaLimitType.WeeklyOnly
-                    ? $"已开启 {account.Name} 的周额度监测；推测总额度不低于 $90 时判定正常。"
-                    : $"已开启 {account.Name} 的额度监测；本轮从 {started.StartedAtUtc?.ToLocalTime():MM-dd HH:mm:ss} 开始。";
+                _statusBox.Text =
+                    $"已开启 {account.Name} 的额度监测；本轮从 {started.StartedAtUtc?.ToLocalTime():MM-dd HH:mm:ss} 开始。";
             }
 
             RenderCards();
@@ -12598,7 +12700,6 @@ public partial class Form1 : Form
         out string trendEmptyText,
         out DateTimeOffset trendFromUtc,
         out DateTimeOffset trendThroughUtc,
-        out IReadOnlyList<PassiveQuotaAssessmentWindow> trendAssessmentWindows,
         out Button exportButton)
     {
         var monitoringState = account.IsCompatibleApi
@@ -12777,7 +12878,6 @@ public partial class Form1 : Form
         trendEmptyText = trendData.EmptyText;
         trendFromUtc = trendData.FromUtc;
         trendThroughUtc = trendData.ThroughUtc;
-        trendAssessmentWindows = trendData.AssessmentWindows ?? [];
         var export = MakeActionButton(
             "导出 CSV",
             width - exportWidth - 16,
@@ -12875,18 +12975,11 @@ public partial class Form1 : Form
                 GetQuotaTrendBucketSize(_quotaTrendRange),
                 throughUtc,
                 officialObservations);
-        var assessmentWindows = SelectQuotaTrendAssessmentWindows(
-            scope,
-            hasMonitoringEpoch,
-            (monitoringResult?.Estimate ?? monitoringState?.LastEstimate)?.AssessmentWindows,
-            fromUtc,
-            throughUtc);
         return new QuotaTrendDisplayData(
             points,
             emptyText,
             fromUtc,
-            throughUtc,
-            assessmentWindows);
+            throughUtc);
     }
 
     private static IReadOnlyList<PassiveQuotaOfficialObservation> BuildQuotaTrendOfficialObservations(
@@ -12945,31 +13038,6 @@ public partial class Form1 : Form
         return PassiveQuotaMonitoringService.NormalizeOfficialObservations(
             deduplicated,
             preferredResetAtUtc);
-    }
-
-    private static IReadOnlyList<PassiveQuotaAssessmentWindow> SelectQuotaTrendAssessmentWindows(
-        QuotaTrendScope scope,
-        bool hasMonitoringEpoch,
-        IReadOnlyList<PassiveQuotaAssessmentWindow>? windows,
-        DateTimeOffset fromUtc,
-        DateTimeOffset throughUtc)
-    {
-        if (scope != QuotaTrendScope.Monitoring ||
-            !hasMonitoringEpoch ||
-            throughUtc <= fromUtc)
-        {
-            return [];
-        }
-
-        return (windows ?? [])
-            .Where(item =>
-                item.Status == PassiveQuotaStatus.Abnormal &&
-                item.ThroughUtc > fromUtc &&
-                item.FromUtc < throughUtc)
-            .OrderBy(item => item.FromUtc)
-            .ThenBy(item => item.ThroughUtc)
-            .TakeLast(256)
-            .ToArray();
     }
 
     private static DateTimeOffset GetQuotaTrendStartUtc(TimeSpan range, DateTimeOffset throughUtc)
@@ -14132,51 +14200,6 @@ public partial class Form1 : Form
         var localFixture = new DateTime(2026, 7, 15, 14, 30, 0, DateTimeKind.Unspecified);
         var fixtureOffset = TimeZoneInfo.Local.GetUtcOffset(localFixture);
         var fixtureThroughUtc = new DateTimeOffset(localFixture, fixtureOffset).ToUniversalTime();
-        PassiveQuotaAssessmentWindow[] assessmentScopeFixture =
-        [
-            new(
-                fixtureThroughUtc.AddHours(-3),
-                fixtureThroughUtc.AddHours(-2),
-                20,
-                22,
-                160D,
-                200D,
-                PassiveQuotaStatus.Abnormal),
-            new(
-                fixtureThroughUtc.AddHours(-2),
-                fixtureThroughUtc.AddHours(-1),
-                22,
-                24,
-                240D,
-                200D,
-                PassiveQuotaStatus.Normal),
-            new(
-                fixtureThroughUtc.AddDays(-2),
-                fixtureThroughUtc.AddDays(-2).AddHours(1),
-                10,
-                12,
-                150D,
-                200D,
-                PassiveQuotaStatus.Abnormal)
-        ];
-        var monitoringAssessmentWindows = SelectQuotaTrendAssessmentWindows(
-            QuotaTrendScope.Monitoring,
-            hasMonitoringEpoch: true,
-            assessmentScopeFixture,
-            fixtureThroughUtc.AddHours(-4),
-            fixtureThroughUtc);
-        var realtimeAssessmentWindows = SelectQuotaTrendAssessmentWindows(
-            QuotaTrendScope.Realtime,
-            hasMonitoringEpoch: true,
-            assessmentScopeFixture,
-            fixtureThroughUtc.AddHours(-4),
-            fixtureThroughUtc);
-        var noEpochAssessmentWindows = SelectQuotaTrendAssessmentWindows(
-            QuotaTrendScope.Monitoring,
-            hasMonitoringEpoch: false,
-            assessmentScopeFixture,
-            fixtureThroughUtc.AddHours(-4),
-            fixtureThroughUtc);
         var todayStartLocal = GetQuotaTrendStartUtc(
             TimeSpan.FromHours(24),
             fixtureThroughUtc).ToLocalTime();
@@ -14353,10 +14376,9 @@ public partial class Form1 : Form
             "monthly",
             fixtureThroughUtc.AddDays(1));
         var projectionEstimate = new PassiveQuotaEstimate(
-            PassiveQuotaStatus.Normal,
+            PassiveQuotaStatus.Estimated,
             "monthly",
             43_200,
-            200D,
             248.33D,
             null,
             null,
@@ -14413,14 +14435,14 @@ public partial class Form1 : Form
             Math.Abs((officialShortByModel["gpt-5.6-luna"] * 10D) - officialShortByModel["gpt-5.6-terra"]) > 0.000_001D ||
             Math.Abs(EstimateTotalCost(gpt55ShortUsage, fallback) - 1.42D) > 0.000_001D ||
             Math.Abs(EstimateTotalCost(gpt55LongUsage, fallback) - 12.7D) > 0.000_001D ||
-            accessTokenFallback.DisplayName != "gpt-5.6-sol Access Token 官网单价" ||
+            accessTokenFallback.DisplayName != "gpt-6.1-sol Access Token 官网单价" ||
             accessTokenFallback.PricingPolicy != UsagePricingPolicy.AccessTokenSub2ApiParity ||
             !accessTokenFallback.UsesLongContextPricing ||
-            Math.Abs(accessTokenFallback.GetCacheWriteRate(false) - 5D) > 0.000_001D ||
-            Math.Abs(accessTokenFallback.GetInputRate(true) - 8D) > 0.000_001D ||
-            Math.Abs(accessTokenFallback.GetCachedInputRate(true) - 0.8D) > 0.000_001D ||
-            Math.Abs(accessTokenFallback.GetOutputRate(true) - 30D) > 0.000_001D ||
-            Math.Abs(accessTokenFallback.GetCacheWriteRate(true) - 10D) > 0.000_001D ||
+            Math.Abs(accessTokenFallback.GetCacheWriteRate(false) - 2.5D) > 0.000_001D ||
+            Math.Abs(accessTokenFallback.GetInputRate(true) - 4D) > 0.000_001D ||
+            Math.Abs(accessTokenFallback.GetCachedInputRate(true) - 0.2D) > 0.000_001D ||
+            Math.Abs(accessTokenFallback.GetOutputRate(true) - 15D) > 0.000_001D ||
+            Math.Abs(accessTokenFallback.GetCacheWriteRate(true) - 5D) > 0.000_001D ||
             compatibleApiFallback.DisplayName != "gpt-5.6-sol 兼容 API 官网单价" ||
             compatibleApiFallback.PricingPolicy != UsagePricingPolicy.CompatibleApiProvider ||
             !compatibleApiFallback.UsesLongContextPricing ||
@@ -14430,7 +14452,7 @@ public partial class Form1 : Form
             Math.Abs(compatibleApiFallback.GetCacheWriteRate(true) - 10D) > 0.000_001D ||
             spacedCompatibleSolProfile.DisplayName != compatibleApiFallback.DisplayName ||
             spacedCompatibleSolProfile.PricingPolicy != UsagePricingPolicy.CompatibleApiProvider ||
-            Math.Abs(EstimateTotalCost(unknownModelUsage, accessTokenFallback) - 1.056D) > 0.000_001D ||
+            Math.Abs(EstimateTotalCost(unknownModelUsage, accessTokenFallback) - 0.524D) > 0.000_001D ||
             unknownCacheWriteUsage.CacheWriteKnownEvents != 0 ||
             unknownCacheWriteUsage.CacheWriteUnknownEvents != 1 ||
             unknownCacheWriteUsage.CacheWriteUnknownInputTokens != 160_000L ||
@@ -14446,11 +14468,6 @@ public partial class Form1 : Form
             mixedDistribution[0].Records != 2 ||
             mixedDistribution[0].TotalTokens != 1_320_000L ||
             Math.Abs(mixedDistribution[0].EquivalentCostUsd - 5.648D) > 0.000_001D ||
-            monitoringAssessmentWindows.Count != 1 ||
-            monitoringAssessmentWindows[0].Status != PassiveQuotaStatus.Abnormal ||
-            monitoringAssessmentWindows[0].FromUtc != fixtureThroughUtc.AddHours(-3) ||
-            realtimeAssessmentWindows.Count != 0 ||
-            noEpochAssessmentWindows.Count != 0 ||
             !weeklyRowDetail.Contains("5h重置：", StringComparison.Ordinal) ||
             !weeklyRowDetail.Contains(Environment.NewLine + "周重置：", StringComparison.Ordinal) ||
             !primaryResetLine.StartsWith("5h重置：", StringComparison.Ordinal) ||

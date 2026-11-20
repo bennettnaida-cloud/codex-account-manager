@@ -8,7 +8,7 @@ namespace CodexAccountManager;
 internal sealed class ModelCatalogDocument
 {
     public int SchemaVersion { get; set; } = 1;
-    public string DefaultModel { get; set; } = "gpt-5.6";
+    public string DefaultModel { get; set; } = "gpt-6.1-sol";
     public string DefaultReasoningEffort { get; set; } = "medium";
     public string CatalogSource { get; set; } = string.Empty;
     public string VerifiedAtUtc { get; set; } = string.Empty;
@@ -180,9 +180,9 @@ internal static partial class ModelCatalogService
             RestoreBundled();
             if (File.Exists(_overridePath!) ||
                 Current.CatalogSource.Equals("manual", StringComparison.OrdinalIgnoreCase) ||
-                CanonicalDefaultModel != "gpt-5.6-sol" ||
+                CanonicalDefaultModel != "gpt-6.1-sol" ||
                 !Current.Models.Take(4).Select(model => model.Id).SequenceEqual(
-                    ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+                    ["gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-sol", "gpt-6.1-terra"],
                     StringComparer.OrdinalIgnoreCase))
             {
                 throw new InvalidOperationException("Bundled model-catalog restore self-test failed.");

@@ -1845,7 +1845,6 @@ internal sealed class PassiveQuotaGauge : Control
 internal sealed class QuotaTrendChart : Control
 {
     private QuotaChartSample[] _samples = [];
-    private PassiveQuotaAssessmentWindow[] _assessmentWindows = [];
     private string _emptyText = "暂无历史用量，开始自然使用后将显示趋势";
     private Color _tokenColor = Color.FromArgb(59, 130, 246);
     private Color _tokenFillColor = Color.FromArgb(82, 96, 165, 250);
@@ -1854,7 +1853,6 @@ internal sealed class QuotaTrendChart : Control
     private Color _modelAccentColor = Color.FromArgb(6, 182, 212);
     private Color _modelOtherColor = Color.FromArgb(148, 163, 184);
     private Color _remainingColor = Color.FromArgb(16, 185, 129);
-    private Color _abnormalRemainingColor = Color.FromArgb(239, 68, 68);
     private Color _gridColor = Color.FromArgb(38, 100, 116, 139);
     private Color _textColor = Color.FromArgb(30, 41, 59);
     private Color _mutedColor = Color.FromArgb(100, 116, 139);
@@ -1925,34 +1923,6 @@ internal sealed class QuotaTrendChart : Control
         }
     }
 
-    [Browsable(false)]
-    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-    public IReadOnlyList<PassiveQuotaAssessmentWindow> AssessmentWindows
-    {
-        get => _assessmentWindows;
-        set
-        {
-            var normalized = value?
-                .Where(item =>
-                    item != null &&
-                    item.Status == PassiveQuotaStatus.Abnormal &&
-                    item.ThroughUtc > item.FromUtc &&
-                    double.IsFinite(item.EstimatedTotalUsd) &&
-                    double.IsFinite(item.ThresholdUsd))
-                .OrderBy(item => item.FromUtc)
-                .ThenBy(item => item.ThroughUtc)
-                .ToArray() ?? [];
-            if (_assessmentWindows.SequenceEqual(normalized))
-            {
-                return;
-            }
-
-            _assessmentWindows = normalized;
-            UpdateAccessibility();
-            Invalidate();
-        }
-    }
-
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public string EmptyText
     {
@@ -2017,13 +1987,6 @@ internal sealed class QuotaTrendChart : Control
     {
         get => _remainingColor;
         set => SetColor(ref _remainingColor, value);
-    }
-
-    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-    public Color AbnormalRemainingColor
-    {
-        get => _abnormalRemainingColor;
-        set => SetColor(ref _abnormalRemainingColor, value);
     }
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
@@ -2180,8 +2143,7 @@ internal sealed class QuotaTrendChart : Control
         _lastPlotStart = start;
         _lastPlotEnd = end;
         DrawStackedModelSeries(graphics, plot, start, end, maximumBucketValue, modelSeries, dpi);
-        var remainingCurves = DrawRemainingSeries(graphics, plot, start, end, dpi);
-        DrawAbnormalRemainingWindows(graphics, plot, start, end, remainingCurves, dpi);
+        DrawRemainingSeries(graphics, plot, start, end, dpi);
         DrawTimeLabels(graphics, plot, start, end, dpi);
         DrawModelLegend(
             graphics,
@@ -2602,9 +2564,6 @@ internal sealed class QuotaTrendChart : Control
         }
 
         var sample = _samples[_hoveredSampleIndex];
-        var abnormalWindow = FindAbnormalAssessmentWindow(
-            sample.Timestamp,
-            GetSampleEnd(sample));
         var total = GetSampleMetricValue(sample);
         var x = MapX(GetSampleCenter(sample), _hoveredSampleIndex, _samples.Length, start, end, plot);
         var y = Math.Clamp(MapCostY(total, maximumCost, plot), plot.Top, plot.Bottom);
@@ -2634,8 +2593,7 @@ internal sealed class QuotaTrendChart : Control
             plot.Height - (10F * dpi),
             dpi,
             modelRows.Count,
-            sample.RemainingPercent.HasValue,
-            abnormalWindow != null);
+            sample.RemainingPercent.HasValue);
         var tooltipHeight = tooltipLayout.Height;
         if (tooltipWidth < 176F * dpi || tooltipLayout.DisplayRows == 0)
         {
@@ -2817,51 +2775,17 @@ internal sealed class QuotaTrendChart : Control
                 Font.Size * 0.78F);
             cursorY += 21F * dpi;
         }
-        if (abnormalWindow != null)
-        {
-            QuotaDashboardDrawing.DrawFittedText(
-                graphics,
-                $"容量推测偏差段（非官方额度异常）· 推测总容量 {QuotaDashboardDrawing.FormatUsdValue(abnormalWindow.EstimatedTotalUsd)} < " +
-                $"阈值 {QuotaDashboardDrawing.FormatUsdValue(abnormalWindow.ThresholdUsd)} · " +
-                $"官方剩余 {abnormalWindow.FromRemainingPercent:0}% → {abnormalWindow.ThroughRemainingPercent:0}%",
-                Font,
-                FontStyle.Bold,
-                _abnormalRemainingColor,
-                new RectangleF(left, cursorY, contentWidth, 21F * dpi),
-                StringAlignment.Near,
-                StringAlignment.Center,
-                Math.Max(5.4F, Font.Size * 0.58F),
-                Font.Size * 0.76F);
-        }
-    }
-
-    private PassiveQuotaAssessmentWindow? FindAbnormalAssessmentWindow(
-        DateTimeOffset from,
-        DateTimeOffset through)
-    {
-        if (through <= from)
-        {
-            return null;
-        }
-
-        return _assessmentWindows
-            .Where(item => item.FromUtc < through && item.ThroughUtc > from)
-            .OrderByDescending(item => item.ThroughUtc)
-            .FirstOrDefault();
     }
 
     private static ModelTooltipLayout CalculateModelTooltipLayout(
         float availableHeight,
         float dpi,
         int modelRowCount,
-        bool hasRemainingPercent,
-        bool hasAbnormalAssessment = false)
+        bool hasRemainingPercent)
     {
         dpi = Math.Max(1F, dpi);
         modelRowCount = Math.Max(0, modelRowCount);
-        var footerRows = 1 +
-                         (hasRemainingPercent ? 1 : 0) +
-                         (hasAbnormalAssessment ? 1 : 0);
+        var footerRows = 1 + (hasRemainingPercent ? 1 : 0);
         var fixedHeight = (68F + (footerRows * 21F) + 18F) * dpi;
         var rowHeight = 23F * dpi;
         var maximumSlots = (int)Math.Floor((availableHeight - fixedHeight) / rowHeight);
@@ -3445,107 +3369,6 @@ internal sealed class QuotaTrendChart : Control
     private static TimeSpan NormalizeBucketDuration(TimeSpan value) =>
         value > TimeSpan.Zero ? value : TimeSpan.FromHours(1);
 
-    private void DrawAbnormalRemainingWindows(
-        Graphics graphics,
-        RectangleF plot,
-        DateTimeOffset start,
-        DateTimeOffset end,
-        IReadOnlyList<PointF[]> remainingCurves,
-        float dpi)
-    {
-        if (_assessmentWindows.Length == 0 || remainingCurves.Count == 0 || end <= start)
-        {
-            return;
-        }
-
-        using var glow = new Pen(
-            Color.FromArgb(58, _abnormalRemainingColor),
-            Math.Max(4.6F, 6.2F * dpi))
-        {
-            StartCap = LineCap.Round,
-            EndCap = LineCap.Round,
-            LineJoin = LineJoin.Round
-        };
-        using var line = new Pen(
-            _abnormalRemainingColor,
-            Math.Max(1.8F, 2.6F * dpi))
-        {
-            StartCap = LineCap.Round,
-            EndCap = LineCap.Round,
-            LineJoin = LineJoin.Round
-        };
-        foreach (var window in _assessmentWindows)
-        {
-            var windowFrom = window.FromUtc.ToUniversalTime();
-            var windowThrough = window.ThroughUtc.ToUniversalTime();
-            var visibleFrom = windowFrom < start ? start : windowFrom;
-            var visibleThrough = windowThrough > end ? end : windowThrough;
-            if (visibleThrough <= visibleFrom)
-            {
-                continue;
-            }
-
-            var left = Math.Clamp(
-                MapX(visibleFrom, 0, 1, start, end, plot),
-                plot.Left,
-                plot.Right);
-            var right = Math.Clamp(
-                MapX(visibleThrough, 0, 1, start, end, plot),
-                plot.Left,
-                plot.Right);
-            if (right - left < 0.25F)
-            {
-                continue;
-            }
-
-            // Do not infer a second y-value from the assessment window.  Clip and redraw the
-            // already-smoothed official green path instead, so the red interval has the exact
-            // same geometry and tangent before, during, and after an abnormal assessment.
-            var state = graphics.Save();
-            try
-            {
-                graphics.SetClip(
-                    new RectangleF(left, plot.Top - (8F * dpi), right - left, plot.Height + (16F * dpi)),
-                    CombineMode.Intersect);
-                foreach (var curve in remainingCurves)
-                {
-                    if (curve.Length > 1)
-                    {
-                        graphics.DrawLines(glow, curve);
-                        graphics.DrawLines(line, curve);
-                    }
-                }
-            }
-            finally
-            {
-                graphics.Restore(state);
-            }
-
-            // A tiny cap on the same curve keeps the color transition round without creating
-            // a detached marker or a parallel red segment.
-            using var endpointBrush = new SolidBrush(_abnormalRemainingColor);
-            var capRadius = Math.Max(1.4F, 1.9F * dpi);
-            if (TryGetRemainingCurvePointAtX(remainingCurves, left, out var fromPoint))
-            {
-                graphics.FillEllipse(
-                    endpointBrush,
-                    fromPoint.X - capRadius,
-                    fromPoint.Y - capRadius,
-                    capRadius * 2F,
-                    capRadius * 2F);
-            }
-            if (TryGetRemainingCurvePointAtX(remainingCurves, right, out var throughPoint))
-            {
-                graphics.FillEllipse(
-                    endpointBrush,
-                    throughPoint.X - capRadius,
-                    throughPoint.Y - capRadius,
-                    capRadius * 2F,
-                    capRadius * 2F);
-            }
-        }
-    }
-
     private IReadOnlyList<PointF[]> DrawRemainingSeries(
         Graphics graphics,
         RectangleF plot,
@@ -3665,45 +3488,6 @@ internal sealed class QuotaTrendChart : Control
             graphics.DrawLines(pen, curve);
         }
         return curve;
-    }
-
-    private static bool TryGetRemainingCurvePointAtX(
-        IReadOnlyList<PointF[]> curves,
-        float x,
-        out PointF point)
-    {
-        foreach (var curve in curves)
-        {
-            for (var index = 1; index < curve.Length; index++)
-            {
-                var from = curve[index - 1];
-                var through = curve[index];
-                var minimum = Math.Min(from.X, through.X) - 0.25F;
-                var maximum = Math.Max(from.X, through.X) + 0.25F;
-                if (x < minimum || x > maximum)
-                {
-                    continue;
-                }
-
-                var horizontalSpan = through.X - from.X;
-                var ratio = Math.Abs(horizontalSpan) < 0.001F
-                    ? 0F
-                    : Math.Clamp((x - from.X) / horizontalSpan, 0F, 1F);
-                point = new PointF(
-                    x,
-                    from.Y + ((through.Y - from.Y) * ratio));
-                return true;
-            }
-
-            if (curve.Length == 1 && Math.Abs(curve[0].X - x) <= 0.75F)
-            {
-                point = curve[0];
-                return true;
-            }
-        }
-
-        point = PointF.Empty;
-        return false;
     }
 
     private void DrawTimeLabels(
@@ -3884,10 +3668,7 @@ internal sealed class QuotaTrendChart : Control
             : "共 " + _samples.Length.ToString(CultureInfo.CurrentCulture) +
               " 个时间点，本视图日志用量 " +
               QuotaDashboardDrawing.FormatUsdValue(totalCost) +
-              "，" + QuotaDashboardDrawing.FormatTokenValue(totalTokens) + " Token" +
-              (_assessmentWindows.Length == 0
-                  ? string.Empty
-                  : $"，其中 {_assessmentWindows.Length} 个容量推测偏差区间已标红");
+              "，" + QuotaDashboardDrawing.FormatTokenValue(totalTokens) + " Token";
     }
 
     internal static void ValidateHighDpiTooltipLayout()
@@ -3899,8 +3680,7 @@ internal sealed class QuotaTrendChart : Control
                 availableHeight,
                 dpi,
                 modelRowCount: 5,
-                hasRemainingPercent: true,
-                hasAbnormalAssessment: true);
+                hasRemainingPercent: true);
             if (layout.DisplayRows <= 0 ||
                 layout.Height > availableHeight + 0.01F ||
                 layout.ExplicitModelRows + layout.HiddenModelRows != 5)
@@ -4027,82 +3807,12 @@ internal sealed class QuotaTrendChart : Control
         chart.DrawToBitmap(bitmap, chart.ClientRectangle);
 
         chart._hoveredSampleIndex = -1;
-        chart.AbnormalRemainingColor = Color.FromArgb(239, 32, 48);
         using var normalBitmap = new Bitmap(chart.Width, chart.Height);
         chart.DrawToBitmap(normalBitmap, chart.ClientRectangle);
-        chart.AssessmentWindows =
-        [
-            new PassiveQuotaAssessmentWindow(
-                start.AddMinutes(30),
-                start.AddMinutes(90),
-                18,
-                20,
-                7D,
-                10D,
-                PassiveQuotaStatus.Abnormal)
-        ];
-        if (chart.FindAbnormalAssessmentWindow(start, start.AddHours(1)) == null)
+        if (chart.AccessibleDescription?.Contains("容量推测", StringComparison.Ordinal) == true)
         {
             throw new InvalidOperationException(
-                "Quota trend abnormal-window hit testing did not retain the monitoring interval.");
-        }
-        using var abnormalBitmap = new Bitmap(chart.Width, chart.Height);
-        chart.DrawToBitmap(abnormalBitmap, chart.ClientRectangle);
-        var changedPixels = 0;
-        var redPixels = 0;
-        for (var y = 0; y < chart.Height; y++)
-        {
-            for (var x = 0; x < chart.Width; x++)
-            {
-                var normalPixel = normalBitmap.GetPixel(x, y);
-                var abnormalPixel = abnormalBitmap.GetPixel(x, y);
-                if (normalPixel.ToArgb() != abnormalPixel.ToArgb())
-                {
-                    changedPixels++;
-                }
-                if (abnormalPixel.R > abnormalPixel.G + 45 &&
-                    abnormalPixel.R > abnormalPixel.B + 30)
-                {
-                    redPixels++;
-                }
-            }
-        }
-        if (changedPixels == 0 || redPixels == 0)
-        {
-            throw new InvalidOperationException(
-                "Quota trend monitoring intervals must visibly overlay the official percentage line in red.");
-        }
-
-        // Realtime scope supplies no assessment windows. Clearing them must restore the
-        // untouched chart and a normal assessment must never be converted to a red span.
-        chart.AssessmentWindows =
-        [
-            new PassiveQuotaAssessmentWindow(
-                start.AddMinutes(30),
-                start.AddMinutes(90),
-                18,
-                20,
-                12D,
-                10D,
-                PassiveQuotaStatus.Normal)
-        ];
-        if (chart.AssessmentWindows.Count != 0)
-        {
-            throw new InvalidOperationException(
-                "Quota trend must ignore normal assessment windows when selecting red overlays.");
-        }
-        using var realtimeBitmap = new Bitmap(chart.Width, chart.Height);
-        chart.DrawToBitmap(realtimeBitmap, chart.ClientRectangle);
-        for (var y = 0; y < chart.Height; y++)
-        {
-            for (var x = 0; x < chart.Width; x++)
-            {
-                if (normalBitmap.GetPixel(x, y).ToArgb() != realtimeBitmap.GetPixel(x, y).ToArgb())
-                {
-                    throw new InvalidOperationException(
-                        "Quota trend realtime rendering must remain unchanged when no abnormal intervals are supplied.");
-                }
-            }
+                "Quota trend accessibility text must not include removed passive capacity-anomaly labels.");
         }
     }
 }
@@ -4474,7 +4184,7 @@ internal static class QuotaDashboardControls
         RenderToBitmap(gauge);
         gauge.Size = new Size(180, 180);
         gauge.RemainingPercent = 40D;
-        gauge.StatusText = "额度正常";
+        gauge.StatusText = "官方实时额度";
         gauge.AccentColor = Color.FromArgb(12, 190, 125);
         gauge.TrackColor = Color.FromArgb(25, 35, 45);
         RenderToBitmap(gauge);
@@ -4697,13 +4407,13 @@ internal static class QuotaDashboardControls
     private static void ValidateFixedBluePurplePalette(PassiveQuotaGauge gauge)
     {
         gauge.RemainingPercent = 58D;
-        gauge.StatusText = "额度正常";
+        gauge.StatusText = "官方实时额度";
         gauge.AccentColor = Color.FromArgb(16, 185, 129);
         using var normalFrame = RenderGaugeFrame(gauge, MathF.Tau * 0.23F);
-        gauge.StatusText = "额度异常";
+        gauge.StatusText = "本窗口额度已用尽";
         gauge.AccentColor = Color.FromArgb(239, 68, 68);
-        using var abnormalFrame = RenderGaugeFrame(gauge, MathF.Tau * 0.23F);
-        if (CountChangedPixels(normalFrame, abnormalFrame) != 0)
+        using var exhaustedFrame = RenderGaugeFrame(gauge, MathF.Tau * 0.23F);
+        if (CountChangedPixels(normalFrame, exhaustedFrame) != 0)
         {
             throw new InvalidOperationException(
                 "Passive quota gauge palette must remain blue-purple regardless of quota health accent.");
@@ -4792,11 +4502,11 @@ internal static class QuotaDashboardControls
 
     private static void ValidateStatusIsNotPaintedInsideGauge(PassiveQuotaGauge gauge)
     {
-        gauge.StatusText = "额度正常";
+        gauge.StatusText = "官方实时额度";
         using var normalFrame = RenderGaugeFrame(gauge, MathF.Tau * 0.37F);
-        gauge.StatusText = "额度异常";
-        using var abnormalFrame = RenderGaugeFrame(gauge, MathF.Tau * 0.37F);
-        if (CountChangedPixels(normalFrame, abnormalFrame) != 0)
+        gauge.StatusText = "本窗口额度已用尽";
+        using var exhaustedFrame = RenderGaugeFrame(gauge, MathF.Tau * 0.37F);
+        if (CountChangedPixels(normalFrame, exhaustedFrame) != 0)
         {
             throw new InvalidOperationException(
                 "Quota health text must be rendered outside the gauge; the sphere only paints percentage and caption.");

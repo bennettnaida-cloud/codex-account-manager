@@ -38,7 +38,7 @@ async function main() {
     assert.doesNotMatch(manifest, /sk-test-secret|accessToken|"apiKey"/i);
     const config = fs.readFileSync(path.join(account.codexHome, 'config.toml'), 'utf8');
     assert.doesNotMatch(config, /\[windows\]|windows_wsl/i);
-    assert.match(config, /model = "gpt-5\.6"/);
+    assert.match(config, /model = "gpt-6\.1-sol"/);
     assert.ok(account.codexHome.startsWith(path.join(root, 'account-homes') + path.sep));
 
     store.updateQuotaProfile(account.id, {

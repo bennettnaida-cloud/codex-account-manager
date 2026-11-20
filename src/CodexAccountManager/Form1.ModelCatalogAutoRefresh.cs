@@ -15,6 +15,7 @@ public partial class Form1
     private Control? _modelCatalogPanel;
     private Label? _modelCatalogSourceLabel;
     private Label? _accountModelRefreshStatusLabel;
+    private string _modelCatalogAutoRefreshNote = string.Empty;
     private string _accountModelRefreshStatus = "账号模型独立同步；官网价格页失败不会关闭模型更新。";
     private string _automaticCompatibleModelStatus = "API：尚未检查";
     private string _automaticAccessTokenModelStatus = "AT：尚未检查";
@@ -185,18 +186,22 @@ public partial class Form1
             await ModelCatalogService.CheckAndSaveOfficialAsync(proxy, cancellationToken);
             if (IsDisposed || Disposing) return;
             _nextAutomaticPriceCheckUtc = DateTimeOffset.UtcNow.AddHours(6);
+            _modelCatalogAutoRefreshNote = string.Empty;
             InvalidateQuotaUsageCache(clearCachedData: true);
             if (_modelCatalogPanel is { IsDisposed: false, Visible: true } && !_modelCatalogEditorDirty)
                 RenderCards();
-            else if (_modelCatalogSourceLabel is { IsDisposed: false })
-                _modelCatalogSourceLabel.Text = GetModelCatalogSourceText(ModelCatalogService.Current) + " · 官网价格已更新";
+            else
+                UpdateModelCatalogSourceBadge(GetModelCatalogSourceText(ModelCatalogService.Current) + " · 官网价格已更新");
         }
         catch (OperationCanceledException) { }
-        catch
+        catch (Exception ex)
         {
-            // A price refresh must never display a startup error or discard the last good catalog.
-            if (!IsDisposed && _modelCatalogSourceLabel is { IsDisposed: false })
-                _modelCatalogSourceLabel.Text = GetModelCatalogSourceText(ModelCatalogService.Current) + " · 自动检查失败，稍后重试";
+            // A price refresh must never display a startup error or discard the last good catalog,
+            // but record the exact reason in diagnostics so format/network regressions are never silent.
+            ManagerLifecycleDiagnostics.WriteException("model-catalog-auto-refresh-failed", ex);
+            _modelCatalogAutoRefreshNote = "自动检查失败，稍后重试";
+            if (!IsDisposed)
+                UpdateModelCatalogSourceBadge(GetModelCatalogSourceText(ModelCatalogService.Current) + " · " + _modelCatalogAutoRefreshNote);
         }
         finally
         {

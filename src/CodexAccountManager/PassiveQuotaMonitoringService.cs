@@ -605,14 +605,7 @@ public sealed class PassiveQuotaMonitoringService
             stored.DisplayQuotaKind = displayAnchor.QuotaKind;
             stored.DisplayResetAtUtc = displayAnchor.ResetAtUtc;
             var snapshot = StoredEstimate.FromEstimate(estimate);
-            var assessmentWindowsChanged = !StoredAssessmentWindowsEqual(
-                stored.LastEstimate?.AssessmentWindows,
-                snapshot.AssessmentWindows);
-            var comparableSnapshot = stored.LastEstimate == null
-                ? snapshot
-                : snapshot with { AssessmentWindows = stored.LastEstimate.AssessmentWindows };
-            if (stored.LastEstimate != comparableSnapshot ||
-                assessmentWindowsChanged ||
+            if (stored.LastEstimate != snapshot ||
                 displayAnchorChanged)
             {
                 stored.LastEstimate = snapshot;
@@ -667,27 +660,6 @@ public sealed class PassiveQuotaMonitoringService
         return preferredQuotaKind != null && estimate.QuotaKind == preferredQuotaKind;
     }
 
-    private static bool StoredAssessmentWindowsEqual(
-        IReadOnlyList<StoredAssessmentWindow>? left,
-        IReadOnlyList<StoredAssessmentWindow>? right)
-    {
-        left ??= [];
-        right ??= [];
-        if (left.Count != right.Count)
-        {
-            return false;
-        }
-
-        for (var index = 0; index < left.Count; index++)
-        {
-            if (left[index] != right[index])
-            {
-                return false;
-            }
-        }
-        return true;
-    }
-
     private MonitoringFile LoadUnsafe()
     {
         if (!File.Exists(_path))
@@ -709,10 +681,6 @@ public sealed class PassiveQuotaMonitoringService
             foreach (var account in file.Accounts)
             {
                 account.OfficialObservations ??= [];
-                if (account.LastEstimate != null)
-                {
-                    account.LastEstimate.AssessmentWindows ??= [];
-                }
             }
             file.Accounts = file.Accounts
                 .Where(item => !string.IsNullOrWhiteSpace(item.AccountKey))
@@ -967,12 +935,8 @@ public sealed class PassiveQuotaMonitoringService
             var activeResult = service.Analyze(account, usage, SyntheticCost, epochStart.AddMinutes(20));
             if (!activeResult.IsEnabled ||
                 activeResult.IsRetainedEstimate ||
-                activeResult.Estimate is not { Status: PassiveQuotaStatus.Normal, EstimatedTotalUsd: { } total } ||
-                Math.Abs(total - 12D) > 0.000_001D ||
-                activeResult.Estimate.AssessmentWindows.Count == 0 ||
-                activeResult.Estimate.AssessmentWindows.Any(item =>
-                    item.Status != PassiveQuotaStatus.Normal ||
-                    Math.Abs(item.EstimatedTotalUsd - 12D) > 0.000_001D))
+                activeResult.Estimate is not { Status: PassiveQuotaStatus.Estimated, EstimatedTotalUsd: { } total } ||
+                Math.Abs(total - 12D) > 0.000_001D)
             {
                 throw new InvalidOperationException("Passive quota epoch cutoff self-test failed.");
             }
@@ -984,10 +948,6 @@ public sealed class PassiveQuotaMonitoringService
                 reloaded.StartingWindowMinutes != 300 ||
                 reloaded.LastEstimate?.EstimatedTotalUsd is not { } reloadedTotal ||
                 Math.Abs(reloadedTotal - 12D) > 0.000_001D ||
-                reloaded.LastEstimate.AssessmentWindows.Count !=
-                    activeResult.Estimate.AssessmentWindows.Count ||
-                !reloaded.LastEstimate.AssessmentWindows.SequenceEqual(
-                    activeResult.Estimate.AssessmentWindows) ||
                 reloaded.DisplayCapacityUsd is not { } reloadedDisplayCapacity ||
                 Math.Abs(reloadedDisplayCapacity - 12D) > 0.000_001D)
             {
@@ -1123,10 +1083,10 @@ public sealed class PassiveQuotaMonitoringService
                 SyntheticCost,
                 epochStart.AddMinutes(5));
             if (observedResult.Estimate is not
-                    { Status: PassiveQuotaStatus.Normal, EstimatedTotalUsd: { } observedTotal, CycleCount: 1 } ||
+                    { Status: PassiveQuotaStatus.Estimated, EstimatedTotalUsd: { } observedTotal, CycleCount: 1 } ||
                 Math.Abs(observedTotal - 210D) > 0.000_001D ||
                 observedReloaded.Estimate is not
-                    { Status: PassiveQuotaStatus.Normal, EstimatedTotalUsd: { } reloadedObservedTotal } ||
+                    { Status: PassiveQuotaStatus.Estimated, EstimatedTotalUsd: { } reloadedObservedTotal } ||
                 Math.Abs(reloadedObservedTotal - 210D) > 0.000_001D)
             {
                 throw new InvalidOperationException(
@@ -1165,7 +1125,7 @@ public sealed class PassiveQuotaMonitoringService
             // last window that happened to be calculated while an account detail was open.
             // The exact capacity may legitimately change with the later real workload;
             // what matters here is that no persisted boundary is silently ignored.
-            var completedWindowCount = livePercentageResult.Estimate.AssessmentWindows.Count;
+            var completedCycleCount = livePercentageResult.Estimate.CycleCount;
             observedUsage.Timeline.Add(new UsageEvent
             {
                 AccountName = observedAccount.Name,
@@ -1202,18 +1162,15 @@ public sealed class PassiveQuotaMonitoringService
                 epochStart.AddMinutes(10));
             var appendedReloaded = new PassiveQuotaMonitoringService(root).GetState(observedAccount);
             if (appendedBoundaryResult.Estimate is not { LatestUsedPercent: 7D } appendedEstimate ||
-                appendedEstimate.AssessmentWindows.Count <= completedWindowCount ||
-                !appendedEstimate.AssessmentWindows.Any(window =>
-                    window.ThroughUtc == epochStart.AddMinutes(10) &&
-                    window.ThroughUsedPercent == 7) ||
+                appendedEstimate.CycleCount <= completedCycleCount ||
                 appendedReloaded.LastEstimate is not { LatestUsedPercent: 7D } reloadedEstimate ||
-                reloadedEstimate.AssessmentWindows.Count != appendedEstimate.AssessmentWindows.Count ||
+                reloadedEstimate.CycleCount != appendedEstimate.CycleCount ||
                 appendedReloaded.DisplayCapacityUsd is not { } reloadedCapacity ||
                 appendedEstimate.EstimatedTotalUsd is not { } appendedCapacity ||
                 Math.Abs(reloadedCapacity - appendedCapacity) > 0.000_001D)
             {
                 throw new InvalidOperationException(
-                    "Persisted official boundaries appended after an earlier estimate must refresh the latest assessment and display capacity.");
+                    "Persisted official boundaries appended after an earlier estimate must refresh the latest capacity estimate and display capacity.");
             }
         }
         finally
@@ -1251,12 +1208,14 @@ public sealed class PassiveQuotaMonitoringService
               "AccountName": "legacy-monitor",
               "IsEnabled": false,
               "LastEstimate": {
-                "Status": 1,
+                "Status": 2,
                 "QuotaKind": "five_hour",
                 "WindowMinutes": 300,
                 "ThresholdUsd": 10,
                 "EstimatedTotalUsd": 12,
-                "Reason": "legacy state without assessment windows"
+                "EstimatedRemainingUsd": 9.6,
+                "Reason": "legacy state with deprecated anomaly status and assessment windows",
+                "AssessmentWindows": []
               }
             }
           ]
@@ -1268,11 +1227,10 @@ public sealed class PassiveQuotaMonitoringService
             new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
 
         var reloaded = new PassiveQuotaMonitoringService(legacyRoot).GetState(account);
-        if (reloaded.LastEstimate is not { EstimatedTotalUsd: 12D } legacyEstimate ||
-            legacyEstimate.AssessmentWindows.Count != 0)
+        if (reloaded.LastEstimate is not { Status: PassiveQuotaStatus.Estimated, EstimatedTotalUsd: 12D, EstimatedRemainingUsd: 9.6D })
         {
             throw new InvalidOperationException(
-                "Passive quota schema-5 state without assessment windows must remain readable.");
+                "Legacy schema-5/6 state with deprecated anomaly status must still deserialize capacity and remaining USD cleanly.");
         }
     }
 
@@ -1374,43 +1332,11 @@ public sealed class PassiveQuotaMonitoringService
         public DateTimeOffset? ResetsAtUtc { get; set; }
     }
 
-    private sealed record StoredAssessmentWindow
-    {
-        public DateTimeOffset FromUtc { get; init; }
-        public DateTimeOffset ThroughUtc { get; init; }
-        public int FromUsedPercent { get; init; }
-        public int ThroughUsedPercent { get; init; }
-        public double EstimatedTotalUsd { get; init; }
-        public double ThresholdUsd { get; init; }
-        public PassiveQuotaStatus Status { get; init; }
-
-        public static StoredAssessmentWindow FromWindow(PassiveQuotaAssessmentWindow window) => new()
-        {
-            FromUtc = window.FromUtc,
-            ThroughUtc = window.ThroughUtc,
-            FromUsedPercent = window.FromUsedPercent,
-            ThroughUsedPercent = window.ThroughUsedPercent,
-            EstimatedTotalUsd = window.EstimatedTotalUsd,
-            ThresholdUsd = window.ThresholdUsd,
-            Status = window.Status
-        };
-
-        public PassiveQuotaAssessmentWindow ToWindow() => new(
-            FromUtc,
-            ThroughUtc,
-            FromUsedPercent,
-            ThroughUsedPercent,
-            EstimatedTotalUsd,
-            ThresholdUsd,
-            Status);
-    }
-
     private sealed record StoredEstimate
     {
-        public PassiveQuotaStatus Status { get; init; }
+        public int Status { get; init; }
         public string QuotaKind { get; init; } = "unknown";
         public long? WindowMinutes { get; init; }
-        public double ThresholdUsd { get; init; }
         public double? EstimatedTotalUsd { get; init; }
         public double? EstimatedTotalLowerUsd { get; init; }
         public double? EstimatedTotalUpperUsd { get; init; }
@@ -1426,14 +1352,12 @@ public sealed class PassiveQuotaMonitoringService
         public int QualifiedCycleCount { get; init; }
         public DateTimeOffset? UpdatedAtUtc { get; init; }
         public string Reason { get; init; } = "";
-        public List<StoredAssessmentWindow> AssessmentWindows { get; set; } = [];
 
         public static StoredEstimate FromEstimate(PassiveQuotaEstimate estimate) => new()
         {
-            Status = estimate.Status,
+            Status = (int)estimate.Status,
             QuotaKind = estimate.QuotaKind,
             WindowMinutes = estimate.WindowMinutes,
-            ThresholdUsd = estimate.ThresholdUsd,
             EstimatedTotalUsd = estimate.EstimatedTotalUsd,
             EstimatedTotalLowerUsd = estimate.EstimatedTotalLowerUsd,
             EstimatedTotalUpperUsd = estimate.EstimatedTotalUpperUsd,
@@ -1448,19 +1372,13 @@ public sealed class PassiveQuotaMonitoringService
             CycleCount = estimate.CycleCount,
             QualifiedCycleCount = estimate.QualifiedCycleCount,
             UpdatedAtUtc = estimate.UpdatedAtUtc,
-            Reason = estimate.Reason,
-            AssessmentWindows = estimate.AssessmentWindows
-                .OrderBy(item => item.FromUtc)
-                .ThenBy(item => item.ThroughUtc)
-                .Select(StoredAssessmentWindow.FromWindow)
-                .ToList()
+            Reason = estimate.Reason
         };
 
         public PassiveQuotaEstimate ToEstimate() => new(
-            Status,
+            EstimatedTotalUsd is > 0D ? PassiveQuotaStatus.Estimated : PassiveQuotaStatus.Collecting,
             QuotaKind,
             WindowMinutes,
-            ThresholdUsd,
             EstimatedTotalUsd,
             EstimatedTotalLowerUsd,
             EstimatedTotalUpperUsd,
@@ -1476,13 +1394,6 @@ public sealed class PassiveQuotaMonitoringService
             QualifiedCycleCount,
             UpdatedAtUtc,
             Reason,
-            [])
-        {
-            AssessmentWindows = (AssessmentWindows ?? [])
-                .OrderBy(item => item.FromUtc)
-                .ThenBy(item => item.ThroughUtc)
-                .Select(item => item.ToWindow())
-                .ToArray()
-        };
+            []);
     }
 }

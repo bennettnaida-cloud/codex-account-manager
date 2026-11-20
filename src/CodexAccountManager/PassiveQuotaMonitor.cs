@@ -4,16 +4,14 @@ using System.Text;
 namespace CodexAccountManager;
 
 /// <summary>
-/// Result states emitted by the passive quota analyzer. The analyzer never creates
-/// model traffic: it only evaluates natural token_count events already present in
-/// an <see cref="AccountUsageSummary"/>.
+/// Result states emitted by the passive quota capacity estimator. The estimator never
+/// creates model traffic: it only evaluates natural token_count events already present in
+/// an <see cref="AccountUsageSummary"/> to estimate API-equivalent capacity and remaining USD.
 /// </summary>
 public enum PassiveQuotaStatus
 {
-    Collecting,
-    Normal,
-    Abnormal,
-    Indeterminate
+    Collecting = 0,
+    Estimated = 1
 }
 
 public sealed record PassiveQuotaModelUsage(
@@ -57,30 +55,10 @@ public sealed record PassiveQuotaOfficialObservation(
     DateTimeOffset? ResetsAtUtc,
     DateTimeOffset? ActivationEpochUtc);
 
-/// <summary>
-/// One completed, directly observed rolling measurement window.  These windows are
-/// emitted by the same analyzer that produces the headline estimate, so the chart can
-/// distinguish a genuinely low-capacity interval from an unrelated historical bucket.
-/// </summary>
-public sealed record PassiveQuotaAssessmentWindow(
-    DateTimeOffset FromUtc,
-    DateTimeOffset ThroughUtc,
-    int FromUsedPercent,
-    int ThroughUsedPercent,
-    double EstimatedTotalUsd,
-    double ThresholdUsd,
-    PassiveQuotaStatus Status)
-{
-    public double FromRemainingPercent => 100D - FromUsedPercent;
-
-    public double ThroughRemainingPercent => 100D - ThroughUsedPercent;
-}
-
 public sealed record PassiveQuotaEstimate(
     PassiveQuotaStatus Status,
     string QuotaKind,
     long? WindowMinutes,
-    double ThresholdUsd,
     double? EstimatedTotalUsd,
     double? EstimatedTotalLowerUsd,
     double? EstimatedTotalUpperUsd,
@@ -98,13 +76,9 @@ public sealed record PassiveQuotaEstimate(
     string Reason,
     IReadOnlyList<PassiveQuotaTrendPoint> Trend)
 {
-    public IReadOnlyList<PassiveQuotaAssessmentWindow> AssessmentWindows { get; init; } = [];
-
     public string StatusCode => Status switch
     {
-        PassiveQuotaStatus.Normal => "normal",
-        PassiveQuotaStatus.Abnormal => "abnormal",
-        PassiveQuotaStatus.Indeterminate => "indeterminate",
+        PassiveQuotaStatus.Estimated => "estimated",
         _ => "collecting"
     };
 }
@@ -120,13 +94,9 @@ public static class PassiveQuotaMonitor
     private const int MinimumNaturalSamples = 2;
     private const int MinimumObservedPercentSpan = 2;
     private const int RecentCompletedWindowLimit = 5;
-    private const int MaximumAssessmentWindowCount = 256;
     private const double PricingUncertainty = 0.05D;
     private const double RecentRegimeRelativeTolerance = 0.25D;
     private const double RecentRegimeMinimumToleranceUsd = 1D;
-    private const double MonthlySolThresholdUsd = 200D;
-    private const double MonthlyTerraThresholdUsd = 100D;
-    private const double MonthlyLunaThresholdUsd = 80D;
     private static readonly TimeSpan ResetTimestampTolerance = TimeSpan.FromMinutes(2);
 
     private sealed record QuotaProfile(
@@ -134,7 +104,6 @@ public static class PassiveQuotaMonitor
         long MinimumWindowMinutes,
         long MaximumWindowMinutes,
         long NominalWindowMinutes,
-        double ThresholdUsd,
         TimeSpan TrendLookback);
 
     private sealed record CalibrationSample(
@@ -211,7 +180,6 @@ public static class PassiveQuotaMonitor
         240,
         360,
         300,
-        10D,
         TimeSpan.FromDays(7));
 
     private static readonly QuotaProfile WeeklyProfile = new(
@@ -219,7 +187,6 @@ public static class PassiveQuotaMonitor
         9_000,
         11_000,
         10_080,
-        90D,
         TimeSpan.FromDays(14));
 
     private static readonly QuotaProfile MonthlyProfile = new(
@@ -227,9 +194,7 @@ public static class PassiveQuotaMonitor
         40_000,
         47_000,
         43_800,
-        200D,
         TimeSpan.FromDays(35));
-    private const double DisplayThresholdToleranceUsd = 0.005D;
 
     public static PassiveQuotaEstimate Analyze(
         AccountRecord account,
@@ -305,7 +270,6 @@ public static class PassiveQuotaMonitor
                 PassiveQuotaStatus.Collecting,
                 "unknown",
                 null,
-                0D,
                 null,
                 null,
                 null,
@@ -321,7 +285,7 @@ public static class PassiveQuotaMonitor
                 0,
                 null,
                 account.IsCompatibleApi
-                    ? "兼容 API 账号没有套餐百分比窗口，无法进行套餐总额度推断。"
+                    ? "兼容 API 账号没有套餐百分比窗口，无法进行套餐剩余金额推算。"
                     : "尚未识别到 5h、周或月额度窗口，正在等待自然用量日志。",
                 BuildTrend(
                     account,
@@ -330,9 +294,6 @@ public static class PassiveQuotaMonitor
                     Later(now.AddDays(-30), epochStartUtc),
                     TimeSpan.FromHours(1)));
         }
-
-        var latestNaturalModel = ResolveLatestNaturalModel(orderedEvents);
-        var latestModelThresholdUsd = ResolveStatusThresholdUsd(profile, latestNaturalModel);
 
         var trend = BuildTrend(
             account,
@@ -407,7 +368,6 @@ public static class PassiveQuotaMonitor
         {
             return EmptyEstimate(
                 profile,
-                latestModelThresholdUsd,
                 trend,
                 "已识别额度类型，但自然用量日志中还没有可用的官方整数百分比样本。",
                 currentOfficialUsedPercent,
@@ -436,26 +396,6 @@ public static class PassiveQuotaMonitor
             .Where(item => item != null)
             .Cast<SegmentEstimate>()
             .ToList();
-        var assessmentWindows = allSegmentEstimates
-            .Select(item =>
-            {
-                var windowModel = ResolveDominantNaturalModel(
-                    orderedEvents,
-                    CachedEventCost,
-                    item.FromUtc,
-                    item.ThroughUtc) ?? latestNaturalModel;
-                var windowThresholdUsd = ResolveStatusThresholdUsd(profile, windowModel);
-                return new PassiveQuotaAssessmentWindow(
-                    item.FromUtc,
-                    item.ThroughUtc,
-                    item.FromUsedPercent,
-                    item.ThroughUsedPercent,
-                    item.TotalUsd,
-                    windowThresholdUsd,
-                    ClassifyPointEstimateStatus(item.TotalUsd, windowThresholdUsd));
-            })
-            .TakeLast(MaximumAssessmentWindowCount)
-            .ToArray();
         var segmentEstimates = allSegmentEstimates
             .TakeLast(RecentCompletedWindowLimit)
             .ToList();
@@ -477,10 +417,9 @@ public static class PassiveQuotaMonitor
         {
             var hasCompletedRawWindow = rolling.CompletedWindows.Count > 0;
             return new PassiveQuotaEstimate(
-                hasCompletedRawWindow ? PassiveQuotaStatus.Indeterminate : PassiveQuotaStatus.Collecting,
+                PassiveQuotaStatus.Collecting,
                 profile.Kind,
                 latest.WindowMinutes,
-                latestModelThresholdUsd,
                 null,
                 null,
                 null,
@@ -496,10 +435,10 @@ public static class PassiveQuotaMonitor
                 0,
                 latestObservedAtUtc,
                 hasCompletedRawWindow
-                    ? "最近一个绝对 2 个百分点滑动窗口已完成，但本地 API 等值消耗不足或样本不一致，暂不判断正常或异常。"
+                    ? "最近一个绝对 2 个百分点滑动窗口已完成，但本地 API 等值消耗不足，暂无法推算剩余金额。"
                     : rolling.HasStartingBoundary
-                        ? $"监测中：当前滑动窗口已跨越 {observedSpan}/2 个百分点；达到 2 后更新结果。"
-                        : "正在等待官方整数百分比首次跳变；第一次跳变只用于锁定起测边界，不计入额度估算。",
+                        ? $"监测中：当前滑动窗口已跨越 {observedSpan}/2 个百分点；达到 2 后更新剩余金额估算。"
+                        : "正在等待官方整数百分比首次跳变；第一次跳变只用于锁定起测边界，不计入容量推算。",
                 trend);
         }
 
@@ -507,14 +446,6 @@ public static class PassiveQuotaMonitor
         var totalUsd = RecencySmoothedValue(robustSegments, item => item.TotalUsd);
         var lowerUsd = RecencySmoothedValue(robustSegments, item => item.LowerUsd);
         var upperUsd = RecencySmoothedValue(robustSegments, item => item.UpperUsd);
-        var statusModel = robustSegments.Count == 0
-            ? latestNaturalModel
-            : ResolveDominantNaturalModel(
-                  orderedEvents,
-                  CachedEventCost,
-                  robustSegments[^1].FromUtc,
-                  robustSegments[^1].ThroughUtc) ?? latestNaturalModel;
-        var statusThresholdUsd = ResolveStatusThresholdUsd(profile, statusModel);
 
         // The official percentage is integer-quantized. Add a modest uncertainty
         // margin as well, because an API-equivalent dollar is not an official
@@ -527,32 +458,16 @@ public static class PassiveQuotaMonitor
         var remainingUsd = totalUsd * remainingFraction;
         var remainingLowerUsd = lowerUsd * remainingLowerFraction;
         var remainingUpperUsd = upperUsd * remainingUpperFraction;
-        // The account-health badge and highlighted assessment windows deliberately use
-        // a deterministic reference threshold against the displayed point estimate. Monthly
-        // quotas follow the model represented by the latest accepted measurement window;
-        // five-hour and weekly quotas retain their fixed profile thresholds.
-        // The uncertainty interval remains available in the tooltip, but it must not
-        // replace a deterministic threshold result with a status based on whether the
-        // current official quota happens to be exhausted.
-        var status = ClassifyPointEstimateStatus(totalUsd, statusThresholdUsd);
         var robustWindowLabel = robustSegments.Count == 1
             ? "最近 1 个有效窗口"
             : $"最近 {robustSegments.Count} 个有效窗口的平滑值";
-        var reason = status switch
-        {
-            PassiveQuotaStatus.Normal =>
-                $"{robustWindowLabel}不低于 {FormatUsd(statusThresholdUsd)}，推断额度正常。",
-            PassiveQuotaStatus.Abnormal =>
-                $"{robustWindowLabel}低于 {FormatUsd(statusThresholdUsd)}，推断额度异常。",
-            _ =>
-                $"{robustWindowLabel}跨过 {FormatUsd(statusThresholdUsd)} 阈值；监测会继续滚动更新。"
-        };
+        var reason =
+            $"{robustWindowLabel}推算参考容量 {FormatUsd(totalUsd)}，按当前官方剩余 {100D - latestUsedPercent:0.#}% 换算约 {FormatUsd(remainingUsd)}。";
 
         return new PassiveQuotaEstimate(
-            status,
+            PassiveQuotaStatus.Estimated,
             profile.Kind,
             latest.WindowMinutes,
-            statusThresholdUsd,
             totalUsd,
             lowerUsd,
             upperUsd,
@@ -567,113 +482,8 @@ public static class PassiveQuotaMonitor
             rolling.CompletedWindows.Count,
             robustSegments.Count,
             latestObservedAtUtc,
-            reason + " 所有金额均按每条事件实际模型的 sub2api 实际账单口径换算（基础价格档，不启用 >272K 长上下文加价），并非官方美元余额；同样 Token 数量下会保留 Sol、Terra、Luna 等模型的价格差异。",
-            trend)
-        {
-            AssessmentWindows = assessmentWindows
-        };
-    }
-
-    private static double ResolveStatusThresholdUsd(QuotaProfile profile, string? modelName)
-    {
-        if (profile.Kind != MonthlyProfile.Kind)
-        {
-            return profile.ThresholdUsd;
-        }
-
-        return NormalizeTrendModel(modelName) switch
-        {
-            "gpt-5.6-terra" => MonthlyTerraThresholdUsd,
-            "gpt-5.6-luna" => MonthlyLunaThresholdUsd,
-            "gpt-5.6-sol" => MonthlySolThresholdUsd,
-            _ => profile.ThresholdUsd
-        };
-    }
-
-    private static string? ResolveLatestNaturalModel(
-        IReadOnlyList<UsageEvent> events,
-        DateTimeOffset? throughUtc = null)
-    {
-        var normalizedThroughUtc = throughUtc?.ToUniversalTime();
-        return events
-            .Where(item =>
-                item.Source == UsageEventSource.Natural &&
-                !string.IsNullOrWhiteSpace(item.Model) &&
-                (!normalizedThroughUtc.HasValue || item.TimestampUtc <= normalizedThroughUtc.Value))
-            .OrderByDescending(item => item.TimestampUtc)
-            .Select(item => item.Model!.Trim())
-            .FirstOrDefault();
-    }
-
-    private static string? ResolveDominantNaturalModel(
-        IReadOnlyList<UsageEvent> events,
-        Func<UsageEvent, double> estimateEventCostUsd,
-        DateTimeOffset fromUtc,
-        DateTimeOffset throughUtc)
-    {
-        var normalizedFromUtc = fromUtc.ToUniversalTime();
-        var normalizedThroughUtc = throughUtc.ToUniversalTime();
-        var dominant = events
-            .Where(item =>
-                item.Source == UsageEventSource.Natural &&
-                item.TimestampUtc > normalizedFromUtc &&
-                item.TimestampUtc <= normalizedThroughUtc &&
-                !string.IsNullOrWhiteSpace(item.Model))
-            .GroupBy(item => NormalizeTrendModel(item.Model), StringComparer.OrdinalIgnoreCase)
-            .Select(group => new
-            {
-                Model = group.Key,
-                CostUsd = group.Sum(item => SafeCost(item, estimateEventCostUsd)),
-                EventCount = group.Count(),
-                LatestTimestampUtc = group.Max(item => item.TimestampUtc)
-            })
-            .OrderByDescending(item => item.CostUsd)
-            .ThenByDescending(item => item.EventCount)
-            .ThenByDescending(item => item.LatestTimestampUtc)
-            .FirstOrDefault();
-
-        return dominant?.Model ?? ResolveLatestNaturalModel(events, normalizedThroughUtc);
-    }
-
-    private static PassiveQuotaStatus ClassifyCapacityRangeStatus(
-        double lowerUsd,
-        double upperUsd,
-        double thresholdUsd)
-    {
-        if (!double.IsFinite(lowerUsd) ||
-            !double.IsFinite(upperUsd) ||
-            !double.IsFinite(thresholdUsd) ||
-            lowerUsd < 0D ||
-            upperUsd < lowerUsd ||
-            thresholdUsd < 0D)
-        {
-            return PassiveQuotaStatus.Indeterminate;
-        }
-
-        return lowerUsd >= thresholdUsd
-            ? PassiveQuotaStatus.Normal
-            : upperUsd < thresholdUsd
-                ? PassiveQuotaStatus.Abnormal
-                : PassiveQuotaStatus.Indeterminate;
-    }
-
-    private static PassiveQuotaStatus ClassifyPointEstimateStatus(
-        double estimatedTotalUsd,
-        double thresholdUsd)
-    {
-        if (!double.IsFinite(estimatedTotalUsd) ||
-            !double.IsFinite(thresholdUsd) ||
-            estimatedTotalUsd < 0D ||
-            thresholdUsd < 0D)
-        {
-            return PassiveQuotaStatus.Indeterminate;
-        }
-
-        // Estimates are presented to cents, so a sub-cent floating-point artifact at
-        // exactly the configured threshold must not turn a normal capacity abnormal.
-        return estimatedTotalUsd + DisplayThresholdToleranceUsd >= thresholdUsd
-            ? PassiveQuotaStatus.Normal
-            : PassiveQuotaStatus.Abnormal;
+            reason + " 所有金额均按每条事件实际模型的 sub2api 实际账单口径换算（基础价格档，不启用 >272K 长上下文加价），并非官方美元余额。",
+            trend);
     }
 
     /// <summary>
@@ -685,38 +495,38 @@ public static class PassiveQuotaMonitor
         var now = new DateTimeOffset(2026, 7, 12, 12, 0, 0, TimeSpan.Zero);
         static double SyntheticCost(UsageEvent item) => item.InputTokens / 1_000_000D;
 
-        var weeklyNormal = Analyze(
-            MakeSyntheticAccount("weekly-normal", AccountQuotaLimitType.FiveHourAndWeekly),
+        var fiveHourHigh = Analyze(
+            MakeSyntheticAccount("five-hour-high", AccountQuotaLimitType.FiveHourAndWeekly),
             MakeSyntheticUsage(now, 300, dollarsPerPercent: 0.20D, percentSpan: 10),
             SyntheticCost,
             now);
-        var weeklyAbnormal = Analyze(
-            MakeSyntheticAccount("weekly-abnormal", AccountQuotaLimitType.FiveHourAndWeekly),
+        var fiveHourLow = Analyze(
+            MakeSyntheticAccount("five-hour-low", AccountQuotaLimitType.FiveHourAndWeekly),
             MakeSyntheticUsage(now, 300, dollarsPerPercent: 0.04D, percentSpan: 5),
             SyntheticCost,
             now);
-        var weeklyWindowNormal = Analyze(
-            MakeSyntheticAccount("weekly-window-normal", AccountQuotaLimitType.WeeklyOnly),
+        var weeklyWindowHigh = Analyze(
+            MakeSyntheticAccount("weekly-window-high", AccountQuotaLimitType.WeeklyOnly),
             MakeSyntheticUsage(now, 10_080, dollarsPerPercent: 1.60D, percentSpan: 10),
             SyntheticCost,
             now);
-        var weeklyWindowAbnormal = Analyze(
-            MakeSyntheticAccount("weekly-window-abnormal", AccountQuotaLimitType.WeeklyOnly),
+        var weeklyWindowLow = Analyze(
+            MakeSyntheticAccount("weekly-window-low", AccountQuotaLimitType.WeeklyOnly),
             MakeSyntheticUsage(now, 10_080, dollarsPerPercent: 0.40D, percentSpan: 10),
             SyntheticCost,
             now);
-        var weeklyWindowBoundary = Analyze(
-            MakeSyntheticAccount("weekly-window-boundary", AccountQuotaLimitType.WeeklyOnly),
+        var weeklyWindowMid = Analyze(
+            MakeSyntheticAccount("weekly-window-mid", AccountQuotaLimitType.WeeklyOnly),
             MakeSyntheticUsage(now, 10_080, dollarsPerPercent: 0.90D, percentSpan: 10),
             SyntheticCost,
             now);
-        var monthlyNormal = Analyze(
-            MakeSyntheticAccount("monthly-normal", AccountQuotaLimitType.Monthly),
+        var monthlyHigh = Analyze(
+            MakeSyntheticAccount("monthly-high", AccountQuotaLimitType.Monthly),
             MakeSyntheticUsage(now, 43_800, dollarsPerPercent: 3.40D, percentSpan: 10),
             SyntheticCost,
             now);
-        var monthlyAbnormal = Analyze(
-            MakeSyntheticAccount("monthly-abnormal", AccountQuotaLimitType.Monthly),
+        var monthlyLow = Analyze(
+            MakeSyntheticAccount("monthly-low", AccountQuotaLimitType.Monthly),
             MakeSyntheticUsage(now, 43_800, dollarsPerPercent: 0.80D, percentSpan: 20),
             SyntheticCost,
             now);
@@ -725,55 +535,44 @@ public static class PassiveQuotaMonitor
             MakeSyntheticUsage(now, 300, dollarsPerPercent: 0.12D, percentSpan: 1),
             SyntheticCost,
             now);
-        var thresholdCrossing = Analyze(
-            MakeSyntheticAccount("indeterminate", AccountQuotaLimitType.FiveHourAndWeekly),
-            MakeSyntheticUsage(now, 300, dollarsPerPercent: 0.10D, percentSpan: 10),
-            SyntheticCost,
-            now);
-        var terraSwitchingRangeStatus = ClassifyCapacityRangeStatus(87.59D, 290.43D, 200D);
 
-        if (weeklyNormal.Status != PassiveQuotaStatus.Normal ||
-            weeklyNormal.EstimatedTotalUsd is not { } weeklyNormalTotal ||
-            Math.Abs(weeklyNormalTotal - 20D) > 0.000_001D ||
-            weeklyAbnormal.Status != PassiveQuotaStatus.Abnormal ||
-            weeklyAbnormal.EstimatedTotalUsd is not { } weeklyAbnormalTotal ||
-            Math.Abs(weeklyAbnormalTotal - 4D) > 0.000_001D ||
-            weeklyWindowNormal.Status != PassiveQuotaStatus.Normal ||
-            weeklyWindowNormal.ThresholdUsd != 90D ||
-            weeklyWindowNormal.EstimatedTotalUsd is not { } weeklyWindowNormalTotal ||
-            Math.Abs(weeklyWindowNormalTotal - 160D) > 0.000_001D ||
-            weeklyWindowAbnormal.Status != PassiveQuotaStatus.Abnormal ||
-            weeklyWindowAbnormal.ThresholdUsd != 90D ||
-            weeklyWindowAbnormal.EstimatedTotalUsd is not { } weeklyWindowAbnormalTotal ||
-            Math.Abs(weeklyWindowAbnormalTotal - 40D) > 0.000_001D ||
-            weeklyWindowBoundary.Status != PassiveQuotaStatus.Normal ||
-            weeklyWindowBoundary.EstimatedTotalUsd is not { } weeklyWindowBoundaryTotal ||
-            Math.Abs(weeklyWindowBoundaryTotal - 90D) > 0.000_001D ||
-            monthlyNormal.Status != PassiveQuotaStatus.Normal ||
-            monthlyNormal.EstimatedTotalUsd is not { } monthlyNormalTotal ||
-            Math.Abs(monthlyNormalTotal - 340D) > 0.000_001D ||
-            monthlyAbnormal.Status != PassiveQuotaStatus.Abnormal ||
-            monthlyAbnormal.EstimatedTotalUsd is not { } monthlyAbnormalTotal ||
-            Math.Abs(monthlyAbnormalTotal - 80D) > 0.000_001D ||
+        if (fiveHourHigh.Status != PassiveQuotaStatus.Estimated ||
+            fiveHourHigh.EstimatedTotalUsd is not { } fiveHourHighTotal ||
+            Math.Abs(fiveHourHighTotal - 20D) > 0.000_001D ||
+            fiveHourHigh.EstimatedRemainingUsd is not { } fiveHourHighRemaining ||
+            Math.Abs(fiveHourHighRemaining - 16D) > 0.000_001D ||
+            fiveHourLow.Status != PassiveQuotaStatus.Estimated ||
+            fiveHourLow.EstimatedTotalUsd is not { } fiveHourLowTotal ||
+            Math.Abs(fiveHourLowTotal - 4D) > 0.000_001D ||
+            weeklyWindowHigh.Status != PassiveQuotaStatus.Estimated ||
+            weeklyWindowHigh.EstimatedTotalUsd is not { } weeklyWindowHighTotal ||
+            Math.Abs(weeklyWindowHighTotal - 160D) > 0.000_001D ||
+            weeklyWindowLow.Status != PassiveQuotaStatus.Estimated ||
+            weeklyWindowLow.EstimatedTotalUsd is not { } weeklyWindowLowTotal ||
+            Math.Abs(weeklyWindowLowTotal - 40D) > 0.000_001D ||
+            weeklyWindowMid.Status != PassiveQuotaStatus.Estimated ||
+            weeklyWindowMid.EstimatedTotalUsd is not { } weeklyWindowMidTotal ||
+            Math.Abs(weeklyWindowMidTotal - 90D) > 0.000_001D ||
+            monthlyHigh.Status != PassiveQuotaStatus.Estimated ||
+            monthlyHigh.EstimatedTotalUsd is not { } monthlyHighTotal ||
+            Math.Abs(monthlyHighTotal - 340D) > 0.000_001D ||
+            monthlyLow.Status != PassiveQuotaStatus.Estimated ||
+            monthlyLow.EstimatedTotalUsd is not { } monthlyLowTotal ||
+            Math.Abs(monthlyLowTotal - 80D) > 0.000_001D ||
             insufficient.Status != PassiveQuotaStatus.Collecting ||
-            thresholdCrossing.Status != PassiveQuotaStatus.Normal ||
-            thresholdCrossing.EstimatedTotalLowerUsd is not { } crossingLower ||
-            thresholdCrossing.EstimatedTotalUpperUsd is not { } crossingUpper ||
-            crossingLower >= thresholdCrossing.ThresholdUsd ||
-            crossingUpper < thresholdCrossing.ThresholdUsd ||
-            terraSwitchingRangeStatus != PassiveQuotaStatus.Indeterminate)
+            fiveHourLow.Reason.Contains("异常", StringComparison.Ordinal) ||
+            fiveHourHigh.Reason.Contains("正常", StringComparison.Ordinal))
         {
             throw new InvalidOperationException(
-                "Passive quota classification self-test failed: " +
-                $"weeklyNormal={weeklyNormal.Status}/{weeklyNormal.EstimatedTotalUsd}, " +
-                $"weeklyAbnormal={weeklyAbnormal.Status}/{weeklyAbnormal.EstimatedTotalUsd}, " +
-                $"weeklyWindowNormal={weeklyWindowNormal.Status}/{weeklyWindowNormal.EstimatedTotalUsd}, " +
-                $"weeklyWindowAbnormal={weeklyWindowAbnormal.Status}/{weeklyWindowAbnormal.EstimatedTotalUsd}, " +
-                $"weeklyWindowBoundary={weeklyWindowBoundary.Status}/{weeklyWindowBoundary.EstimatedTotalUsd}, " +
-                $"monthlyNormal={monthlyNormal.Status}/{monthlyNormal.EstimatedTotalUsd}, " +
-                $"monthlyAbnormal={monthlyAbnormal.Status}/{monthlyAbnormal.EstimatedTotalUsd}, " +
-                $"insufficient={insufficient.Status}, crossing={thresholdCrossing.Status}, " +
-                $"terraSwitchingRange={terraSwitchingRangeStatus}.");
+                "Passive quota capacity estimation self-test failed: " +
+                $"fiveHourHigh={fiveHourHigh.Status}/{fiveHourHigh.EstimatedTotalUsd}, " +
+                $"fiveHourLow={fiveHourLow.Status}/{fiveHourLow.EstimatedTotalUsd}, " +
+                $"weeklyWindowHigh={weeklyWindowHigh.Status}/{weeklyWindowHigh.EstimatedTotalUsd}, " +
+                $"weeklyWindowLow={weeklyWindowLow.Status}/{weeklyWindowLow.EstimatedTotalUsd}, " +
+                $"weeklyWindowMid={weeklyWindowMid.Status}/{weeklyWindowMid.EstimatedTotalUsd}, " +
+                $"monthlyHigh={monthlyHigh.Status}/{monthlyHigh.EstimatedTotalUsd}, " +
+                $"monthlyLow={monthlyLow.Status}/{monthlyLow.EstimatedTotalUsd}, " +
+                $"insufficient={insufficient.Status}.");
         }
 
         var csvAccount = MakeSyntheticAccount("comma,quote\"account", AccountQuotaLimitType.FiveHourAndWeekly);
@@ -792,7 +591,6 @@ public static class PassiveQuotaMonitor
         ValidateRollingMeasurementWindows();
         ValidateEveryOnePercentRefreshesEstimate();
         ValidateRecentConsensusOverridesHistoricalRegime();
-        ValidateMonthlyModelThresholds();
         ValidateOfficialModelEquivalentCapacity();
         ValidatePersistedOfficialBoundariesIgnoreInterleavedNaturalEpochs();
         ValidateHighVelocityMeasurementWindows();
@@ -845,31 +643,18 @@ public static class PassiveQuotaMonitor
         AddBoundary(5, 15, 0.30D);
         var third = Analyze(account, usage, SyntheticCost, startedAtUtc.AddMinutes(5), startedAtUtc, 10, 300);
 
-        if (first.Status != PassiveQuotaStatus.Normal ||
+        if (first.Status != PassiveQuotaStatus.Estimated ||
             first.EstimatedTotalUsd is not { } firstTotal ||
             Math.Abs(firstTotal - 12D) > 0.000_001D ||
             first.CycleCount != 1 ||
-            first.AssessmentWindows is not
-                [{ Status: PassiveQuotaStatus.Normal, EstimatedTotalUsd: { } firstWindowTotal }] ||
-            Math.Abs(firstWindowTotal - 12D) > 0.000_001D ||
-            first.AssessmentWindows[0].FromUsedPercent != 11 ||
-            first.AssessmentWindows[0].ThroughUsedPercent != 13 ||
-            second.Status != PassiveQuotaStatus.Abnormal ||
+            second.Status != PassiveQuotaStatus.Estimated ||
             second.EstimatedTotalUsd is not { } secondTotal ||
             Math.Abs(secondTotal - 9.5D) > 0.000_001D ||
             second.CycleCount != 2 ||
-            second.AssessmentWindows.Count != 2 ||
-            second.AssessmentWindows[1].Status != PassiveQuotaStatus.Abnormal ||
-            Math.Abs(second.AssessmentWindows[1].EstimatedTotalUsd - 7D) > 0.000_001D ||
-            second.AssessmentWindows[1].FromUtc != startedAtUtc.AddMinutes(2) ||
-            second.AssessmentWindows[1].ThroughUtc != startedAtUtc.AddMinutes(4) ||
-            third.Status != PassiveQuotaStatus.Normal ||
+            third.Status != PassiveQuotaStatus.Estimated ||
             third.EstimatedTotalUsd is not { } thirdTotal ||
             Math.Abs(thirdTotal - 12.75D) > 0.000_001D ||
-            third.CycleCount != 3 ||
-            third.AssessmentWindows.Count != 3 ||
-            third.AssessmentWindows[2].Status != PassiveQuotaStatus.Normal ||
-            Math.Abs(third.AssessmentWindows[2].EstimatedTotalUsd - 16D) > 0.000_001D)
+            third.CycleCount != 3)
         {
             throw new InvalidOperationException(
                 "Passive quota rolling-window self-test failed: the first transition " +
@@ -1029,7 +814,7 @@ public static class PassiveQuotaMonitor
             startingWindowMinutes: 43_800,
             officialObservations);
 
-        if (estimate.Status != PassiveQuotaStatus.Normal ||
+        if (estimate.Status != PassiveQuotaStatus.Estimated ||
             estimate.EstimatedTotalUsd is not { } totalUsd ||
             Math.Abs(totalUsd - 240D) > 0.000_001D ||
             estimate.ObservedPercentSpan != 1D ||
@@ -1082,7 +867,7 @@ public static class PassiveQuotaMonitor
         AddBoundary(5, 28, 0.48D);
 
         var estimate = Analyze(account, usage, SyntheticCost, startedAtUtc.AddMinutes(5));
-        if (estimate.Status != PassiveQuotaStatus.Normal ||
+        if (estimate.Status != PassiveQuotaStatus.Estimated ||
             estimate.EstimatedTotalUsd is not { } totalUsd ||
             Math.Abs(totalUsd - 12D) > 0.000_001D ||
             estimate.CycleCount != 4 ||
@@ -1130,7 +915,7 @@ public static class PassiveQuotaMonitor
         AddBoundary(61, 5, 1D, secondActivation);
 
         var estimate = Analyze(account, usage, SyntheticCost, startedAtUtc.AddMinutes(61));
-        if (estimate.Status != PassiveQuotaStatus.Normal ||
+        if (estimate.Status != PassiveQuotaStatus.Estimated ||
             estimate.EstimatedTotalUsd is not { } totalUsd ||
             Math.Abs(totalUsd - 210D) > 0.000_001D ||
             estimate.CycleCount != 1)
@@ -1363,7 +1148,6 @@ public static class PassiveQuotaMonitor
         if (weeklyOnlyEstimate.Status != PassiveQuotaStatus.Collecting ||
             weeklyOnlyEstimate.EstimatedTotalUsd.HasValue ||
             weeklyOnlyEstimate.QuotaKind != "weekly" ||
-            weeklyOnlyEstimate.ThresholdUsd != 90D ||
             weeklyOnlyTrend.Count != 1 ||
             weeklyOnlyTrend[0] is not { QuotaKind: "weekly", WindowMinutes: 10_080, RemainingPercent: 51D } ||
             reversedTrend.Count != 1 ||
@@ -1710,7 +1494,6 @@ public static class PassiveQuotaMonitor
 
     private static PassiveQuotaEstimate EmptyEstimate(
         QuotaProfile profile,
-        double thresholdUsd,
         IReadOnlyList<PassiveQuotaTrendPoint> trend,
         string reason,
         double? latestUsedPercent,
@@ -1720,7 +1503,6 @@ public static class PassiveQuotaMonitor
             PassiveQuotaStatus.Collecting,
             profile.Kind,
             profile.NominalWindowMinutes,
-            thresholdUsd,
             null,
             null,
             null,
@@ -2134,73 +1916,6 @@ public static class PassiveQuotaMonitor
             });
         }
         return usage;
-    }
-
-    private static void ValidateMonthlyModelThresholds()
-    {
-        var now = new DateTimeOffset(2026, 7, 16, 12, 0, 0, TimeSpan.Zero);
-        static double SyntheticCost(UsageEvent item) => item.InputTokens / 1_000_000D;
-
-        static AccountUsageSummary MakeModelUsage(
-            DateTimeOffset now,
-            string model,
-            double dollarsPerPercent)
-        {
-            var usage = MakeSyntheticUsage(
-                now,
-                43_800,
-                dollarsPerPercent,
-                percentSpan: 10);
-            foreach (var item in usage.Timeline)
-            {
-                item.Model = model;
-            }
-            return usage;
-        }
-
-        var sol = Analyze(
-            MakeSyntheticAccount("monthly-sol-threshold", AccountQuotaLimitType.Monthly),
-            MakeModelUsage(now, "gpt-5.6-sol", 1.50D),
-            SyntheticCost,
-            now);
-        var terra = Analyze(
-            MakeSyntheticAccount("monthly-terra-threshold", AccountQuotaLimitType.Monthly),
-            MakeModelUsage(now, "gpt-5.6-terra", 1.50D),
-            SyntheticCost,
-            now);
-        var luna = Analyze(
-            MakeSyntheticAccount("monthly-luna-threshold", AccountQuotaLimitType.Monthly),
-            MakeModelUsage(now, "gpt-5.6-luna", 0.90D),
-            SyntheticCost,
-            now);
-        var lunaAbnormal = Analyze(
-            MakeSyntheticAccount("monthly-luna-abnormal", AccountQuotaLimitType.Monthly),
-            MakeModelUsage(now, "gpt-5.6-luna", 0.70D),
-            SyntheticCost,
-            now);
-
-        if (sol.ThresholdUsd != MonthlySolThresholdUsd ||
-            sol.Status != PassiveQuotaStatus.Abnormal ||
-            terra.ThresholdUsd != MonthlyTerraThresholdUsd ||
-            terra.Status != PassiveQuotaStatus.Normal ||
-            luna.ThresholdUsd != MonthlyLunaThresholdUsd ||
-            luna.Status != PassiveQuotaStatus.Normal ||
-            lunaAbnormal.ThresholdUsd != MonthlyLunaThresholdUsd ||
-            lunaAbnormal.Status != PassiveQuotaStatus.Abnormal ||
-            sol.AssessmentWindows.Count == 0 ||
-            terra.AssessmentWindows.Count == 0 ||
-            luna.AssessmentWindows.Count == 0 ||
-            lunaAbnormal.AssessmentWindows.Count == 0 ||
-            sol.AssessmentWindows.Any(item => item.ThresholdUsd != MonthlySolThresholdUsd) ||
-            terra.AssessmentWindows.Any(item => item.ThresholdUsd != MonthlyTerraThresholdUsd) ||
-            luna.AssessmentWindows.Any(item => item.ThresholdUsd != MonthlyLunaThresholdUsd) ||
-            lunaAbnormal.AssessmentWindows.Any(item => item.ThresholdUsd != MonthlyLunaThresholdUsd))
-        {
-            throw new InvalidOperationException(
-                "Monthly passive quota thresholds must follow the model represented by each accepted window: " +
-                $"sol={sol.Status}/{sol.ThresholdUsd}, terra={terra.Status}/{terra.ThresholdUsd}, " +
-                $"luna={luna.Status}/{luna.ThresholdUsd}, lunaAbnormal={lunaAbnormal.Status}/{lunaAbnormal.ThresholdUsd}.");
-        }
     }
 
     private static void ValidateOfficialModelEquivalentCapacity()

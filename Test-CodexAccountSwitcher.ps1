@@ -1,4 +1,4 @@
-Set-StrictMode -Version Latest
+﻿Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $PSDefaultParameterValues['Get-Content:Encoding'] = 'utf8'
 
@@ -662,24 +662,14 @@ if ($probeUsageLedgerSource -notmatch 'LoadSince\(' -or
 }
 if ($passiveQuotaMonitorSource -notmatch 'PassiveQuotaMonitor' -or
     $passiveQuotaMonitorSource -notmatch 'MinimumObservedPercentSpan\s*=\s*2' -or
-    $passiveQuotaMonitorSource -notmatch '(?s)FiveHourProfile\s*=\s*new\(\s*"five_hour",\s*240,\s*360,\s*300,\s*10D,' -or
-    $passiveQuotaMonitorSource -notmatch '(?s)WeeklyProfile\s*=\s*new\(\s*"weekly",\s*9_000,\s*11_000,\s*10_080,\s*90D,' -or
-    $passiveQuotaMonitorSource -notmatch '(?s)MonthlyProfile\s*=\s*new\(\s*"monthly",\s*40_000,\s*47_000,\s*43_800,\s*200D,' -or
-    $passiveQuotaMonitorSource -notmatch 'MonthlySolThresholdUsd\s*=\s*200D' -or
-    $passiveQuotaMonitorSource -notmatch 'MonthlyTerraThresholdUsd\s*=\s*100D' -or
-    $passiveQuotaMonitorSource -notmatch 'MonthlyLunaThresholdUsd\s*=\s*80D' -or
-    $passiveQuotaMonitorSource -notmatch 'ResolveStatusThresholdUsd' -or
-    $passiveQuotaMonitorSource -notmatch 'ResolveDominantNaturalModel' -or
-    $passiveQuotaMonitorSource -notmatch 'ValidateMonthlyModelThresholds' -or
+    $passiveQuotaMonitorSource -notmatch '(?s)FiveHourProfile\s*=\s*new\(\s*"five_hour",\s*240,\s*360,\s*300,' -or
+    $passiveQuotaMonitorSource -notmatch '(?s)WeeklyProfile\s*=\s*new\(\s*"weekly",\s*9_000,\s*11_000,\s*10_080,' -or
+    $passiveQuotaMonitorSource -notmatch '(?s)MonthlyProfile\s*=\s*new\(\s*"monthly",\s*40_000,\s*47_000,\s*43_800,' -or
     $passiveQuotaMonitorSource -notmatch 'UsageEventSource\.Natural or UsageEventSource\.OfficialSnapshot' -or
     $passiveQuotaMonitoringSource -notmatch 'CaptureOfficialObservationsIfCurrent' -or
     $passiveQuotaMonitorSource -notmatch 'ActivationEpochUtc' -or
     $passiveQuotaMonitorSource -notmatch 'naturalUsageNotBeforeUtc' -or
     $passiveQuotaMonitorSource -notmatch 'ExportCsv' -or
-    $passiveQuotaMonitorSource -notmatch 'PassiveQuotaAssessmentWindow' -or
-    $passiveQuotaMonitorSource -notmatch 'MaximumAssessmentWindowCount\s*=\s*256' -or
-    $passiveQuotaMonitoringSource -notmatch 'StoredAssessmentWindow' -or
-    $passiveQuotaMonitoringSource -notmatch 'ValidateLegacyAssessmentSchema' -or
     $passiveQuotaMonitorSource -match 'CodexCliService|Process\.Start|thread/start|turn/start|CALIBRATION_PAYLOAD' -or
     $passiveQuotaMonitoringSource -notmatch 'class PassiveQuotaMonitoringService' -or
     $passiveQuotaMonitoringSource -notmatch 'quota-monitor-settings\.json' -or
@@ -703,9 +693,8 @@ if ($passiveQuotaMonitorSource -notmatch 'PassiveQuotaMonitor' -or
     $quotaDashboardControlsSource -notmatch 'public Color CostFillColor' -or
     $quotaDashboardControlsSource -notmatch 'FormatUsdAxis\(cost, maximumCost\)' -or
     $quotaDashboardControlsSource -notmatch 'protected override void OnMouseMove\(MouseEventArgs e\)' -or
-     $quotaDashboardControlsSource -notmatch 'GetRollingOneHourMetric\(' -or
-    $quotaDashboardControlsSource -notmatch 'DrawAbnormalRemainingWindows\(' -or
-     $quotaDashboardControlsSource -notmatch '容量推测偏差段' -or
+    $quotaDashboardControlsSource -notmatch 'GetRollingOneHourMetric\(' -or
+    $quotaDashboardControlsSource -match 'DrawAbnormalRemainingWindows|容量推测偏差段|额度异常|额度正常' -or
     $quotaDashboardControlsSource -notmatch '使用速率' -or
     $quotaDashboardControlsSource -notmatch '近 1 小时' -or
     $formSource -notmatch 'MakePassiveQuotaMonitor' -or
@@ -717,13 +706,14 @@ if ($passiveQuotaMonitorSource -notmatch 'PassiveQuotaMonitor' -or
     $formSource -notmatch 'MakeQuotaTrendToolbar' -or
     $formSource -notmatch 'Height\s*=\s*GetQuotaTrendChartHeight\(innerWidth\)' -or
     $formSource -notmatch 'CalculateQuotaTrendChartHeight\(innerWidth, dpiScale\)' -or
+    $formSource -match '"额度异常"|"额度正常"|"额度待确认"|"推测异常"|"推测正常"' -or
     $quotaDashboardControlsSource -notmatch 'CalculateModelTooltipLayout' -or
     $quotaDashboardControlsSource -notmatch 'ValidateHighDpiTooltipLayout' -or
     $formSource -notmatch 'CostColor\s*=\s*_palette\.PrimaryColor' -or
     $formSource -notmatch '导出 CSV' -or
     $programSource -notmatch 'PassiveQuotaMonitor\.Validate\(\)' -or
     $programSource -notmatch 'QuotaDashboardControls\.Validate\(\)') {
-    throw 'Passive quota monitoring must use only natural logs, render a level-controlled gauge plus a tall USD trend with hourly hover details, and export safe CSV.'
+    throw 'Passive quota monitoring must preserve remaining-USD estimation and natural-log trends without anomaly/normality verdict labels.'
 }
 if ($modernUiControlsSource -notmatch 'new LinearGradientBrush\(bounds, topFill, fill, 90F\)' -or
     $modernUiControlsSource -notmatch 'content\.Offset\(0, 1\)' -or
@@ -839,17 +829,12 @@ if (-not $quotaTrendScopeLayout.Success -or
     $quotaTrendToolbarLayout.Value -notmatch 'var trendData\s*=\s*GetQuotaTrendData\(account,\s*usage,\s*priceProfile,\s*passiveMonitoring\)' -or
     $quotaTrendToolbarLayout.Value -notmatch 'trendPoints\s*=\s*trendData\.Points' -or
     $quotaTrendToolbarLayout.Value -notmatch 'trendEmptyText\s*=\s*trendData\.EmptyText' -or
-    $quotaTrendToolbarLayout.Value -notmatch 'trendAssessmentWindows\s*=\s*trendData\.AssessmentWindows \?\? \[\]' -or
     $quotaTrendToolbarLayout.Value -notmatch 'private QuotaTrendDisplayData GetQuotaTrendData' -or
-    $quotaTrendToolbarLayout.Value -notmatch 'var points\s*=[\s\S]*?PassiveQuotaMonitor\.BuildTrend\([\s\S]*?throughUtc\)' -or
+    $quotaTrendToolbarLayout.Value -notmatch 'var points\s*=[\s\S]*?PassiveQuotaMonitor\.BuildTrend\([\s\S]*?throughUtc' -or
     $quotaTrendToolbarLayout.Value -notmatch 'export\.Tag\s*=\s*trendPoints' -or
     $quotaTrendToolbarLayout.Value -notmatch 'export\.Tag as IReadOnlyList<PassiveQuotaTrendPoint>' -or
-    $formSource -notmatch 'out var trendPoints,\s*out var trendEmptyText,\s*out var trendFromUtc,\s*out var trendThroughUtc,\s*out var trendAssessmentWindows,\s*out var exportButton' -or
+    $formSource -notmatch 'out var trendPoints,\s*out var trendEmptyText,\s*out var trendFromUtc,\s*out var trendThroughUtc,\s*out var exportButton' -or
     $formSource -notmatch 'Samples\s*=\s*BuildQuotaChartSamples\(' -or
-    $formSource -notmatch 'AssessmentWindows\s*=\s*trendAssessmentWindows' -or
-    $formSource -notmatch 'SelectQuotaTrendAssessmentWindows\(' -or
-    $formSource -notmatch 'scope != QuotaTrendScope\.Monitoring[\s\S]*?!hasMonitoringEpoch[\s\S]*?return \[\]' -or
-    $formSource -notmatch 'item\.Status == PassiveQuotaStatus\.Abnormal' -or
     $formSource -notmatch 'EmptyText\s*=\s*trendEmptyText' -or
     $formSource -notmatch 'PassiveQuotaMonitor\.ExportCsv\(trendPoints\)') {
     throw 'Quota trend UI must default to Realtime, expose Realtime and Monitoring scopes, return its empty text, and export the exact points currently charted.'
@@ -920,7 +905,7 @@ if (-not $passiveMonitoringAnalyzeLayout.Success -or
     -not $passiveMonitoringValidation.Success -or
     $passiveMonitoringValidation.Value -notmatch 'var activeResult\s*=\s*service\.Analyze\(' -or
     $passiveMonitoringValidation.Value -notmatch '!activeResult\.IsEnabled' -or
-    $passiveMonitoringValidation.Value -notmatch 'activeResult\.Estimate is not \{ Status: PassiveQuotaStatus\.Normal, EstimatedTotalUsd: \{ \} total \}' -or
+    $passiveMonitoringValidation.Value -notmatch 'activeResult\.Estimate is not \{ Status: PassiveQuotaStatus\.Estimated, EstimatedTotalUsd: \{ \} total \}' -or
     $passiveMonitoringValidation.Value -notmatch '!reloaded\.IsEnabled') {
     throw 'A completed two-percent estimate must remain live and persisted while monitoring stays enabled; only the user may stop it.'
 }
@@ -1299,11 +1284,10 @@ if ($passiveQuotaMonitoringSource -notmatch 'StartingWindowMinutes' -or
     $passiveQuotaMonitoringSource -notmatch 'AccountQuotaWindowKind\.Weekly' -or
     $passiveQuotaMonitorSource -notmatch 'ResolveProfile\(account, usage, orderedEvents\)' -or
     $passiveQuotaMonitorSource -notmatch 'GetEventQuotaWindow\(item, trendWindowKind\)' -or
-    $passiveQuotaMonitorSource -notmatch 'weeklyWindowNormal\.ThresholdUsd != 90D' -or
-    $passiveQuotaMonitorSource -notmatch 'Math\.Abs\(weeklyWindowNormalTotal - 160D\)' -or
-    $passiveQuotaMonitorSource -notmatch 'Math\.Abs\(weeklyWindowAbnormalTotal - 40D\)' -or
-    $passiveQuotaMonitorSource -notmatch 'Math\.Abs\(weeklyWindowBoundaryTotal - 90D\)') {
-    throw 'Passive quota monitoring must invalidate stale window estimates and classify weekly-only capacity with the natural-usage $90 threshold.'
+    $passiveQuotaMonitorSource -notmatch 'Math\.Abs\(weeklyWindowHighTotal - 160D\)' -or
+    $passiveQuotaMonitorSource -notmatch 'Math\.Abs\(weeklyWindowLowTotal - 40D\)' -or
+    $passiveQuotaMonitorSource -notmatch 'Math\.Abs\(weeklyWindowMidTotal - 90D\)') {
+    throw 'Passive quota monitoring must invalidate stale window estimates and preserve weekly-only remaining-USD capacity estimation.'
 }
 if ($formSource -notmatch 'MeasureActionButtonWidth\("查询重置次数", 184\)' -or
     $formSource -notmatch 'var baseControlHeight\s*=\s*compact \? 42 : 54' -or
@@ -3764,13 +3748,13 @@ if ($formSource -notmatch 'BuildAccountGroups\(\s*visible(?:Accounts)?(?:,\s*(?:
     $formSource -notmatch 'var resetAreaHeight = \(resetLineHeight \* 2\) \+ resetLineGap' -or
     $formSource -notmatch 'var actionTop = resetAreaTop \+ resetAreaHeight \+ resetToActionGap' -or
     $formSource -notmatch 'var rowHeight = actionTop \+ actionHeight \+ cardBottomPadding' -or
-    $formSource -notmatch 'var accountInfoHeight = showsCapacity \? 136 : 68' -or
+    $formSource -notmatch 'var accountInfoHeight = showsStatusPill && showsCapacitySummary' -or
     $formSource -notmatch 'CenterQuotaRowContent\(rowHeight, accountInfoHeight\)' -or
     $formSource -notmatch 'CalculateQuotaUsageHorizontalGeometry\(width\)' -or
     $formSource -notmatch 'CapacitySummary' -or
     $formSource -notmatch '推测剩余  \{FormatUsd\(remainingUsd\)\} / \{FormatUsd\(totalUsd\)\}' -or
     $formSource -notmatch '首次估算 \{observedSpan:0\.#\}/\{requiredPercentSpan:0\}%' -or
-    $formSource -notmatch 'var primaryRemainingPercent = GetPrimaryDisplayedQuotaWindow\(quotaLimitType, usage\)\?\.RemainingPercent;[\s\S]*?UpdatePassiveQuotaStatus\(\s*capacityStatus,\s*capacitySummary,\s*monitoring,\s*primaryRemainingPercent\)' -or
+    $formSource -notmatch 'UpdatePassiveQuotaStatus\(\s*capacityStatus,\s*capacitySummary,\s*monitoring!,\s*primaryRemainingPercent\)' -or
     $formSource -notmatch 'binding\.CapacitySummary' -or
     $formSource -notmatch 'void FitBadgeToContent\(\)' -or
     $formSource -notmatch 'badge\.Width = Math\.Clamp\(measuredWidth, Math\.Min\(124, maximumWidth\), maximumWidth\)' -or

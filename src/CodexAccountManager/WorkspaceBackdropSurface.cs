@@ -25,9 +25,11 @@ internal sealed class WorkspaceBackdropPanel : Panel, IBackdropSurface
     private ThemePalette? _palette;
 
     /// <summary>
-    /// All themes now share a rich deep cosmic starry-sky canvas behind floating frosted cards.
+    /// Dark themes (`深海夜色`, `星云夜色`) use a deep cosmic starry-sky canvas;
+    /// light themes (`极光浅色`, `青瓷浅色`) use a bright, airy daylight-luminous pastel aurora canvas.
     /// </summary>
-    public static bool UsesDarkCosmicBackdrop(ThemeMode mode) => true;
+    public static bool UsesDarkCosmicBackdrop(ThemeMode mode) =>
+        mode is ThemeMode.Dark or ThemeMode.NebulaDark;
 
     public WorkspaceBackdropPanel()
     {
@@ -343,6 +345,11 @@ internal sealed class WorkspaceBackdropPanel : Panel, IBackdropSurface
         float dpiScale)
     {
         var spec = ResolveBackdropSpec(themeMode, palette);
+        if (spec.IsCalmLightCanvas)
+        {
+            RenderCalmLightBackdrop(graphics, bounds, spec, dpiScale);
+            return;
+        }
 
         // 1. Full-bleed deep cosmic sky gradient spanning top header through bottom status bar.
         using (var baseGradient = new LinearGradientBrush(
@@ -399,13 +406,13 @@ internal sealed class WorkspaceBackdropPanel : Panel, IBackdropSurface
                 bounds.Height * 0.60F),
             Color.FromArgb(spec.BottomRightBloomAlpha, spec.BloomHighlight));
 
-        // Concentrated jewel nebula pocket in the open upper-center-right header sky.
+        // Concentrated jewel nebula pocket in the open upper-right header sky.
         DrawRadialGlow(
             graphics,
             new RectangleF(
-                bounds.Left + bounds.Width * 0.28F,
+                bounds.Left + bounds.Width * 0.48F,
                 bounds.Top - bounds.Height * 0.08F,
-                bounds.Width * 0.42F,
+                bounds.Width * 0.44F,
                 bounds.Height * 0.26F),
             Color.FromArgb(spec.HeaderNebulaAlpha, spec.BloomSecondary));
 
@@ -478,21 +485,452 @@ internal sealed class WorkspaceBackdropPanel : Panel, IBackdropSurface
         DrawDistantCosmicAura(graphics, bounds, spec, dpiScale);
 
         // 6. Rich multi-layer starfield: deep-field micro-dust, mid-field bright stars,
-        //    delicate constellations, and jewel-like 4-point star glints.
+        //    delicate constellations, and jewel-like 4-point star glints (kept clear of header/status text).
         DrawStarfield(graphics, bounds, spec, dpiScale);
         DrawConstellations(graphics, bounds, spec, dpiScale);
         DrawHeroStarGlints(graphics, bounds, spec, dpiScale);
 
-        // 7. Signature luminous curved diagonal shooting meteors across header, margins & lower sky.
+        // 7. Signature luminous curved diagonal shooting meteors across open header sky, margins & lower sky.
         DrawCosmicMeteors(graphics, bounds, spec, dpiScale);
 
         // 8. Subtle vertical depth seam along the sidebar boundary for clean edge separation.
+        DrawSidebarSeam(graphics, bounds, dpiScale, alpha: 62);
+    }
+
+    private static void RenderCalmLightBackdrop(
+        Graphics graphics,
+        RectangleF bounds,
+        BackdropSpec spec,
+        float dpiScale)
+    {
+        // 1. Bright, airy, daylight-luminous pastel aurora / celadon-porcelain base gradient
+        //    spanning top frosted header through bottom status bar.
+        using (var baseGradient = new LinearGradientBrush(
+                   new PointF(bounds.Left, bounds.Top),
+                   new PointF(bounds.Right, bounds.Bottom),
+                   spec.GradientStops[0],
+                   spec.GradientStops[^1]))
+        {
+            baseGradient.InterpolationColors = new ColorBlend
+            {
+                Colors = spec.GradientStops,
+                Positions = [0F, 0.34F, 0.70F, 1F]
+            };
+            graphics.FillRectangle(baseGradient, bounds);
+        }
+
+        // 2. Smooth cross-diagonal translucent pastel sky washes (linear gradients keep color
+        //    transitions silky with zero 8-bit concentric banding on bright daylight canvases).
+        using (var upperWash = new LinearGradientBrush(
+                   new PointF(bounds.Right, bounds.Top),
+                   new PointF(bounds.Left, bounds.Bottom),
+                   Color.FromArgb(Math.Clamp(spec.TopRightBloomAlpha * 2 / 3, 0, 255), spec.BloomPrimary),
+                   Color.FromArgb(0, spec.BloomSecondary)))
+        {
+            upperWash.InterpolationColors = new ColorBlend
+            {
+                Colors =
+                [
+                    Color.FromArgb(Math.Clamp(spec.TopRightBloomAlpha * 2 / 3, 0, 255), spec.BloomPrimary),
+                    Color.FromArgb(Math.Clamp(spec.MidRightBloomAlpha / 2, 0, 255), spec.BloomSecondary),
+                    Color.FromArgb(0, spec.BloomSecondary)
+                ],
+                Positions = [0F, 0.44F, 1F]
+            };
+            graphics.FillRectangle(upperWash, bounds);
+        }
+
+        using (var lowerWash = new LinearGradientBrush(
+                   new PointF(bounds.Left, bounds.Bottom),
+                   new PointF(bounds.Right, bounds.Top),
+                   Color.FromArgb(Math.Clamp(spec.BottomLeftBloomAlpha * 3 / 5, 0, 255), spec.BloomTertiary),
+                   Color.FromArgb(0, spec.BloomTertiary)))
+        {
+            lowerWash.InterpolationColors = new ColorBlend
+            {
+                Colors =
+                [
+                    Color.FromArgb(Math.Clamp(spec.BottomLeftBloomAlpha * 3 / 5, 0, 255), spec.BloomTertiary),
+                    Color.FromArgb(Math.Clamp(spec.BottomRightBloomAlpha / 3, 0, 255), spec.BloomHighlight),
+                    Color.FromArgb(0, spec.BloomHighlight)
+                ],
+                Positions = [0F, 0.48F, 1F]
+            };
+            graphics.FillRectangle(lowerWash, bounds);
+        }
+
+        // 3. Soft, airy translucent pastel aurora blooms positioned across header sky, side
+        //    margins, card gaps, and open lower sky so the canvas feels luminous and alive.
+        DrawSoftPastelBloom(
+            graphics,
+            new RectangleF(
+                bounds.Left + bounds.Width * 0.36F,
+                bounds.Top - bounds.Height * 0.24F,
+                bounds.Width * 0.72F,
+                bounds.Height * 0.58F),
+            Color.FromArgb(spec.TopRightBloomAlpha, spec.BloomPrimary));
+
+        DrawSoftPastelBloom(
+            graphics,
+            new RectangleF(
+                bounds.Left + bounds.Width * 0.52F,
+                bounds.Top + bounds.Height * 0.16F,
+                bounds.Width * 0.66F,
+                bounds.Height * 0.66F),
+            Color.FromArgb(spec.MidRightBloomAlpha, spec.BloomSecondary));
+
+        DrawSoftPastelBloom(
+            graphics,
+            new RectangleF(
+                bounds.Left - bounds.Width * 0.16F,
+                bounds.Top + bounds.Height * 0.46F,
+                bounds.Width * 0.68F,
+                bounds.Height * 0.68F),
+            Color.FromArgb(spec.BottomLeftBloomAlpha, spec.BloomTertiary));
+
+        DrawSoftPastelBloom(
+            graphics,
+            new RectangleF(
+                bounds.Left + bounds.Width * 0.30F,
+                bounds.Top + bounds.Height * 0.56F,
+                bounds.Width * 0.80F,
+                bounds.Height * 0.60F),
+            Color.FromArgb(spec.BottomRightBloomAlpha, spec.BloomSecondary));
+
+        DrawSoftPastelBloom(
+            graphics,
+            new RectangleF(
+                bounds.Left + bounds.Width * 0.50F,
+                bounds.Top - bounds.Height * 0.08F,
+                bounds.Width * 0.46F,
+                bounds.Height * 0.28F),
+            Color.FromArgb(spec.HeaderNebulaAlpha, spec.BloomHighlight));
+
+        // 4. Tasteful, clearly visible yet calm soft-pastel aurora silk ribbons sweeping
+        //    gracefully across the canvas (zero harsh neon streaks).
+        DrawPastelAuroraRibbon(
+            graphics,
+            bounds,
+            start: new PointF(-0.12F, 0.16F),
+            c1: new PointF(0.24F, -0.02F),
+            c2: new PointF(0.64F, 0.20F),
+            end: new PointF(1.14F, 0.04F),
+            color: spec.RibbonPrimary,
+            alpha: 56,
+            coreAlpha: 72,
+            width: 96F * dpiScale);
+
+        DrawPastelAuroraRibbon(
+            graphics,
+            bounds,
+            start: new PointF(-0.14F, 0.54F),
+            c1: new PointF(0.28F, 0.36F),
+            c2: new PointF(0.68F, 0.56F),
+            end: new PointF(1.14F, 0.30F),
+            color: spec.RibbonTertiary,
+            alpha: 48,
+            coreAlpha: 64,
+            width: 88F * dpiScale);
+
+        DrawPastelAuroraRibbon(
+            graphics,
+            bounds,
+            start: new PointF(-0.12F, 0.84F),
+            c1: new PointF(0.26F, 0.64F),
+            c2: new PointF(0.68F, 0.88F),
+            end: new PointF(1.14F, 0.60F),
+            color: spec.RibbonSecondary,
+            alpha: 58,
+            coreAlpha: 74,
+            width: 108F * dpiScale);
+
+        DrawPastelAuroraRibbon(
+            graphics,
+            bounds,
+            start: new PointF(0.04F, 1.04F),
+            c1: new PointF(0.38F, 0.84F),
+            c2: new PointF(0.74F, 0.98F),
+            end: new PointF(1.14F, 0.78F),
+            color: UiDesign.Blend(spec.RibbonPrimary, spec.RibbonTertiary, 0.45F),
+            alpha: 46,
+            coreAlpha: 60,
+            width: 82F * dpiScale);
+
+        // 5. Whisper-delicate luminous aurora arcs & soft pearlescent glints in the open
+        //    upper-right and lower-right space (kept clear of protected text zones & cards).
+        DrawLightAuroraArc(
+            graphics,
+            bounds,
+            centerX: 0.85F,
+            centerY: 0.16F,
+            radiusX: 0.25F,
+            radiusY: 0.18F,
+            rotationDegrees: -12F,
+            startAngle: 146F,
+            sweepAngle: 176F,
+            color: spec.OrbitPrimary,
+            alpha: 68,
+            dpiScale: dpiScale);
+
+        DrawLightAuroraArc(
+            graphics,
+            bounds,
+            centerX: 0.80F,
+            centerY: 0.88F,
+            radiusX: 0.30F,
+            radiusY: 0.20F,
+            rotationDegrees: 10F,
+            startAngle: 188F,
+            sweepAngle: 158F,
+            color: spec.OrbitSecondary,
+            alpha: 56,
+            dpiScale: dpiScale);
+
+        DrawLightAuroraGlints(graphics, bounds, spec, dpiScale);
+
+        // 6. Subtle cool-tinted vertical depth seam along the dark sidebar boundary.
+        var seamTint = UiDesign.Blend(spec.OrbitPrimary, Color.FromArgb(20, 32, 68), 0.72F);
+        DrawSidebarSeam(graphics, bounds, dpiScale, alpha: 24, tint: seamTint);
+    }
+
+    private static void DrawSidebarSeam(
+        Graphics graphics,
+        RectangleF bounds,
+        float dpiScale,
+        int alpha,
+        Color? tint = null)
+    {
+        var seamColor = tint ?? Color.Black;
+        var seamWidth = Math.Max(4F, 10F * dpiScale);
         using var seamBrush = new LinearGradientBrush(
-            new RectangleF(bounds.Left, bounds.Top, Math.Max(4F, 12F * dpiScale), Math.Max(1F, bounds.Height)),
-            Color.FromArgb(62, Color.Black),
-            Color.FromArgb(0, Color.Black),
+            new RectangleF(bounds.Left, bounds.Top, seamWidth, Math.Max(1F, bounds.Height)),
+            Color.FromArgb(Math.Clamp(alpha, 0, 255), seamColor),
+            Color.FromArgb(0, seamColor),
             LinearGradientMode.Horizontal);
-        graphics.FillRectangle(seamBrush, bounds.Left, bounds.Top, Math.Max(4F, 12F * dpiScale), bounds.Height);
+        graphics.FillRectangle(seamBrush, bounds.Left, bounds.Top, seamWidth, bounds.Height);
+    }
+
+    private static void DrawSoftPastelBloom(Graphics graphics, RectangleF bounds, Color centerColor)
+    {
+        if (bounds.Width <= 1F || bounds.Height <= 1F || centerColor.A == 0)
+        {
+            return;
+        }
+
+        using var path = new GraphicsPath();
+        path.AddEllipse(bounds);
+        using var brush = new PathGradientBrush(path)
+        {
+            CenterColor = centerColor,
+            SurroundColors = [Color.FromArgb(0, centerColor)],
+            FocusScales = new PointF(0.36F, 0.36F)
+        };
+        graphics.FillPath(brush, path);
+    }
+
+    private static void DrawPastelAuroraRibbon(
+        Graphics graphics,
+        RectangleF bounds,
+        PointF start,
+        PointF c1,
+        PointF c2,
+        PointF end,
+        Color color,
+        int alpha,
+        int coreAlpha,
+        float width)
+    {
+        var p0 = new PointF(bounds.Left + bounds.Width * start.X, bounds.Top + bounds.Height * start.Y);
+        var p1 = new PointF(bounds.Left + bounds.Width * c1.X, bounds.Top + bounds.Height * c1.Y);
+        var p2 = new PointF(bounds.Left + bounds.Width * c2.X, bounds.Top + bounds.Height * c2.Y);
+        var p3 = new PointF(bounds.Left + bounds.Width * end.X, bounds.Top + bounds.Height * end.Y);
+
+        using var path = new GraphicsPath();
+        path.AddBezier(p0, p1, p2, p3);
+
+        using (var outerVeil = new Pen(Color.FromArgb(Math.Clamp((int)MathF.Round(alpha * 0.46F), 0, 255), color), width * 1.56F)
+               {
+                   StartCap = LineCap.Round,
+                   EndCap = LineCap.Round,
+                   LineJoin = LineJoin.Round
+               })
+        {
+            graphics.DrawPath(outerVeil, path);
+        }
+
+        using (var midSilk = new Pen(Color.FromArgb(Math.Clamp((int)MathF.Round(alpha * 0.84F), 0, 255), color), width * 0.78F)
+               {
+                   StartCap = LineCap.Round,
+                   EndCap = LineCap.Round,
+                   LineJoin = LineJoin.Round
+               })
+        {
+            graphics.DrawPath(midSilk, path);
+        }
+
+        var pearlHighlight = UiDesign.Blend(color, Color.White, 0.58F);
+        using (var luminousCore = new Pen(Color.FromArgb(Math.Clamp((int)MathF.Round(coreAlpha * 0.72F), 0, 255), pearlHighlight), Math.Max(6F, width * 0.28F))
+               {
+                   StartCap = LineCap.Round,
+                   EndCap = LineCap.Round,
+                   LineJoin = LineJoin.Round
+               })
+        {
+            graphics.DrawPath(luminousCore, path);
+        }
+
+        using var silkFilament = new Pen(
+            Color.FromArgb(Math.Clamp((int)MathF.Round(coreAlpha * 0.62F), 0, 88), Color.White),
+            Math.Max(2.0F, width * 0.065F))
+        {
+            StartCap = LineCap.Round,
+            EndCap = LineCap.Round,
+            LineJoin = LineJoin.Round
+        };
+        graphics.DrawPath(silkFilament, path);
+    }
+
+    private static void DrawLightAuroraArc(
+        Graphics graphics,
+        RectangleF bounds,
+        float centerX,
+        float centerY,
+        float radiusX,
+        float radiusY,
+        float rotationDegrees,
+        float startAngle,
+        float sweepAngle,
+        Color color,
+        int alpha,
+        float dpiScale)
+    {
+        var cx = bounds.Left + bounds.Width * centerX;
+        var cy = bounds.Top + bounds.Height * centerY;
+        var rx = Math.Max(40F * dpiScale, bounds.Width * radiusX);
+        var ry = Math.Max(30F * dpiScale, bounds.Height * radiusY);
+        var ellipse = new RectangleF(-rx, -ry, rx * 2F, ry * 2F);
+
+        var state = graphics.Save();
+        try
+        {
+            graphics.TranslateTransform(cx, cy);
+            graphics.RotateTransform(rotationDegrees);
+
+            using (var softGlow = new Pen(Color.FromArgb(Math.Clamp(alpha / 2, 0, 255), color), 4.2F * dpiScale)
+                   {
+                       StartCap = LineCap.Round,
+                       EndCap = LineCap.Round
+                   })
+            {
+                graphics.DrawArc(softGlow, ellipse, startAngle, sweepAngle);
+            }
+
+            var crispTone = UiDesign.Blend(color, Color.White, 0.56F);
+            using var silkStroke = new Pen(Color.FromArgb(Math.Clamp(alpha + 28, 0, 148), crispTone), 1.1F * dpiScale)
+            {
+                StartCap = LineCap.Round,
+                EndCap = LineCap.Round
+            };
+            graphics.DrawArc(silkStroke, ellipse, startAngle, sweepAngle);
+        }
+        finally
+        {
+            graphics.Restore(state);
+        }
+    }
+
+    private static void DrawLightAuroraGlints(
+        Graphics graphics,
+        RectangleF bounds,
+        BackdropSpec spec,
+        float dpiScale)
+    {
+        // Whisper-delicate pearlescent aurora glints placed strictly in the open upper-right
+        // and lower-right space (never over header/status text and never noisy behind cards).
+        ReadOnlySpan<(float X, float Y, float Size, byte Tone, float Intensity)> glints =
+        [
+            (0.585F, 0.036F, 4.4F, 1, 0.68F),
+            (0.652F, 0.068F, 5.0F, 0, 0.74F),
+            (0.758F, 0.026F, 3.8F, 2, 0.62F),
+            (0.958F, 0.032F, 4.6F, 1, 0.70F),
+            (0.842F, 0.878F, 4.6F, 2, 0.64F),
+            (0.922F, 0.916F, 5.2F, 0, 0.70F)
+        ];
+
+        foreach (var glint in glints)
+        {
+            var gx = bounds.Left + bounds.Width * glint.X;
+            var gy = bounds.Top + bounds.Height * glint.Y;
+            if (IsInProtectedTextZone(gx, gy, bounds, dpiScale))
+            {
+                continue;
+            }
+
+            var haloTint = glint.Tone switch
+            {
+                1 => spec.StarPrimary,
+                2 => spec.StarSecondary,
+                _ => spec.StarHighlight
+            };
+            var arm = glint.Size * dpiScale;
+            var haloR = arm * 2.1F;
+            DrawSoftPastelBloom(
+                graphics,
+                new RectangleF(gx - haloR, gy - haloR, haloR * 2F, haloR * 2F),
+                Color.FromArgb(ScaleAlpha(glint.Intensity, 102), Color.White));
+            DrawSoftPastelBloom(
+                graphics,
+                new RectangleF(gx - arm * 1.4F, gy - arm * 1.4F, arm * 2.8F, arm * 2.8F),
+                Color.FromArgb(ScaleAlpha(glint.Intensity, 56), haloTint));
+
+            var halfWaist = Math.Max(0.65F, arm * 0.14F);
+            using (var starPath = new GraphicsPath())
+            {
+                starPath.AddPolygon(
+                [
+                    new PointF(gx, gy - arm),
+                    new PointF(gx + halfWaist, gy - halfWaist),
+                    new PointF(gx + arm, gy),
+                    new PointF(gx + halfWaist, gy + halfWaist),
+                    new PointF(gx, gy + arm),
+                    new PointF(gx - halfWaist, gy + halfWaist),
+                    new PointF(gx - arm, gy),
+                    new PointF(gx - halfWaist, gy - halfWaist)
+                ]);
+                using var starBrush = new SolidBrush(Color.FromArgb(ScaleAlpha(glint.Intensity, 210), Color.White));
+                graphics.FillPath(starBrush, starPath);
+            }
+
+            var coreR = Math.Max(0.9F, arm * 0.22F);
+            using var coreBrush = new SolidBrush(Color.FromArgb(ScaleAlpha(glint.Intensity, 238), Color.White));
+            graphics.FillEllipse(coreBrush, gx - coreR, gy - coreR, coreR * 2F, coreR * 2F);
+        }
+    }
+
+    private static bool IsInProtectedTextZone(float x, float y, RectangleF bounds, float dpiScale)
+    {
+        if (bounds.Width <= 1F || bounds.Height <= 1F)
+        {
+            return false;
+        }
+
+        var nx = (x - bounds.Left) / bounds.Width;
+        var topOffset = y - bounds.Top;
+        var bottomOffset = bounds.Bottom - y;
+
+        // Top-left header title & subtitle zone ("本地用量估算与额度窗口 · 当前使用：...")
+        if (nx < 0.56F && topOffset < 78F * dpiScale)
+        {
+            return true;
+        }
+
+        // Bottom-left status text zone ("已切换到...")
+        if (nx < 0.44F && bottomOffset < 42F * dpiScale)
+        {
+            return true;
+        }
+
+        return false;
     }
 
     private static void DrawMilkyWayBand(Graphics graphics, RectangleF bounds, BackdropSpec spec)
@@ -724,8 +1162,10 @@ internal sealed class WorkspaceBackdropPanel : Panel, IBackdropSurface
             };
 
             var framingZone = nx < 0.06F || nx > 0.93F || ny < 0.14F || ny > 0.90F;
+            var inProtectedText = IsInProtectedTextZone(x, y, bounds, dpiScale);
             var baseAlpha = 68 + random.Next(0, 110);
-            var alpha = Math.Clamp((int)MathF.Round(baseAlpha * (framingZone ? 1.24F : 0.96F)), 44, 240);
+            var zoneFactor = inProtectedText ? 0.42F : framingZone ? 1.24F : 0.96F;
+            var alpha = Math.Clamp((int)MathF.Round(baseAlpha * zoneFactor), 26, 240);
             using var brush = new SolidBrush(Color.FromArgb(alpha, tint));
             graphics.FillEllipse(brush, x - radius, y - radius, radius * 2F, radius * 2F);
         }
@@ -738,6 +1178,10 @@ internal sealed class WorkspaceBackdropPanel : Panel, IBackdropSurface
             var radius = (0.98F + (float)(random.NextDouble() * 0.92D)) * dpiScale;
             var x = bounds.Left + nx * bounds.Width;
             var y = bounds.Top + ny * bounds.Height;
+            if (IsInProtectedTextZone(x, y, bounds, dpiScale))
+            {
+                continue;
+            }
 
             var tint = (i % 7) switch
             {
@@ -774,17 +1218,17 @@ internal sealed class WorkspaceBackdropPanel : Panel, IBackdropSurface
         static PointF Pt(RectangleF b, float nx, float ny) =>
             new(b.Left + b.Width * nx, b.Top + b.Height * ny);
 
-        // Upper-center-right constellation spanning the header sky and upper edge.
+        // Upper-right constellation kept clear of the top-left header title/subtitle zone (0..55% X).
         PointF[] upperConstellation =
         [
-            Pt(bounds, 0.37F, 0.056F),
-            Pt(bounds, 0.44F, 0.024F),
-            Pt(bounds, 0.51F, 0.062F),
-            Pt(bounds, 0.59F, 0.032F),
-            Pt(bounds, 0.66F, 0.078F)
+            Pt(bounds, 0.585F, 0.056F),
+            Pt(bounds, 0.648F, 0.024F),
+            Pt(bounds, 0.722F, 0.062F),
+            Pt(bounds, 0.802F, 0.030F),
+            Pt(bounds, 0.878F, 0.072F)
         ];
 
-        // Lower-right constellation peeking through lower gaps and status bar.
+        // Lower-right constellation peeking through lower gaps and status bar (clear of 0..40% status text).
         PointF[] lowerConstellation =
         [
             Pt(bounds, 0.72F, 0.86F),
@@ -815,19 +1259,19 @@ internal sealed class WorkspaceBackdropPanel : Panel, IBackdropSurface
         BackdropSpec spec,
         float dpiScale)
     {
-        // Authored jewel-like 4-point star glints placed in the open header sky, breathing margins,
-        // card-gap corridors, and bottom status bar so starlight unmistakably sparkles everywhere.
+        // Authored jewel-like 4-point star glints placed in the open upper-right header sky,
+        // breathing margins, card-gap corridors, and right half of the bottom status bar so
+        // starlight sparkles richly while NEVER sitting on top of top-left header or bottom-left status text.
         ReadOnlySpan<(float X, float Y, float Size, byte Tone, float Intensity)> glints =
         [
-            // Upper header sky band (visible around title, open center-right corridor & search rim)
-            (0.030F, 0.026F, 4.2F, 0, 0.82F),
-            (0.355F, 0.032F, 5.8F, 1, 0.96F),
-            (0.475F, 0.068F, 7.2F, 0, 1.00F),
-            (0.565F, 0.022F, 5.2F, 2, 0.92F),
-            (0.642F, 0.072F, 4.8F, 3, 0.88F),
+            // Upper-right header sky band (strictly clear of 0..56% X top-left header text zone)
+            (0.585F, 0.032F, 5.6F, 1, 0.94F),
+            (0.648F, 0.068F, 6.4F, 0, 0.98F),
+            (0.742F, 0.024F, 5.0F, 2, 0.90F),
+            (0.848F, 0.062F, 4.8F, 3, 0.88F),
             (0.978F, 0.022F, 6.2F, 1, 0.96F),
 
-            // Left vertical breathing margin (centered cleanly inside the 22px left margin)
+            // Left vertical breathing margin (centered cleanly inside the 22px left margin, well below header)
             (0.012F, 0.240F, 3.8F, 1, 0.90F),
             (0.012F, 0.515F, 4.2F, 2, 0.92F),
             (0.012F, 0.785F, 3.6F, 0, 0.88F),
@@ -841,14 +1285,20 @@ internal sealed class WorkspaceBackdropPanel : Panel, IBackdropSurface
             (0.260F, 0.365F, 5.4F, 0, 0.86F),
             (0.710F, 0.545F, 6.0F, 2, 0.90F),
 
-            // Lower sky & translucent bottom status bar band
-            (0.185F, 0.968F, 5.2F, 1, 0.92F),
-            (0.540F, 0.974F, 4.6F, 3, 0.88F),
-            (0.845F, 0.966F, 6.0F, 0, 0.96F)
+            // Lower sky & right half of bottom status bar band (strictly clear of 0..44% X status text zone)
+            (0.525F, 0.972F, 4.8F, 3, 0.88F),
+            (0.715F, 0.968F, 5.0F, 1, 0.90F),
+            (0.885F, 0.966F, 6.0F, 0, 0.96F)
         ];
 
         foreach (var glint in glints)
         {
+            var gx = bounds.Left + bounds.Width * glint.X;
+            var gy = bounds.Top + bounds.Height * glint.Y;
+            if (IsInProtectedTextZone(gx, gy, bounds, dpiScale))
+            {
+                continue;
+            }
             var color = glint.Tone switch
             {
                 1 => spec.StarPrimary,
@@ -858,8 +1308,8 @@ internal sealed class WorkspaceBackdropPanel : Panel, IBackdropSurface
             };
             DrawFourPointStarGlint(
                 graphics,
-                bounds.Left + bounds.Width * glint.X,
-                bounds.Top + bounds.Height * glint.Y,
+                gx,
+                gy,
                 glint.Size * dpiScale,
                 color,
                 glint.Intensity);
@@ -912,8 +1362,8 @@ internal sealed class WorkspaceBackdropPanel : Panel, IBackdropSurface
         BackdropSpec spec,
         float dpiScale)
     {
-        // Six curved diagonal shooting meteors positioned so they read immediately in the
-        // compact 68px header open sky, upper-right rim, breathing margins, card gaps, and lower cosmos.
+        // Six curved diagonal shooting meteors positioned in the open right header sky,
+        // upper-right rim, breathing margins, card gaps, and lower-right cosmos (clear of header/status text).
         ReadOnlySpan<(
             float StartX,
             float StartY,
@@ -925,17 +1375,17 @@ internal sealed class WorkspaceBackdropPanel : Panel, IBackdropSurface
             float Intensity,
             byte Tone)> meteors =
         [
-            // 1. Hero upper-center header meteor (prominent right between title and search bar)
-            (0.618F, 0.008F, 0.535F, 0.036F, 0.422F, 0.082F, 1.24F, 1.00F, 1),
-            // 2. Companion upper-center header meteor (delicate violet-white streak)
-            (0.495F, 0.012F, 0.435F, 0.038F, 0.358F, 0.072F, 0.90F, 0.82F, 2),
+            // 1. Hero upper-right header meteor (strictly clear of 0..56% X header text zone)
+            (0.755F, 0.008F, 0.678F, 0.036F, 0.585F, 0.074F, 1.18F, 0.98F, 1),
+            // 2. Companion upper-right header meteor (delicate violet-white streak)
+            (0.875F, 0.010F, 0.812F, 0.034F, 0.735F, 0.066F, 0.90F, 0.82F, 2),
             // 3. Upper-right rim meteor entering from top-right sky into right breathing margin
             (0.996F, 0.010F, 0.932F, 0.064F, 0.835F, 0.142F, 1.08F, 0.94F, 3),
             // 4. Mid-right cosmic meteor crossing right margin & card gaps
             (0.992F, 0.285F, 0.902F, 0.372F, 0.768F, 0.492F, 1.10F, 0.90F, 0),
-            // 5. Lower-left cosmic meteor sweeping out into left breathing margin & lower gaps
+            // 5. Lower-left cosmic meteor sweeping out into left breathing margin & lower gaps (above status bar)
             (0.265F, 0.545F, 0.148F, 0.652F, 0.016F, 0.788F, 1.02F, 0.88F, 2),
-            // 6. Lower-right deep-space meteor gliding into the translucent bottom status bar
+            // 6. Lower-right deep-space meteor gliding into the right half of the bottom status bar
             (0.915F, 0.778F, 0.798F, 0.868F, 0.642F, 0.974F, 1.12F, 0.94F, 1)
         ];
 
@@ -1064,6 +1514,7 @@ internal sealed class WorkspaceBackdropPanel : Panel, IBackdropSurface
         return mode switch
         {
             ThemeMode.Dark => new BackdropSpec(
+                IsCalmLightCanvas: false,
                 // 深海夜色 (Deep Sea Cosmic Night): abyssal ocean-indigo cosmos + cyan-sapphire aurora.
                 GradientStops:
                 [
@@ -1098,6 +1549,7 @@ internal sealed class WorkspaceBackdropPanel : Panel, IBackdropSurface
                 MeteorRose: Color.FromArgb(124, 220, 255)),
 
             ThemeMode.NebulaDark => new BackdropSpec(
+                IsCalmLightCanvas: false,
                 // 星云夜色 (Nebula Cosmic Night): deep ultraviolet space + luminous orchid/magenta nebula clouds.
                 GradientStops:
                 [
@@ -1132,77 +1584,82 @@ internal sealed class WorkspaceBackdropPanel : Panel, IBackdropSurface
                 MeteorRose: Color.FromArgb(255, 138, 208)),
 
             ThemeMode.PorcelainLight => new BackdropSpec(
-                // 青瓷浅色 (Porcelain Cosmic Night): nocturnal starry celadon-jade cosmos behind frosted porcelain cards.
+                IsCalmLightCanvas: true,
+                // 青瓷浅色 (Airy Celadon-Porcelain Mist): bright, serene pale celadon mist (#DDF0EC) ->
+                // soft porcelain cloud (#EAF5F3) -> pale sky-aqua (#DFEEF6) with gentle jade/aqua washes.
                 GradientStops:
                 [
-                    Color.FromArgb(14, 38, 40),
-                    Color.FromArgb(22, 58, 63),
-                    Color.FromArgb(31, 75, 86),
-                    Color.FromArgb(27, 57, 79)
+                    Color.FromArgb(221, 240, 236),
+                    Color.FromArgb(234, 245, 243),
+                    Color.FromArgb(223, 238, 246),
+                    Color.FromArgb(226, 242, 238)
                 ],
-                MilkyWayOuter: Color.FromArgb(62, 162, 152),
-                MilkyWayCore: Color.FromArgb(116, 214, 196),
-                BloomPrimary: Color.FromArgb(72, 196, 176),
-                BloomSecondary: Color.FromArgb(98, 178, 212),
-                BloomTertiary: Color.FromArgb(64, 156, 148),
-                BloomHighlight: Color.FromArgb(226, 194, 122),
-                TopRightBloomAlpha: 80,
-                MidRightBloomAlpha: 72,
-                BottomLeftBloomAlpha: 56,
-                BottomRightBloomAlpha: 64,
-                HeaderNebulaAlpha: 66,
-                RibbonPrimary: Color.FromArgb(96, 216, 194),
-                RibbonSecondary: Color.FromArgb(122, 192, 224),
-                RibbonTertiary: Color.FromArgb(230, 198, 132),
-                OrbitPrimary: Color.FromArgb(126, 226, 208),
-                OrbitSecondary: Color.FromArgb(226, 196, 136),
-                StarPrimary: Color.FromArgb(148, 242, 226),
-                StarSecondary: Color.FromArgb(174, 222, 250),
-                StarHighlight: Color.FromArgb(252, 226, 162),
-                StarWarm: Color.FromArgb(255, 234, 184),
-                StarNeutral: Color.FromArgb(246, 253, 251),
-                MeteorCyan: Color.FromArgb(122, 242, 224),
-                MeteorViolet: Color.FromArgb(156, 212, 255),
-                MeteorRose: Color.FromArgb(250, 216, 152)),
+                MilkyWayOuter: Color.FromArgb(150, 214, 202),
+                MilkyWayCore: Color.FromArgb(164, 214, 232),
+                BloomPrimary: Color.FromArgb(150, 214, 202),
+                BloomSecondary: Color.FromArgb(164, 214, 232),
+                BloomTertiary: Color.FromArgb(174, 226, 214),
+                BloomHighlight: Color.FromArgb(188, 228, 224),
+                TopRightBloomAlpha: 74,
+                MidRightBloomAlpha: 60,
+                BottomLeftBloomAlpha: 64,
+                BottomRightBloomAlpha: 58,
+                HeaderNebulaAlpha: 52,
+                RibbonPrimary: Color.FromArgb(148, 212, 200),
+                RibbonSecondary: Color.FromArgb(162, 210, 230),
+                RibbonTertiary: Color.FromArgb(172, 226, 212),
+                OrbitPrimary: Color.FromArgb(136, 198, 188),
+                OrbitSecondary: Color.FromArgb(156, 200, 220),
+                StarPrimary: Color.FromArgb(148, 208, 198),
+                StarSecondary: Color.FromArgb(166, 208, 228),
+                StarHighlight: Color.FromArgb(186, 232, 224),
+                StarWarm: Color.FromArgb(248, 252, 250),
+                StarNeutral: Color.FromArgb(255, 255, 255),
+                MeteorCyan: Color.FromArgb(148, 212, 200),
+                MeteorViolet: Color.FromArgb(162, 210, 230),
+                MeteorRose: Color.FromArgb(186, 232, 224)),
 
             _ => new BackdropSpec(
-                // 极光浅色 (Aurora Cosmic Night): beloved 2.4.3 deep cosmic indigo-violet starry sky
-                // (#101738 -> #1D225C -> #342982 -> #233478) behind crisp frosted luminous-white cards!
+                IsCalmLightCanvas: true,
+                // 极光浅色 (Bright Luminous Pastel Aurora): airy daylight-luminous pastel sky-blue (#DCE8FC) ->
+                // misty lavender-periwinkle (#E6E2FA) -> airy ice-aqua (#DDF2F8) -> soft cloud-blue (#E4ECFC)
+                // layered with soft pastel aurora silk ribbons & gentle blooms.
                 GradientStops:
                 [
-                    Color.FromArgb(16, 23, 56),
-                    Color.FromArgb(29, 34, 92),
-                    Color.FromArgb(52, 41, 130),
-                    Color.FromArgb(35, 52, 120)
+                    Color.FromArgb(220, 232, 252),
+                    Color.FromArgb(230, 226, 250),
+                    Color.FromArgb(221, 242, 248),
+                    Color.FromArgb(228, 236, 252)
                 ],
-                MilkyWayOuter: Color.FromArgb(92, 118, 242),
-                MilkyWayCore: Color.FromArgb(152, 132, 255),
-                BloomPrimary: Color.FromArgb(92, 158, 255),
-                BloomSecondary: Color.FromArgb(162, 114, 255),
-                BloomTertiary: Color.FromArgb(72, 132, 246),
-                BloomHighlight: Color.FromArgb(64, 214, 242),
-                TopRightBloomAlpha: 92,
-                MidRightBloomAlpha: 86,
-                BottomLeftBloomAlpha: 64,
-                BottomRightBloomAlpha: 76,
-                HeaderNebulaAlpha: 82,
-                RibbonPrimary: Color.FromArgb(98, 176, 255),
-                RibbonSecondary: Color.FromArgb(186, 126, 255),
-                RibbonTertiary: Color.FromArgb(72, 218, 244),
-                OrbitPrimary: Color.FromArgb(132, 198, 255),
-                OrbitSecondary: Color.FromArgb(196, 148, 255),
-                StarPrimary: Color.FromArgb(138, 218, 255),
-                StarSecondary: Color.FromArgb(212, 162, 255),
-                StarHighlight: Color.FromArgb(118, 240, 252),
-                StarWarm: Color.FromArgb(255, 228, 194),
-                StarNeutral: Color.FromArgb(247, 250, 255),
-                MeteorCyan: Color.FromArgb(112, 224, 255),
-                MeteorViolet: Color.FromArgb(204, 148, 255),
-                MeteorRose: Color.FromArgb(255, 148, 220))
+                MilkyWayOuter: Color.FromArgb(158, 197, 255),
+                MilkyWayCore: Color.FromArgb(194, 180, 252),
+                BloomPrimary: Color.FromArgb(158, 197, 255),
+                BloomSecondary: Color.FromArgb(194, 180, 252),
+                BloomTertiary: Color.FromArgb(155, 229, 224),
+                BloomHighlight: Color.FromArgb(182, 212, 255),
+                TopRightBloomAlpha: 78,
+                MidRightBloomAlpha: 66,
+                BottomLeftBloomAlpha: 68,
+                BottomRightBloomAlpha: 62,
+                HeaderNebulaAlpha: 58,
+                RibbonPrimary: Color.FromArgb(158, 197, 255),
+                RibbonSecondary: Color.FromArgb(194, 180, 252),
+                RibbonTertiary: Color.FromArgb(155, 229, 224),
+                OrbitPrimary: Color.FromArgb(148, 184, 248),
+                OrbitSecondary: Color.FromArgb(184, 168, 248),
+                StarPrimary: Color.FromArgb(152, 192, 255),
+                StarSecondary: Color.FromArgb(192, 178, 252),
+                StarHighlight: Color.FromArgb(146, 222, 222),
+                StarWarm: Color.FromArgb(248, 250, 255),
+                StarNeutral: Color.FromArgb(255, 255, 255),
+                MeteorCyan: Color.FromArgb(155, 229, 224),
+                MeteorViolet: Color.FromArgb(194, 180, 252),
+                MeteorRose: Color.FromArgb(158, 197, 255))
         };
     }
 
     private sealed record BackdropSpec(
+        bool IsCalmLightCanvas,
         Color[] GradientStops,
         Color MilkyWayOuter,
         Color MilkyWayCore,

@@ -838,6 +838,7 @@ internal sealed class ModernToggleSwitch : CheckBox
             ControlStyles.OptimizedDoubleBuffer |
             ControlStyles.ResizeRedraw |
             ControlStyles.UserPaint |
+            ControlStyles.SupportsTransparentBackColor |
             ControlStyles.Selectable,
             true);
     }
@@ -894,10 +895,17 @@ internal sealed class ModernToggleSwitch : CheckBox
             graphics.Clear(effectiveBack);
         }
 
-        var trackWidth = Math.Clamp(Width / 3, 34, 42);
-        var trackHeight = Math.Clamp(Height - 10, 18, 22);
+        var dpiScale = Math.Max(1F, DeviceDpi / 96F);
+        var minTrackWidth = (int)Math.Round(38 * dpiScale);
+        var maxTrackWidth = (int)Math.Round(46 * dpiScale);
+        var candidateTrackWidth = string.IsNullOrEmpty(Text) ? Width - (int)Math.Round(8 * dpiScale) : Width / 3;
+        var trackWidth = Math.Clamp(candidateTrackWidth, minTrackWidth, Math.Max(minTrackWidth, maxTrackWidth));
+        var minTrackHeight = (int)Math.Round(20 * dpiScale);
+        var maxTrackHeight = (int)Math.Round(24 * dpiScale);
+        var trackHeight = Math.Clamp(Height - (int)Math.Round(10 * dpiScale), minTrackHeight, Math.Max(minTrackHeight, maxTrackHeight));
+        var rightPad = Math.Max(4F, 6F * dpiScale);
         var track = new RectangleF(
-            Width - trackWidth - 7F,
+            Width - trackWidth - rightPad,
             (Height - trackHeight) / 2F,
             trackWidth,
             trackHeight);
@@ -942,7 +950,7 @@ internal sealed class ModernToggleSwitch : CheckBox
             }
         }
 
-        var inset = 2.5F;
+        var inset = Math.Max(2.5F, 2.5F * dpiScale);
         var knobSize = track.Height - inset * 2F;
         var knobLeft = Checked
             ? track.Right - inset - knobSize
@@ -1211,6 +1219,8 @@ internal sealed class ModernInputShell : Panel
 
 internal sealed class ThemedComboBox : ComboBox
 {
+    private const int WmPaint = 0x000F;
+
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public Color ItemBackColor { get; set; } = Color.White;
 
@@ -1222,6 +1232,12 @@ internal sealed class ThemedComboBox : ComboBox
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public Color SelectedItemTextColor { get; set; } = Color.White;
+
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public Color ChevronColor { get; set; } = Color.DimGray;
+
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public Color FocusChevronColor { get; set; } = Color.RoyalBlue;
 
     public ThemedComboBox()
     {
@@ -1257,6 +1273,8 @@ internal sealed class ThemedComboBox : ComboBox
         ItemTextColor = palette.TextColor;
         SelectedItemBackColor = UiDesign.Blend(palette.PrimaryColor, palette.SurfaceColor, 0.18F);
         SelectedItemTextColor = Color.White;
+        ChevronColor = palette.MutedTextColor;
+        FocusChevronColor = palette.FocusColor;
         Invalidate();
     }
 
@@ -1278,7 +1296,8 @@ internal sealed class ThemedComboBox : ComboBox
             ? ForeColor
             : selected ? SelectedItemTextColor : ItemTextColor;
         var itemText = GetItemText(Items[e.Index]) ?? string.Empty;
-        var textBounds = Rectangle.Inflate(e.Bounds, -10, 0);
+        var horizontalInset = isComboBoxEdit && Parent is ModernInputShell ? -3 : -10;
+        var textBounds = Rectangle.Inflate(e.Bounds, horizontalInset, 0);
         textBounds = UiDesign.CenterTextVertically(e.Graphics, itemText, Font, textBounds);
         TextRenderer.DrawText(
             e.Graphics,
@@ -1295,6 +1314,63 @@ internal sealed class ThemedComboBox : ComboBox
         if (!isComboBoxEdit)
         {
             e.DrawFocusRectangle();
+        }
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        base.WndProc(ref m);
+        if (m.Msg == WmPaint &&
+            Parent is ModernInputShell &&
+            DropDownStyle == ComboBoxStyle.DropDownList &&
+            Width > 12 &&
+            Height > 8 &&
+            IsHandleCreated)
+        {
+            using var graphics = Graphics.FromHwnd(Handle);
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            var back = BackColor;
+            using var maskPen = new Pen(back, 2F);
+            graphics.DrawRectangle(maskPen, 0.5F, 0.5F, Width - 1F, Height - 1F);
+            graphics.DrawRectangle(maskPen, 1.5F, 1.5F, Width - 3F, Height - 3F);
+
+            var dpiScale = Math.Max(1F, DeviceDpi / 96F);
+            var arrowAreaWidth = Math.Max(
+                SystemInformation.VerticalScrollBarWidth + 4,
+                (int)Math.Round(24 * dpiScale));
+            var arrowRect = new Rectangle(Math.Max(0, Width - arrowAreaWidth), 0, arrowAreaWidth, Height);
+            using var backBrush = new SolidBrush(back);
+            graphics.FillRectangle(backBrush, arrowRect);
+
+            var cx = arrowRect.Left + (arrowRect.Width / 2F);
+            var cy = Height / 2F;
+            var half = Math.Max(3.4F, 4.0F * dpiScale);
+            using var chevronPen = new Pen(
+                Focused || DroppedDown ? FocusChevronColor : ChevronColor,
+                Math.Max(1.5F, 1.45F * dpiScale))
+            {
+                StartCap = LineCap.Round,
+                EndCap = LineCap.Round,
+                LineJoin = LineJoin.Round
+            };
+            if (DroppedDown)
+            {
+                graphics.DrawLines(chevronPen,
+                [
+                    new PointF(cx - half, cy + (half * 0.42F)),
+                    new PointF(cx, cy - (half * 0.58F)),
+                    new PointF(cx + half, cy + (half * 0.42F))
+                ]);
+            }
+            else
+            {
+                graphics.DrawLines(chevronPen,
+                [
+                    new PointF(cx - half, cy - (half * 0.42F)),
+                    new PointF(cx, cy + (half * 0.58F)),
+                    new PointF(cx + half, cy - (half * 0.42F))
+                ]);
+            }
         }
     }
 }
@@ -2484,10 +2560,18 @@ internal static class NativeWindowTheme
 
         try
         {
-            _ = SetWindowTheme(
-                control.Handle,
-                dark ? "DarkMode_Explorer" : "Explorer",
-                null);
+            var themeName = dark ? "DarkMode_Explorer" : "Explorer";
+            _ = SetWindowTheme(control.Handle, themeName, null);
+            if (control is DataGridView)
+            {
+                foreach (Control child in control.Controls)
+                {
+                    if (child is ScrollBar && child.IsHandleCreated)
+                    {
+                        _ = SetWindowTheme(child.Handle, themeName, null);
+                    }
+                }
+            }
         }
         catch
         {

@@ -15,7 +15,7 @@ test('bundled catalog supplies one default model and long-context official rates
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cam-model-catalog-'));
   try {
     configureModelCatalog(root);
-    assert.equal(defaultModel(), 'gpt-5.6');
+    assert.equal(defaultModel(), 'gpt-6.1-sol');
     assert.deepEqual(officialRates('gpt-5.6-terra', 1000), [2, 0.2, 2.5, 12]);
     assert.deepEqual(officialRates('gpt-5.6', 300000), [8, 0.8, 10, 30]);
   } finally {
