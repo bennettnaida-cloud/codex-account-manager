@@ -361,7 +361,7 @@ public sealed class ThemeService
 
     public ThemePalette GetPalette(ThemeMode mode)
     {
-        var resolved = mode == ThemeMode.System ? ResolveSystemTheme() : mode;
+        var resolved = ResolveEffectiveThemeMode(mode);
         return resolved switch
         {
             ThemeMode.Dark => CreateDarkPalette(),
@@ -370,6 +370,9 @@ public sealed class ThemeService
             _ => CreateLightPalette()
         };
     }
+
+    internal static ThemeMode ResolveEffectiveThemeMode(ThemeMode mode) =>
+        mode == ThemeMode.System ? ResolveSystemTheme() : mode;
 
     private static ThemeMode ResolveSystemTheme()
     {

@@ -80,7 +80,10 @@ internal static class LocalPatGateway
     // v17 adds CPA fill-first / round-robin admission and transient cooldown.
     internal const string LegacyV17RotationProtocolValue = "request-boundary-v17";
     // v18 keys newly registered accounts separately from deleted entries.
-    internal const string RotationProtocolValue = "request-boundary-v18";
+    internal const string LegacyV18RotationProtocolValue = "request-boundary-v18";
+    // v19 preserves/re-compresses model request Content-Encoding (zstd/gzip/deflate/br)
+    // and retries upstream HTTP 413 with bounded compression before returning an error.
+    internal const string RotationProtocolValue = "request-boundary-v19";
     private static readonly SemaphoreSlim StartupLock = new(1, 1);
     private static readonly TimeSpan StartupLockTimeout = TimeSpan.FromSeconds(8);
     private static readonly TimeSpan DesktopStartupTimeout = TimeSpan.FromSeconds(12);
@@ -168,7 +171,7 @@ internal static class LocalPatGateway
         }
         // Only injected gates/preparation callbacks are used: no real listener, account,
         // proxy or credential is read/changed by these tests.
-        foreach (var legacyProtocol in new[] { LegacyV15RotationProtocolValue, LegacyV16RotationProtocolValue, LegacyV17RotationProtocolValue })
+        foreach (var legacyProtocol in new[] { LegacyV15RotationProtocolValue, LegacyV16RotationProtocolValue, LegacyV17RotationProtocolValue, LegacyV18RotationProtocolValue })
         {
             using var legacy = new HttpResponseMessage();
             legacy.Headers.Add(RotationProtocolHeader, legacyProtocol);
@@ -1027,6 +1030,7 @@ internal static class LocalPatGateway
 
     internal static bool IsCompatibleRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV18RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV17RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV16RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV15RotationProtocolValue, StringComparison.Ordinal) ||
@@ -1048,6 +1052,7 @@ internal static class LocalPatGateway
     // new executable waits for a request-boundary listener hand-off.
     internal static bool IsCurrentRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV18RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV17RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV16RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV15RotationProtocolValue, StringComparison.Ordinal) ||
@@ -1059,6 +1064,7 @@ internal static class LocalPatGateway
 
     internal static bool IsTransparentRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV18RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV17RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV16RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV15RotationProtocolValue, StringComparison.Ordinal) ||
@@ -1075,6 +1081,7 @@ internal static class LocalPatGateway
 
     internal static bool IsConfirmedQuotaRotationProtocolValue(string? value) =>
         string.Equals(value, RotationProtocolValue, StringComparison.Ordinal) ||
+        string.Equals(value, LegacyV18RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV17RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV16RotationProtocolValue, StringComparison.Ordinal) ||
         string.Equals(value, LegacyV15RotationProtocolValue, StringComparison.Ordinal) ||
@@ -1116,6 +1123,7 @@ internal static class LocalPatGateway
                         string.Equals(value, SafeContentEncodingRotationProtocolValue, StringComparison.Ordinal) ||
                         string.Equals(value, "request-boundary-v9", StringComparison.Ordinal) ||
                         string.Equals(value, LegacyV11RotationProtocolValue, StringComparison.Ordinal) ||
+                        string.Equals(value, LegacyV18RotationProtocolValue, StringComparison.Ordinal) ||
                         string.Equals(value, LegacyV17RotationProtocolValue, StringComparison.Ordinal) ||
                         string.Equals(value, LegacyV16RotationProtocolValue, StringComparison.Ordinal) ||
                         string.Equals(value, LegacyV15RotationProtocolValue, StringComparison.Ordinal) ||
@@ -1212,6 +1220,16 @@ internal sealed partial class LocalPatGatewayHost
 {
     private const int CompatibleApiRequestBodyMaxBytes = 128 * 1024 * 1024;
     private const int ReplayableModelRequestBodyMaxBytes = CompatibleApiRequestBodyMaxBytes;
+    // Official ChatGPT Codex endpoints natively accept Content-Encoding: zstd and enforce
+    // edge/Cloudflare body size limits on large uncompressed payloads.  Compressing large
+    // identity-encoded official requests (and preserving/re-compressing already-compressed
+    // payloads) prevents spurious HTTP 413 Payload Too Large rejections.
+    private const int OfficialAutoCompressMinBytes = 256 * 1024;
+    // Compatible API relays vary in Content-Encoding support, so smaller requests default
+    // to identity JSON and only compress on HTTP 413 fallback; very large payloads (>= 32 MiB)
+    // proactively try gzip first (rolling back cleanly to identity on 400/415) so they do not
+    // waste upload bandwidth slamming into Cloudflare/Caddy size caps.
+    private const int CompatibleApiAutoCompressMinBytes = 32 * 1024 * 1024;
     private const int SessionAffinityInspectableBodyMaxBytes = 4 * 1024 * 1024;
     private const int SessionAffinityMetadataMaxCharacters = 64 * 1024;
     private const int SessionAffinityIdentifierMaxCharacters = 512;
@@ -1858,6 +1876,87 @@ internal sealed partial class LocalPatGatewayHost
                 "for gzip, deflate, br, or zstd.");
         }
 
+        // Verify RFC 9110 round-trip re-compression and outbound encoding selection so
+        // compressed Codex requests are preserved/re-compressed for ChatGPT instead of
+        // expanding into uncompressed bodies that trigger HTTP 413 Payload Too Large.
+        foreach (var coding in new[] { "zstd", "gzip", "x-gzip", "deflate", "br", "gzip, br" })
+        {
+            var reencoded = EncodeRequestBody(compressedRequestFixture, coding);
+            if (!DecodeRequestBody(reencoded, coding).AsSpan().SequenceEqual(compressedRequestFixture))
+            {
+                throw new InvalidOperationException(
+                    $"Model request Content-Encoding round-trip failed for '{coding}'.");
+            }
+        }
+        var zstdReplayFixture = new ReplayableModelRequestBody(
+            compressedRequestFixture,
+            WasContentDecoded: true,
+            OriginalContentEncoding: "zstd",
+            OriginalEncodedBytes: zstdFixture);
+        var officialPreserved = SelectOutboundRequestBody(
+            compressedRequestFixture,
+            zstdReplayFixture,
+            isModelRequest: true,
+            isCompatibleApi: false,
+            bodyContentModified: false,
+            encodingOverride: null);
+        if (officialPreserved.ContentEncoding != "zstd" ||
+            officialPreserved.Body == null ||
+            !ReferenceEquals(officialPreserved.Body, zstdFixture) ||
+            officialPreserved.WasAutoCompressed)
+        {
+            throw new InvalidOperationException(
+                "Unmodified zstd official model request must forward the exact original compressed bytes.");
+        }
+        var modifiedJsonFixture = Encoding.UTF8.GetBytes(
+            "{\"model\":\"gpt-test\",\"previous_response_id\":null,\"input\":\"normalized-" +
+            new string('a', 4096) + "\"}");
+        var officialRecompressed = SelectOutboundRequestBody(
+            modifiedJsonFixture,
+            zstdReplayFixture with { Bytes = modifiedJsonFixture, WasCompanionNormalized = true, OriginalEncodedBytes = null },
+            isModelRequest: true,
+            isCompatibleApi: false,
+            bodyContentModified: true,
+            encodingOverride: null);
+        if (officialRecompressed.ContentEncoding != "zstd" ||
+            officialRecompressed.Body == null ||
+            officialRecompressed.Body.Length >= modifiedJsonFixture.Length ||
+            !DecodeRequestBody(officialRecompressed.Body, "zstd").AsSpan().SequenceEqual(modifiedJsonFixture))
+        {
+            throw new InvalidOperationException(
+                "Modified official model request originally sent as zstd must be re-compressed back to zstd.");
+        }
+        var largeOfficialIdentity = Encoding.UTF8.GetBytes(
+            "{\"model\":\"gpt-test\",\"input\":\"" + new string('x', OfficialAutoCompressMinBytes + 1024) + "\"}");
+        var officialAutoZstd = SelectOutboundRequestBody(
+            largeOfficialIdentity,
+            new ReplayableModelRequestBody(largeOfficialIdentity),
+            isModelRequest: true,
+            isCompatibleApi: false,
+            bodyContentModified: false,
+            encodingOverride: null);
+        if (officialAutoZstd.ContentEncoding != "zstd" ||
+            !officialAutoZstd.WasAutoCompressed ||
+            officialAutoZstd.Body == null ||
+            officialAutoZstd.Body.Length >= largeOfficialIdentity.Length ||
+            !DecodeRequestBody(officialAutoZstd.Body, "zstd").AsSpan().SequenceEqual(largeOfficialIdentity))
+        {
+            throw new InvalidOperationException(
+                "Large uncompressed official model request must auto-compress to zstd.");
+        }
+        var smallCompatible = SelectOutboundRequestBody(
+            compressedRequestFixture,
+            zstdReplayFixture,
+            isModelRequest: true,
+            isCompatibleApi: true,
+            bodyContentModified: true,
+            encodingOverride: null);
+        if (smallCompatible.ContentEncoding != null || smallCompatible.WasAutoCompressed)
+        {
+            throw new InvalidOperationException(
+                "Small compatible API request must stay identity-encoded on the first attempt.");
+        }
+
         var quotaObservationNow = DateTimeOffset.UtcNow;
         if (!IsQuotaLimitObservationActive(
                 new QuotaLimitObservation(
@@ -2374,6 +2473,8 @@ internal sealed partial class LocalPatGatewayHost
         // can dispose them even when request handling exits through an early error.
         HttpResponseMessage? lastTransient429Response = null;
         HttpResponseMessage? lastQuotaResponse = null;
+        HttpResponseMessage? saved413Response = null;
+        string? saved413AccountKey = null;
         response.Headers[_markerHeader] = _markerValue;
         try
         {
@@ -2510,7 +2611,12 @@ internal sealed partial class LocalPatGatewayHost
                     replayableBody.Bytes, context.Request.UserAgent, out var removed);
                 if (removed > 0)
                 {
-                    replayableBody = replayableBody with { Bytes = normalized, WasCompanionNormalized = true };
+                    replayableBody = replayableBody with
+                    {
+                        Bytes = normalized,
+                        WasCompanionNormalized = true,
+                        OriginalEncodedBytes = null
+                    };
                     ManagerLifecycleDiagnostics.Write("gateway-empty-page-snapshots-removed", $"count={removed}");
                 }
             }
@@ -2729,6 +2835,8 @@ internal sealed partial class LocalPatGatewayHost
             var unconfirmed429Confirmations = new Dictionary<
                 string,
                 (int Count, string Signature)>(StringComparer.Ordinal);
+            var accountEncodingOverrides = new Dictionary<string, OutboundRequestBody>(StringComparer.Ordinal);
+            var triedEncodingsByAccount = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
             GatewayCredential? lastQuotaCredential = null;
             var globalRouteQuotaSeen = false;
             HttpResponseMessage? finalUpstreamResponse = null;
@@ -3034,12 +3142,10 @@ internal sealed partial class LocalPatGatewayHost
                 }
 
                 byte[]? requestBody = replayableBody?.Bytes;
-                // A decoded body must be sent as identity-encoded bytes. Treat the
-                // normalization as a rewrite for header/content-length handling; this
-                // also makes retries deterministic because every attempt uses the same
-                // replay buffer.
-                var requestBodyWasRewritten = replayableBody?.WasContentDecoded == true ||
-                                              replayableBody?.WasCompanionNormalized == true;
+                // Track logical JSON modification separately from transport Content-Encoding
+                // so unmodified compressed official requests can forward their original wire
+                // bytes without inflation, while modified bodies are re-compressed cleanly.
+                var bodyContentModified = replayableBody?.WasCompanionNormalized == true;
                 var fingerprintPlan = ResolveCodexFingerprintPlan(credential, context.Request);
                 if (credential.IsCompatibleApi)
                 {
@@ -3053,7 +3159,7 @@ internal sealed partial class LocalPatGatewayHost
                             replayableBody.Bytes,
                             credential.CompatibleApiModel!,
                             credential.CompatibleApiModels);
-                        requestBodyWasRewritten = true;
+                        bodyContentModified = true;
                     }
                     catch (InvalidDataException ex)
                     {
@@ -3165,7 +3271,7 @@ internal sealed partial class LocalPatGatewayHost
                         return;
                     }
                     requestBody = rewritten;
-                    requestBodyWasRewritten |= fingerprintBodyModified;
+                    bodyContentModified |= fingerprintBodyModified;
                 }
 
                 if (activeAffinityLease != null &&
@@ -3220,14 +3326,37 @@ internal sealed partial class LocalPatGatewayHost
                     }
                 }
 
+                var attemptCompressionKey = NormalizeOptionalAccountKey(credential.AccountKey) ??
+                    (credential.IsCompatibleApi
+                        ? "compat:" + upstreamUri.GetLeftPart(UriPartial.Authority)
+                        : "official");
+                var outboundPayload = accountEncodingOverrides.TryGetValue(
+                    attemptCompressionKey,
+                    out var cachedOverridePayload)
+                    ? cachedOverridePayload
+                    : SelectOutboundRequestBody(
+                        requestBody,
+                        replayableBody,
+                        isModelRequest,
+                        credential.IsCompatibleApi,
+                        bodyContentModified,
+                        encodingOverride: null);
+                if (!triedEncodingsByAccount.TryGetValue(attemptCompressionKey, out var triedEncodings))
+                {
+                    triedEncodings = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    triedEncodingsByAccount[attemptCompressionKey] = triedEncodings;
+                }
+                triedEncodings.Add(outboundPayload.ContentEncoding ?? "identity");
+
                 using var upstreamRequest = BuildUpstreamRequest(
                     context.Request,
                     upstreamUri,
                     credential,
                     identity,
-                    requestBody,
-                    requestBodyWasRewritten,
-                    fingerprintPlan);
+                    outboundPayload.Body,
+                    bodyContentModified,
+                    fingerprintPlan,
+                    outboundPayload.ContentEncoding);
                 HttpResponseMessage attemptResponse;
                 try
                 {
@@ -3281,6 +3410,101 @@ internal sealed partial class LocalPatGatewayHost
                         "通过本地代理请求 ChatGPT Codex 上游失败：" +
                         SanitizeNetworkError(ex.Message));
                     return;
+                }
+
+                // HTTP 413 rejects the request before execution.  When an uncompressed
+                // (or lightly compressed) model request hits 413 on the same account,
+                // transparently retry with tighter Content-Encoding (zstd/gzip) before
+                // writing any downstream bytes.  If a compression probe itself is
+                // rejected with 400/415 by a relay that lacks Content-Encoding support,
+                // fall back to gzip or restore the real upstream 413 response.
+                if (isModelRequest && requestBody is { Length: > 0 } &&
+                    attemptResponse.StatusCode == HttpStatusCode.RequestEntityTooLarge &&
+                    TrySelectNext413CompressionEncoding(
+                        requestBody,
+                        outboundPayload.Body?.Length ?? requestBody.Length,
+                        outboundPayload.ContentEncoding,
+                        replayableBody?.OriginalContentEncoding,
+                        credential.IsCompatibleApi,
+                        triedEncodings,
+                        out var next413Payload))
+                {
+                    if (saved413Response == null ||
+                        !string.Equals(saved413AccountKey, attemptCompressionKey, StringComparison.Ordinal))
+                    {
+                        saved413Response?.Dispose();
+                        saved413Response = attemptResponse;
+                        saved413AccountKey = attemptCompressionKey;
+                    }
+                    else
+                    {
+                        attemptResponse.Dispose();
+                    }
+                    accountEncodingOverrides[attemptCompressionKey] = next413Payload;
+                    ManagerLifecycleDiagnostics.Write(
+                        "pat-gateway-http-413-compress-retry",
+                        $"from_encoding={outboundPayload.ContentEncoding ?? "identity"}; " +
+                        $"to_encoding={next413Payload.ContentEncoding}; raw_bytes={requestBody.Length}; " +
+                        $"encoded_bytes={next413Payload.Body?.Length ?? 0}; downstream_bytes=0");
+                    continue;
+                }
+
+                if (isModelRequest && outboundPayload.WasAutoCompressed &&
+                    attemptResponse.StatusCode is HttpStatusCode.UnsupportedMediaType or HttpStatusCode.BadRequest &&
+                    (attemptResponse.StatusCode == HttpStatusCode.UnsupportedMediaType || credential.IsCompatibleApi))
+                {
+                    var hasSaved413ForAccount = saved413Response != null &&
+                        string.Equals(saved413AccountKey, attemptCompressionKey, StringComparison.Ordinal);
+                    if (hasSaved413ForAccount)
+                    {
+                        if (TrySelectFallback413CompressionEncoding(
+                                requestBody!,
+                                triedEncodings,
+                                out var fallbackPayload))
+                        {
+                            var rejectedStatus = (int)attemptResponse.StatusCode;
+                            attemptResponse.Dispose();
+                            accountEncodingOverrides[attemptCompressionKey] = fallbackPayload;
+                            ManagerLifecycleDiagnostics.Write(
+                                "pat-gateway-http-413-compress-fallback",
+                                $"rejected_encoding={outboundPayload.ContentEncoding}; " +
+                                $"status={rejectedStatus}; " +
+                                $"next_encoding={fallbackPayload.ContentEncoding}; " +
+                                $"encoded_bytes={fallbackPayload.Body?.Length ?? 0}; " +
+                                "downstream_bytes=0");
+                            continue;
+                        }
+
+                        // The relay rejected every compressed retry with 400/415; return
+                        // the genuine upstream 413 rather than a probe-induced 400/415.
+                        attemptResponse.Dispose();
+                        finalUpstreamResponse = saved413Response;
+                        saved413Response = null;
+                        saved413AccountKey = null;
+                        break;
+                    }
+
+                    if (!triedEncodings.Contains("identity"))
+                    {
+                        var rejectedStatus = (int)attemptResponse.StatusCode;
+                        attemptResponse.Dispose();
+                        accountEncodingOverrides[attemptCompressionKey] = new OutboundRequestBody(
+                            requestBody,
+                            ContentEncoding: null,
+                            WasAutoCompressed: false);
+                        ManagerLifecycleDiagnostics.Write(
+                            "pat-gateway-auto-compress-fallback-identity",
+                            $"rejected_encoding={outboundPayload.ContentEncoding}; " +
+                            $"status={rejectedStatus}; downstream_bytes=0");
+                        continue;
+                    }
+                }
+
+                if (saved413Response != null)
+                {
+                    saved413Response.Dispose();
+                    saved413Response = null;
+                    saved413AccountKey = null;
                 }
 
                 byte[]? quotaErrorBody = null;
@@ -3941,6 +4165,7 @@ internal sealed partial class LocalPatGatewayHost
             // or a successful request so a long-lived gateway cannot accumulate them.
             lastTransient429Response?.Dispose();
             lastQuotaResponse?.Dispose();
+            saved413Response?.Dispose();
             for (var index = clientLeases.Count - 1; index >= 0; index--)
             {
                 clientLeases[index].Release();
@@ -6622,16 +6847,26 @@ internal sealed partial class LocalPatGatewayHost
         return new ReplayableModelRequestBody(
             decoded,
             WasContentDecoded: true,
-            OriginalContentEncoding: contentEncoding);
+            OriginalContentEncoding: contentEncoding,
+            OriginalEncodedBytes: encoded);
     }
 
-    private static byte[] DecodeRequestBody(byte[] encoded, string contentEncoding)
+    private static string[] ParseContentCodings(string? contentEncoding)
     {
-        var codings = contentEncoding
+        if (string.IsNullOrWhiteSpace(contentEncoding))
+        {
+            return [];
+        }
+        return contentEncoding
             .Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
             .Select(value => value.Split(';', 2)[0].Trim().ToLowerInvariant())
             .Where(value => value.Length > 0 && !value.Equals("identity", StringComparison.Ordinal))
             .ToArray();
+    }
+
+    private static byte[] DecodeRequestBody(byte[] encoded, string contentEncoding)
+    {
+        var codings = ParseContentCodings(contentEncoding);
         if (codings.Length == 0)
         {
             return encoded;
@@ -6645,6 +6880,193 @@ internal sealed partial class LocalPatGatewayHost
             current = DecodeSingleContentCoding(current, codings[index]);
         }
         return current;
+    }
+
+    private static byte[] EncodeRequestBody(byte[] plain, string contentEncoding)
+    {
+        var codings = ParseContentCodings(contentEncoding);
+        if (codings.Length == 0)
+        {
+            return plain;
+        }
+
+        var current = plain;
+        // Content codings are applied from left to right (RFC 9110, section 8.4).
+        for (var index = 0; index < codings.Length; index++)
+        {
+            current = EncodeSingleContentCoding(current, codings[index]);
+        }
+        return current;
+    }
+
+    private static byte[] EncodeSingleContentCoding(byte[] plain, string coding)
+    {
+        if (coding == "zstd")
+        {
+            using var compressor = new ZstdSharp.Compressor(level: 3);
+            return compressor.Wrap(plain).ToArray();
+        }
+        if (coding is not ("gzip" or "x-gzip" or "deflate" or "br"))
+        {
+            throw new UnsupportedContentEncodingException(coding);
+        }
+
+        using var output = new MemoryStream(Math.Min(Math.Max(plain.Length / 2, 256), 1024 * 1024));
+        using (Stream encoder = coding switch
+        {
+            "gzip" or "x-gzip" => new GZipStream(output, CompressionLevel.Fastest, leaveOpen: true),
+            "deflate" => new DeflateStream(output, CompressionLevel.Fastest, leaveOpen: true),
+            "br" => new BrotliStream(output, CompressionLevel.Fastest, leaveOpen: true),
+            _ => throw new UnsupportedContentEncodingException(coding)
+        })
+        {
+            if (plain.Length > 0)
+            {
+                encoder.Write(plain, 0, plain.Length);
+            }
+        }
+        return output.ToArray();
+    }
+
+    private static OutboundRequestBody SelectOutboundRequestBody(
+        byte[]? plainBody,
+        ReplayableModelRequestBody? replayableBody,
+        bool isModelRequest,
+        bool isCompatibleApi,
+        bool bodyContentModified,
+        string? encodingOverride)
+    {
+        if (plainBody == null || plainBody.Length == 0)
+        {
+            return new OutboundRequestBody(plainBody, ContentEncoding: null, WasAutoCompressed: false);
+        }
+
+        if (!string.IsNullOrWhiteSpace(encodingOverride))
+        {
+            if (encodingOverride.Equals("identity", StringComparison.OrdinalIgnoreCase))
+            {
+                return new OutboundRequestBody(plainBody, ContentEncoding: null, WasAutoCompressed: false);
+            }
+            var forcedBytes = EncodeRequestBody(plainBody, encodingOverride);
+            return forcedBytes.Length < plainBody.Length
+                ? new OutboundRequestBody(forcedBytes, encodingOverride, WasAutoCompressed: true)
+                : new OutboundRequestBody(plainBody, ContentEncoding: null, WasAutoCompressed: false);
+        }
+
+        if (!isCompatibleApi)
+        {
+            var originalEncoding = replayableBody?.OriginalContentEncoding?.Trim();
+            if (replayableBody?.WasContentDecoded == true &&
+                !string.IsNullOrWhiteSpace(originalEncoding) &&
+                ParseContentCodings(originalEncoding).Length > 0)
+            {
+                if (!bodyContentModified &&
+                    replayableBody.OriginalEncodedBytes is { Length: > 0 } originalEncoded)
+                {
+                    return new OutboundRequestBody(
+                        originalEncoded,
+                        originalEncoding,
+                        WasAutoCompressed: false);
+                }
+
+                var reencoded = EncodeRequestBody(plainBody, originalEncoding);
+                return new OutboundRequestBody(
+                    reencoded,
+                    originalEncoding,
+                    WasAutoCompressed: false);
+            }
+
+            if (isModelRequest && plainBody.Length >= OfficialAutoCompressMinBytes)
+            {
+                var zstd = EncodeSingleContentCoding(plainBody, "zstd");
+                if (zstd.Length < plainBody.Length)
+                {
+                    return new OutboundRequestBody(zstd, "zstd", WasAutoCompressed: true);
+                }
+            }
+
+            return new OutboundRequestBody(plainBody, ContentEncoding: null, WasAutoCompressed: false);
+        }
+
+        if (isModelRequest && plainBody.Length >= CompatibleApiAutoCompressMinBytes)
+        {
+            var gzip = EncodeSingleContentCoding(plainBody, "gzip");
+            if (gzip.Length < plainBody.Length)
+            {
+                return new OutboundRequestBody(gzip, "gzip", WasAutoCompressed: true);
+            }
+        }
+
+        return new OutboundRequestBody(plainBody, ContentEncoding: null, WasAutoCompressed: false);
+    }
+
+    private static bool TrySelectNext413CompressionEncoding(
+        byte[] plainBody,
+        int currentWireBytes,
+        string? currentEncoding,
+        string? originalClientEncoding,
+        bool isCompatibleApi,
+        HashSet<string> triedEncodings,
+        out OutboundRequestBody nextPayload)
+    {
+        nextPayload = default!;
+        if (plainBody.Length == 0)
+        {
+            return false;
+        }
+
+        var originalCodings = ParseContentCodings(originalClientEncoding);
+        var clientSentZstd = originalCodings.Length == 1 && originalCodings[0] == "zstd";
+        string[] candidates = !isCompatibleApi
+            ? ["zstd", "gzip"]
+            : clientSentZstd
+                ? ["zstd", "gzip"]
+                : ["gzip", "zstd"];
+
+        foreach (var candidate in candidates)
+        {
+            if (triedEncodings.Contains(candidate) ||
+                string.Equals(currentEncoding, candidate, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            var encoded = EncodeSingleContentCoding(plainBody, candidate);
+            if (encoded.Length < currentWireBytes)
+            {
+                nextPayload = new OutboundRequestBody(encoded, candidate, WasAutoCompressed: true);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TrySelectFallback413CompressionEncoding(
+        byte[] plainBody,
+        HashSet<string> triedEncodings,
+        out OutboundRequestBody nextPayload)
+    {
+        nextPayload = default!;
+        if (plainBody.Length == 0)
+        {
+            return false;
+        }
+
+        foreach (var candidate in new[] { "gzip", "zstd" })
+        {
+            if (triedEncodings.Contains(candidate))
+            {
+                continue;
+            }
+            var encoded = EncodeSingleContentCoding(plainBody, candidate);
+            if (encoded.Length < plainBody.Length)
+            {
+                nextPayload = new OutboundRequestBody(encoded, candidate, WasAutoCompressed: true);
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static byte[] DecodeSingleContentCoding(byte[] encoded, string coding)
@@ -6823,7 +7245,8 @@ internal sealed partial class LocalPatGatewayHost
         PatIdentity? identity,
         byte[]? requestBody = null,
         bool requestBodyWasRewritten = false,
-        CodexFingerprintPlan? fingerprintPlan = null)
+        CodexFingerprintPlan? fingerprintPlan = null,
+        string? outboundContentEncoding = null)
     {
         var request = new HttpRequestMessage(new HttpMethod(incoming.HttpMethod), upstreamUri);
         if (incoming.HasEntityBody)
@@ -6838,6 +7261,10 @@ internal sealed partial class LocalPatGatewayHost
             {
                 request.Content.Headers.TryAddWithoutValidation("Content-Type", contentType);
             }
+            if (requestBody != null && !string.IsNullOrWhiteSpace(outboundContentEncoding))
+            {
+                request.Content.Headers.TryAddWithoutValidation("Content-Encoding", outboundContentEncoding);
+            }
             if (requestBody == null && incoming.ContentLength64 >= 0)
             {
                 request.Content.Headers.ContentLength = incoming.ContentLength64;
@@ -6848,7 +7275,7 @@ internal sealed partial class LocalPatGatewayHost
         {
             if (headerName == null ||
                 headerName.Equals("content-type", StringComparison.OrdinalIgnoreCase) ||
-                (requestBodyWasRewritten &&
+                ((requestBody != null || requestBodyWasRewritten) &&
                  headerName.Equals("content-encoding", StringComparison.OrdinalIgnoreCase)) ||
                  !ShouldForwardRequestHeader(
                      headerName,
@@ -7789,7 +8216,12 @@ internal sealed partial class LocalPatGatewayHost
         byte[] Bytes,
         bool WasContentDecoded = false,
         string? OriginalContentEncoding = null,
-        bool WasCompanionNormalized = false);
+        bool WasCompanionNormalized = false,
+        byte[]? OriginalEncodedBytes = null);
+    private sealed record OutboundRequestBody(
+        byte[]? Body,
+        string? ContentEncoding,
+        bool WasAutoCompressed);
     private sealed record Upstream429Classification(
         bool IsQuotaExhausted,
         string Reason,

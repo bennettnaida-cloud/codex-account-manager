@@ -78,6 +78,16 @@ internal enum ModernButtonGlyph
     Refresh
 }
 
+internal interface IBackdropSurface
+{
+    bool TryPaintBackdropSlice(Graphics graphics, Control target, Rectangle targetClip);
+}
+
+internal interface IBackdropPassthrough
+{
+    bool UseBackdropSurface { get; }
+}
+
 internal static class UiDesign
 {
     public const int RadiusSmall = 8;
@@ -100,30 +110,138 @@ internal static class UiDesign
             : SystemColors.Control;
     }
 
-    public static void PaintParentBackdrop(Graphics graphics, Control control)
+    public static bool TryPaintBackdrop(Graphics graphics, Control control, Rectangle targetClip) =>
+        TryPaintBackdropFromAncestor(graphics, control, control.Parent, targetClip);
+
+    private static bool TryPaintBackdropFromAncestor(
+        Graphics graphics,
+        Control target,
+        Control? startAncestor,
+        Rectangle targetClip)
     {
-        if (control.Parent is RoundedPanel { UseGradient: true, ShowStarfield: false, GradientColor.A: > 0 } parentPanel &&
-            parentPanel.Width > 2 &&
-            parentPanel.Height > 2 &&
-            control.Width > 0 &&
-            control.Height > 0)
+        for (var parent = startAncestor; parent != null; parent = parent.Parent)
         {
-            var parentGradientBounds = new RectangleF(
-                0.75F - control.Left,
-                0.75F - control.Top,
-                Math.Max(1F, parentPanel.Width - 1.5F),
-                Math.Max(1F, parentPanel.Height - 1.5F));
-            using var gradient = new LinearGradientBrush(
-                parentGradientBounds,
-                parentPanel.EffectiveBackColor,
-                parentPanel.EffectiveGradientColor,
-                LinearGradientMode.Horizontal);
-            graphics.FillRectangle(gradient, control.ClientRectangle);
+            if (parent is IBackdropSurface surface)
+            {
+                return surface.TryPaintBackdropSlice(graphics, target, targetClip);
+            }
+
+            if (parent is IBackdropPassthrough { UseBackdropSurface: true })
+            {
+                continue;
+            }
+
+            if (parent.BackColor == Color.Transparent || parent.BackColor.A < 255)
+            {
+                continue;
+            }
+
+            return false;
+        }
+
+        return false;
+    }
+
+    public static void PaintParentBackdrop(Graphics graphics, Control control) =>
+        PaintParentBackdrop(graphics, control, control.ClientRectangle);
+
+    public static void PaintParentBackdrop(Graphics graphics, Control control, Rectangle targetClip)
+    {
+        var clip = targetClip;
+        if (clip.Width <= 0 || clip.Height <= 0)
+        {
+            clip = control.ClientRectangle;
+        }
+        if (clip.Width <= 0 || clip.Height <= 0)
+        {
+            return;
+        }
+
+        if (control.Parent is RoundedPanel parentPanel &&
+            parentPanel.Width > 1 &&
+            parentPanel.Height > 1)
+        {
+            var opacity = parentPanel.SurfaceOpacity;
+            var fillBack = parentPanel.EffectiveBackColor;
+            var fillGradient = parentPanel.EffectiveGradientColor;
+            var useParentGradient = parentPanel.UseGradient &&
+                                    (!parentPanel.ShowStarfield || parentPanel.HeaderAmbientSkyOnly) &&
+                                    fillGradient.A > 0 &&
+                                    parentPanel.Width > 2 &&
+                                    parentPanel.Height > 2;
+            var effectiveAlpha = opacity < 255 ? opacity : fillBack.A;
+
+            if (effectiveAlpha < 255)
+            {
+                if (!TryPaintBackdropFromAncestor(graphics, control, parentPanel.Parent, clip))
+                {
+                    var fallback = ResolveParentBackColor(parentPanel);
+                    using var fallbackBrush = new SolidBrush(Color.FromArgb(255, fallback));
+                    graphics.FillRectangle(fallbackBrush, clip);
+                }
+            }
+
+            if (effectiveAlpha > 0)
+            {
+                var prevSmoothing = graphics.SmoothingMode;
+                var prevPixelOffset = graphics.PixelOffsetMode;
+                graphics.SmoothingMode = SmoothingMode.None;
+                graphics.PixelOffsetMode = PixelOffsetMode.Half;
+                try
+                {
+                    var startColor = Color.FromArgb(effectiveAlpha, fillBack.R, fillBack.G, fillBack.B);
+                    if (useParentGradient)
+                    {
+                        var endAlpha = opacity < 255 ? opacity : fillGradient.A;
+                        var endColor = Color.FromArgb(endAlpha, fillGradient.R, fillGradient.G, fillGradient.B);
+                        var inset = parentPanel.Radius > 0 ? 0.75F : 0F;
+                        var parentGradientBounds = new RectangleF(
+                            inset - control.Left,
+                            inset - control.Top,
+                            Math.Max(1F, parentPanel.Width - (inset * 2F)),
+                            Math.Max(1F, parentPanel.Height - (inset * 2F)));
+                        using var gradient = new LinearGradientBrush(
+                            parentGradientBounds,
+                            startColor,
+                            endColor,
+                            LinearGradientMode.Horizontal);
+                        graphics.FillRectangle(gradient, clip);
+                    }
+                    else
+                    {
+                        using var solid = new SolidBrush(startColor);
+                        graphics.FillRectangle(solid, clip);
+                    }
+                }
+                finally
+                {
+                    graphics.PixelOffsetMode = prevPixelOffset;
+                    graphics.SmoothingMode = prevSmoothing;
+                }
+            }
+            return;
+        }
+
+        if (TryPaintBackdrop(graphics, control, clip))
+        {
             return;
         }
 
         var backdrop = ResolveParentBackColor(control);
-        graphics.Clear(Color.FromArgb(255, backdrop.R, backdrop.G, backdrop.B));
+        var fallbackPrevSmoothing = graphics.SmoothingMode;
+        var fallbackPrevPixelOffset = graphics.PixelOffsetMode;
+        graphics.SmoothingMode = SmoothingMode.None;
+        graphics.PixelOffsetMode = PixelOffsetMode.Half;
+        try
+        {
+            using var brush = new SolidBrush(Color.FromArgb(255, backdrop.R, backdrop.G, backdrop.B));
+            graphics.FillRectangle(brush, clip);
+        }
+        finally
+        {
+            graphics.PixelOffsetMode = fallbackPrevPixelOffset;
+            graphics.SmoothingMode = fallbackPrevSmoothing;
+        }
     }
 
     public static Color Blend(Color from, Color to, float amount)
@@ -750,6 +868,11 @@ internal sealed class ModernToggleSwitch : CheckBox
         base.OnEnabledChanged(eventArgs);
     }
 
+    protected override void OnPaintBackground(PaintEventArgs pevent)
+    {
+        // AllPaintingInWmPaint + UserPaint: OnPaint paints the parent backdrop and toggle cleanly.
+    }
+
     protected override void OnPaint(PaintEventArgs eventArgs)
     {
         if (Width <= 1 || Height <= 1)
@@ -1052,13 +1175,23 @@ internal sealed class ModernInputShell : Panel
         {
             using var glyphPen = new Pen(
                 _focused ? FocusBorderColor : GlyphColor,
-                Math.Max(1.7F, 1.35F * dpiScale))
+                Math.Max(1.6F, 1.45F * dpiScale))
             {
                 StartCap = LineCap.Round,
                 EndCap = LineCap.Round
             };
-            e.Graphics.DrawEllipse(glyphPen, 16F, (Height / 2F) - 7F, 11F, 11F);
-            e.Graphics.DrawLine(glyphPen, 25F, (Height / 2F) + 3F, 30F, (Height / 2F) + 8F);
+            var circleDiameter = 11F * dpiScale;
+            var glyphLeft = Math.Max(10F * dpiScale, (Padding.Left - (15F * dpiScale)) * 0.5F);
+            var glyphTop = (Height - circleDiameter) * 0.5F - (1F * dpiScale);
+            e.Graphics.DrawEllipse(glyphPen, glyphLeft, glyphTop, circleDiameter, circleDiameter);
+            var handleStartX = glyphLeft + (circleDiameter * 0.82F);
+            var handleStartY = glyphTop + (circleDiameter * 0.82F);
+            e.Graphics.DrawLine(
+                glyphPen,
+                handleStartX,
+                handleStartY,
+                handleStartX + (4.2F * dpiScale),
+                handleStartY + (4.2F * dpiScale));
         }
 
         base.OnPaint(e);
@@ -1398,6 +1531,11 @@ internal sealed class ThemePicker : Control
         Invalidate();
     }
 
+    protected override void OnPaintBackground(PaintEventArgs pevent)
+    {
+        // AllPaintingInWmPaint + UserPaint: OnPaint paints the aligned parent backdrop slice.
+    }
+
     protected override void OnPaint(PaintEventArgs e)
     {
         if (Width <= 1 || Height <= 1)
@@ -1405,6 +1543,7 @@ internal sealed class ThemePicker : Control
             return;
         }
 
+        UiDesign.PaintParentBackdrop(e.Graphics, this);
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
         var bounds = new RectangleF(0.75F, 0.75F, Math.Max(1F, Width - 1.5F), Math.Max(1F, Height - 1.5F));
         using var path = UiDesign.CreateRoundedPath(bounds, Math.Max(8, ScaleLogical(10)));
@@ -1711,7 +1850,7 @@ internal sealed class PillLabel : Label
 
     protected override void OnPaintBackground(PaintEventArgs pevent)
     {
-        base.OnPaintBackground(pevent);
+        // AllPaintingInWmPaint + UserPaint: OnPaint paints the aligned parent backdrop slice.
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -1721,6 +1860,7 @@ internal sealed class PillLabel : Label
             return;
         }
 
+        UiDesign.PaintParentBackdrop(e.Graphics, this);
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
         var bounds = new RectangleF(0.5F, 0.5F, Math.Max(1F, Width - 1F), Math.Max(1F, Height - 1F));
         using var path = UiDesign.CreateRoundedPath(bounds, Height / 2F);
@@ -1815,6 +1955,11 @@ internal sealed class QuotaProgressBar : Control
         BackColor = Color.Transparent;
     }
 
+    protected override void OnPaintBackground(PaintEventArgs pevent)
+    {
+        // AllPaintingInWmPaint + UserPaint: OnPaint paints the aligned parent backdrop slice.
+    }
+
     protected override void OnPaint(PaintEventArgs e)
     {
         if (Width <= 1 || Height <= 1)
@@ -1822,6 +1967,7 @@ internal sealed class QuotaProgressBar : Control
             return;
         }
 
+        UiDesign.PaintParentBackdrop(e.Graphics, this);
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
         var track = new RectangleF(0F, 0F, Width, Height);
         using var trackPath = UiDesign.CreateRoundedPath(track, Height / 2F);
@@ -1856,17 +2002,22 @@ internal static class GraphicsExtensions
     }
 }
 
-internal sealed class BufferedFlowLayoutPanel : FlowLayoutPanel
+internal sealed class BufferedFlowLayoutPanel : FlowLayoutPanel, IBackdropPassthrough
 {
-    private const int ScrollFrameIntervalMilliseconds = 33;
-    private const int ScrollSettleDelayMilliseconds = 90;
+    private const int ScrollFrameIntervalMilliseconds = 16;
+    private const int ScrollSettleDelayMilliseconds = 85;
+    private const float LogicalWheelStepPixels = 92F;
     private readonly System.Windows.Forms.Timer _scrollFrameTimer;
     private readonly System.Windows.Forms.Timer _scrollSettleTimer;
     private bool _scrollFramePending;
     private bool _scrollInProgress;
     private int _scrollRefreshVersion;
+    private float _wheelPixelRemainder;
 
     public event EventHandler? ViewportChanged;
+
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public bool UseBackdropSurface { get; set; }
 
     internal bool IsScrollInProgress => _scrollInProgress;
 
@@ -1887,6 +2038,16 @@ internal sealed class BufferedFlowLayoutPanel : FlowLayoutPanel
         _scrollSettleTimer.Tick += HandleScrollSettled;
     }
 
+    protected override void OnPaintBackground(PaintEventArgs e)
+    {
+        if (UseBackdropSurface && UiDesign.TryPaintBackdrop(e.Graphics, this, e.ClipRectangle))
+        {
+            return;
+        }
+
+        base.OnPaintBackground(e);
+    }
+
     protected override void OnScroll(ScrollEventArgs se)
     {
         base.OnScroll(se);
@@ -1895,6 +2056,15 @@ internal sealed class BufferedFlowLayoutPanel : FlowLayoutPanel
 
     protected override void OnMouseWheel(MouseEventArgs e)
     {
+        if (e.Delta != 0 && ScrollByMouseWheelDelta(e.Delta))
+        {
+            if (e is HandledMouseEventArgs handled)
+            {
+                handled.Handled = true;
+            }
+            return;
+        }
+
         // ScrollableControl's wheel path can call SetDisplayRectLocation/ScrollWindowEx
         // without raising OnScroll. Compare the native display position around the base
         // call so wheel and precision-touchpad scrolling receive the same repaint policy.
@@ -1905,6 +2075,54 @@ internal sealed class BufferedFlowLayoutPanel : FlowLayoutPanel
         {
             QueueScrollRefresh();
         }
+    }
+
+    internal bool ScrollByMouseWheelDelta(int wheelDelta)
+    {
+        if (!AutoScroll || IsDisposed || Disposing || !IsHandleCreated || wheelDelta == 0)
+        {
+            return false;
+        }
+
+        var maxScrollY = Math.Max(0, DisplayRectangle.Height - ClientSize.Height);
+        if (maxScrollY <= 0)
+        {
+            _wheelPixelRemainder = 0F;
+            return false;
+        }
+
+        var dpiScale = Math.Max(1F, DeviceDpi / 96F);
+        var wheelUnit = Math.Max(1, SystemInformation.MouseWheelScrollDelta);
+        var stepPixels = LogicalWheelStepPixels * dpiScale;
+        var deltaPixels = -(wheelDelta / (float)wheelUnit) * stepPixels;
+
+        // Reset sub-pixel remainder on direction change so reversal feels immediate.
+        if ((_wheelPixelRemainder > 0F && deltaPixels < 0F) ||
+            (_wheelPixelRemainder < 0F && deltaPixels > 0F))
+        {
+            _wheelPixelRemainder = 0F;
+        }
+
+        var totalPixels = deltaPixels + _wheelPixelRemainder;
+        var wholePixels = (int)MathF.Truncate(totalPixels);
+        _wheelPixelRemainder = totalPixels - wholePixels;
+        if (wholePixels == 0)
+        {
+            return true;
+        }
+
+        var currentY = Math.Max(0, -AutoScrollPosition.Y);
+        var targetY = Math.Clamp(currentY + wholePixels, 0, maxScrollY);
+        if (targetY == currentY)
+        {
+            _wheelPixelRemainder = 0F;
+            return true;
+        }
+
+        var currentX = Math.Max(0, -AutoScrollPosition.X);
+        AutoScrollPosition = new Point(currentX, targetY);
+        QueueScrollRefresh();
+        return true;
     }
 
     private void QueueScrollRefresh()
@@ -1943,10 +2161,9 @@ internal sealed class BufferedFlowLayoutPanel : FlowLayoutPanel
         }
 
         ViewportChanged?.Invoke(this, EventArgs.Empty);
-        // Native AutoScroll moves child windows with a bit-block transfer. Repaint the
-        // visible descendants synchronously at a throttled 30 FPS so an owner-drawn child
-        // cannot leave copied horizontal strips behind while the wheel is still moving.
-        InvalidateVisibleViewport(flush: true);
+        // Coalesce visible-viewport invalidations into Windows' natural WM_PAINT pass
+        // instead of forcing synchronous multi-hundred-HWND Update() calls per wheel notch.
+        InvalidateVisibleViewport(flush: false);
     }
 
     private void HandleScrollSettled(object? sender, EventArgs e)
@@ -1955,13 +2172,14 @@ internal sealed class BufferedFlowLayoutPanel : FlowLayoutPanel
         _scrollFrameTimer.Stop();
         _scrollFramePending = false;
         _scrollInProgress = false;
+        _wheelPixelRemainder = 0F;
         if (IsDisposed || Disposing || !IsHandleCreated)
         {
             return;
         }
 
         ViewportChanged?.Invoke(this, EventArgs.Empty);
-        InvalidateVisibleViewport(flush: true);
+        InvalidateVisibleViewport(flush: false);
     }
 
     protected override void Dispose(bool disposing)
@@ -2094,13 +2312,26 @@ internal sealed class BufferedFlowLayoutPanel : FlowLayoutPanel
     }
 }
 
-internal sealed class BufferedTableLayoutPanel : TableLayoutPanel
+internal sealed class BufferedTableLayoutPanel : TableLayoutPanel, IBackdropPassthrough
 {
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public bool UseBackdropSurface { get; set; }
+
     public BufferedTableLayoutPanel()
     {
         DoubleBuffered = true;
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true);
         UpdateStyles();
+    }
+
+    protected override void OnPaintBackground(PaintEventArgs e)
+    {
+        if (UseBackdropSurface && UiDesign.TryPaintBackdrop(e.Graphics, this, e.ClipRectangle))
+        {
+            return;
+        }
+
+        base.OnPaintBackground(e);
     }
 }
 

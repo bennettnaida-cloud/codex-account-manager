@@ -118,7 +118,8 @@ internal sealed partial class LocalPatGatewayHost
             await Send(CodexEmptyCompanionSnapshotsTests.Request(realPage), "identity", HttpStatusCode.BadRequest);
             await Send(bootstrap, "identity", HttpStatusCode.BadRequest, "other-client");
             if (observedSuccesses != 10) throw new InvalidOperationException("Unexpected successful upstream request count.");
-            Console.WriteLine("PASS: unpatched HTTP relay rejects direct bootstrap; local gateway completes tool round trips for identity/gzip/deflate/br/zstd; real Page content and unknown clients remain intact");
+            await ValidatePayloadTooLargeCompressionRecoveryAsync(deadline.Token);
+            Console.WriteLine("PASS: unpatched HTTP relay rejects direct bootstrap; local gateway completes tool round trips for identity/gzip/deflate/br/zstd; real Page content and unknown clients remain intact; HTTP 413 compression retry and fallback verified");
 
             async Task<string> Send(byte[] bytes, string encoding, HttpStatusCode expected, string? agent = null)
             {
@@ -181,6 +182,198 @@ internal sealed partial class LocalPatGatewayHost
             var reservation = new TcpListener(IPAddress.Loopback, 0);
             reservation.Start(); var port = ((IPEndPoint)reservation.LocalEndpoint).Port; reservation.Stop();
             var listener = new HttpListener(); listener.Prefixes.Add($"http://127.0.0.1:{port}/"); listener.Start();
+            return listener;
+        }
+    }
+
+    private static async Task ValidatePayloadTooLargeCompressionRecoveryAsync(CancellationToken cancellationToken)
+    {
+        var root = Path.Combine(Path.GetTempPath(), "cam-413-compress-" + Guid.NewGuid().ToString("N"));
+        var previousRoot = Environment.GetEnvironmentVariable("CODEX_ACCOUNT_MANAGER_HOME");
+        var previousShared = Environment.GetEnvironmentVariable("CODEX_ACCOUNT_MANAGER_SHARED_CODEX_HOME");
+        using var upstream = NewLoopbackListener();
+        using var gateway = NewLoopbackListener();
+        LocalPatGatewayHost? host = null;
+        Task? upstreamTask = null;
+        var mode = "zstd-ok";
+        var observedEncodings = new List<string>();
+        const int wireLimitBytes = 4096;
+        try
+        {
+            Directory.CreateDirectory(root);
+            Environment.SetEnvironmentVariable("CODEX_ACCOUNT_MANAGER_HOME", root);
+            Environment.SetEnvironmentVariable("CODEX_ACCOUNT_MANAGER_SHARED_CODEX_HOME", Path.Combine(root, "shared"));
+            var account = new AccountRecord
+            {
+                Name = "size-limited-relay",
+                AuthKind = AccountAuthKind.CompatibleApi,
+                CodexHome = Path.Combine(root, "account"),
+                ApiBaseUrl = upstream.Prefixes.Single().TrimEnd('/') + "/v1",
+                ApiModel = "gpt-6-astra"
+            };
+            Directory.CreateDirectory(account.CodexHome);
+            File.WriteAllText(
+                Path.Combine(account.CodexHome, "auth.json"),
+                "{\"OPENAI_API_KEY\":\"sk-413-fixture-only\"}");
+            new AccountStore(root).SaveAccounts([account]);
+            new ThemeService(root).SaveSettings(new AppSettings
+            {
+                AccountRotationEnabled = false,
+                PatAutoRotationEnabled = false,
+                PatGatewayProxyAutoDetect = false,
+                PatGatewayProxy = null,
+                PatGatewayProxyPort = null
+            });
+
+            upstreamTask = Task.Run(async () =>
+            {
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    var context = await upstream.GetContextAsync().WaitAsync(cancellationToken);
+                    using var rawBuffer = new MemoryStream();
+                    await context.Request.InputStream.CopyToAsync(rawBuffer, cancellationToken);
+                    var rawBytes = rawBuffer.ToArray();
+                    var encoding = context.Request.Headers["Content-Encoding"]?.Trim() ?? "identity";
+                    observedEncodings.Add(encoding);
+
+                    if (rawBytes.Length > wireLimitBytes)
+                    {
+                        context.Response.StatusCode = 413;
+                        context.Response.Headers["cf-ray"] = "fixture413-LAX";
+                        await context.Response.OutputStream.WriteAsync(
+                            Encoding.UTF8.GetBytes("<html>413 Request Entity Too Large</html>"),
+                            cancellationToken);
+                        context.Response.Close();
+                        continue;
+                    }
+
+                    var rejectEncoding = mode switch
+                    {
+                        "zstd-ok" => false,
+                        "gzip-only" => encoding.Equals("zstd", StringComparison.OrdinalIgnoreCase),
+                        "none" => !encoding.Equals("identity", StringComparison.OrdinalIgnoreCase),
+                        _ => false
+                    };
+                    if (rejectEncoding)
+                    {
+                        context.Response.StatusCode = mode == "gzip-only" ? 415 : 400;
+                        await context.Response.OutputStream.WriteAsync(
+                            Encoding.UTF8.GetBytes("{\"error\":{\"message\":\"unsupported encoding\"}}"),
+                            cancellationToken);
+                        context.Response.Close();
+                        continue;
+                    }
+
+                    var decoded = encoding.Equals("identity", StringComparison.OrdinalIgnoreCase)
+                        ? rawBytes
+                        : DecodeRequestBody(rawBytes, encoding);
+                    using var document = JsonDocument.Parse(decoded);
+                    if (document.RootElement.GetProperty("model").GetString() != "gpt-6-astra" ||
+                        !document.RootElement.GetProperty("input").GetString()!.StartsWith("large-context-", StringComparison.Ordinal))
+                    {
+                        throw new InvalidOperationException("413 compression retry corrupted the forwarded JSON payload.");
+                    }
+
+                    context.Response.StatusCode = 200;
+                    context.Response.ContentType = "application/json";
+                    await context.Response.OutputStream.WriteAsync(
+                        Encoding.UTF8.GetBytes(
+                            "{\"id\":\"resp_413_recovered\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"gpt-6-astra\",\"output\":[]}"),
+                        cancellationToken);
+                    context.Response.Close();
+                }
+            }, cancellationToken);
+
+            host = new LocalPatGatewayHost("X-413-Fixture", "1", new Uri(gateway.Prefixes.Single()).Port);
+            using var client = new HttpClient(new HttpClientHandler { UseProxy = false });
+            var largePlain = Encoding.UTF8.GetBytes(
+                "{\"model\":\"gpt-6-astra\",\"stream\":false,\"input\":\"large-context-" +
+                new string('Q', 16_384) + "\"}");
+            var largeZstd = EncodeRequestBody(largePlain, "zstd");
+
+            // Case 1: relay returns 413 on identity, accepts zstd retry -> 200 OK.
+            mode = "zstd-ok";
+            observedEncodings.Clear();
+            var (status1, body1, _) = await SendLargeAsync(largeZstd, "zstd");
+            if (status1 != HttpStatusCode.OK || !body1.Contains("resp_413_recovered", StringComparison.Ordinal) ||
+                !observedEncodings.SequenceEqual(["identity", "zstd"]))
+            {
+                throw new InvalidOperationException(
+                    $"413->zstd recovery failed: status={status1}, attempts={string.Join(',', observedEncodings)}");
+            }
+
+            // Case 2: relay returns 413 on identity, 415 on zstd, accepts gzip fallback -> 200 OK.
+            mode = "gzip-only";
+            observedEncodings.Clear();
+            var (status2, body2, _) = await SendLargeAsync(largeZstd, "zstd");
+            if (status2 != HttpStatusCode.OK || !body2.Contains("resp_413_recovered", StringComparison.Ordinal) ||
+                !observedEncodings.SequenceEqual(["identity", "zstd", "gzip"]))
+            {
+                throw new InvalidOperationException(
+                    $"413->zstd->gzip fallback failed: status={status2}, attempts={string.Join(',', observedEncodings)}");
+            }
+
+            // Case 3: relay rejects all compression probes -> preserves original 413 + cf-ray (never 400/415).
+            mode = "none";
+            observedEncodings.Clear();
+            var (status3, _, cfRay3) = await SendLargeAsync(largeZstd, "zstd");
+            if (status3 != HttpStatusCode.RequestEntityTooLarge ||
+                cfRay3 != "fixture413-LAX" ||
+                !observedEncodings.SequenceEqual(["identity", "zstd", "gzip"]))
+            {
+                throw new InvalidOperationException(
+                    $"413 preservation failed: status={status3}, cf-ray={cfRay3}, attempts={string.Join(',', observedEncodings)}");
+            }
+
+            async Task<(HttpStatusCode Status, string Body, string? CfRay)> SendLargeAsync(byte[] wireBytes, string encoding)
+            {
+                using var shutdown = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                var handle = Task.Run(async () => await host.HandleAsync(
+                    await gateway.GetContextAsync().WaitAsync(cancellationToken),
+                    gateway,
+                    shutdown));
+                using var request = new HttpRequestMessage(
+                    HttpMethod.Post,
+                    gateway.Prefixes.Single() + "backend-api/codex/responses");
+                request.Headers.Authorization = new("Bearer", "sk-413-fixture-only");
+                request.Content = new ByteArrayContent(wireBytes);
+                request.Content.Headers.ContentType = new("application/json");
+                if (encoding != "identity")
+                {
+                    request.Content.Headers.ContentEncoding.Add(encoding);
+                }
+                using var response = await client.SendAsync(request, cancellationToken);
+                var body = await response.Content.ReadAsStringAsync(cancellationToken);
+                var cfRay = response.Headers.TryGetValues("cf-ray", out var values) ? values.FirstOrDefault() : null;
+                await handle.WaitAsync(cancellationToken);
+                return (response.StatusCode, body, cfRay);
+            }
+        }
+        finally
+        {
+            upstream.Stop();
+            gateway.Stop();
+            if (upstreamTask != null)
+            {
+                try { await upstreamTask; }
+                catch (OperationCanceledException) { }
+                catch (HttpListenerException) { }
+            }
+            host?.DisposeUpstreamClients();
+            Environment.SetEnvironmentVariable("CODEX_ACCOUNT_MANAGER_HOME", previousRoot);
+            Environment.SetEnvironmentVariable("CODEX_ACCOUNT_MANAGER_SHARED_CODEX_HOME", previousShared);
+            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+        }
+
+        static HttpListener NewLoopbackListener()
+        {
+            var reservation = new TcpListener(IPAddress.Loopback, 0);
+            reservation.Start();
+            var port = ((IPEndPoint)reservation.LocalEndpoint).Port;
+            reservation.Stop();
+            var listener = new HttpListener();
+            listener.Prefixes.Add($"http://127.0.0.1:{port}/");
+            listener.Start();
             return listener;
         }
     }

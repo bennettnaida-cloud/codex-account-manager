@@ -215,8 +215,11 @@ public partial class Form1 : Form
     private const int AccountRowMinWidth = 560;
     private const int AccountSwitchHorizontalMinWidth = 920;
     private const int QuotaUsageHorizontalMinWidth = 900;
-    private const int WorkspaceHeroHeight = 160;
-    private const int CompactWorkspaceHeroHeight = 108;
+    private const int WorkspaceHeroHeight = 68;
+    private const int CompactWorkspaceHeroHeight = 56;
+    private const int StackedWorkspaceHeroHeight = 104;
+    private const int HeaderHorizontalMinWidth = 640;
+    private const int CompactStatusBarHeight = 30;
     private const int QuotaRefreshActiveIntervalMs = 250;
     private const int QuotaRefreshMinimizedIntervalMs = 2000;
     private const int WorkspaceScrollbarEdgeInset = 2;
@@ -449,9 +452,11 @@ public partial class Form1 : Form
     private ModernInputShell? _projectPathShell;
     private ModernInputShell? _patGatewayProxyAddressShell;
     private ModernInputShell? _patGatewayProxyPortShell;
+    private WorkspaceBackdropPanel? _contentPanel;
     private RoundedPanel? _headerPanel;
+    private RoundedPanel? _statusBarPanel;
     private BufferedTableLayoutPanel? _contentLayout;
-    private BufferedFlowLayoutPanel? _controlsRow;
+    private WorkspaceMouseWheelFilter? _mouseWheelFilter;
     private Panel? _sidebarFooter;
     private Label? _managerAppearanceLabel;
     private ProxySidebarPanel? _proxySidebar;
@@ -533,6 +538,32 @@ public partial class Form1 : Form
     {
         base.OnLoad(e);
         ApplyInitialWindowBounds();
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            RemoveMouseWheelFilter();
+            _contentPanel?.ReleaseBackdropCache();
+        }
+        base.Dispose(disposing);
+    }
+
+    private void RemoveMouseWheelFilter()
+    {
+        var filter = Interlocked.Exchange(ref _mouseWheelFilter, null);
+        if (filter != null)
+        {
+            try
+            {
+                Application.RemoveMessageFilter(filter);
+            }
+            catch
+            {
+                // Teardown is best-effort.
+            }
+        }
     }
 
     protected override void OnPaintBackground(PaintEventArgs e)
@@ -884,13 +915,15 @@ public partial class Form1 : Form
         _toolTip.SetToolTip(_currentVersionLabel, $"当前运行版本：{AppUpdateService.DisplayVersion}");
         _toolTip.SetToolTip(_themeModePicker, "管理器外观与 Codex 主题相互独立，选择后立即保存并应用。");
 
-        var content = new Panel
+        var content = _contentPanel = new WorkspaceBackdropPanel
         {
             Dock = DockStyle.Fill,
-            Padding = new Padding(20, 18, 20, 12),
+            Padding = Padding.Empty,
+            Margin = Padding.Empty,
             Name = "Content",
             BackColor = _palette.FormBackColor
         };
+        content.SetTheme(ThemeService.ResolveEffectiveThemeMode(_appSettings.ThemeMode), _palette);
         layout.Controls.Add(content, 1, 0);
 
         var contentLayout = _contentLayout = new BufferedTableLayoutPanel
@@ -898,36 +931,43 @@ public partial class Form1 : Form
             Dock = DockStyle.Fill,
             ColumnCount = 1,
             RowCount = 3,
-            BackColor = _palette.FormBackColor
+            Margin = Padding.Empty,
+            Padding = Padding.Empty,
+            BackColor = _palette.FormBackColor,
+            UseBackdropSurface = true
         };
         contentLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         contentLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, WorkspaceHeroHeight));
         contentLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        contentLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
+        contentLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, CompactStatusBarHeight));
         content.Controls.Add(contentLayout);
 
         var header = _headerPanel = new RoundedPanel
         {
             Dock = DockStyle.Fill,
             Height = WorkspaceHeroHeight,
-            Radius = 18,
+            Margin = Padding.Empty,
+            Radius = 0,
             Padding = Padding.Empty,
             UseGradient = true,
             ShowTechDecoration = false,
             ShowStarfield = true,
-            Elevation = 2,
+            HeaderAmbientSkyOnly = true,
+            DrawBottomDividerOnly = true,
+            Elevation = 0,
+            ShouldPauseStarfieldAnimation = () => _cardsPanel.IsScrollInProgress,
             Name = "HeaderPanel"
         };
         contentLayout.Controls.Add(header, 0, 0);
 
         _headerTitle.Text = "账号切换";
-        _headerTitle.Left = 32;
-        _headerTitle.Top = 4;
-        _headerTitle.Width = 520;
-        _headerTitle.Height = 62;
-        _headerTitle.Font = new Font(Font.FontFamily, 14.6F, FontStyle.Bold);
+        _headerTitle.Left = 18;
+        _headerTitle.Top = 10;
+        _headerTitle.Width = 420;
+        _headerTitle.Height = 26;
+        _headerTitle.Font = new Font(Font.FontFamily, 12.6F, FontStyle.Bold);
         _headerTitle.TextAlign = ContentAlignment.MiddleLeft;
-        _headerTitle.AutoEllipsis = false;
+        _headerTitle.AutoEllipsis = true;
         _headerTitle.AutoSize = false;
         _headerTitle.UseMnemonic = false;
         _headerTitle.UseCompatibleTextRendering = true;
@@ -935,59 +975,27 @@ public partial class Form1 : Form
         header.Controls.Add(_headerTitle);
 
         _headerSubtitle.Text = "选择账号并用官方 Codex 或 CLI 启动。";
-        _headerSubtitle.Left = 32;
-        _headerSubtitle.Top = 66;
-        _headerSubtitle.Width = 1040;
-        _headerSubtitle.Height = 30;
-        _headerSubtitle.Font = new Font(Font.FontFamily, 8.8F);
-        _headerSubtitle.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
-        _headerSubtitle.AutoEllipsis = false;
+        _headerSubtitle.Left = 18;
+        _headerSubtitle.Top = 38;
+        _headerSubtitle.Width = 420;
+        _headerSubtitle.Height = 20;
+        _headerSubtitle.Font = new Font(Font.FontFamily, 8.4F);
+        _headerSubtitle.AutoEllipsis = true;
+        _headerSubtitle.AutoSize = false;
         _headerSubtitle.UseMnemonic = false;
         _headerSubtitle.UseCompatibleTextRendering = true;
         _headerSubtitle.TextAlign = ContentAlignment.MiddleLeft;
         _headerSubtitle.Name = "HeaderSubtitle";
         header.Controls.Add(_headerSubtitle);
 
-        header.Resize += (_, _) =>
-        {
-            // Transparent WinForms labels repaint their own rectangular parent background.
-            // Letting them span the whole hero therefore hides the starfield drawn by the
-            // parent panel even though the labels contain text only on the left. Reserve the
-            // right side for the meteor scene while keeping every workspace title comfortably
-            // inside a responsive text column.
-            var headerTextWidth = Math.Clamp(
-                (int)MathF.Round(header.ClientSize.Width * 0.52F),
-                320,
-                680);
-            _headerTitle.Width = Math.Max(
-                240,
-                Math.Min(headerTextWidth, header.ClientSize.Width - _headerTitle.Left - 20));
-            _headerSubtitle.Width = Math.Max(
-                260,
-                Math.Min(headerTextWidth, header.ClientSize.Width - _headerSubtitle.Left - 20));
-            UpdateHeaderControlLayout();
-        };
-
-        var controlsRow = _controlsRow = new BufferedFlowLayoutPanel
-        {
-            Dock = DockStyle.Bottom,
-            Height = 58,
-            WrapContents = false,
-            AutoScroll = false,
-            FlowDirection = FlowDirection.LeftToRight,
-            Padding = new Padding(32, 4, 32, 8),
-            Margin = Padding.Empty,
-            BackColor = Color.Transparent,
-            Name = "ControlsRow"
-        };
-        header.Controls.Add(controlsRow);
+        header.Resize += (_, _) => UpdateHeaderControlLayout();
 
         _searchBox.PlaceholderText = "搜索账号";
         _searchBox.Left = 0;
         _searchBox.Top = 0;
-        _searchBox.Width = 450;
+        _searchBox.Width = 260;
         _searchBox.AutoSize = true;
-        _searchBox.Font = new Font(Font.FontFamily, 9.5F);
+        _searchBox.Font = new Font(Font.FontFamily, 9.0F);
         _searchBox.Margin = Padding.Empty;
         _searchBox.TextChanged += (_, _) =>
         {
@@ -1005,12 +1013,13 @@ public partial class Form1 : Form
         };
         _searchShell = new ModernInputShell(_searchBox, showSearchGlyph: true)
         {
-            Width = 500,
-            Height = 44,
-            Margin = new Padding(0, 0, 12, 0),
+            Width = 300,
+            Height = 36,
+            Padding = new Padding(38, 6, 10, 6),
+            Margin = Padding.Empty,
             Radius = 10
         };
-        controlsRow.Controls.Add(_searchShell);
+        header.Controls.Add(_searchShell);
 
         // Keep the bulk quota probe as a persistent control so its progress/handler survive
         // list refreshes. It is reparented to the first quota account-group header rather
@@ -1045,9 +1054,7 @@ public partial class Form1 : Form
         _bulkQuotaTestButton.IconTileBorderColor = Color.FromArgb(92, Color.White);
         // The bulk quota action is attached to the quota account-group header when that
         // page is rendered.  Keeping it out of the hero prevents the button from covering
-        // the starfield artwork and makes it sit next to the group's collapse control.
-
-        controlsRow.SizeChanged += (_, _) => UpdateHeaderControlLayout();
+        // the header title/search band and makes it sit next to the group's collapse control.
 
         _projectPathBox.Text = ResolveInitialProjectPath();
         _projectPathBox.Validated += (_, _) => SaveEditedProjectPath();
@@ -1132,6 +1139,8 @@ public partial class Form1 : Form
         {
             ManagerLifecycleDiagnostics.Write("manager-form-closed");
             _formClosed = true;
+            RemoveMouseWheelFilter();
+            _contentPanel?.ReleaseBackdropCache();
             _bulkQuotaTestInProgress = false;
             _workspaceLoadGeneration++;
             _proxyDetectionCancellation?.Cancel();
@@ -1181,23 +1190,39 @@ public partial class Form1 : Form
             Radius = 9
         };
 
+        var statusBarPanel = _statusBarPanel = new RoundedPanel
+        {
+            Dock = DockStyle.Fill,
+            Height = CompactStatusBarHeight,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty,
+            Radius = 0,
+            Elevation = 0,
+            UseGradient = true,
+            DrawTopDividerOnly = true,
+            Name = "StatusBarPanel"
+        };
         _statusBox.Dock = DockStyle.Fill;
-        _statusBox.Height = 52;
+        _statusBox.Height = CompactStatusBarHeight;
         _statusBox.AutoEllipsis = false;
         _statusBox.UseCompatibleTextRendering = true;
-        _statusBox.Padding = new Padding(24, 4, 24, 8);
+        _statusBox.Padding = new Padding(22, 2, 22, 2);
         _statusBox.TextAlign = ContentAlignment.MiddleLeft;
-        _statusBox.Font = new Font(Font.FontFamily, 8.8F);
+        _statusBox.Font = new Font(Font.FontFamily, 8.4F);
+        _statusBox.BackColor = Color.Transparent;
         _statusBox.Text = "就绪";
         _statusBox.TextChanged += (_, _) => UpdateStatusBarLayout();
-        contentLayout.Controls.Add(_statusBox, 0, 2);
+        statusBarPanel.Controls.Add(_statusBox);
+        contentLayout.Controls.Add(statusBarPanel, 0, 2);
 
         _accountLayout.Dock = DockStyle.Fill;
         _accountLayout.ColumnCount = 1;
         _accountLayout.RowCount = 1;
-        _accountLayout.Padding = new Padding(2, 12, 0, 4);
+        _accountLayout.Margin = Padding.Empty;
+        _accountLayout.Padding = new Padding(22, 10, 6, 0);
         _accountLayout.Name = "AccountWorkspace";
         _accountLayout.BackColor = _palette.FormBackColor;
+        _accountLayout.UseBackdropSurface = true;
         _accountLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         _accountLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         contentLayout.Controls.Add(_accountLayout, 0, 1);
@@ -1207,12 +1232,15 @@ public partial class Form1 : Form
         _cardsPanel.AutoScroll = true;
         _cardsPanel.WrapContents = false;
         _cardsPanel.FlowDirection = FlowDirection.TopDown;
-        // Keep the native scrollbar at the far-right edge. Card widths reserve one
-        // stable system scrollbar slot themselves, so extra panel padding would only
-        // create a second, visually heavy strip on the right.
-        _cardsPanel.Padding = Padding.Empty;
+        // Keep the native scrollbar at the far-right edge while giving floating cards
+        // balanced left/right cosmic starry-sky breathing margins.
+        _cardsPanel.Padding = new Padding(0, 2, 16, 0);
+        _cardsPanel.AutoScrollMargin = new Size(0, 14);
         _cardsPanel.BackColor = _palette.FormBackColor;
+        _cardsPanel.UseBackdropSurface = true;
         _cardsPanel.ViewportChanged += (_, _) => RefreshCardsAnimationVisibility();
+        _mouseWheelFilter = new WorkspaceMouseWheelFilter(this, _cardsPanel);
+        Application.AddMessageFilter(_mouseWheelFilter);
         _layoutRefreshTimer.Tick += (_, _) =>
         {
             _layoutRefreshTimer.Stop();
@@ -1243,7 +1271,7 @@ public partial class Form1 : Form
         };
         _cardsPanel.Name = "WorkspaceListPanel";
         _cardsPanel.HandleCreated += (_, _) =>
-            NativeWindowTheme.ApplyScrollable(_cardsPanel, ThemeStyler.IsDark(_palette));
+            NativeWindowTheme.ApplyScrollable(_cardsPanel, UsesCosmicDarkBackdrop());
         _accountLayout.Controls.Add(_cardsPanel, 0, 0);
 
         SizeChanged += (_, _) => RestoreWorkspaceAfterMinimize();
@@ -1264,6 +1292,9 @@ public partial class Form1 : Form
                         return;
                     }
                     ClearWorkspaceViewCache();
+                    var scale = Math.Max(1F, DeviceDpi / 96F);
+                    _cardsPanel.AutoScrollMargin = new Size(0, (int)Math.Round(14F * scale));
+                    _contentPanel?.ReleaseBackdropCache();
                     UpdateWorkspaceChrome();
                     UpdateStatusBarLayout();
                     RenderCards();
@@ -1487,12 +1518,18 @@ public partial class Form1 : Form
         footer.BringToFront();
     }
 
+    private bool UsesCosmicDarkBackdrop() =>
+        WorkspaceBackdropPanel.UsesDarkCosmicBackdrop(
+            ThemeService.ResolveEffectiveThemeMode(_appSettings.ThemeMode));
+
     private void ApplyTheme(bool renderCards = true)
     {
         _palette = _themeService.GetPalette(_appSettings.ThemeMode);
+        var resolvedThemeMode = ThemeService.ResolveEffectiveThemeMode(_appSettings.ThemeMode);
         BackColor = _palette.FormBackColor;
+        _contentPanel?.SetTheme(resolvedThemeMode, _palette);
         NativeWindowTheme.Apply(this, ThemeStyler.IsDark(_palette));
-        NativeWindowTheme.ApplyScrollable(_cardsPanel, ThemeStyler.IsDark(_palette));
+        NativeWindowTheme.ApplyScrollable(_cardsPanel, UsesCosmicDarkBackdrop());
 
         ApplyThemeRecursive(this);
         _proxySidebar?.ApplyPalette(_palette);
@@ -1500,6 +1537,28 @@ public partial class Form1 : Form
         if (_searchShell != null)
         {
             ThemeStyler.ApplyInputShell(_searchShell, _palette);
+            var dark = ThemeStyler.IsDark(_palette);
+            if (dark)
+            {
+                _searchShell.FillColor = UiDesign.Blend(_palette.InputBackColor, _palette.HeroStartColor, 0.24F);
+                _searchShell.BorderColor = Color.FromArgb(148, UiDesign.Blend(_palette.BorderColor, _palette.AccentColor, 0.42F));
+                _searchShell.FocusBorderColor = _palette.AccentColor;
+                _searchShell.GlyphColor = UiDesign.Blend(_palette.HeroMutedTextColor, Color.White, 0.16F);
+            }
+            else
+            {
+                _searchShell.FillColor = resolvedThemeMode == ThemeMode.PorcelainLight
+                    ? Color.FromArgb(244, 250, 248)
+                    : Color.FromArgb(245, 248, 255);
+                _searchShell.BorderColor = resolvedThemeMode == ThemeMode.PorcelainLight
+                    ? Color.FromArgb(174, 214, 206)
+                    : Color.FromArgb(182, 204, 255);
+                _searchShell.FocusBorderColor = _palette.AccentColor;
+                _searchShell.GlyphColor = UiDesign.Blend(_palette.MutedTextColor, _palette.PrimaryColor, 0.28F);
+            }
+            _searchBox.BackColor = _searchShell.FillColor;
+            _searchBox.ForeColor = _palette.TextColor;
+            _searchShell.Invalidate();
         }
         ThemeStyler.ApplyInput(_projectPathBox, _palette);
         if (_projectPathShell != null)
@@ -1509,8 +1568,8 @@ public partial class Form1 : Form
         _themeModePicker.ApplyPalette(_palette);
         ThemeStyler.ApplyPrimaryButton(_updateAvailableButton, _palette);
         ApplyPatAutoRotationThresholdBadgeStyle();
-        _statusBox.BackColor = _palette.StatusBackColor;
-        _statusBox.ForeColor = _palette.MutedTextColor;
+        ApplyHeaderPanelTheme();
+        ApplyStatusBarTheme();
         UpdateWorkspaceChrome();
         ApplySidebarNavButtons();
         if (renderCards)
@@ -1518,6 +1577,138 @@ public partial class Form1 : Form
             RenderCards();
         }
         Invalidate(true);
+    }
+
+    private byte GetFloatingCardOpacity(bool emphasized = false)
+    {
+        var dark = ThemeStyler.IsDark(_palette);
+        if (dark)
+        {
+            return emphasized ? (byte)206 : (byte)192;
+        }
+        return emphasized ? (byte)234 : (byte)226;
+    }
+
+    private Color GetFloatingCardBorderColor(Color accent, bool emphasized = false)
+    {
+        var dark = ThemeStyler.IsDark(_palette);
+        if (dark)
+        {
+            return emphasized
+                ? Color.FromArgb(186, UiDesign.Blend(_palette.BorderColor, accent, 0.56F))
+                : Color.FromArgb(132, UiDesign.Blend(_palette.BorderColor, _palette.AccentColor, 0.30F));
+        }
+
+        return emphasized
+            ? Color.FromArgb(228, UiDesign.Blend(Color.White, accent, 0.32F))
+            : Color.FromArgb(192, UiDesign.Blend(Color.White, accent, 0.16F));
+    }
+
+    private Color GetFloatingCardShadowColor(bool emphasized = false)
+    {
+        var dark = ThemeStyler.IsDark(_palette);
+        if (dark)
+        {
+            return Color.FromArgb(emphasized ? 104 : 78, 0, 0, 0);
+        }
+
+        return Color.FromArgb(emphasized ? 88 : 64, 5, 9, 26);
+    }
+
+    private void ApplyHeaderPanelTheme()
+    {
+        if (_headerPanel == null || _headerPanel.IsDisposed)
+        {
+            return;
+        }
+
+        var resolvedThemeMode = ThemeService.ResolveEffectiveThemeMode(_appSettings.ThemeMode);
+        switch (resolvedThemeMode)
+        {
+            case ThemeMode.Dark:
+                _headerPanel.BackColor = Color.FromArgb(6, 15, 34);
+                _headerPanel.GradientColor = Color.FromArgb(16, 28, 66);
+                _headerPanel.SurfaceOpacity = 80;
+                _headerPanel.BorderColor = Color.FromArgb(96, 76, 194, 244);
+                _headerPanel.DecorationColor = Color.FromArgb(165, _palette.AccentColor);
+                break;
+
+            case ThemeMode.NebulaDark:
+                _headerPanel.BackColor = Color.FromArgb(14, 8, 34);
+                _headerPanel.GradientColor = Color.FromArgb(38, 18, 72);
+                _headerPanel.SurfaceOpacity = 82;
+                _headerPanel.BorderColor = Color.FromArgb(100, 196, 138, 252);
+                _headerPanel.DecorationColor = Color.FromArgb(168, _palette.AccentColor);
+                break;
+
+            case ThemeMode.PorcelainLight:
+                _headerPanel.BackColor = Color.FromArgb(12, 34, 36);
+                _headerPanel.GradientColor = Color.FromArgb(24, 54, 62);
+                _headerPanel.SurfaceOpacity = 74;
+                _headerPanel.BorderColor = Color.FromArgb(96, 128, 214, 198);
+                _headerPanel.DecorationColor = Color.FromArgb(165, Color.FromArgb(126, 232, 214));
+                break;
+
+            default:
+                // 极光浅色: translucent cosmic glass header so the deep indigo-violet starry sky
+                // and diagonal shooting meteors shine right through the compact 68px top bar.
+                _headerPanel.BackColor = Color.FromArgb(14, 21, 52);
+                _headerPanel.GradientColor = Color.FromArgb(30, 29, 78);
+                _headerPanel.SurfaceOpacity = 70;
+                _headerPanel.BorderColor = Color.FromArgb(102, 162, 188, 255);
+                _headerPanel.DecorationColor = Color.FromArgb(170, Color.FromArgb(142, 186, 255));
+                break;
+        }
+
+        _headerPanel.ShadowColor = Color.Transparent;
+        _headerTitle.ForeColor = _palette.HeroTextColor;
+        _headerSubtitle.ForeColor = UiDesign.Blend(_palette.HeroMutedTextColor, Color.White, 0.28F);
+        _headerTitle.BackColor = Color.Transparent;
+        _headerSubtitle.BackColor = Color.Transparent;
+        _headerPanel.Invalidate(invalidateChildren: true);
+    }
+
+    private void ApplyStatusBarTheme()
+    {
+        var resolvedThemeMode = ThemeService.ResolveEffectiveThemeMode(_appSettings.ThemeMode);
+        if (_statusBarPanel != null && !_statusBarPanel.IsDisposed)
+        {
+            switch (resolvedThemeMode)
+            {
+                case ThemeMode.Dark:
+                    _statusBarPanel.BackColor = Color.FromArgb(6, 15, 32);
+                    _statusBarPanel.GradientColor = Color.FromArgb(14, 26, 58);
+                    _statusBarPanel.SurfaceOpacity = 92;
+                    _statusBarPanel.BorderColor = Color.FromArgb(84, 72, 188, 240);
+                    break;
+
+                case ThemeMode.NebulaDark:
+                    _statusBarPanel.BackColor = Color.FromArgb(13, 8, 30);
+                    _statusBarPanel.GradientColor = Color.FromArgb(32, 16, 62);
+                    _statusBarPanel.SurfaceOpacity = 92;
+                    _statusBarPanel.BorderColor = Color.FromArgb(88, 186, 132, 248);
+                    break;
+
+                case ThemeMode.PorcelainLight:
+                    _statusBarPanel.BackColor = Color.FromArgb(11, 32, 34);
+                    _statusBarPanel.GradientColor = Color.FromArgb(20, 48, 54);
+                    _statusBarPanel.SurfaceOpacity = 88;
+                    _statusBarPanel.BorderColor = Color.FromArgb(82, 120, 204, 192);
+                    break;
+
+                default:
+                    _statusBarPanel.BackColor = Color.FromArgb(12, 19, 46);
+                    _statusBarPanel.GradientColor = Color.FromArgb(24, 28, 68);
+                    _statusBarPanel.SurfaceOpacity = 86;
+                    _statusBarPanel.BorderColor = Color.FromArgb(86, 152, 180, 255);
+                    break;
+            }
+            _statusBarPanel.ShadowColor = Color.Transparent;
+            _statusBarPanel.Invalidate(invalidateChildren: true);
+        }
+
+        _statusBox.BackColor = Color.Transparent;
+        _statusBox.ForeColor = UiDesign.Blend(_palette.HeroMutedTextColor, Color.White, 0.32F);
     }
 
     private void ApplyThemeRecursive(Control control)
@@ -1531,11 +1722,12 @@ public partial class Form1 : Form
             case RoundedPanel roundedPanel:
                 if (roundedPanel.Name == "HeaderPanel")
                 {
-                    roundedPanel.BackColor = _palette.HeroStartColor;
-                    roundedPanel.GradientColor = _palette.HeroEndColor;
-                    roundedPanel.DecorationColor = Color.FromArgb(48, _palette.SecondaryAccentColor);
-                    roundedPanel.BorderColor = Color.FromArgb(82, _palette.TertiaryAccentColor);
-                    roundedPanel.ShadowColor = Color.FromArgb(70, _palette.ShadowColor);
+                    ApplyHeaderPanelTheme();
+                    break;
+                }
+                if (roundedPanel.Name == "StatusBarPanel")
+                {
+                    ApplyStatusBarTheme();
                     break;
                 }
                 roundedPanel.BorderColor = _palette.BorderColor;
@@ -1557,7 +1749,7 @@ public partial class Form1 : Form
                 {
                     "Sidebar" => _palette.SidebarColor,
                     "SidebarFooter" => Color.Transparent,
-                    "Content" => _palette.FormBackColor,
+                    "Content" => _contentPanel?.BackColor ?? _palette.FormBackColor,
                     "AccountDetailPanel" => _palette.FormBackColor,
                     _ => panel.Parent == null ? _palette.FormBackColor : panel.BackColor
                 };
@@ -1570,8 +1762,13 @@ public partial class Form1 : Form
                 {
                     label.BackColor = Color.Transparent;
                     label.ForeColor = label.Name == "HeaderSubtitle"
-                        ? _palette.HeroMutedTextColor
+                        ? UiDesign.Blend(_palette.HeroMutedTextColor, Color.White, 0.28F)
                         : _palette.HeroTextColor;
+                }
+                else if (IsInsideNamedControl(label, "StatusBarPanel"))
+                {
+                    label.BackColor = Color.Transparent;
+                    label.ForeColor = UiDesign.Blend(_palette.HeroMutedTextColor, Color.White, 0.32F);
                 }
                 else if (IsInsideNamedControl(label, "Sidebar"))
                 {
@@ -3685,14 +3882,8 @@ public partial class Form1 : Form
 
         if (_headerPanel != null)
         {
-            // A theme owns one workspace background. Switching pages must not silently
-            // recolor the hero surface, otherwise the same selected theme looks like a
-            // different theme on every page.
-            _headerPanel.BackColor = _palette.HeroStartColor;
-            _headerPanel.GradientColor = _palette.HeroEndColor;
-            _headerPanel.DecorationColor = Color.FromArgb(48, _palette.SecondaryAccentColor);
-            _headerPanel.BorderColor = Color.FromArgb(82, _palette.TertiaryAccentColor);
-            _headerPanel.Invalidate();
+            // A theme owns one unified full-canvas backdrop and frosted header bar.
+            ApplyHeaderPanelTheme();
         }
     }
 
@@ -4023,30 +4214,133 @@ public partial class Form1 : Form
         });
     }
 
+    private bool IsHeaderCompactMode() =>
+        (_showAccountDetail &&
+         _activeView is WorkspaceView.AccountSwitch or WorkspaceView.QuotaUsage) ||
+        (_showCodexAppearanceDetail && _activeView == WorkspaceView.ThemeSettings) ||
+        _activeView is WorkspaceView.ThemeSettings or WorkspaceView.SystemConfig or WorkspaceView.ProxyManagement;
+
     private void UpdateHeaderControlLayout()
     {
-        if (_controlsRow == null || _searchShell == null)
+        if (_headerPanel == null || _headerPanel.IsDisposed || _searchShell == null || _searchShell.IsDisposed)
         {
             return;
         }
 
-        var available = Math.Max(260, _controlsRow.ClientSize.Width - _controlsRow.Padding.Horizontal);
-        _searchShell.Width = Math.Max(260, Math.Min(500, available));
+        var dpiScale = Math.Max(1F, DeviceDpi / 96F);
+        int Scale(int logicalPx) => Math.Max(1, (int)Math.Round(logicalPx * dpiScale));
 
-        // The bulk action is anchored in the hero's upper-right corner.  Reposition it on
-        // every resize (including per-monitor DPI changes) so its complete caption never
-        // gets clipped by the meteor artwork or the window edge.
-        if (_headerPanel is { IsDisposed: false } header &&
-            _bulkQuotaTestButton is { IsDisposed: false } &&
-            ReferenceEquals(_bulkQuotaTestButton.Parent, header))
+        var headerWidth = _headerPanel.ClientSize.Width;
+        if (headerWidth <= 0 && _contentLayout != null)
         {
-            const int rightInset = 28;
-            const int top = 8;
-            // Reserve enough room for the full caption at the current DPI.  The
-            // old 178–214px range produced an ellipsis on normal 125% displays.
-            var buttonWidth = Math.Min(340, Math.Max(300, header.ClientSize.Width / 4));
-            var left = Math.Max(12, header.ClientSize.Width - rightInset - buttonWidth);
-            _bulkQuotaTestButton.SetBounds(left, top, buttonWidth, 46);
+            headerWidth = _contentLayout.ClientSize.Width;
+        }
+        headerWidth = Math.Max(Scale(320), headerWidth);
+
+        var compact = IsHeaderCompactMode();
+        var showSearch = !compact;
+        var stacked = showSearch && headerWidth < Scale(HeaderHorizontalMinWidth);
+        var padX = Scale(22);
+        var textGap = 0;
+
+        var titleMeasured = TextRenderer.MeasureText(
+            string.IsNullOrEmpty(_headerTitle.Text) ? "国Ag" : _headerTitle.Text,
+            _headerTitle.Font,
+            Size.Empty,
+            TextFormatFlags.SingleLine | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+        var subtitleMeasured = TextRenderer.MeasureText(
+            string.IsNullOrEmpty(_headerSubtitle.Text) ? "国Ag" : _headerSubtitle.Text,
+            _headerSubtitle.Font,
+            Size.Empty,
+            TextFormatFlags.SingleLine | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+
+        var titleHeight = Math.Max(Scale(26), titleMeasured.Height + Scale(6));
+        var subtitleHeight = Math.Max(Scale(21), subtitleMeasured.Height + Scale(6));
+        var textBlockHeight = titleHeight + textGap + subtitleHeight;
+        var searchHeight = Math.Max(Scale(36), _searchBox.PreferredHeight + Scale(14));
+
+        int targetHeroHeight;
+        if (!showSearch)
+        {
+            targetHeroHeight = Math.Max(Scale(CompactWorkspaceHeroHeight), textBlockHeight + Scale(14));
+            var topY = Math.Max(Scale(6), (targetHeroHeight - textBlockHeight) / 2);
+            var maxTextWidth = Math.Max(Scale(160), headerWidth - (padX * 2));
+            var titleWidth = Math.Min(maxTextWidth, Math.Max(Scale(120), titleMeasured.Width + Scale(14)));
+            var subtitleWidth = Math.Min(maxTextWidth, Math.Max(Scale(120), subtitleMeasured.Width + Scale(14)));
+            _headerTitle.SetBounds(padX, topY, titleWidth, titleHeight);
+            _headerSubtitle.SetBounds(padX, topY + titleHeight + textGap, subtitleWidth, subtitleHeight);
+            _searchShell.Visible = false;
+        }
+        else if (!stacked)
+        {
+            targetHeroHeight = Math.Max(Scale(WorkspaceHeroHeight), Math.Max(textBlockHeight, searchHeight) + Scale(20));
+            var searchWidth = Math.Clamp(
+                (int)Math.Round(headerWidth * 0.34F),
+                Scale(230),
+                Scale(350));
+            var searchLeft = Math.Max(padX, headerWidth - padX - searchWidth);
+            var searchTop = Math.Max(Scale(6), (targetHeroHeight - searchHeight) / 2);
+            _searchShell.Padding = new Padding(Scale(38), Scale(6), Scale(10), Scale(6));
+            _searchShell.SetBounds(searchLeft, searchTop, searchWidth, searchHeight);
+            _searchShell.Visible = true;
+
+            var maxTextWidth = Math.Max(Scale(160), searchLeft - padX - Scale(16));
+            var titleWidth = Math.Min(maxTextWidth, Math.Max(Scale(120), titleMeasured.Width + Scale(14)));
+            var subtitleWidth = Math.Min(maxTextWidth, Math.Max(Scale(120), subtitleMeasured.Width + Scale(14)));
+            var topY = Math.Max(Scale(6), (targetHeroHeight - textBlockHeight) / 2);
+            _headerTitle.SetBounds(padX, topY, titleWidth, titleHeight);
+            _headerSubtitle.SetBounds(padX, topY + titleHeight + textGap, subtitleWidth, subtitleHeight);
+        }
+        else
+        {
+            var topY = Scale(8);
+            var searchTop = topY + textBlockHeight + Scale(8);
+            targetHeroHeight = Math.Max(Scale(StackedWorkspaceHeroHeight), searchTop + searchHeight + Scale(10));
+            var innerWidth = Math.Max(Scale(160), headerWidth - (padX * 2));
+            _headerTitle.SetBounds(padX, topY, innerWidth, titleHeight);
+            _headerSubtitle.SetBounds(padX, topY + titleHeight + textGap, innerWidth, subtitleHeight);
+            _searchShell.Padding = new Padding(Scale(38), Scale(6), Scale(10), Scale(6));
+            _searchShell.SetBounds(padX, searchTop, innerWidth, searchHeight);
+            _searchShell.Visible = true;
+        }
+
+        // Expose only the unobstructed cosmic sky corridor between title/subtitle and search box
+        // to the optional low-CPU ambient header star-twinkle animation.
+        if (!stacked)
+        {
+            var openSkyLeft = Math.Max(_headerTitle.Right, _headerSubtitle.Right) + Scale(12);
+            var openSkyRight = _searchShell.Visible
+                ? _searchShell.Left - Scale(12)
+                : headerWidth - padX;
+            var openSkyWidth = openSkyRight - openSkyLeft;
+            _headerPanel.AmbientSkyBounds = openSkyWidth >= Scale(96)
+                ? new Rectangle(openSkyLeft, 0, openSkyWidth, targetHeroHeight)
+                : Rectangle.Empty;
+        }
+        else
+        {
+            _headerPanel.AmbientSkyBounds = Rectangle.Empty;
+        }
+
+        if (_contentLayout != null &&
+            _contentLayout.RowStyles.Count > 0 &&
+            Math.Abs(_contentLayout.RowStyles[0].Height - targetHeroHeight) > 0.5F)
+        {
+            _contentLayout.RowStyles[0].Height = targetHeroHeight;
+        }
+        if (_headerPanel.Height != targetHeroHeight)
+        {
+            _headerPanel.Height = targetHeroHeight;
+        }
+
+        if (_bulkQuotaTestButton is { IsDisposed: false } &&
+            ReferenceEquals(_bulkQuotaTestButton.Parent, _headerPanel))
+        {
+            var rightInset = Scale(18);
+            var top = Math.Max(Scale(6), (targetHeroHeight - Scale(36)) / 2);
+            var buttonWidth = Math.Min(Scale(260), Math.Max(Scale(200), headerWidth / 4));
+            var left = Math.Max(padX, headerWidth - rightInset - buttonWidth);
+            _bulkQuotaTestButton.SetBounds(left, top, buttonWidth, Scale(36));
             _bulkQuotaTestButton.BringToFront();
         }
     }
@@ -4257,13 +4551,13 @@ public partial class Form1 : Form
             TextFormatFlags.NoPrefix |
             TextFormatFlags.TextBoxControl);
         var scale = Math.Max(1F, DeviceDpi / 96F);
-        // The footer is a real layout row, not an overlay. Reserve a little more space
-        // as DPI rises so the descenders and the final line never touch the client edge.
-        var dpiMinimum = 52 + (int)Math.Ceiling(Math.Max(0F, scale - 1F) * 12F);
+        // Slim, unobtrusive frosted footer row (~30 logical px) that expands only when a
+        // multi-line status message requires extra vertical height.
+        var dpiMinimum = (int)Math.Ceiling(CompactStatusBarHeight * scale);
         var desiredHeight = Math.Max(
             dpiMinimum,
-            measured.Height + _statusBox.Padding.Vertical + (int)Math.Ceiling(8F * scale));
-        _contentLayout.RowStyles[2].Height = Math.Min(128, desiredHeight);
+            measured.Height + _statusBox.Padding.Vertical + (int)Math.Ceiling(6F * scale));
+        _contentLayout.RowStyles[2].Height = Math.Min((int)Math.Ceiling(96F * scale), desiredHeight);
     }
 
     private static string GetWindowsClientDisplayName(WindowsClientMode mode) => mode switch
@@ -4904,7 +5198,8 @@ public partial class Form1 : Form
 
     private void PumpHeaderAnimationFrame()
     {
-        if (_headerPanel is not { ShowStarfield: true } header ||
+        if (_cardsPanel.IsScrollInProgress ||
+            _headerPanel is not { ShowStarfield: true } header ||
             header.IsDisposed ||
             !header.IsHandleCreated)
         {
@@ -4925,35 +5220,22 @@ public partial class Form1 : Form
 
     private void ApplyDetailViewportMode()
     {
-        if (_contentLayout == null || _controlsRow == null || _contentLayout.RowStyles.Count == 0)
+        if (_contentLayout == null || _contentLayout.RowStyles.Count == 0)
         {
             return;
         }
 
-        var compact = (_showAccountDetail &&
-                       _activeView is WorkspaceView.AccountSwitch or WorkspaceView.QuotaUsage) ||
-                      (_showCodexAppearanceDetail && _activeView == WorkspaceView.ThemeSettings) ||
-                      _activeView is WorkspaceView.ThemeSettings or WorkspaceView.SystemConfig or WorkspaceView.ProxyManagement;
+        var compact = IsHeaderCompactMode();
+        UpdateHeaderControlLayout();
         var dpiScale = Math.Max(1F, DeviceDpi / 96F);
-        var compactHeight = Math.Max(
-            (int)Math.Ceiling(CompactWorkspaceHeroHeight * dpiScale),
-            _headerSubtitle.Bottom + (int)Math.Ceiling(12F * dpiScale));
-        var fullHeight = Math.Max(
-            (int)Math.Ceiling(WorkspaceHeroHeight * dpiScale),
-            compactHeight + Math.Max(48, _controlsRow.Height));
-        var targetHeroHeight = compact ? compactHeight : fullHeight;
-        if (Math.Abs(_contentLayout.RowStyles[0].Height - targetHeroHeight) > 0.5F)
-        {
-            _contentLayout.RowStyles[0].Height = targetHeroHeight;
-        }
-        if (_headerPanel != null && _headerPanel.Height != targetHeroHeight)
-        {
-            _headerPanel.Height = targetHeroHeight;
-        }
-        _controlsRow.Visible = !compact;
-        _accountLayout.Padding = compact
-            ? new Padding(2, 6, 0, 0)
-            : new Padding(2, 12, 0, 4);
+        var leftPad = (int)Math.Round(22F * dpiScale);
+        var rightPad = (int)Math.Round(6F * dpiScale);
+        var topPad = (int)Math.Round((compact ? 8F : 10F) * dpiScale);
+        _accountLayout.Padding = new Padding(leftPad, topPad, rightPad, 0);
+        var cardRightBreathingPad = (int)Math.Round(16F * dpiScale);
+        var cardTopPad = (int)Math.Round(2F * dpiScale);
+        _cardsPanel.Padding = new Padding(0, cardTopPad, cardRightBreathingPad, 0);
+        _statusBox.Padding = new Padding(leftPad, (int)Math.Round(2F * dpiScale), leftPad, (int)Math.Round(2F * dpiScale));
     }
 
     private IReadOnlyList<AccountGroupSection> BuildAccountGroups(
@@ -5084,41 +5366,74 @@ public partial class Form1 : Form
     {
         var collapsed = IsAccountGroupCollapsed(group.Key);
         var accent = GetAccountGroupAccent(group.Key);
-        const int rightPadding = 12;
-        const int toggleWidth = 86;
-        const int countWidth = 72;
-        const int headerGap = 8;
+        var dpiScale = Math.Max(1F, DeviceDpi / 96F);
+        int Scale(int logicalPx) => Math.Max(1, (int)Math.Round(logicalPx * dpiScale));
+
+        var titleFont = UiFontCache.Get(Font.FontFamily, 9.4F, FontStyle.Bold);
+        var countText = $"{group.Accounts.Count} 个";
+        var countFont = UiFontCache.Get(Font.FontFamily, 8.2F, FontStyle.Bold);
+        var toggleFont = UiFontCache.Get(Font.FontFamily, 8.4F, FontStyle.Bold);
+        var titleMeasured = TextRenderer.MeasureText(
+            string.IsNullOrEmpty(group.Title) ? "国Ag" : group.Title,
+            titleFont,
+            Size.Empty,
+            TextFormatFlags.SingleLine | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+        var countMeasured = TextRenderer.MeasureText(
+            countText,
+            countFont,
+            Size.Empty,
+            TextFormatFlags.SingleLine | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+        var toggleMeasured = TextRenderer.MeasureText(
+            "收起",
+            toggleFont,
+            Size.Empty,
+            TextFormatFlags.SingleLine | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+
+        var headerHeight = Math.Max(Scale(40), titleMeasured.Height + Scale(14));
+        var rightPadding = Scale(12);
+        var headerGap = Scale(8);
+        var toggleWidth = Math.Max(Scale(72), toggleMeasured.Width + Scale(28));
+        var toggleHeight = Math.Min(headerHeight - Scale(8), Math.Max(Scale(28), toggleMeasured.Height + Scale(8)));
+        var countWidth = Math.Max(Scale(62), countMeasured.Width + Scale(24));
+        var countHeight = Math.Min(headerHeight - Scale(10), Math.Max(Scale(24), countMeasured.Height + Scale(6)));
         var toggleLeft = width - rightPadding - toggleWidth;
         var countLeft = toggleLeft - headerGap - countWidth;
-        const int bulkActionWidth = 218;
+        var bulkActionWidth = MeasureActionButtonWidth("一键测试全部账号", Scale(188));
+        var bulkActionHeight = Math.Min(headerHeight - Scale(6), Math.Max(Scale(30), toggleHeight));
         var bulkActionLeft = countLeft - headerGap - bulkActionWidth;
         var titleRight = showBulkQuotaAction ? bulkActionLeft : countLeft;
+
         var panel = new RoundedPanel
         {
             Width = width,
-            Height = 50,
-            Radius = 12,
-            BorderColor = Color.FromArgb(50, accent),
+            Height = headerHeight,
+            Radius = Scale(11),
+            BorderColor = GetFloatingCardBorderColor(accent, emphasized: true),
             BackColor = _palette.CardColor,
+            SurfaceOpacity = GetFloatingCardOpacity(),
             UseGradient = true,
-            GradientColor = UiDesign.Blend(_palette.SurfaceColor, accent, 0.025F),
+            GradientColor = UiDesign.Blend(_palette.SurfaceColor, accent, 0.032F),
             AccentColor = accent,
-            AccentWidth = 3,
-            Margin = new Padding(0, 2, 0, 8),
+            AccentWidth = Math.Max(3, Scale(3)),
+            ShadowColor = GetFloatingCardShadowColor(),
+            Margin = new Padding(0, Scale(2), 0, Scale(8)),
             Cursor = Cursors.Hand,
             AccessibleName = $"{group.Title}，{group.Accounts.Count} 个账号",
             Tag = group
         };
 
+        var titleLeft = Scale(16);
         var title = new Label
         {
             Text = group.Title,
-            Left = 20,
-            Top = 4,
-            Width = Math.Max(160, titleRight - 32),
-            Height = 40,
-            Font = new Font(Font.FontFamily, 9.6F, FontStyle.Bold),
+            Left = titleLeft,
+            Top = 2,
+            Width = Math.Max(Scale(120), titleRight - titleLeft - Scale(10)),
+            Height = Math.Max(1, headerHeight - 4),
+            Font = titleFont,
             TextAlign = ContentAlignment.MiddleLeft,
+            AutoEllipsis = true,
+            UseCompatibleTextRendering = false,
             UseMnemonic = false,
             Cursor = Cursors.Hand
         };
@@ -5126,13 +5441,13 @@ public partial class Form1 : Form
         panel.Controls.Add(title);
 
         var count = MakeBadge(
-            $"{group.Accounts.Count} 个",
+            countText,
             countLeft,
-            11,
+            (headerHeight - countHeight) / 2,
             Color.FromArgb(24, accent),
             accent);
         count.Width = countWidth;
-        count.Height = 28;
+        count.Height = countHeight;
         count.Cursor = Cursors.Hand;
         panel.Controls.Add(count);
 
@@ -5142,14 +5457,14 @@ public partial class Form1 : Form
             // detached. This keeps its click handler/progress state while ensuring the
             // button is aligned with the count and collapse controls rather than the hero.
             _bulkQuotaTestButton.Parent?.Controls.Remove(_bulkQuotaTestButton);
-            _bulkQuotaTestButton.SetBounds(bulkActionLeft, 7, bulkActionWidth, 36);
+            _bulkQuotaTestButton.SetBounds(bulkActionLeft, (headerHeight - bulkActionHeight) / 2, bulkActionWidth, bulkActionHeight);
             _bulkQuotaTestButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             _bulkQuotaTestButton.Width = bulkActionWidth;
-            _bulkQuotaTestButton.Height = 36;
-            _bulkQuotaTestButton.Radius = 18;
-            _bulkQuotaTestButton.Padding = new Padding(14, 0, 14, 0);
-            _bulkQuotaTestButton.Font = new Font(Font.FontFamily, 8.8F, FontStyle.Bold);
-            _bulkQuotaTestButton.MinimumFontSize = 8F;
+            _bulkQuotaTestButton.Height = bulkActionHeight;
+            _bulkQuotaTestButton.Radius = bulkActionHeight / 2;
+            _bulkQuotaTestButton.Padding = new Padding(Scale(12), 0, Scale(12), 0);
+            _bulkQuotaTestButton.Font = UiFontCache.Get(Font.FontFamily, 8.6F, FontStyle.Bold);
+            _bulkQuotaTestButton.MinimumFontSize = 7.8F;
             _bulkQuotaTestButton.AutoShrinkText = true;
             _bulkQuotaTestButton.TextAlign = ContentAlignment.MiddleCenter;
             _bulkQuotaTestButton.Tag = "quota-bulk-primary";
@@ -5159,7 +5474,15 @@ public partial class Form1 : Form
             panel.Controls.Add(_bulkQuotaTestButton);
         }
 
-        var toggle = MakeAccountGroupToggleButton(collapsed, toggleLeft, 7);
+        var toggle = MakeAccountGroupToggleButton(collapsed, toggleLeft, (headerHeight - toggleHeight) / 2);
+        toggle.Width = toggleWidth;
+        toggle.Height = toggleHeight;
+        if (toggle is ModernButton modernToggle)
+        {
+            modernToggle.Radius = toggleHeight / 2;
+            modernToggle.Font = toggleFont;
+            modernToggle.Padding = new Padding(Scale(10), 0, Scale(10), 0);
+        }
         toggle.AccessibleName = collapsed ? "展开分组" : "收起分组";
         _toolTip.SetToolTip(toggle, collapsed ? "展开" : "收起");
         panel.Controls.Add(toggle);
@@ -6011,12 +6334,14 @@ public partial class Form1 : Form
             Width = width,
             Height = geometry.Height,
             Radius = 12,
-            BorderColor = Color.FromArgb(58, group.AccentColor),
+            BorderColor = GetFloatingCardBorderColor(group.AccentColor, emphasized: true),
             BackColor = _palette.CardColor,
+            SurfaceOpacity = GetFloatingCardOpacity(),
             UseGradient = true,
             GradientColor = UiDesign.Blend(_palette.SurfaceColor, group.AccentColor, 0.03F),
             AccentColor = group.AccentColor,
             AccentWidth = 3,
+            ShadowColor = GetFloatingCardShadowColor(),
             Margin = new Padding(0, 2, 0, 8),
             Cursor = searching ? Cursors.Default : Cursors.Hand,
             AccessibleName = $"{group.Title}，{group.Threads.Count} 条聊天"
@@ -6159,11 +6484,12 @@ public partial class Form1 : Form
             Width = width,
             Height = geometry.Height,
             Radius = 12,
-            BorderColor = UiDesign.Blend(_palette.BorderColor, _palette.PrimaryColor, 0.24F),
+            BorderColor = GetFloatingCardBorderColor(_palette.PrimaryColor),
             BackColor = _palette.SurfaceColor,
+            SurfaceOpacity = GetFloatingCardOpacity(),
             UseGradient = true,
             GradientColor = UiDesign.Blend(_palette.SurfaceColor, _palette.PrimaryColor, 0.035F),
-            ShadowColor = Color.FromArgb(12, _palette.ShadowColor),
+            ShadowColor = GetFloatingCardShadowColor(),
             Elevation = 1,
             Margin = new Padding(0, 0, 0, 14)
         };
@@ -6251,8 +6577,9 @@ public partial class Form1 : Form
             Width = width,
             Height = geometry.Height,
             Radius = 14,
-            BorderColor = thread.Archived ? _palette.WarningColor : _palette.BorderColor,
+            BorderColor = GetFloatingCardBorderColor(thread.Archived ? _palette.WarningColor : _palette.PrimaryColor),
             BackColor = _palette.CardColor,
+            SurfaceOpacity = GetFloatingCardOpacity(),
             UseGradient = true,
             GradientColor = UiDesign.Blend(
                 _palette.CardColor,
@@ -6262,9 +6589,9 @@ public partial class Form1 : Form
                 ? _palette.WarningColor
                 : UiDesign.Blend(_palette.PrimaryColor, _palette.SecondaryAccentColor, 0.34F),
             AccentWidth = 2,
-            ShadowColor = Color.FromArgb(12, _palette.ShadowColor),
+            ShadowColor = GetFloatingCardShadowColor(),
             Elevation = 1,
-            Margin = new Padding(0, 0, 0, 12),
+            Margin = new Padding(0, 0, 0, 10),
             Cursor = Cursors.Hand,
             AccessibleName = $"阅读本地聊天：{thread.Title}",
             AccessibleDescription = thread.Id
@@ -7712,11 +8039,13 @@ public partial class Form1 : Form
             // The previous 320px minimum clipped the Chinese explanation on
             // high-DPI displays.
             Width = Math.Max(520, width),
-            Height = 180,
-            Radius = 18,
-            BorderColor = _palette.BorderColor,
+            Height = 160,
+            Radius = 16,
+            BorderColor = GetFloatingCardBorderColor(_palette.PrimaryColor),
             BackColor = _palette.SurfaceColor,
-            Margin = new Padding(0, 0, 20, 20),
+            SurfaceOpacity = GetFloatingCardOpacity(),
+            ShadowColor = GetFloatingCardShadowColor(),
+            Margin = new Padding(0, 0, 20, 16),
             Padding = new Padding(24)
         };
 
@@ -7788,7 +8117,8 @@ public partial class Form1 : Form
             Font = libraryTitleFont,
             TextAlign = ContentAlignment.MiddleLeft
         };
-        ThemeStyler.ApplyLabel(libraryTitle, _palette);
+        libraryTitle.BackColor = Color.Transparent;
+        libraryTitle.ForeColor = _palette.HeroTextColor;
         libraryHeader.Controls.Add(libraryTitle);
         var librarySubtitle = new Label
         {
@@ -7802,7 +8132,8 @@ public partial class Form1 : Form
             AutoEllipsis = false,
             UseCompatibleTextRendering = true
         };
-        ThemeStyler.ApplyLabel(librarySubtitle, _palette, true);
+        librarySubtitle.BackColor = Color.Transparent;
+        librarySubtitle.ForeColor = UiDesign.Blend(_palette.HeroMutedTextColor, Color.White, 0.24F);
         libraryHeader.Controls.Add(librarySubtitle);
         var editCustom = MakeActionButton(
             "自定义主题",
@@ -7883,7 +8214,8 @@ public partial class Form1 : Form
             TextAlign = ContentAlignment.MiddleLeft,
             UseCompatibleTextRendering = true
         };
-        ThemeStyler.ApplyLabel(title, _palette);
+        title.BackColor = Color.Transparent;
+        title.ForeColor = _palette.HeroTextColor;
         header.Controls.Add(title);
         var subtitle = new Label
         {
@@ -7897,7 +8229,8 @@ public partial class Form1 : Form
             AutoEllipsis = false,
             UseCompatibleTextRendering = true
         };
-        ThemeStyler.ApplyLabel(subtitle, _palette, true);
+        subtitle.BackColor = Color.Transparent;
+        subtitle.ForeColor = UiDesign.Blend(_palette.HeroMutedTextColor, Color.White, 0.24F);
         header.Controls.Add(subtitle);
         return header;
     }
@@ -8534,13 +8867,14 @@ public partial class Form1 : Form
             Width = width,
             Height = 648,
             Radius = 16,
-            BorderColor = _palette.BorderColor,
+            BorderColor = GetFloatingCardBorderColor(_palette.AccentColor),
             BackColor = _palette.CardColor,
+            SurfaceOpacity = GetFloatingCardOpacity(),
             UseGradient = true,
             GradientColor = UiDesign.Blend(_palette.CardColor, _palette.PrimaryColor, 0.025F),
             AccentColor = _palette.AccentColor,
             AccentWidth = 3,
-            ShadowColor = Color.FromArgb(26, _palette.ShadowColor),
+            ShadowColor = GetFloatingCardShadowColor(),
             // The flow panel already reserves the vertical gap between cards.  A
             // right margin here becomes part of the child width and creates an
             // unnecessary outer horizontal scrollbar on the system-config page.
@@ -8832,90 +9166,129 @@ public partial class Form1 : Form
 
     private Control CreateAccountSwitchRow(AccountRecord account, int width)
     {
-        const int cliButtonWidth = 74;
-        const int detailButtonWidth = 86;
-        const int actionGap = 10;
-        const int wideBadgeWidth = 150;
-        const int compactBadgeWidth = 120;
-        var horizontal = UsesHorizontalAccountSwitchLayout(width);
-        var roomyHorizontal = width >= 1280;
+        var dpiScale = Math.Max(1F, DeviceDpi / 96F);
+        int Scale(int logicalPx) => Math.Max(1, (int)Math.Round(logicalPx * dpiScale));
+
+        var nameFont = UiFontCache.Get(Font.FontFamily, 9.7F, FontStyle.Bold);
+        var kindFont = UiFontCache.Get(Font.FontFamily, 8.3F, FontStyle.Regular);
+        var primaryBtnFont = UiFontCache.Get(Font.FontFamily, 8.8F, FontStyle.Bold);
+        var tonalBtnFont = UiFontCache.Get(Font.FontFamily, 8.6F, FontStyle.Bold);
+        var badgeFont = UiFontCache.Get(Font.FontFamily, 8.2F, FontStyle.Bold);
+
+        var nameMeasured = TextRenderer.MeasureText(
+            "国Ag",
+            nameFont,
+            Size.Empty,
+            TextFormatFlags.SingleLine | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+        var kindMeasured = TextRenderer.MeasureText(
+            "通过 ChatGPT 登录（官方）",
+            kindFont,
+            Size.Empty,
+            TextFormatFlags.SingleLine | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+        var btnMeasured = TextRenderer.MeasureText(
+            "Codex 启动",
+            primaryBtnFont,
+            Size.Empty,
+            TextFormatFlags.SingleLine | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+        var badgeMeasured = TextRenderer.MeasureText(
+            "当前使用",
+            badgeFont,
+            Size.Empty,
+            TextFormatFlags.SingleLine | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+
+        var nameHeight = Math.Max(Scale(22), nameMeasured.Height + Scale(4));
+        var kindHeight = Math.Max(Scale(18), kindMeasured.Height + Scale(3));
+        var textGap = Scale(2);
+        var textBlockHeight = nameHeight + textGap + kindHeight;
+        var buttonHeight = Math.Max(Scale(34), btnMeasured.Height + Scale(12));
+        var badgeHeight = Math.Max(Scale(26), badgeMeasured.Height + Scale(8));
+        var badgeWidth = Math.Max(Scale(84), badgeMeasured.Width + Scale(26));
+        var sidePad = Scale(16);
+        var rightPad = Scale(14);
+        var actionGap = Scale(8);
+
         var hasChatGptFeatureLaunch = !account.IsOfficialOAuth;
-        var measuredCodexWidth = MeasureActionButtonWidth("Codex 启动", 180);
+        var cliButtonWidth = MeasureActionButtonWidth("CLI", Scale(58));
+        var detailButtonWidth = MeasureActionButtonWidth("详情", Scale(64));
+        var measuredCodexWidth = MeasureActionButtonWidth("Codex 启动", Scale(108));
         var measuredFeatureWidth = hasChatGptFeatureLaunch
-            ? MeasureActionButtonWidth("语音 / 手机", 160)
+            ? MeasureActionButtonWidth("语音 / 手机", Scale(104))
             : 0;
-        var splitActionWidth = Math.Max(160, (width - 46) / 2);
-        var primaryActionCount = hasChatGptFeatureLaunch ? 2 : 1;
-        var stackedPrimaryWidth = Math.Max(
-            108,
-            (width - 36 - (actionGap * (primaryActionCount - 1))) / primaryActionCount);
         var singleRowGapCount = hasChatGptFeatureLaunch ? 3 : 2;
-        var featureActionSpace = hasChatGptFeatureLaunch
-            ? measuredFeatureWidth
-            : 0;
-        var singleRowActionsFit = width - 36 >=
-                                  measuredCodexWidth +
-                                  featureActionSpace + cliButtonWidth + detailButtonWidth +
-                                  (actionGap * singleRowGapCount);
-        var twoActionRows = !singleRowActionsFit;
-        var codexButtonWidth = twoActionRows ? stackedPrimaryWidth : measuredCodexWidth;
-        var featureButtonWidth = twoActionRows ? stackedPrimaryWidth : measuredFeatureWidth;
+        var featureActionSpace = hasChatGptFeatureLaunch ? measuredFeatureWidth : 0;
         var actionTotalWidth = measuredCodexWidth +
                                featureActionSpace + cliButtonWidth + detailButtonWidth +
                                (actionGap * singleRowGapCount);
+
+        var singleLineCandidateNameWidth = width - sidePad - Scale(12) - badgeWidth - Scale(10) - actionTotalWidth - rightPad;
+        var singleLine = singleLineCandidateNameWidth >= Scale(170);
+        var singleRowActionsFit = width - (sidePad * 2) >= actionTotalWidth;
+        var twoActionRows = !singleLine && !singleRowActionsFit;
+
+        var splitActionWidth = Math.Max(Scale(120), (width - (sidePad * 2) - actionGap) / 2);
+        var primaryActionCount = hasChatGptFeatureLaunch ? 2 : 1;
+        var stackedPrimaryWidth = Math.Max(
+            Scale(100),
+            (width - (sidePad * 2) - (actionGap * (primaryActionCount - 1))) / primaryActionCount);
+        var codexButtonWidth = twoActionRows ? stackedPrimaryWidth : measuredCodexWidth;
+        var featureButtonWidth = twoActionRows ? stackedPrimaryWidth : measuredFeatureWidth;
+
+        var current = IsCurrentAccount(account);
+        var dark = ThemeStyler.IsDark(_palette);
+        var stateColor = GetAccountStateColor(account);
+        var stackedTopPad = Scale(8);
+        var stackedActionTop = stackedTopPad + textBlockHeight + Scale(8);
+        var rowHeight = singleLine
+            ? Math.Max(Scale(62), Math.Max(textBlockHeight, buttonHeight) + Scale(16))
+            : twoActionRows
+                ? stackedActionTop + (buttonHeight * 2) + Scale(8) + Scale(10)
+                : stackedActionTop + buttonHeight + Scale(10);
+
         var row = new RoundedPanel
         {
             Width = width,
-            Height = twoActionRows ? 168 : horizontal ? 112 : 118,
-            Radius = 16,
-            BorderColor = UiDesign.Blend(
-                _palette.BorderColor,
-                GetAccountStateColor(account),
-                IsCurrentAccount(account) ? 0.22F : 0.10F),
+            Height = rowHeight,
+            Radius = Scale(13),
+            BorderColor = GetFloatingCardBorderColor(stateColor, emphasized: current),
             BackColor = _palette.CardColor,
+            SurfaceOpacity = GetFloatingCardOpacity(emphasized: current),
             UseGradient = true,
             GradientColor = UiDesign.Blend(
                 _palette.CardColor,
-                GetAccountStateColor(account),
-                IsCurrentAccount(account) ? 0.055F : 0.025F),
-            AccentColor = GetAccountStateColor(account),
-            AccentWidth = IsCurrentAccount(account) ? 4 : 2,
-            ShadowColor = Color.FromArgb(24, _palette.ShadowColor),
-            Elevation = IsCurrentAccount(account) ? 3 : 1,
-            ShowTechDecoration = IsCurrentAccount(account),
+                stateColor,
+                current ? (dark ? 0.085F : 0.055F) : (dark ? 0.035F : 0.022F)),
+            AccentColor = stateColor,
+            AccentWidth = current ? Math.Max(4, Scale(4)) : Math.Max(2, Scale(2)),
+            ShadowColor = GetFloatingCardShadowColor(emphasized: current),
+            Elevation = current ? 2 : 1,
+            ShowTechDecoration = false,
             DecorationColor = Color.FromArgb(42, _palette.SecondaryAccentColor),
-            Margin = new Padding(0, 0, 0, 12),
+            Margin = new Padding(0, 0, 0, Scale(10)),
             Cursor = Cursors.Hand
         };
 
-        var badgeWidth = roomyHorizontal ? wideBadgeWidth : compactBadgeWidth;
-        var actionLeft = horizontal
-            ? roomyHorizontal
-                ? width - actionTotalWidth - 18
-                : Math.Max(18, (width - actionTotalWidth) / 2)
-            : Math.Max(18, (width - actionTotalWidth) / 2);
-        if (twoActionRows)
-        {
-            actionLeft = 18;
-        }
-        var badgeLeft = horizontal
-            ? roomyHorizontal
-                ? actionLeft - badgeWidth - 12
-                : width - badgeWidth - 20
-            : width - badgeWidth - 20;
-        var nameWidth = Math.Max(220, badgeLeft - 36);
+        var actionLeft = singleLine
+            ? width - actionTotalWidth - rightPad
+            : sidePad;
+        var badgeLeft = singleLine
+            ? actionLeft - badgeWidth - Scale(10)
+            : width - badgeWidth - sidePad;
+        var nameWidth = Math.Max(Scale(140), badgeLeft - sidePad - Scale(12));
+        var textTop = singleLine
+            ? Math.Max(Scale(6), (rowHeight - textBlockHeight) / 2)
+            : stackedTopPad;
 
         var name = new Label
         {
             Text = account.Name,
-            Left = 18,
-            Top = roomyHorizontal ? 14 : horizontal ? 4 : 6,
+            Left = sidePad,
+            Top = textTop,
             Width = nameWidth,
-            Height = roomyHorizontal ? 38 : 30,
-            Font = UiFontCache.Get(Font.FontFamily, 10F, FontStyle.Bold),
+            Height = nameHeight,
+            Font = nameFont,
             AutoEllipsis = true,
             TextAlign = ContentAlignment.MiddleLeft,
-            UseCompatibleTextRendering = true,
+            UseCompatibleTextRendering = false,
             UseMnemonic = false,
             Cursor = Cursors.Hand
         };
@@ -8926,14 +9299,14 @@ public partial class Form1 : Form
         var kind = new Label
         {
             Text = account.AuthKindLabel,
-            Left = 18,
-            Top = roomyHorizontal ? 58 : horizontal ? 34 : 36,
+            Left = sidePad,
+            Top = textTop + nameHeight + textGap,
             Width = nameWidth,
-            Height = roomyHorizontal ? 32 : 24,
-            Font = UiFontCache.Get(Font.FontFamily, 8.7F, FontStyle.Bold),
+            Height = kindHeight,
+            Font = kindFont,
             AutoEllipsis = true,
             TextAlign = ContentAlignment.MiddleLeft,
-            UseCompatibleTextRendering = true,
+            UseCompatibleTextRendering = false,
             UseMnemonic = false,
             Cursor = Cursors.Hand
         };
@@ -8943,20 +9316,28 @@ public partial class Form1 : Form
         var stateBadge = MakeAccountStateBadge(
             account,
             badgeLeft,
-            roomyHorizontal ? 39 : 10);
+            singleLine ? (rowHeight - badgeHeight) / 2 : textTop + ((textBlockHeight - badgeHeight) / 2));
         stateBadge.Width = badgeWidth;
-        stateBadge.Height = 36;
+        stateBadge.Height = badgeHeight;
         stateBadge.UseMnemonic = false;
         stateBadge.Cursor = Cursors.Hand;
         row.Controls.Add(stateBadge);
 
-        var actionTop = roomyHorizontal ? 35 : horizontal ? 62 : 66;
+        var actionTop = singleLine ? (rowHeight - buttonHeight) / 2 : stackedActionTop;
+        var btnRadius = Scale(10);
         var codexLeft = actionLeft;
         var codex = MakeLaunchActionButton(
             "Codex 启动",
             codexLeft,
             actionTop,
             codexButtonWidth);
+        codex.Height = buttonHeight;
+        if (codex is ModernButton modernCodex)
+        {
+            modernCodex.Radius = btnRadius;
+            modernCodex.Padding = new Padding(Scale(10), 0, Scale(10), 0);
+            modernCodex.Font = primaryBtnFont;
+        }
         codex.Click += async (_, _) => await LaunchAccountAsync(account, WindowsClientMode.OfficialCodex);
         _toolTip.SetToolTip(
             codex,
@@ -8974,6 +9355,13 @@ public partial class Form1 : Form
                 featureLeft,
                 actionTop,
                 featureButtonWidth);
+            feature.Height = buttonHeight;
+            if (feature is ModernButton modernFeature)
+            {
+                modernFeature.Radius = btnRadius;
+                modernFeature.Padding = new Padding(Scale(10), 0, Scale(10), 0);
+                modernFeature.Font = primaryBtnFont;
+            }
             feature.Click += async (_, _) => await LaunchChatGptFeatureAccountAsync(account);
             _toolTip.SetToolTip(
                 feature,
@@ -8984,10 +9372,17 @@ public partial class Form1 : Form
             featureRight = featureLeft + featureButtonWidth;
         }
 
-        var secondaryActionTop = twoActionRows ? actionTop + 50 : actionTop;
-        var cliLeft = twoActionRows ? 18 : featureRight + actionGap;
+        var secondaryActionTop = twoActionRows ? actionTop + buttonHeight + Scale(8) : actionTop;
+        var cliLeft = twoActionRows ? sidePad : featureRight + actionGap;
         var effectiveCliWidth = twoActionRows ? splitActionWidth : cliButtonWidth;
         var cli = MakeLaunchTonalButton("CLI", cliLeft, secondaryActionTop, effectiveCliWidth);
+        cli.Height = buttonHeight;
+        if (cli is ModernButton modernCli)
+        {
+            modernCli.Radius = btnRadius;
+            modernCli.Padding = new Padding(Scale(8), 0, Scale(8), 0);
+            modernCli.Font = tonalBtnFont;
+        }
         cli.Click += async (_, _) => await LaunchCliAccountAsync(account);
         row.Controls.Add(cli);
 
@@ -8996,11 +9391,18 @@ public partial class Form1 : Form
             : cliLeft + cliButtonWidth + actionGap;
         var effectiveDetailWidth = twoActionRows ? splitActionWidth : detailButtonWidth;
         var detail = MakeLaunchTonalButton("详情", detailLeft, secondaryActionTop, effectiveDetailWidth);
+        detail.Height = buttonHeight;
+        if (detail is ModernButton modernDetail)
+        {
+            modernDetail.Radius = btnRadius;
+            modernDetail.Padding = new Padding(Scale(8), 0, Scale(8), 0);
+            modernDetail.Font = tonalBtnFont;
+        }
         detail.Click += (_, _) => SelectAccount(account.Name);
         row.Controls.Add(detail);
 
         AttachAccountSelection(row, account.Name);
-        AttachRowHoverHighlight(row, GetAccountStateColor(account));
+        AttachRowHoverHighlight(row, stateColor);
         return row;
     }
 
@@ -9462,15 +9864,16 @@ public partial class Form1 : Form
         {
             Width = width,
             Height = geometry.Height,
-            Radius = 16,
-            BorderColor = UiDesign.Blend(_palette.BorderColor, _palette.PrimaryColor, 0.10F),
+            Radius = 14,
+            BorderColor = GetFloatingCardBorderColor(GetAccountStateColor(account), emphasized: IsCurrentAccount(account)),
             BackColor = _palette.CardColor,
+            SurfaceOpacity = GetFloatingCardOpacity(emphasized: IsCurrentAccount(account)),
             UseGradient = true,
             GradientColor = UiDesign.Blend(_palette.CardColor, _palette.PrimaryColor, 0.022F),
             AccentColor = GetAccountStateColor(account),
             AccentWidth = IsCurrentAccount(account) ? 4 : 2,
-            ShadowColor = Color.FromArgb(20, _palette.ShadowColor),
-            Margin = new Padding(0, 0, 0, 12),
+            ShadowColor = GetFloatingCardShadowColor(emphasized: IsCurrentAccount(account)),
+            Margin = new Padding(0, 0, 0, 10),
             Cursor = Cursors.Hand,
             Name = "StatusTokenRow"
         };
@@ -10862,11 +11265,9 @@ public partial class Form1 : Form
             Width = width,
             Height = rowHeight,
             Radius = 15,
-            BorderColor = UiDesign.Blend(
-                _palette.BorderColor,
-                GetAccountStateColor(account),
-                IsCurrentAccount(account) ? 0.18F : 0.08F),
+            BorderColor = GetFloatingCardBorderColor(GetAccountStateColor(account), emphasized: IsCurrentAccount(account)),
             BackColor = _palette.CardColor,
+            SurfaceOpacity = GetFloatingCardOpacity(emphasized: IsCurrentAccount(account)),
             UseGradient = true,
             GradientColor = UiDesign.Blend(
                 _palette.CardColor,
@@ -10874,14 +11275,14 @@ public partial class Form1 : Form
                 IsCurrentAccount(account) ? 0.045F : 0.025F),
             AccentColor = GetAccountStateColor(account),
             AccentWidth = IsCurrentAccount(account) ? 4 : 1,
-            ShadowColor = Color.FromArgb(26, _palette.ShadowColor),
+            ShadowColor = GetFloatingCardShadowColor(emphasized: IsCurrentAccount(account)),
             Elevation = IsCurrentAccount(account) ? 3 : 2,
             // These cards already contain meaningful quota progress bars. The
             // decorative circuit lines previously crossed reset labels and made
             // them look like duplicated data separators.
             ShowTechDecoration = false,
             DecorationColor = Color.FromArgb(36, _palette.SecondaryAccentColor),
-            Margin = new Padding(0, 0, 0, 12),
+            Margin = new Padding(0, 0, 0, 10),
             Cursor = Cursors.Hand
         };
         row.Click += (_, _) => SelectAccount(account.Name);
@@ -20638,6 +21039,39 @@ internal sealed class RoundedPanel : Panel
     public int Elevation { get; set; } = 1;
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public byte SurfaceOpacity { get; set; } = byte.MaxValue;
+
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public bool DrawBottomDividerOnly { get; set; }
+
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public bool DrawTopDividerOnly { get; set; }
+
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public Func<bool>? ShouldPauseStarfieldAnimation { get; set; }
+
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public bool HeaderAmbientSkyOnly { get; set; }
+
+    private Rectangle _ambientSkyBounds = Rectangle.Empty;
+
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public Rectangle AmbientSkyBounds
+    {
+        get => _ambientSkyBounds;
+        set
+        {
+            if (_ambientSkyBounds == value)
+            {
+                return;
+            }
+
+            _ambientSkyBounds = value;
+            UpdateStarfieldAnimationState();
+        }
+    }
+
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public Color AccentColor { get; set; } = Color.Transparent;
 
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
@@ -20881,6 +21315,9 @@ internal sealed class RoundedPanel : Panel
         !IsDisposed &&
         IsHandleCreated &&
         Visible &&
+        (!HeaderAmbientSkyOnly || (!_ambientSkyBounds.IsEmpty && _ambientSkyBounds.Width >= 48 && _ambientSkyBounds.Height >= 24)) &&
+        ShouldPauseStarfieldAnimation?.Invoke() != true &&
+        !ControlViewport.HasActiveScrollAncestor(this) &&
         IsStarfieldAnimationHostActive();
 
     private bool IsStarfieldAnimationHostActive()
@@ -20940,6 +21377,11 @@ internal sealed class RoundedPanel : Panel
 
     private Rectangle GetStarfieldAnimationBounds()
     {
+        if (HeaderAmbientSkyOnly)
+        {
+            return Rectangle.Intersect(ClientRectangle, _ambientSkyBounds);
+        }
+
         // Keep timer-driven invalidation out of the title/search column. The static cache is
         // still painted behind transparent labels when Windows asks for a background repaint.
         var left = Math.Clamp((int)MathF.Floor(Width * 0.48F), 0, Math.Max(0, Width - 1));
@@ -20957,6 +21399,11 @@ internal sealed class RoundedPanel : Panel
 
     private RectangleF GetSurfaceBounds()
     {
+        if (Radius <= 0 && Elevation <= 0)
+        {
+            return new RectangleF(0F, 0F, Math.Max(1F, Width), Math.Max(1F, Height));
+        }
+
         var shadowSpace = Math.Max(0, Elevation);
         return new RectangleF(
             0.75F,
@@ -20973,7 +21420,9 @@ internal sealed class RoundedPanel : Panel
         }
 
         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        UiDesign.PaintParentBackdrop(e.Graphics, this);
+        // Pass full ClientRectangle and let TryPaintBackdropSlice clip against Graphics.ClipBounds,
+        // which stays accurate in parent coordinates even during WinForms PaintTransparentBackground.
+        UiDesign.PaintParentBackdrop(e.Graphics, this, ClientRectangle);
 
         var surfaceBounds = GetSurfaceBounds();
         if (surfaceBounds.Width <= 0F || surfaceBounds.Height <= 0F)
@@ -20981,31 +21430,76 @@ internal sealed class RoundedPanel : Panel
             return;
         }
 
+        var fillBack = EffectiveBackColor;
+        var fillGradient = EffectiveGradientColor;
+        var surfaceAlpha = SurfaceOpacity < byte.MaxValue ? SurfaceOpacity : fillBack.A;
         if (Elevation > 0 && ShadowColor.A > 0)
         {
             var shadowBounds = surfaceBounds;
             shadowBounds.Offset(0F, Elevation);
             using var shadowPath = UiDesign.CreateRoundedPath(shadowBounds, Radius);
             using var shadowBrush = new SolidBrush(ShadowColor);
-            e.Graphics.FillPath(shadowBrush, shadowPath);
+            if (surfaceAlpha < byte.MaxValue && Radius > 0)
+            {
+                using var cardClipPath = UiDesign.CreateRoundedPath(surfaceBounds, Radius);
+                var shadowState = e.Graphics.Save();
+                try
+                {
+                    e.Graphics.SetClip(cardClipPath, CombineMode.Exclude);
+                    e.Graphics.FillPath(shadowBrush, shadowPath);
+                }
+                finally
+                {
+                    e.Graphics.Restore(shadowState);
+                }
+            }
+            else
+            {
+                e.Graphics.FillPath(shadowBrush, shadowPath);
+            }
         }
-
-        var fillBack = EffectiveBackColor;
-        var fillGradient = EffectiveGradientColor;
-        using var surfacePath = UiDesign.CreateRoundedPath(surfaceBounds, Radius);
-        if (UseGradient && fillGradient.A > 0)
+        if (surfaceAlpha > 0)
         {
-            using var gradient = new LinearGradientBrush(
-                surfaceBounds,
-                fillBack,
-                fillGradient,
-                LinearGradientMode.Horizontal);
-            e.Graphics.FillPath(gradient, surfacePath);
-        }
-        else
-        {
-            using var brush = new SolidBrush(fillBack);
-            e.Graphics.FillPath(brush, surfacePath);
+            var startColor = Color.FromArgb(surfaceAlpha, fillBack.R, fillBack.G, fillBack.B);
+            if (Radius <= 0)
+            {
+                if (UseGradient && fillGradient.A > 0)
+                {
+                    var endAlpha = SurfaceOpacity < byte.MaxValue ? SurfaceOpacity : fillGradient.A;
+                    var endColor = Color.FromArgb(endAlpha, fillGradient.R, fillGradient.G, fillGradient.B);
+                    using var gradient = new LinearGradientBrush(
+                        surfaceBounds,
+                        startColor,
+                        endColor,
+                        LinearGradientMode.Horizontal);
+                    e.Graphics.FillRectangle(gradient, surfaceBounds);
+                }
+                else
+                {
+                    using var brush = new SolidBrush(startColor);
+                    e.Graphics.FillRectangle(brush, surfaceBounds);
+                }
+            }
+            else
+            {
+                using var surfacePath = UiDesign.CreateRoundedPath(surfaceBounds, Radius);
+                if (UseGradient && fillGradient.A > 0)
+                {
+                    var endAlpha = SurfaceOpacity < byte.MaxValue ? SurfaceOpacity : fillGradient.A;
+                    var endColor = Color.FromArgb(endAlpha, fillGradient.R, fillGradient.G, fillGradient.B);
+                    using var gradient = new LinearGradientBrush(
+                        surfaceBounds,
+                        startColor,
+                        endColor,
+                        LinearGradientMode.Horizontal);
+                    e.Graphics.FillPath(gradient, surfacePath);
+                }
+                else
+                {
+                    using var brush = new SolidBrush(startColor);
+                    e.Graphics.FillPath(brush, surfacePath);
+                }
+            }
         }
 
         // The star scene is part of the hero background, not a foreground ornament.
@@ -21060,6 +21554,25 @@ internal sealed class RoundedPanel : Panel
         var borderColor = EnableHoverHighlight && _isHovered && HoverBorderColor.A > 0
             ? HoverBorderColor
             : BorderColor;
+        if (borderColor.A <= 0)
+        {
+            return;
+        }
+
+        if (DrawBottomDividerOnly)
+        {
+            using var dividerPen = new Pen(borderColor, 1F);
+            e.Graphics.DrawLine(dividerPen, 0F, Height - 1F, Width, Height - 1F);
+            return;
+        }
+
+        if (DrawTopDividerOnly)
+        {
+            using var dividerPen = new Pen(borderColor, 1F);
+            e.Graphics.DrawLine(dividerPen, 0F, 0F, Width, 0F);
+            return;
+        }
+
         using var path = UiDesign.CreateRoundedPath(surfaceBounds, Radius);
         using var pen = new Pen(borderColor, 1F);
         e.Graphics.DrawPath(pen, path);
@@ -21106,6 +21619,55 @@ internal sealed class RoundedPanel : Panel
         var starBlue = UiDesign.Blend(accent, Color.FromArgb(112, 214, 255), 0.44F);
         var starViolet = UiDesign.Blend(accent, Color.FromArgb(231, 139, 255), 0.38F);
         var starRose = UiDesign.Blend(starViolet, Color.FromArgb(255, 118, 206), 0.40F);
+
+        if (HeaderAmbientSkyOnly)
+        {
+            if (_ambientSkyBounds.IsEmpty || _ambientSkyBounds.Width < 48 || _ambientSkyBounds.Height < 24)
+            {
+                return;
+            }
+
+            var ambientRect = RectangleF.Intersect(surfaceBounds, _ambientSkyBounds);
+            if (ambientRect.Width < 48F || ambientRect.Height < 24F)
+            {
+                return;
+            }
+
+            var ambientState = graphics.Save();
+            try
+            {
+                graphics.SetClip(ambientRect, CombineMode.Intersect);
+                var ambientSeconds = (float)_starfieldAnimationClock.Elapsed.TotalSeconds;
+                var twinkleA = 0.56F + (0.44F * (0.5F + (0.5F * MathF.Sin(ambientSeconds * 1.48F))));
+                var twinkleB = 0.52F + (0.48F * (0.5F + (0.5F * MathF.Sin((ambientSeconds * 1.12F) + 2.0F))));
+                var twinkleC = 0.60F + (0.40F * (0.5F + (0.5F * MathF.Sin((ambientSeconds * 1.92F) + 4.1F))));
+                DrawStarGlow(graphics, ambientRect, 0.22F, 0.26F, 2.2F * scale, starBlue, twinkleA * 0.85F);
+                DrawStarGlow(graphics, ambientRect, 0.54F, 0.72F, 2.5F * scale, starWhite, twinkleC * 0.90F);
+                DrawStarGlow(graphics, ambientRect, 0.82F, 0.24F, 2.1F * scale, starViolet, twinkleB * 0.82F);
+                DrawCurvedAnimatedMeteor(
+                    graphics,
+                    ambientRect,
+                    ambientSeconds,
+                    cycleSeconds: 13.5F,
+                    phaseOffset: 0.32F,
+                    startX: 1.06F,
+                    startY: 0.08F,
+                    controlX: 0.58F,
+                    controlY: 0.34F,
+                    endX: 0.04F,
+                    endY: 0.88F,
+                    trailSpan: 0.24F,
+                    normalizedLength: 0.078F,
+                    color: starBlue,
+                    scale: scale * 0.86F,
+                    baseIntensity: 0.76F);
+            }
+            finally
+            {
+                graphics.Restore(ambientState);
+            }
+            return;
+        }
 
         // Nebulae, distant stars, constellations and quiet far-field streaks are all stable.
         // Rendering them once makes the timer tick mostly a handful of tiny moving objects.

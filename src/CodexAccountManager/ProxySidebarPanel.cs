@@ -7,8 +7,9 @@ namespace CodexAccountManager;
 
 /// <summary>Persistent proxy-node workspace. Credentials are edited in transient
 /// dialogs and only DPAPI ciphertext is written to the manager root.</summary>
-internal sealed class ProxySidebarPanel : Panel
+internal sealed class ProxySidebarPanel : Panel, IBackdropPassthrough
 {
+    public bool UseBackdropSurface => true;
     private readonly ProxyNodeStore _store;
     private readonly AccountProxyResolver _resolver;
     private readonly Func<IReadOnlyList<AccountRecord>> _accounts;
@@ -54,10 +55,20 @@ internal sealed class ProxySidebarPanel : Panel
         Name = "ProxySidebarPanel";
         Dock = DockStyle.None;
         AutoScroll = true;
+        DoubleBuffered = true;
         Padding = new Padding(2, 4, 2, 8);
         Font = UiFontCache.Get("Microsoft YaHei UI", 9.25F);
         HandleCreated += (_, _) => ApplyScrollableTheme();
         Build();
+    }
+
+    protected override void OnPaintBackground(PaintEventArgs e)
+    {
+        if (UseBackdropSurface && UiDesign.TryPaintBackdrop(e.Graphics, this, e.ClipRectangle))
+        {
+            return;
+        }
+        base.OnPaintBackground(e);
     }
 
     protected override void Dispose(bool disposing)
@@ -230,7 +241,7 @@ internal sealed class ProxySidebarPanel : Panel
     {
         if (!IsUsable || _palette == null) return;
         var dark = ThemeStyler.IsDark(_palette);
-        NativeWindowTheme.ApplyScrollable(this, dark);
+        NativeWindowTheme.ApplyScrollable(this, true);
         NativeWindowTheme.ApplyScrollable(_nodes, dark);
     }
 
@@ -357,14 +368,18 @@ internal sealed class ProxySidebarPanel : Panel
         _palette = palette;
         BackColor = palette.FormBackColor;
         ForeColor = palette.TextColor;
+        var dark = ThemeStyler.IsDark(palette);
         foreach (var card in new[] { _bindingCard, _nodesCard })
         {
             card.BackColor = palette.CardColor;
-            card.BorderColor = palette.BorderColor;
+            card.SurfaceOpacity = dark ? (byte)196 : (byte)228;
+            card.BorderColor = dark
+                ? Color.FromArgb(136, UiDesign.Blend(palette.BorderColor, palette.AccentColor, 0.30F))
+                : Color.FromArgb(196, UiDesign.Blend(Color.White, palette.TertiaryAccentColor, 0.18F));
             card.GradientColor = UiDesign.Blend(palette.CardColor, palette.PrimaryColor, 0.025F);
             card.AccentColor = palette.TertiaryAccentColor;
             card.AccentWidth = 3;
-            card.ShadowColor = Color.FromArgb(26, palette.ShadowColor);
+            card.ShadowColor = dark ? Color.FromArgb(80, 0, 0, 0) : Color.FromArgb(66, 5, 9, 26);
         }
         _metricsCard.BackColor = palette.SurfaceAltColor;
         _metricsCard.BorderColor = palette.BorderColor;

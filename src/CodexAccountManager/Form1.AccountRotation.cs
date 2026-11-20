@@ -143,14 +143,15 @@ public partial class Form1
             Width = width,
             Height = panelHeight,
             Radius = 16,
-            BorderColor = UiDesign.Blend(_palette.BorderColor, accent, 0.22F),
+            BorderColor = GetFloatingCardBorderColor(accent, emphasized: true),
             BackColor = _palette.CardColor,
+            SurfaceOpacity = GetFloatingCardOpacity(),
             UseGradient = true,
             GradientColor = UiDesign.Blend(_palette.CardColor, accent, 0.035F),
             AccentColor = accent,
             AccentWidth = 4,
-            ShadowColor = Color.FromArgb(18, _palette.ShadowColor),
-            Margin = new Padding(0, 0, 0, 16),
+            ShadowColor = GetFloatingCardShadowColor(),
+            Margin = new Padding(0, 0, 0, 12),
             AccessibleName = enabled ? "账号轮换已开启" : "账号轮换已关闭"
         };
 
@@ -419,14 +420,16 @@ public partial class Form1
         var panel = new RoundedPanel
         {
             Width = width,
-            Height = 52,
-            Radius = 12,
-            BorderColor = Color.FromArgb(48, accent),
+            Height = 46,
+            Radius = 11,
+            BorderColor = GetFloatingCardBorderColor(accent, emphasized: true),
             BackColor = _palette.CardColor,
+            SurfaceOpacity = GetFloatingCardOpacity(),
             UseGradient = true,
             GradientColor = UiDesign.Blend(_palette.SurfaceColor, accent, 0.028F),
             AccentColor = accent,
             AccentWidth = 3,
+            ShadowColor = GetFloatingCardShadowColor(),
             Margin = new Padding(0, 2, 0, 8),
             AccessibleName = $"{title}，{totalCount} 个账号"
         };
@@ -487,7 +490,8 @@ public partial class Form1
             Radius = 12,
             BorderColor = _palette.BorderColor,
             BackColor = _palette.SurfaceAltColor,
-            Margin = new Padding(0, 0, 0, 14)
+            SurfaceOpacity = GetFloatingCardOpacity(),
+            Margin = new Padding(0, 0, 0, 12)
         };
         var label = new Label
         {
@@ -521,15 +525,16 @@ public partial class Form1
             Width = width,
             Height = horizontal ? 94 : 188,
             Radius = 14,
-            BorderColor = IsCurrentAccount(account)
-                ? _palette.SuccessColor
-                : UiDesign.Blend(_palette.BorderColor, accent, 0.14F),
+            BorderColor = GetFloatingCardBorderColor(
+                IsCurrentAccount(account) ? _palette.SuccessColor : accent,
+                emphasized: IsCurrentAccount(account)),
             BackColor = _palette.CardColor,
+            SurfaceOpacity = GetFloatingCardOpacity(emphasized: IsCurrentAccount(account)),
             UseGradient = true,
             GradientColor = UiDesign.Blend(_palette.CardColor, accent, 0.018F),
             AccentColor = accent,
             AccentWidth = 3,
-            ShadowColor = Color.FromArgb(14, _palette.ShadowColor),
+            ShadowColor = GetFloatingCardShadowColor(emphasized: IsCurrentAccount(account)),
             Margin = new Padding(0, 0, 0, 10),
             AccessibleName = $"{account.Name}，{GetAccountRotationPoolLabel(pool)}"
         };
